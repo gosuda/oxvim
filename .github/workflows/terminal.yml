@@ -28,6 +28,8 @@ jobs:
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo test --locked --release -p oxvim --test tui_e2e --test interactive_pty
       - run: cargo test --locked --release -p ox-editor --test unicode_input
+      - run: cargo test --locked --release -p ox-api --lib ui::tests
+      - run: cargo test --locked --release -p oxvim --bin oxvim multiple_uis_redraw
       - run: cargo test --locked --release -p ox-tui
       - name: Preserve failed terminal sessions
         if: failure()
