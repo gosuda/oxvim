@@ -106,6 +106,7 @@ fn message_locale_from_environment() -> Option<String> {
         }
         return Some(value);
     }
+    // get_mess_env falls back to LC_CTYPE when LANG is absent or numeric.
     current_locale(LocaleCategory::CType)
 }
 
@@ -130,6 +131,60 @@ mod tests {
     #[test]
     fn locale_names_reject_embedded_nul() {
         assert!(set_locale(LocaleCategory::Messages, "C\0ignored").is_none());
+    }
+
+    #[test]
+    fn message_locale_environment_precedence_and_ctype_fallback() -> std::io::Result<()> {
+        const EXPECTED: &str = "OXVIM_TEST_MESSAGE_LOCALE";
+        const CTYPE_FALLBACK: &str = "<ctype>";
+        if let Ok(expected) = std::env::var(EXPECTED) {
+            let expected = if expected == CTYPE_FALLBACK {
+                super::current_locale(LocaleCategory::CType)
+            } else {
+                Some(expected)
+            };
+            assert!(expected.is_some());
+            assert_eq!(super::message_locale_from_environment(), expected);
+            #[cfg(windows)]
+            assert_eq!(super::current_locale(LocaleCategory::Messages), expected);
+            return Ok(());
+        }
+
+        // Each child owns its environment; no test mutates process-global state.
+        for (values, expected) in [
+            ([None, None, None], CTYPE_FALLBACK),
+            ([Some(""), Some(""), Some("")], CTYPE_FALLBACK),
+            ([None, None, Some("1043")], CTYPE_FALLBACK),
+            ([None, None, Some("en_US")], "en_US"),
+            ([Some(""), Some(""), Some("en_US")], "en_US"),
+            ([None, Some("messages"), Some("en_US")], "messages"),
+            ([Some("all"), Some("messages"), Some("en_US")], "all"),
+            ([Some("1043"), None, None], "1043"),
+            ([None, Some("1043"), None], "1043"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .args([
+                    "--exact",
+                    "locale::tests::message_locale_environment_precedence_and_ctype_fallback",
+                    "--nocapture",
+                ])
+                .env(EXPECTED, expected);
+            for (name, value) in ["LC_ALL", "LC_MESSAGES", "LANG"].into_iter().zip(values) {
+                match value {
+                    Some(value) => child.env(name, value),
+                    None => child.env_remove(name),
+                };
+            }
+            let output = child.output()?;
+            assert!(
+                output.status.success(),
+                "locale environment {values:?}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     #[cfg(windows)]

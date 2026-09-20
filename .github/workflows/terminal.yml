@@ -26,6 +26,7 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo test --locked --release -p ox-sys --lib
       - run: cargo test --locked --release -p oxvim --test tui_e2e --test interactive_pty
       - run: cargo test --locked --release -p ox-editor --test unicode_input
       - run: cargo test --locked --release -p ox-editor --test platform_startup
