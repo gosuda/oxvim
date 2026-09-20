@@ -1,0 +1,21 @@
+diff --git a/crates/ox-lua/build.rs b/crates/ox-lua/build.rs
+index 4d48631..84bd51a 100644
+--- a/crates/ox-lua/build.rs
++++ b/crates/ox-lua/build.rs
+@@ -165,7 +165,15 @@ fn build_lpeg() -> Result<(), Box<dyn Error>> {
+     // artifacts of a sibling build script that Cargo may still be running.
+     let include_dir = manifest_dir.join("../../third_party/lua51");
+     for header in ["lua.h", "luaconf.h", "lauxlib.h"] {
+-        println!("cargo:rerun-if-changed={}", include_dir.join(header).display());
++        let path = include_dir.join(header);
++        if !path.is_file() {
++            return Err(io::Error::new(
++                ErrorKind::NotFound,
++                format!("required vendored Lua header is missing: {}", path.display()),
++            )
++            .into());
++        }
++        println!("cargo:rerun-if-changed={}", path.display());
+     }
+ 
+     let mut build = cc::Build::new();
