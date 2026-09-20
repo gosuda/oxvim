@@ -1,0 +1,202 @@
+diff --git a/crates/ox-api/tests/ui_dimensions.rs b/crates/ox-api/tests/ui_dimensions.rs
+new file mode 100644
+index 0000000..edd4bcb
+--- /dev/null
++++ b/crates/ox-api/tests/ui_dimensions.rs
+@@ -0,0 +1,101 @@
++//! Shared screen geometry follows all attached RPC UIs, not the last caller.
++
++use std::cell::RefCell;
++use std::error::Error;
++use std::io;
++use std::rc::Rc;
++
++use ox_api::{ApiSession, Dict, Object, OxStr, Registry, core};
++use ox_editor::{Editor, Geometry};
++use ox_rpc::ChannelId;
++
++struct Session {
++    api: ApiSession,
++    registry: Registry,
++}
++
++impl Session {
++    fn new() -> Result<Self, Box<dyn Error>> {
++        let mut editor = Editor::new();
++        let buffer = editor.create_buffer(true)?;
++        editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24)?)?;
++        Ok(Self {
++            api: ApiSession::new(Rc::new(RefCell::new(editor))),
++            registry: core()?,
++        })
++    }
++
++    fn call(&self, channel: u64, name: &str, args: &[Object]) -> Result<Object, Box<dyn Error>> {
++        let (_, dispatch) = self.registry.get(name).ok_or_else(|| io::Error::other(format!("missing API {name}")))?;
++        let _caller = self.api.enter_rpc_call(ChannelId::new(channel));
++        Ok(dispatch(&self.api, args)?)
++    }
++
++    fn attach(&self, channel: u64, width: i64, height: i64) -> Result<(), Box<dyn Error>> {
++        self.call(channel, "nvim_ui_attach", &[
++            Object::Integer(width), Object::Integer(height),
++            Object::Dict(Dict(vec![(OxStr::from("ext_linegrid"), Object::Boolean(true))])),
++        ])?;
++        Ok(())
++    }
++
++    fn resize(&self, channel: u64, width: i64, height: i64) -> Result<(), Box<dyn Error>> {
++        self.call(channel, "nvim_ui_try_resize", &[Object::Integer(width), Object::Integer(height)])?;
++        Ok(())
++    }
++
++    fn assert_size(&self, width: i64, height: i64) -> Result<(), Box<dyn Error>> {
++        for (name, expected) in [("columns", width), ("lines", height)] {
++            assert_eq!(self.call(3, "nvim_get_option_value", &[
++                Object::String(OxStr::from(name)), Object::Dict(Dict::default()),
++            ])?, Object::Integer(expected), "{name}");
++        }
++        let geometry = self.api.with_editor(|editor| {
++            editor.tabpage(ox_types::TabHandle::CURRENT).map(|tab| tab.layout().size())
++        })?;
++        assert_eq!((geometry.width, geometry.height), (usize::try_from(width)?, usize::try_from(height)?));
++        Ok(())
++    }
++}
++
++#[test]
++fn ui_dimensions_use_componentwise_minima_on_attach_resize_and_detach() -> Result<(), Box<dyn Error>> {
++    let session = Session::new()?;
++    session.attach(3, 80, 40)?;
++    session.attach(4, 200, 24)?;
++    session.assert_size(80, 24)?;
++    let Object::Array(uis) = session.call(3, "nvim_list_uis", &[])? else { return Err(io::Error::other("expected UI array").into()) };
++    for (ui, (width, height)) in uis.iter().zip([(80, 40), (200, 24)]) {
++        let Object::Dict(ui) = ui else { return Err(io::Error::other("expected UI dict").into()) };
++        assert_eq!(ui.get(&OxStr::from("width")), Some(&Object::Integer(width)));
++        assert_eq!(ui.get(&OxStr::from("height")), Some(&Object::Integer(height)));
++    }
++    session.resize(3, 120, 60)?;
++    session.assert_size(120, 24)?;
++    session.resize(4, 100, 70)?;
++    session.assert_size(100, 60)?;
++    session.call(3, "nvim_ui_detach", &[])?;
++    session.assert_size(100, 70)?;
++    session.call(4, "nvim_ui_detach", &[])?;
++    session.assert_size(100, 70)?;
++    assert_eq!(session.call(4, "nvim_list_uis", &[])?, Object::Array(Vec::new()));
++    Ok(())
++}
++
++#[test]
++fn attach_order_and_rejected_requests_do_not_change_shared_size() -> Result<(), Box<dyn Error>> {
++    for sizes in [[(200, 100), (80, 24)], [(80, 24), (200, 100)]] {
++        let session = Session::new()?;
++        session.attach(3, sizes[0].0, sizes[0].1)?;
++        session.attach(4, sizes[1].0, sizes[1].1)?;
++        session.assert_size(80, 24)?;
++        let uis = session.call(3, "nvim_list_uis", &[])?;
++        assert!(session.resize(3, 0, 10).is_err());
++        assert!(session.resize(99, 10, 10).is_err());
++        assert!(session.attach(3, 10, 10).is_err());
++        assert!(session.call(99, "nvim_ui_detach", &[]).is_err());
++        session.assert_size(80, 24)?;
++        assert_eq!(session.call(3, "nvim_list_uis", &[])?, uis);
++    }
++    Ok(())
++}
+ diff --git a/crates/ox-editor/tests/unicode_find.rs b/crates/ox-editor/tests/unicode_find.rs
+new file mode 100644
+index 0000000..72bcd9b
+--- /dev/null
++++ b/crates/ox-editor/tests/unicode_find.rs
+@@ -0,0 +1,89 @@
++//! Character-find commands through the byte-oriented typeahead boundary.
++
++use std::error::Error;
++use std::io;
++
++use ox_editor::{Editor, Geometry, Keys, ModeMachine, NullExprEval, TypeaheadFlags};
++use ox_text::{Buffer, Position};
++
++struct FindResult {
++    column: usize,
++    text: Vec<u8>,
++    register: Vec<u8>,
++}
++
++fn run_find(text: &str, column: usize, keys: &str) -> Result<FindResult, Box<dyn Error>> {
++    let mut editor = Editor::new();
++    let buffer = editor.create_buffer_with(Buffer::from_bytes(text.as_bytes())?, true)?;
++    let tab = editor.create_tabpage(buffer, Geometry::new(0, 0, 80, 24)?)?;
++    let window = editor.tabpage(tab)?.current_window();
++    editor.set_window_cursor(window, Position { lnum: 1, col: column })?;
++    editor.typeahead_mut().append(
++        &Keys::encode(keys.as_bytes()),
++        TypeaheadFlags::default(),
++    );
++    let mut machine = ModeMachine::default();
++    for _ in 0..=keys.len() {
++        if !machine.run_once(&mut editor, &mut NullExprEval)? {
++            let captured = editor.registers().get('"')?.map_or_else(Vec::new, |value| value.to_bytes());
++            return Ok(FindResult {
++                column: editor.window(window)?.cursor.col,
++                text: editor.buffer(buffer)?.text()?.to_bytes(),
++                register: captured,
++            });
++        }
++    }
++    Err(io::Error::other(format!("queued find command did not drain: {keys:?}")).into())
++}
++
++#[test]
++fn queued_find_targets_are_full_scalars_in_both_directions() -> Result<(), Box<dyn Error>> {
++    for target in ['\u{e9}', '\u{100}', '\u{ac00}', '\u{1f642}'] {
++        let text = format!("x{target}x{target}z");
++        let last = text.len() - 1;
++        let second = 2 + target.len_utf8();
++        for (start, keys, expected) in [
++            (0, format!("f{target}"), 1),
++            (last, format!("F{target}"), second),
++            (0, format!("2f{target}"), second),
++            (0, format!("f{target};,"), 1),
++            (last, format!("2F{target}"), 1),
++        ] {
++            let result = run_find(&text, start, &keys)?;
++            assert_eq!(result.column, expected, "{keys:?}");
++            assert_eq!(result.text, text.as_bytes());
++        }
++    }
++    // U+0141 has low byte 'A'; truncating the target must not find that A.
++    assert_eq!(run_find("xA\u{141}z", 0, "f\u{141}")?.column, 2);
++    assert_eq!(run_find("xAz", 0, "f\u{141}")?.column, 0);
++    Ok(())
++}
++
++#[test]
++fn till_stops_at_character_boundaries() -> Result<(), Box<dyn Error>> {
++    let text = "x\u{e9}\u{1f642}\u{ac00}z";
++    assert_eq!(run_find(text, 0, "t\u{ac00}")?.column, 3);
++    assert_eq!(run_find(text, 10, "T\u{e9}")?.column, 3);
++    assert_eq!(run_find("x\u{e9}x\u{e9}z", 0, "2t\u{e9}")?.column, 3);
++    Ok(())
++}
++
++#[test]
++fn find_operators_capture_whole_characters_with_directional_inclusivity() -> Result<(), Box<dyn Error>> {
++    for (text, start, keys, remaining, captured) in [
++        ("x\u{e9}z", 0, "df\u{e9}", "z", "x\u{e9}"),
++        ("x\u{1f642}z", 0, "df\u{1f642}", "z", "x\u{1f642}"),
++        ("x\u{1f642}\u{e9}z", 0, "dt\u{e9}", "\u{e9}z", "x\u{1f642}"),
++        ("x\u{e9}\u{1f642}z", 7, "dF\u{e9}", "xz", "\u{e9}\u{1f642}"),
++        ("x\u{e9}\u{1f642}z", 7, "dT\u{e9}", "x\u{e9}z", "\u{1f642}"),
++        ("x\u{e9}z", 0, "yf\u{e9}", "x\u{e9}z", "x\u{e9}"),
++        ("x\u{e9}z", 0, "vf\u{e9}y", "x\u{e9}z", "x\u{e9}"),
++        ("x\u{e9}z", 3, "vF\u{e9}y", "x\u{e9}z", "\u{e9}z"),
++    ] {
++        let result = run_find(text, start, keys)?;
++        assert_eq!(result.text, remaining.as_bytes(), "{keys:?}");
++        assert_eq!(result.register, captured.as_bytes(), "{keys:?}");
++    }
++    Ok(())
++}
