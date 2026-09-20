@@ -41,14 +41,31 @@ pub fn gettimeofday() -> Result<(u64, u32)> {
 }
 
 /// Returns the four fields documented by `uv.os_uname()`.
-#[must_use]
-pub fn os_uname() -> Uname {
-    let value = rustix::system::uname();
-    Uname {
-        sysname: value.sysname().to_string_lossy().into_owned(),
-        release: value.release().to_string_lossy().into_owned(),
-        version: value.version().to_string_lossy().into_owned(),
-        machine: value.machine().to_string_lossy().into_owned(),
+///
+/// # Errors
+///
+/// Returns the Windows system-query error or an invalid system-description
+/// encoding. Unix `uname` queries cannot fail in rustix's supported contract.
+pub fn os_uname() -> Result<Uname> {
+    #[cfg(unix)]
+    {
+        let value = rustix::system::uname();
+        Ok(Uname {
+            sysname: value.sysname().to_string_lossy().into_owned(),
+            release: value.release().to_string_lossy().into_owned(),
+            version: value.version().to_string_lossy().into_owned(),
+            machine: value.machine().to_string_lossy().into_owned(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let value = ox_sys::windows::system_identity()?;
+        Ok(Uname {
+            sysname: value.sysname,
+            release: value.release,
+            version: value.version,
+            machine: value.machine,
+        })
     }
 }
 
@@ -442,9 +459,18 @@ pub fn resident_set_memory() -> Result<u64> {
 ///
 /// See `uv.get_total_memory()` in `runtime/doc/luvref.txt` (lines 4070-4074).
 /// Reads `MemTotal` (kB) from `/proc/meminfo` on Linux.
+/// Windows uses `GlobalMemoryStatusEx`, returning zero on failure as libuv does.
 #[must_use]
 pub fn get_total_memory() -> u64 {
-    meminfo_kb("MemTotal").saturating_mul(1024)
+    #[cfg(target_os = "linux")]
+    {
+        meminfo_kb("MemTotal").saturating_mul(1024)
+    }
+    #[cfg(windows)]
+    {
+        // libuv returns zero when GlobalMemoryStatusEx fails.
+        ox_sys::windows::physical_memory().map_or(0, |memory| memory.total)
+    }
 }
 
 /// Returns the current free system memory in bytes.
@@ -452,9 +478,17 @@ pub fn get_total_memory() -> u64 {
 /// See `uv.get_free_memory()` in `runtime/doc/luvref.txt` (lines 4076-4080).
 /// Reads `MemAvailable` (kB) from `/proc/meminfo` on Linux, falling back to
 /// `MemFree`.
+/// Windows returns available physical memory, or zero when its query fails.
 #[must_use]
 pub fn get_free_memory() -> u64 {
-    meminfo_kb("MemAvailable").saturating_mul(1024)
+    #[cfg(target_os = "linux")]
+    {
+        meminfo_kb("MemAvailable").saturating_mul(1024)
+    }
+    #[cfg(windows)]
+    {
+        ox_sys::windows::physical_memory().map_or(0, |memory| memory.available)
+    }
 }
 
 /// Returns the amount of memory available to the process based on imposed

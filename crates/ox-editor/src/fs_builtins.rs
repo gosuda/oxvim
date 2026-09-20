@@ -760,22 +760,19 @@ pub(crate) fn expand_glob(io: &dyn FileIO, pattern: &str, all_links: bool) -> Ve
         pattern
     };
     let path = Path::new(pattern);
-    let absolute = path.is_absolute();
+    let mut base = PathBuf::new();
     let components: Vec<String> = path
         .components()
         .filter_map(|component| match component {
-            Component::RootDir => None,
+            Component::Prefix(_) | Component::RootDir => {
+                base.push(component.as_os_str());
+                None
+            }
             Component::CurDir => Some(".".to_owned()),
             Component::ParentDir => Some("..".to_owned()),
             Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
-            Component::Prefix(value) => Some(value.as_os_str().to_string_lossy().into_owned()),
         })
         .collect();
-    let base = if absolute {
-        PathBuf::from("/")
-    } else {
-        PathBuf::new()
-    };
     let mut output = Vec::new();
     expand_components(io, &base, &components, 0, all_links, &mut output);
     output.sort();

@@ -388,13 +388,16 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
     uv.set(
         "os_uname",
         lua.create_function(|lua, ()| {
-            let uname = misc::os_uname();
+            let uname = match misc::os_uname() {
+                Ok(uname) => uname,
+                Err(error) => return uv_fail(lua, &error),
+            };
             let table = lua.create_table()?;
             table.set("sysname", uname.sysname.as_str())?;
             table.set("release", uname.release.as_str())?;
             table.set("version", uname.version.as_str())?;
             table.set("machine", uname.machine.as_str())?;
-            Ok(table)
+            single_value(lua, table)
         })?,
     )?;
 

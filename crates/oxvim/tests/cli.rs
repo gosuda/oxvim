@@ -74,6 +74,36 @@ impl Drop for TempFile {
     }
 }
 
+#[test]
+fn crlf_init_file_obeys_native_source_rules() {
+    let config = TempFile::new(".vim", "let g:crlf_loaded = 42\r\n");
+    let output = oxvim()
+        .args([
+            "--headless",
+            "--noplugin",
+            "-i",
+            "NONE",
+            "-n",
+            "-u",
+            config.text(),
+            "-c",
+            "echo g:crlf_loaded",
+            "-c",
+            "qall!",
+        ])
+        .output()
+        .expect("run editor with CRLF init file");
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    assert!(output.status.success(), "{text}");
+    if cfg!(windows) {
+        assert!(text.lines().any(|line| line == "42"), "{text}");
+        assert!(!text.contains("E488"), "{text}");
+    } else {
+        assert!(text.contains("E488"), "{text}");
+    }
+}
+
 #[expect(
     clippy::panic,
     reason = "test assertion primitive: the panic names the metadata field the test expected"

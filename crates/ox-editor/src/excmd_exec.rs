@@ -9594,13 +9594,13 @@ fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
             })
     }
     #[cfg(not(unix))]
-    let lossy: String;
+    let lossy: std::borrow::Cow<'_, str>;
     #[cfg(unix)]
     let stored: &std::ffi::OsStr = std::os::unix::ffi::OsStrExt::from_bytes(name.as_bytes());
     #[cfg(not(unix))]
     let stored: &std::ffi::OsStr = {
         lossy = String::from_utf8_lossy(name.as_bytes());
-        lossy.as_ref()
+        std::ffi::OsStr::new(lossy.as_ref())
     };
     absolute_clean(Path::new(stored)) == absolute_clean(target)
 }

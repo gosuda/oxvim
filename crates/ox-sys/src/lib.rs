@@ -3,6 +3,8 @@
 //! Locale state lives in [`locale`]; environment mutation below.
 
 pub mod locale;
+#[cfg(windows)]
+pub mod windows;
 
 pub use locale::{LocaleCategory, current_locale, set_locale};
 
@@ -95,13 +97,6 @@ pub fn current_euid() -> u32 {
 mod tests {
     use std::ffi::OsStr;
 
-    // Interior NUL cannot be written as a Rust string literal; on Unix an
-    // `OsStr` carries arbitrary bytes, which is exactly the input a caller can
-    // hand us from Vimscript.
-    fn with_nul(bytes: &[u8]) -> &OsStr {
-        std::os::unix::ffi::OsStrExt::from_bytes(bytes)
-    }
-
     // One case per clause of `name_is_usable` plus the value-NUL clause, each
     // failing only the clause it names: drop any single clause and exactly the
     // matching assertion flips, while the accepted-name case pins the
@@ -118,16 +113,16 @@ mod tests {
         assert!(!super::unset_env("OX_SYS_EQ=BAD"), "`=` in name accepted");
 
         assert!(
-            !super::set_env(with_nul(b"OX_SYS\0NUL"), "value"),
+            !super::set_env(OsStr::new("OX_SYS\0NUL"), "value"),
             "NUL in name accepted"
         );
         assert!(
-            !super::unset_env(with_nul(b"OX_SYS\0NUL")),
+            !super::unset_env(OsStr::new("OX_SYS\0NUL")),
             "NUL in name accepted"
         );
 
         assert!(
-            !super::set_env("OX_SYS_NUL_VALUE", with_nul(b"a\0b")),
+            !super::set_env("OX_SYS_NUL_VALUE", OsStr::new("a\0b")),
             "NUL in value accepted"
         );
         assert_eq!(std::env::var_os("OX_SYS_NUL_VALUE"), None);

@@ -1,4 +1,4 @@
-use crate::{Event, MultiQueue, Owner, Reactor, Result};
+use crate::{MultiQueue, Owner, Reactor, Result};
 
 #[cfg(unix)]
 mod platform {
@@ -10,8 +10,8 @@ mod platform {
     use signal_hook::iterator::backend::SignalDelivery;
     use signal_hook::iterator::exfiltrator::SignalOnly;
 
-    use super::{Event, MultiQueue, Owner, Reactor, Result};
-    use crate::SIGNAL_TOKEN;
+    use super::{MultiQueue, Owner, Reactor, Result};
+    use crate::{Event, SIGNAL_TOKEN};
 
     /// Signal-hook self-pipe integrated as a normal mio readiness source.
     pub struct Signals {

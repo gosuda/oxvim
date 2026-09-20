@@ -672,6 +672,7 @@ name = "ox-sys"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "windows-sys",
 ]
 
 [[package]]
