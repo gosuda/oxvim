@@ -57,7 +57,7 @@ use crate::options::{
 };
 use crate::quickfix::QuickfixMove;
 use crate::register::RegisterContent;
-use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext};
+use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext, SourceFormat};
 use crate::search::{SearchDirection, SearchError, SearchState, pattern_with_case};
 use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
 use crate::userfunc::{UserFuncError, UserFunctions};
@@ -4409,10 +4409,25 @@ pub(crate) fn join_source_lines<F: FileIO, E: ExEditorAccess>(
     text: &str,
     use_crnl: bool,
 ) -> Result<Vec<LogicalLine>, ExecError> {
+    let format = if use_crnl {
+        access.with_ex_editor(|editor| {
+            let Ok(OptionValue::String(formats)) = editor.options().get_global("fileformats")
+            else {
+                unreachable!("fileformats is a canonical global string option with a default");
+            };
+            if formats.is_empty() {
+                SourceFormat::Dos
+            } else {
+                SourceFormat::Detect
+            }
+        })
+    } else {
+        SourceFormat::Unix
+    };
     let did_emsg = &mut runtime.did_emsg;
     let lines = runtime
         .scripts
-        .join_logical_lines_with_format(text, use_crnl, || {
+        .join_logical_lines_with_format(text, format, || {
             *did_emsg = true;
             access.with_ex_editor(|editor| {
                 push_text_message(

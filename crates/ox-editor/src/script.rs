@@ -474,6 +474,17 @@ pub struct LogicalLine {
     pub first_line: usize,
 }
 
+/// Initial separator policy for a sourced script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceFormat {
+    /// Preserve carriage returns as data.
+    Unix,
+    /// Require CRLF until an LF-only line triggers W15 and switches to Unix.
+    Dos,
+    /// Select DOS or Unix from the first newline-terminated line.
+    Detect,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeredocKind {
     Script,
@@ -1278,10 +1289,15 @@ impl<F: FileIO> ScriptCtx<F> {
     /// Returns [`ScriptError`] for malformed heredoc syntax, a missing
     /// `let` heredoc end marker, or a logical line exceeding the size limit.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
-        self.join_logical_lines_with_format(text, cfg!(windows), || {})
+        let format = if cfg!(windows) {
+            SourceFormat::Detect
+        } else {
+            SourceFormat::Unix
+        };
+        self.join_logical_lines_with_format(text, format, || {})
     }
 
-    /// The source reader's platform policy, with a diagnostic hook so pure
+    /// The source reader's initial separator mode, with a diagnostic hook so pure
     /// line-joining callers need not own an editor message sink.
     ///
     /// # Errors
@@ -1290,18 +1306,18 @@ impl<F: FileIO> ScriptCtx<F> {
     pub(crate) fn join_logical_lines_with_format(
         &self,
         text: &str,
-        use_crnl: bool,
+        format: SourceFormat,
         mut wrong_separator: impl FnMut(),
     ) -> Result<Vec<LogicalLine>, ScriptError> {
         let mut physical = text.split('\n').collect::<Vec<_>>();
-        if use_crnl {
+        if format != SourceFormat::Unix {
             // split always yields at least one entry. The last has no newline.
             let terminated = physical.len() - 1;
             for (index, line) in physical[..terminated].iter_mut().enumerate() {
                 let Some(without_cr) = line.strip_suffix('\r') else {
                     // get_one_sourceline emits W15 once before leaving DOS
-                    // mode. An LF on the first line simply selects Unix mode.
-                    if index != 0 {
+                    // mode. Only auto-detection accepts a first-line LF silently.
+                    if format == SourceFormat::Dos || index != 0 {
                         wrong_separator();
                     }
                     break;

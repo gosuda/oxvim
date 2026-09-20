@@ -50,6 +50,24 @@ cargo test --locked --release -p oxvim --test cli crlf_init_file_obeys_native_so
 cargo clippy --locked --target x86_64-pc-windows-msvc -p ox-sys --all-targets
 ```
 
+## Review follow-up
+
+The shared source executor now reads the current global `fileformats` value
+before joining a script. On Windows, an empty value starts in DOS mode;
+any nonempty value enables first-newline detection. An LF-only separator
+in DOS mode emits W15 once and switches the remaining input to Unix mode.
+The option is sampled once per source invocation, and Unix behavior is
+unchanged. Portable regressions exercise both policies, including a
+first-line comment, exact message history and `v:errmsg`, pure CRLF input,
+and an unterminated final line.
+
+The proposed removal of the Windows message-locale fallback was rejected.
+Neovim v0.12.5 `src/nvim/os/lang.c:get_mess_env` explicitly queries
+`LC_CTYPE` when `LANG` is absent or numeric. An isolated subprocess matrix
+guards that behavior and environment-variable precedence without changing
+the test runner's process-global environment. The same test checks the
+public message-locale query on native Windows, including the WOW64 CI job.
+
 ## Remaining Windows blockers
 
 The editor's job layer unconditionally imports the Unix-only
@@ -62,6 +80,7 @@ discovery requirement in `luajit-src`. The installed xwin SDK is sufficient
 for checking the system and runtime boundaries, not that native build step.
 
 The CRLF and rooted-path tests have run on Linux, not in a native Windows
-editor. Mixed-separator warning parity and the `fileformats`-empty sourcing
-case are not established by these regressions. Full Windows editor and
-ConPTY E2E coverage therefore remain open, as does issue #28.
+editor. The mixed-separator and empty-`fileformats` regressions exercise
+the Windows reader policy on Linux; they do not establish native editor
+coverage. Full Windows editor and ConPTY E2E coverage remain open, as does
+issue #28.
