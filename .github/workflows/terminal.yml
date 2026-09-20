@@ -29,6 +29,7 @@ jobs:
       - run: cargo test --locked --release -p oxvim --test tui_e2e --test interactive_pty
       - run: cargo test --locked --release -p ox-editor --test unicode_input
       - run: cargo test --locked --release -p ox-editor --test platform_startup
+      - run: cargo test --locked --release -p ox-editor --lib script_separators
       - run: cargo test --locked --release -p oxvim --test cli crlf_init_file_obeys_native_source_rules
       - run: cargo test --locked --release -p ox-api --lib ui::tests
       - run: cargo test --locked --release -p oxvim --bin oxvim multiple_uis_redraw

@@ -1278,20 +1278,37 @@ impl<F: FileIO> ScriptCtx<F> {
     /// Returns [`ScriptError`] for malformed heredoc syntax, a missing
     /// `let` heredoc end marker, or a logical line exceeding the size limit.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
-        let physical = text.split('\n').collect::<Vec<_>>();
-        #[cfg(windows)]
-        let physical = {
-            let mut physical = physical;
+        self.join_logical_lines_with_format(text, cfg!(windows), || {})
+    }
+
+    /// The source reader's platform policy, with a diagnostic hook so pure
+    /// line-joining callers need not own an editor message sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same parse failures as [`Self::join_logical_lines`].
+    pub(crate) fn join_logical_lines_with_format(
+        &self,
+        text: &str,
+        use_crnl: bool,
+        mut wrong_separator: impl FnMut(),
+    ) -> Result<Vec<LogicalLine>, ScriptError> {
+        let mut physical = text.split('\n').collect::<Vec<_>>();
+        if use_crnl {
             // split always yields at least one entry. The last has no newline.
             let terminated = physical.len() - 1;
-            for line in &mut physical[..terminated] {
+            for (index, line) in physical[..terminated].iter_mut().enumerate() {
                 let Some(without_cr) = line.strip_suffix('\r') else {
+                    // get_one_sourceline emits W15 once before leaving DOS
+                    // mode. An LF on the first line simply selects Unix mode.
+                    if index != 0 {
+                        wrong_separator();
+                    }
                     break;
                 };
                 *line = without_cr;
             }
-            physical
-        };
+        }
         let mut logical: Vec<LogicalLine> = Vec::new();
         let mut first_line_of_script = true;
         let mut index = 0;
