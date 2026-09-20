@@ -1095,7 +1095,7 @@ impl ModeMachine {
                     FindDirection::Backward
                 },
                 till: matches!(state.prefix.as_str(), "t" | "T"),
-                target: key as u8,
+                target: key,
             };
             // `nv_csearch`: `if (searchc(cap, t_cmd) == false) clearopbeep()`.
             // `searchc` records the target before searching, so a failed
@@ -1223,7 +1223,7 @@ impl ModeMachine {
                         if key == ',' {
                             find.direction = reverse_find(find.direction);
                         }
-                        Self::move_find(editor, find, count, false)?
+                        Self::move_find(editor, find, count, true)?
                     }
                     None => false,
                 };
@@ -1635,7 +1635,7 @@ impl ModeMachine {
                 FindDirection::Backward
             },
             till: matches!(state.prefix.as_str(), "t" | "T"),
-            target: key as u8,
+            target: key,
         };
         let ctx = cursor_context(editor)?;
         let Some(motion) = ctx.find_under_cursor(
@@ -2079,10 +2079,6 @@ impl ModeMachine {
         state: &mut VisualState,
         key: char,
     ) -> Result<Option<Mode>, ModeError> {
-        if key.len_utf8() != 1 {
-            state.prefix.clear();
-            return Ok(None);
-        }
         let find = FindMotion {
             direction: if matches!(state.prefix.as_str(), "f" | "t") {
                 FindDirection::Forward
@@ -2090,7 +2086,7 @@ impl ModeMachine {
                 FindDirection::Backward
             },
             till: matches!(state.prefix.as_str(), "t" | "T"),
-            target: key as u8,
+            target: key,
         };
         let ctx = cursor_context(editor)?;
         if let Some(motion) = ctx.find_under_cursor(editor, find, state.count.max(1)) {
@@ -3086,12 +3082,26 @@ impl ModeMachine {
         editor: &mut Editor,
         find: FindMotion,
         count: usize,
-        _visual: bool,
+        repeat: bool,
     ) -> Result<bool, ModeError> {
         let ctx = cursor_context(editor)?;
-        let Some(motion) = ctx.find_under_cursor(editor, find, count) else {
+        let Some(mut motion) = ctx.find_under_cursor(editor, find, count) else {
             return Ok(false);
         };
+        // searchc skips an adjacent target only for an uncounted repeat and
+        // without the legacy ';' cpoptions flag.
+        if repeat
+            && find.till
+            && count == 1
+            && motion.target == ctx.cursor
+            && !matches!(editor.options().get_global("cpoptions"),
+                Ok(OptionValue::String(value)) if value.contains(';'))
+        {
+            let Some(next) = ctx.find_under_cursor(editor, find, 2) else {
+                return Ok(false);
+            };
+            motion = next;
+        }
         editor.set_window_cursor(ctx.window, motion.target)?;
         Ok(true)
     }
