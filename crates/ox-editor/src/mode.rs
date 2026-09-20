@@ -68,6 +68,8 @@ pub struct CmdlineState {
     pub kind: CmdlineKind,
     /// Pattern or command text entered so far.
     pub text: String,
+    /// Insertion position: a UTF-8 boundary in `text`, including its end.
+    pub cursor_byte: usize,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
     /// Cursor position when the command line was entered
@@ -156,6 +158,10 @@ pub enum Step {
     ProcessEvents,
     /// Execute one decoded character key.
     Key(char),
+    /// Move the insertion or editing cursor one character left.
+    Left,
+    /// Move the insertion or editing cursor one character right.
+    Right,
 }
 
 /// Failures produced by modal input execution.
@@ -224,6 +230,8 @@ pub struct ModeMachine {
     /// timeout because no key can arrive. The interactive host loop clears
     /// this so a pending mapping parks, the way upstream's main loop waits.
     no_more_input: bool,
+    /// A cursor key moved within Insert/Replace; the next typed key starts an undo block.
+    insert_moved: bool,
     /// `CTRL-\` seen, waiting for the second key of `CTRL-\ CTRL-N`
     /// (`nv_normal`, `normal.c`), which exits Insert, Cmdline, or Visual to
     /// Normal mode.
@@ -263,6 +271,7 @@ impl Default for ModeMachine {
             timestamp: 0,
             map_pending: false,
             no_more_input: true,
+            insert_moved: false,
             pending_ctrl_bslash: false,
             completion: CompletionSession::new(),
             pending_cmdline_literal: false,
@@ -645,6 +654,28 @@ impl ModeMachine {
                 }
             }
             self.may_sync_undo(editor, flags);
+            // Typeahead and mappings remain byte-oriented. The mode machine
+            // consumes Unicode scalars, including continuations whose literal
+            // 0x80 byte uses internal special-key quoting. Paste capture below
+            // must still receive the original bytes rather than decoded text.
+            if self.paste_capture.is_none()
+                && matches!(editor.typeahead().peek()?, Some(Key::Byte(_)))
+            {
+                if let Some((character, width)) = editor.typeahead().peek_character()? {
+                    if self.recording.is_some() && !flags.mapped {
+                        self.recordbuff
+                            .extend_from_slice(editor.typeahead().keylen(width));
+                    }
+                    editor.typeahead_mut().consume(width);
+                    self.map_pending = false;
+                    self.map_depth = 0;
+                    return Ok(Step::Key(character));
+                }
+                if !self.no_more_input {
+                    self.map_pending = false;
+                    return Ok(Step::Idle);
+                }
+            }
             // `mapdepth = 0` once a character is actually returned
             // (`vgetorpeek`, `getchar.c`): the limit counts expansions that
             // produced no input, not expansions overall.
@@ -688,9 +719,11 @@ impl ModeMachine {
             return match key {
                 Key::Byte(byte) => Ok(Step::Key(char::from(byte))),
                 Key::Special(KS_EXTRA, b'R' | b'N') => Ok(Step::Key('\r')),
-                Key::Special(KS_EXTRA, b'T') => Ok(Step::Key('\t')),
+                Key::Special(KS_EXTRA, b'T' | 54) => Ok(Step::Key('\t')),
                 Key::Special(KS_EXTRA, b'E') => Ok(Step::Key('\u{1b}')),
-                Key::Special(KS_EXTRA, b'B') => Ok(Step::Key('\u{8}')),
+                Key::Special(KS_EXTRA, b'B') | Key::Special(b'k', b'b') => Ok(Step::Key('\u{8}')),
+                Key::Special(b'k', b'l') => Ok(Step::Left),
+                Key::Special(b'k', b'r') => Ok(Step::Right),
                 Key::Special(_, _) => Ok(Step::ProcessEvents),
             };
         }
@@ -823,19 +856,16 @@ impl ModeMachine {
     /// mode are exempt so one insert session, and one typed Ex command line,
     /// stay single blocks.
     ///
-    /// Named gap: upstream also syncs inside Insert mode once a cursor key has
-    /// moved the caret (`Ins.moved != kInsNone`). This port's insert mode has
-    /// no cursor-key handling to set that state, so there is nothing here to
-    /// read; when it gains one, this is the predicate to extend.
+    /// Within Insert/Replace, a cursor move closes the block at the next typed
+    /// key, not during a mapping (`Ins.moved != kInsNone`).
     fn may_sync_undo(&mut self, editor: &mut Editor, flags: TypeaheadFlags) {
-        if flags.mapped
-            || matches!(
-                self.mode,
-                Mode::Insert(_) | Mode::Replace(_) | Mode::Cmdline(_)
-            )
-        {
+        if flags.mapped || matches!(self.mode, Mode::Cmdline(_)) {
             return;
         }
+        if self.mode.is_insert() && !self.insert_moved {
+            return;
+        }
+        self.insert_moved = false;
         editor.sync_current_undo();
     }
 
@@ -854,7 +884,46 @@ impl ModeMachine {
         match step {
             Step::Idle | Step::ProcessEvents => Ok(()),
             Step::Key(key) => self.execute_key(editor, key, eval),
+            Step::Left | Step::Right => self.move_horizontal(editor, step == Step::Right, eval),
         }
+    }
+
+    fn move_horizontal(
+        &mut self,
+        editor: &mut Editor,
+        forward: bool,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), ModeError> {
+        if let Mode::Cmdline(state) = &mut self.mode {
+            state.cursor_byte = if forward {
+                crate::motion::next_char_boundary(state.text.as_bytes(), state.cursor_byte)
+            } else {
+                crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte)
+            };
+            return Ok(());
+        }
+        if self.mode.is_insert() {
+            let ctx = cursor_context(editor)?;
+            let line = ctx.line(editor, ctx.cursor.lnum)?;
+            let column = if forward {
+                crate::motion::next_char_boundary(&line, ctx.cursor.col)
+            } else {
+                crate::motion::prev_char_boundary(&line, ctx.cursor.col)
+            };
+            if column != ctx.cursor.col {
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        col: column,
+                        ..ctx.cursor
+                    },
+                )?;
+                self.insert_moved = true;
+                self.completion.reset();
+            }
+            return Ok(());
+        }
+        self.execute_key(editor, if forward { 'l' } else { 'h' }, eval)
     }
 
     /// Runs one check/execute iteration, returning whether work was ready.
@@ -1216,6 +1285,7 @@ impl ModeMachine {
                         SearchDirection::Backward
                     }),
                     text: String::new(),
+                    cursor_byte: 0,
                     count,
                     preview_start: ctx.cursor,
                     preview_topline: topline,
@@ -1240,6 +1310,7 @@ impl ModeMachine {
                 Ok(Some(Mode::Cmdline(CmdlineState {
                     kind: CmdlineKind::Ex,
                     text: String::new(),
+                    cursor_byte: 0,
                     count,
                     preview_start,
                     preview_topline,
@@ -1377,6 +1448,15 @@ impl ModeMachine {
             'u' => {
                 let ctx = cursor_context(editor)?;
                 editor.buffer_undo(ctx.buffer)?;
+                Ok(Some(Mode::default()))
+            }
+            '\u{12}' => {
+                let ctx = cursor_context(editor)?;
+                for _ in 0..count {
+                    if editor.buffer_redo(ctx.buffer)?.is_none() {
+                        break;
+                    }
+                }
                 Ok(Some(Mode::default()))
             }
             '\u{1d}' => {
@@ -1849,6 +1929,7 @@ impl ModeMachine {
                         SearchDirection::Backward
                     }),
                     text: String::new(),
+                    cursor_byte: 0,
                     count: state.count,
                     preview_start: ctx.cursor,
                     preview_topline: topline,
@@ -2463,7 +2544,8 @@ impl ModeMachine {
     ) -> Result<Option<Mode>, ModeError> {
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
-            state.text.push(key);
+            state.text.insert(state.cursor_byte, key);
+            state.cursor_byte += key.len_utf8();
             self.update_incsearch_preview(editor, state)?;
             return Ok(None);
         }
@@ -2493,7 +2575,12 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             '\u{8}' | '\u{7f}' => {
-                state.text.pop();
+                if state.cursor_byte > 0 {
+                    let previous =
+                        crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte);
+                    state.text.drain(previous..state.cursor_byte);
+                    state.cursor_byte = previous;
+                }
                 self.update_incsearch_preview(editor, state)?;
                 Ok(None)
             }
@@ -2529,7 +2616,8 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             ch if !ch.is_control() => {
-                state.text.push(ch);
+                state.text.insert(state.cursor_byte, ch);
+                state.cursor_byte += ch.len_utf8();
                 self.update_incsearch_preview(editor, state)?;
                 Ok(None)
             }

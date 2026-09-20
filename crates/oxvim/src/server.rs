@@ -1637,7 +1637,15 @@ impl AppState {
                 })?;
                 let mut content = Vec::new();
                 let mut plain = String::new();
-                for character in state.text.chars() {
+                let mut position = 0;
+                for (offset, character) in state.text.char_indices() {
+                    if offset < state.cursor_byte {
+                        position += if character.is_ascii_control() {
+                            2
+                        } else {
+                            character.len_utf8()
+                        };
+                    }
                     if character.is_ascii_control() {
                         if !plain.is_empty() {
                             content.push(ContentChunk::new(
@@ -1664,10 +1672,6 @@ impl AppState {
                 if !plain.is_empty() {
                     content.push(ContentChunk::new(0, OxStr(plain.into_bytes())));
                 }
-                let position = content
-                    .iter()
-                    .map(|chunk| chunk.text.as_bytes().len())
-                    .sum();
                 self.session.with_render_state(|_, _, chrome| {
                     chrome.show_cmdline(UiCmdlineState {
                         content,

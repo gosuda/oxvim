@@ -3,18 +3,23 @@
 
 use std::ffi::c_int;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use crossterm::QueueableCommand;
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::{
     Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+#[cfg(unix)]
 use mio::unix::SourceFd;
+#[cfg(unix)]
 use mio::{Events, Interest, Poll, Token};
 use thiserror::Error;
 
@@ -173,6 +178,7 @@ impl TerminalCapabilities {
 ///
 /// Returns an error if raw mode cannot be enabled or if writing, flushing,
 /// polling, registering, or reading the terminal capability exchange fails.
+#[cfg(unix)]
 pub fn probe_terminal<R: Read + AsRawFd, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -185,10 +191,30 @@ pub fn probe_terminal<R: Read + AsRawFd, W: Write>(
     result
 }
 
+/// Use environment-derived capabilities when raw probe replies cannot be read.
+///
+/// Windows console input is decoded by crossterm, not the Unix descriptor poller.
+/// Sending queries without a corresponding raw reader would leak their replies
+/// into editor input. No query or raw-mode transition is made on this path.
+///
+/// # Errors
+///
+/// This path performs no I/O and always returns the environment baseline.
+#[cfg(not(unix))]
+pub fn probe_terminal<R: Read, W: Write>(
+    _reader: &mut R,
+    _writer: &mut W,
+    environment: &TerminalEnvironment,
+    _policy: ProbePolicy,
+) -> Result<TerminalCapabilities, TerminalError> {
+    Ok(TerminalCapabilities::from_environment(environment))
+}
+
 /// Write every probe query, then read bounded responses and parse them.
 ///
 /// Pure with respect to the reader/writer once raw mode is handled by the
 /// caller, so it is driveable with local sockets in tests.
+#[cfg(unix)]
 fn probe_io<R: Read + AsRawFd, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -263,6 +289,7 @@ fn probe_io<R: Read + AsRawFd, W: Write>(
 
 /// Whether the terminal's own terminfo advertises the colored-underline
 /// (Smulx) capability, allowing the DCS probe to be skipped.
+#[cfg(any(unix, test))]
 fn terminfo_colored_underline(terminfo: Option<&str>) -> bool {
     terminfo.is_some_and(|capabilities| {
         capabilities.split([',', ':', '\n', '|']).any(|capability| {
@@ -458,12 +485,16 @@ impl TerminalError {
 /// rather than as an action that writes from the handler, so restoration runs
 /// on the main thread with the ordering [`TerminalSession::restore`] guarantees
 /// and nothing async-signal-unsafe executes inside a handler.
+#[cfg(unix)]
 pub const RESTORE_SIGNALS: [c_int; 4] = [
     signal_hook::consts::SIGHUP,
     signal_hook::consts::SIGINT,
     signal_hook::consts::SIGQUIT,
     signal_hook::consts::SIGTERM,
 ];
+
+#[cfg(not(unix))]
+pub const RESTORE_SIGNALS: [c_int; 2] = [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM];
 
 /// Flags for the terminating signals that must restore the terminal first.
 pub struct ShutdownSignals {
@@ -1046,8 +1077,32 @@ impl<W: Write> TerminalSession<W> {
         self.writer
             .write_all(SYNC_END)
             .map_err(|error| TerminalError::io("synchronized-output end", error))?;
+        self.writer
+            .flush()
+            .map_err(|error| TerminalError::io("synchronized-output flush", error))?;
         self.state.set(SessionState::SYNCHRONIZED_OUTPUT, false);
         Ok(true)
+    }
+
+    /// Set the visible cursor in `(row, column)` order, or hide it while painting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first terminal write or flush error.
+    pub fn set_cursor(&mut self, position: Option<(u16, u16)>) -> Result<(), TerminalError> {
+        if let Some((row, column)) = position {
+            self.writer
+                .queue(MoveTo(column, row))
+                .and_then(|writer| writer.queue(Show))
+                .map_err(|error| TerminalError::io("cursor position", error))?;
+        } else {
+            self.writer
+                .queue(Hide)
+                .map_err(|error| TerminalError::io("cursor hide", error))?;
+        }
+        self.writer
+            .flush()
+            .map_err(|error| TerminalError::io("cursor flush", error))
     }
 
     /// # Errors
@@ -1332,6 +1387,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn live_probe_wires_queries_to_parsers() -> TestResult {
         let (mut server, mut client) = std::os::unix::net::UnixStream::pair()?;
         server.write_all(b"\x1b[?3u\x1b[?2026;1$y\x1bP1$r4:3m\x1b\\\x1b]52;c;dGVzdA\x07")?;
@@ -1376,6 +1432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn unmatched_probe_response_leaves_features_disabled() -> TestResult {
         let (mut server, mut client) = std::os::unix::net::UnixStream::pair()?;
         server.write_all(b"\x1b[\x1b]52;unterminated")?;
@@ -1392,6 +1449,27 @@ mod tests {
         assert!(!capabilities.features.synchronized_output());
         assert!(!capabilities.features.undercurl());
         assert!(!capabilities.features.osc52_clipboard());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn console_probe_does_not_emit_unconsumable_queries() -> TestResult {
+        let mut reader = io::Cursor::new(b"user input");
+        let mut writer = Vec::new();
+        let environment = TerminalEnvironment::default();
+        let capabilities = probe_terminal(
+            &mut reader,
+            &mut writer,
+            &environment,
+            ProbePolicy::default(),
+        )?;
+        assert_eq!(
+            capabilities,
+            TerminalCapabilities::from_environment(&environment)
+        );
+        assert!(writer.is_empty());
+        assert_eq!(reader.position(), 0, "keyboard input must remain unread");
         Ok(())
     }
 
@@ -1614,6 +1692,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restore_signal_set_is_exactly_the_terminating_signals() {
         assert_eq!(
             RESTORE_SIGNALS,
@@ -1636,6 +1715,7 @@ mod tests {
     // process-global and permanent, so raising SIGTERM here would change the
     // disposition every later test in this binary runs under.
     #[test]
+    #[cfg(unix)]
     fn pending_reports_a_delivered_signal_and_ignores_an_undelivered_one() -> TestResult {
         let signals = ShutdownSignals::install_for(&[
             signal_hook::consts::SIGUSR1,

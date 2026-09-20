@@ -23,6 +23,7 @@ ox-uv = { path = "../ox-uv" }
 [dev-dependencies]
 portable-pty = "0.9.0"
 rmpv.workspace = true
+vt100 = "0.16.2"
 
 [lints]
 workspace = true

@@ -30,10 +30,21 @@ fn resize_current_tabpage(
 ) -> Result<(), ApiError> {
     let geometry = Geometry::new(0, 0, width, height)
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    let columns = i64::try_from(width).map_err(|error| ApiError::validation(error.to_string()))?;
+    let lines = i64::try_from(height).map_err(|error| ApiError::validation(error.to_string()))?;
     session.with_editor_mut(|editor| {
         editor
             .resize_tabpage(ox_types::TabHandle::CURRENT, geometry)
-            .map_err(|error| ApiError::exception(error.to_string()))
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        // A screen resize updates the readback used by Vimscript and plugins,
+        // rather than leaving the startup defaults behind a resized grid.
+        for (name, value) in [("columns", columns), ("lines", lines)] {
+            editor
+                .options_mut()
+                .set_global(name, ox_editor::OptionValue::Number(value))
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+        }
+        Ok(())
     })
 }
 
@@ -3286,6 +3297,34 @@ mod tests {
         );
         nvim_ui_attach(&session, 80, 24, Dict(options)).unwrap();
         session
+    }
+
+    #[test]
+    fn resizing_updates_screen_options_without_cross_session_leaks() -> Result<(), ApiError> {
+        let first = attached_session(&[]);
+        let second = attached_session(&[]);
+        nvim_ui_try_resize(&first, 32, 10)?;
+        first.with_editor(|editor| {
+            assert_eq!(
+                editor.options().get_global("columns"),
+                Ok(&ox_editor::OptionValue::Number(32))
+            );
+            assert_eq!(
+                editor.options().get_global("lines"),
+                Ok(&ox_editor::OptionValue::Number(10))
+            );
+        });
+        second.with_editor(|editor| {
+            assert_eq!(
+                editor.options().get_global("columns"),
+                Ok(&ox_editor::OptionValue::Number(80))
+            );
+            assert_eq!(
+                editor.options().get_global("lines"),
+                Ok(&ox_editor::OptionValue::Number(24))
+            );
+        });
+        Ok(())
     }
 
     #[expect(

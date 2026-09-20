@@ -130,13 +130,21 @@ impl Reactor {
     }
 
     /// Waits for readiness, bounded by `timeout` when supplied.
+    /// A signal interruption is an empty wakeup so the owner can service
+    /// signal callbacks without extending its timer deadline.
     ///
     /// # Errors
     ///
     /// Returns the underlying I/O error if polling the registry fails.
     pub fn poll(&mut self, events: &mut Events, timeout: Option<Duration>) -> Result<()> {
-        self.poll.poll(events, timeout)?;
-        Ok(())
+        match self.poll.poll(events, timeout) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                events.clear();
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Returns the shared waker used by thread-safe producers.
