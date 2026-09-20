@@ -185,7 +185,10 @@ fn cursor_after(lines: &[Vec<u8>], line_count: usize, range: EditRange) -> Posit
     let col = if range.kind == MotionKind::LineWise {
         first_nonblank(line)
     } else {
-        range.start.col.min(line.len().saturating_sub(1))
+        range
+            .start
+            .col
+            .min(crate::motion::prev_char_boundary(line, line.len()))
     };
     Position { lnum, col }
 }
@@ -433,6 +436,17 @@ fn normalize(mut range: EditRange, start_line: &[u8], end_line: &[u8]) -> EditRa
     }
     range.start.col = range.start.col.min(start_line.len().saturating_sub(1));
     range.end.col = range.end.col.min(end_line.len().saturating_sub(1));
+    // Consumers use inclusive byte endpoints. Extend a scalar-start endpoint
+    // to its final byte, leaving malformed interior-byte positions invalid.
+    if range.kind == MotionKind::CharacterWise
+        && range.inclusive
+        && let Ok(text) = std::str::from_utf8(end_line)
+        && let Some(character) = text
+            .get(range.end.col..)
+            .and_then(|tail| tail.chars().next())
+    {
+        range.end.col += character.len_utf8() - 1;
+    }
     range
 }
 

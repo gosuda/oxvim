@@ -231,6 +231,39 @@ fn editing_keeps_the_cursor_visible_and_saves_exact_bytes() -> TestResult {
 }
 
 #[test]
+fn unicode_find_repeat_and_delete_reach_the_real_terminal() -> TestResult {
+    let text = "x\u{e9}\u{3b1}\u{1f642}\u{e9}z\n";
+    let mut terminal = Terminal::start(text)?;
+    terminal.wait("Unicode find fixture", |screen| {
+        screen.contents().contains(text.trim_end()) && !screen.hide_cursor()
+    })?;
+    terminal.send("f\u{e9}".as_bytes())?;
+    terminal.wait("first Unicode target", |screen| {
+        screen.cursor_position() == (0, 1)
+    })?;
+    terminal.send(b";")?;
+    terminal.wait("repeated Unicode target", |screen| {
+        screen.cursor_position() == (0, 5)
+    })?;
+    terminal.send(b",")?;
+    terminal.wait("reverse Unicode target", |screen| {
+        screen.cursor_position() == (0, 1)
+    })?;
+    terminal.send("0df\u{e9}".as_bytes())?;
+    let expected = "\u{3b1}\u{1f642}\u{e9}z\n";
+    terminal.wait("whole-scalar deletion", |screen| {
+        screen.contents().starts_with(expected.trim_end()) && screen.cursor_position() == (0, 0)
+    })?;
+    terminal.send(b":wq\r")?;
+    terminal.finish()?;
+    assert_eq!(
+        fs::read(terminal.directory.join("document.txt"))?,
+        expected.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
 fn command_line_cursor_tracks_utf8_and_cursor_only_updates() -> TestResult {
     let mut terminal = Terminal::start("anchor\n")?;
     terminal.wait("initial editor frame", |screen| {

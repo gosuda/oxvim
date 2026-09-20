@@ -82,8 +82,7 @@ impl Emitter {
     }
 
     /// Takes this channel's retained default grid, unshaped. The consumer
-    /// reshapes it: the multigrid branch to the channel size, `compose_into` to
-    /// the compositor size.
+    /// reshapes it to the shared compositor size in either protocol mode.
     fn take_scratch(&mut self, channel_id: u64) -> Result<Grid, GridError> {
         match self.scratch.remove(&channel_id) {
             Some(grid) => Ok(grid),
@@ -138,7 +137,7 @@ impl Emitter {
             }
             if options.ext_multigrid {
                 self.emit_highlights(channel_id, channel, highlights, options)?;
-                let (width, height) = channel.size();
+                let (width, height) = (compositor.width(), compositor.height());
                 let mut default_grid = self.take_scratch(channel_id)?;
                 default_grid.reshape(width, height)?;
                 for layer in compositor.layers() {
