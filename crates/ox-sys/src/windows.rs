@@ -114,6 +114,8 @@ pub fn system_identity() -> io::Result<SystemIdentity> {
         product.push_str(&service_pack);
     }
 
+    // Match libuv's uv_os_uname: this is the process architecture, including
+    // i686 under WOW64. GetNativeSystemInfo would change that contract.
     let mut system = SYSTEM_INFO::default();
     // SAFETY: GetSystemInfo fully initializes the writable structure and has
     // no failure return. It writes the documented architecture union member.
@@ -177,6 +179,15 @@ mod tests {
         let memory = physical_memory()?;
         assert!(memory.total > 0);
         assert!(memory.available <= memory.total);
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86")]
+    #[test]
+    fn x86_uname_keeps_libuv_process_architecture() -> std::io::Result<()> {
+        // The i686 CI target runs under WOW64 on a 64-bit Windows host.
+        // GetNativeSystemInfo would incorrectly change this to x86_64.
+        assert_eq!(system_identity()?.machine, "i686");
         Ok(())
     }
 
