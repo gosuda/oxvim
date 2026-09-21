@@ -378,10 +378,18 @@ fn emit_highlights_filters_groups_coords_and_priority() {
         r#"
         assert(vim._ts_add_language_from_object(parser_path, parser_language))
         local parser = vim._create_ts_parser(parser_language)
-        local tree = parser:parse(nil, 'local value = 1\n')
+        local source, number_kind, scope_kind
+        if parser_language == 'c' then
+          source, number_kind, scope_kind = 'int   value = 1;\n', 'number_literal', 'translation_unit'
+        else
+          source, number_kind, scope_kind = 'local value = 1\n', 'number', 'chunk'
+        end
+        local tree = parser:parse(nil, source)
         local root = tree:root()
-        local query = vim._ts_parse_query(parser_language,
-          '((identifier) @variable) ((number) @_hidden) ((chunk) @scope) ((identifier) @important (#set! "priority" "250"))')
+        assert(not root:has_error())
+        local query = vim._ts_parse_query(parser_language, string.format(
+          '((identifier) @variable) ((%s) @_hidden) ((%s) @scope) ((identifier) @important (#set! "priority" "250"))',
+          number_kind, scope_kind))
 
         local recorded = {}
         vim.api.nvim_buf_set_extmark = function(bufnr, ns, row, col, opts)
@@ -410,7 +418,7 @@ fn emit_highlights_filters_groups_coords_and_priority() {
         assert(variable.opts.end_row == 0 and variable.opts.end_col == 11)
         assert(variable.opts.priority == 100)
 
-        -- Explicit priority survives; the chunk spans both lines.
+        -- Explicit priority survives; the root spans both lines.
         assert(seen['@important'].opts.priority == 250)
         local scope = seen['@scope']
         assert(scope.row == 0 and scope.opts.end_row == 1)

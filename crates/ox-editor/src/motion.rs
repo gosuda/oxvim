@@ -44,8 +44,8 @@ pub struct FindMotion {
     pub direction: FindDirection,
     /// Stop one character before the target.
     pub till: bool,
-    /// Target byte.
-    pub target: u8,
+    /// Target Unicode scalar.
+    pub target: char,
 }
 
 fn line_len(lines: &[Vec<u8>], lnum: usize) -> usize {
@@ -486,23 +486,26 @@ pub fn resolve_find(
     count: usize,
 ) -> Option<Motion> {
     let line = lines.get(start.lnum.checked_sub(1)?)?;
+    let mut encoded = [0; 4];
+    let target = find.target.encode_utf8(&mut encoded).as_bytes();
     let mut found = start.col;
     for _ in 0..count.max(1) {
         found = match find.direction {
             FindDirection::Forward => line
                 .get(found.saturating_add(1)..)?
-                .iter()
-                .position(|b| *b == find.target)?
+                .windows(target.len())
+                .position(|bytes| bytes == target)?
                 .saturating_add(found + 1),
-            FindDirection::Backward => {
-                line.get(..found)?.iter().rposition(|b| *b == find.target)?
-            }
+            FindDirection::Backward => line
+                .get(..found)?
+                .windows(target.len())
+                .rposition(|bytes| bytes == target)?,
         };
     }
     let col = if find.till {
         match find.direction {
-            FindDirection::Forward => found.saturating_sub(1),
-            FindDirection::Backward => found.saturating_add(1).min(line.len().saturating_sub(1)),
+            FindDirection::Forward => prev_char_boundary(line, found),
+            FindDirection::Backward => next_char_boundary(line, found),
         }
     } else {
         found
@@ -513,7 +516,7 @@ pub fn resolve_find(
             col,
         },
         kind: MotionKind::CharacterWise,
-        inclusive: !find.till,
+        inclusive: find.direction == FindDirection::Forward,
         is_jump: false,
         keep_curswant: false,
     })

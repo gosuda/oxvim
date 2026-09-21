@@ -564,6 +564,45 @@ impl Typeahead {
         decode_one(&self.bytes).map(|(key, _)| Some(key))
     }
 
+    /// Decode one character without consuming a fragmented UTF-8 prefix.
+    /// Internal `K_SPECIAL` quoting is removed before UTF-8 validation. Invalid
+    /// input retains the existing single-byte interpretation; a special key or
+    /// an incomplete scalar returns `None`.
+    pub(crate) fn peek_character(&self) -> Result<Option<(char, usize)>, KeyDecodeError> {
+        if self.bytes.is_empty() {
+            return Ok(None);
+        }
+        let (Key::Byte(first), first_len) = decode_one(&self.bytes)? else {
+            return Ok(None);
+        };
+        let length = match first {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => return Ok(Some((char::from(first), first_len))),
+        };
+        let mut bytes = [first, 0, 0, 0];
+        let mut encoded_len = first_len;
+        for byte in &mut bytes[1..length] {
+            if encoded_len == self.bytes.len() {
+                return Ok(None);
+            }
+            let (key, width) = decode_one(&self.bytes[encoded_len..])?;
+            let Key::Byte(continuation @ 0x80..=0xbf) = key else {
+                return Ok(Some((char::from(first), first_len)));
+            };
+            *byte = continuation;
+            encoded_len += width;
+        }
+        match std::str::from_utf8(&bytes[..length]) {
+            Ok(text) => Ok(text
+                .chars()
+                .next()
+                .map(|character| (character, encoded_len))),
+            Err(_) => Ok(Some((char::from(first), first_len))),
+        }
+    }
+
     /// Removes and decodes the next logical key.
     ///
     /// # Errors

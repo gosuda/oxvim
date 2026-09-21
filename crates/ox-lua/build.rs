@@ -161,43 +161,12 @@ fn build_lpeg() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
-    // mlua's vendored LuaJIT (mlua-sys, links = "lua") installs its headers in
-    // <target>/<profile>/build/mlua-sys-<hash>/out/include but emits no
-    // DEP_LUA_INCLUDE metadata, so locate the sibling build directory from our
-    // own OUT_DIR layout: <target>/<profile>/build/ox-lua-<hash>/out.
-    let out_dir = PathBuf::from(
-        env::var_os("OUT_DIR")
-            .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "Cargo did not provide OUT_DIR"))?,
-    );
-    let build_dir = out_dir.ancestors().nth(2).ok_or_else(|| {
-        io::Error::new(
-            ErrorKind::InvalidData,
-            format!("unexpected OUT_DIR layout: {}", out_dir.display()),
-        )
-    })?;
-    let mut include_dirs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(build_dir)? {
-        let entry = entry?;
-        let include = entry.path().join("out").join("include");
-        if include.join("lua.h").is_file() && include.join("luajit.h").is_file() {
-            include_dirs.push((entry.metadata()?.modified()?, include));
-        }
+    // LPeg uses the Lua 5.1 C API. Its pinned headers are build inputs, not
+    // artifacts of a sibling build script that Cargo may still be running.
+    let include_dir = manifest_dir.join("../../third_party/lua51");
+    for header in ["lua.h", "luaconf.h", "lauxlib.h"] {
+        println!("cargo:rerun-if-changed={}", include_dir.join(header).display());
     }
-    include_dirs.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
-    let Some((_, include_dir)) = include_dirs.first() else {
-        return Err(io::Error::new(
-            ErrorKind::NotFound,
-            format!(
-                "no mlua-sys vendored LuaJIT headers found under {}; build mlua first",
-                build_dir.display()
-            ),
-        )
-        .into());
-    };
-    println!(
-        "cargo:rerun-if-changed={}",
-        include_dir.join("lua.h").display()
-    );
 
     let mut build = cc::Build::new();
     build.include(include_dir);

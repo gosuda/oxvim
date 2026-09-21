@@ -1112,6 +1112,8 @@ impl AppState {
         let result = result?;
         let redraws = if name == "nvim_ui_attach"
             || name == "nvim_ui_try_resize"
+            || name == "nvim_ui_try_resize_grid"
+            || name == "nvim_ui_detach"
             || method_is_mutating(&name)
             || self.has_pending_ui_sends()
             || self.has_pending_redraws()
@@ -1557,12 +1559,13 @@ impl AppState {
             .map_err(|error| ApiError::exception(error.to_string()))?;
         if plan.update_screen {
             let (width, height) = self.session.with_render_state(|ui_channels, _, _| {
-                ui_channels.iter().map(|(_, channel)| channel.size()).fold(
-                    (1, 1),
-                    |(max_width, max_height), (width, height)| {
-                        (max_width.max(width), max_height.max(height))
-                    },
-                )
+                ui_channels
+                    .iter()
+                    .map(|(_, channel)| channel.size())
+                    .reduce(|(width, height), (other_width, other_height)| {
+                        (width.min(other_width), height.min(other_height))
+                    })
+                    .unwrap_or((1, 1))
             });
             self.session
                 .with_editor(|editor| {
@@ -1637,7 +1640,15 @@ impl AppState {
                 })?;
                 let mut content = Vec::new();
                 let mut plain = String::new();
-                for character in state.text.chars() {
+                let mut position = 0;
+                for (offset, character) in state.text.char_indices() {
+                    if offset < state.cursor_byte {
+                        position += if character.is_ascii_control() {
+                            2
+                        } else {
+                            character.len_utf8()
+                        };
+                    }
                     if character.is_ascii_control() {
                         if !plain.is_empty() {
                             content.push(ContentChunk::new(
@@ -1664,10 +1675,6 @@ impl AppState {
                 if !plain.is_empty() {
                     content.push(ContentChunk::new(0, OxStr(plain.into_bytes())));
                 }
-                let position = content
-                    .iter()
-                    .map(|chunk| chunk.text.as_bytes().len())
-                    .sum();
                 self.session.with_render_state(|_, _, chrome| {
                     chrome.show_cmdline(UiCmdlineState {
                         content,
@@ -6167,6 +6174,88 @@ mod tests {
     use super::*;
     use ox_rpc::decode;
     use ox_types::Funcref;
+
+    #[test]
+    fn multiple_uis_redraw_at_the_shared_minimum_after_resize_and_detach()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let assert_grid = |frame: &[u8],
+                           size: (usize, usize)|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let Object::Array(outer) = decode(frame)? else {
+                return Err("expected a redraw notification".into());
+            };
+            let Some(Object::Array(events)) = outer.last() else {
+                return Err("expected redraw events".into());
+            };
+            let expected = Object::Array(vec![
+                Object::Integer(1),
+                Object::Integer(i64::try_from(size.0)?),
+                Object::Integer(i64::try_from(size.1)?),
+            ]);
+            assert!(events.iter().any(|event| matches!(event,
+                Object::Array(fields) if matches!(fields.as_slice(),
+                    [Object::String(name), args @ ..] if name.as_bytes() == b"grid_resize" && args.contains(&expected))
+            )), "missing default-grid resize to {size:?}");
+            Ok(())
+        };
+        for multigrid in [false, true] {
+            let mut state = AppState::new(&Cli::default(), &mut StartupTimer::start())?;
+            for (id, width, height) in [(1, 80, 24), (2, 200, 100)] {
+                let (_, frames) = state.dispatch(
+                    ChannelId::new(id),
+                    &OxStr::from("nvim_ui_attach"),
+                    &[
+                        Object::Integer(width),
+                        Object::Integer(height),
+                        Object::Dict(Dict(vec![
+                            (OxStr::from("ext_linegrid"), Object::Boolean(true)),
+                            (OxStr::from("ext_multigrid"), Object::Boolean(multigrid)),
+                        ])),
+                    ],
+                )?;
+                assert_eq!(
+                    (state.compositor.width(), state.compositor.height()),
+                    (80, 24)
+                );
+                assert_grid(
+                    frames.get(&id).ok_or("missing attached UI redraw")?,
+                    (80, 24),
+                )?;
+            }
+            for (method, params, expected) in [
+                (
+                    "nvim_ui_try_resize",
+                    vec![Object::Integer(60), Object::Integer(100)],
+                    (60, 24),
+                ),
+                (
+                    "nvim_ui_try_resize_grid",
+                    vec![
+                        Object::Integer(1),
+                        Object::Integer(120),
+                        Object::Integer(10),
+                    ],
+                    (80, 10),
+                ),
+                ("nvim_ui_detach", Vec::new(), (80, 24)),
+            ] {
+                let (_, frames) = state.dispatch(ChannelId::new(2), &OxStr::from(method), &params)?;
+                assert_eq!(
+                    (state.compositor.width(), state.compositor.height()),
+                    expected,
+                    "{method}"
+                );
+                assert!(frames.contains_key(&1), "{method}");
+                if method != "nvim_ui_detach" {
+                    assert!(frames.contains_key(&2), "{method}");
+                }
+                for frame in frames.values() {
+                    assert_grid(frame, expected)?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[expect(

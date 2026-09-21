@@ -474,6 +474,17 @@ pub struct LogicalLine {
     pub first_line: usize,
 }
 
+/// Initial separator policy for a sourced script.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceFormat {
+    /// Preserve carriage returns as data.
+    Unix,
+    /// Require CRLF until an LF-only line triggers W15 and switches to Unix.
+    Dos,
+    /// Select DOS or Unix from the first newline-terminated line.
+    Detect,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HeredocKind {
     Script,
@@ -1268,18 +1279,52 @@ impl<F: FileIO> ScriptCtx<F> {
     /// * A `#!` interpreter line at the very start of a script is ignored.
     /// * A control character in the text terminates the script, mirroring
     ///   upstream treating NUL as end-of-file.
-    /// * A trailing CR stays in the line. `get_one_sourceline`
-    ///   (`runtime.c:2891-2905`) removes it only when the source file is
-    ///   `EOL_DOS`, and that whole branch sits under `#ifdef USE_CRNL`, which
-    ///   is a Windows-only define — so on this platform a sourced
-    ///   `let g:v = 4<CR>` keeps its CR and reaches `eval0` as E488.
+    /// * Windows detects CRLF from the first newline-terminated line and
+    ///   strips its CR, as `get_one_sourceline` does under `USE_CRNL`.
+    ///   Encountering an LF-only line switches subsequent lines to Unix
+    ///   format. Unix platforms and an unterminated final line retain CR.
     ///
     /// # Errors
     ///
     /// Returns [`ScriptError`] for malformed heredoc syntax, a missing
     /// `let` heredoc end marker, or a logical line exceeding the size limit.
     pub fn join_logical_lines(&self, text: &str) -> Result<Vec<LogicalLine>, ScriptError> {
-        let physical = text.split('\n').collect::<Vec<_>>();
+        let format = if cfg!(windows) {
+            SourceFormat::Detect
+        } else {
+            SourceFormat::Unix
+        };
+        self.join_logical_lines_with_format(text, format, || {})
+    }
+
+    /// The source reader's initial separator mode, with a diagnostic hook so pure
+    /// line-joining callers need not own an editor message sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same parse failures as [`Self::join_logical_lines`].
+    pub(crate) fn join_logical_lines_with_format(
+        &self,
+        text: &str,
+        format: SourceFormat,
+        mut wrong_separator: impl FnMut(),
+    ) -> Result<Vec<LogicalLine>, ScriptError> {
+        let mut physical = text.split('\n').collect::<Vec<_>>();
+        if format != SourceFormat::Unix {
+            // split always yields at least one entry. The last has no newline.
+            let terminated = physical.len() - 1;
+            for (index, line) in physical[..terminated].iter_mut().enumerate() {
+                let Some(without_cr) = line.strip_suffix('\r') else {
+                    // get_one_sourceline emits W15 once before leaving DOS
+                    // mode. Only auto-detection accepts a first-line LF silently.
+                    if format == SourceFormat::Dos || index != 0 {
+                        wrong_separator();
+                    }
+                    break;
+                };
+                *line = without_cr;
+            }
+        }
         let mut logical: Vec<LogicalLine> = Vec::new();
         let mut first_line_of_script = true;
         let mut index = 0;

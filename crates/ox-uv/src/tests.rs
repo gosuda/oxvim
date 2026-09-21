@@ -476,7 +476,7 @@ fn misc_time_and_directory_contracts_are_sane() {
     misc::chdir(&original).expect("restore cwd");
     assert_eq!(misc::cwd().expect("restored cwd"), original);
 
-    let uname = misc::os_uname();
+    let uname = misc::os_uname().expect("system identity");
     assert!(!uname.sysname.is_empty());
     assert!(misc::getpid() > 0);
 

@@ -53,6 +53,117 @@ fn message_text(msg: &crate::Message) -> String {
     }
 }
 
+#[test]
+fn mixed_script_separators_emit_w15_once() -> Result<(), ExecError> {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::new();
+    let (runtime, _) = executor.runtime_scope_mut();
+    let lines = crate::excmd_exec::join_source_lines(
+        runtime,
+        &editor,
+        "echo 1\r\n\" LF comment\necho 2\r\necho 3\n",
+        true,
+    )?;
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        ["echo 1", "echo 2\r", "echo 3", ""]
+    );
+    assert!(executor.did_emsg());
+    let ed = editor.editor();
+    assert_eq!(ed.messages().len(), 1);
+    assert_eq!(ed.messages()[0].kind, MessageKind::Error);
+    assert_eq!(
+        message_text(&ed.messages()[0]),
+        "W15: Warning: Wrong line separator, ^M may be missing"
+    );
+    assert_eq!(
+        ed.vvars().get(&OxStr::from("errmsg")),
+        Some(&Object::String(OxStr::from(
+            "W15: Warning: Wrong line separator, ^M may be missing"
+        )))
+    );
+    Ok(())
+}
+
+#[test]
+fn homogeneous_script_separators_do_not_emit_w15() -> Result<(), ExecError> {
+    for (source, use_crnl) in [
+        ("echo 1\r\necho 2\r\n", true),
+        ("echo 1\necho 2\r\n", true),
+        ("echo 1\r\necho 2\r", true),
+        ("echo 1\r\necho 2\n", false),
+        ("", true),
+    ] {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut executor = ExExecutor::new();
+        let (runtime, _) = executor.runtime_scope_mut();
+        crate::excmd_exec::join_source_lines(runtime, &editor, source, use_crnl)?;
+        assert!(!executor.did_emsg(), "{source:?}");
+        assert!(editor.editor().messages().is_empty(), "{source:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn empty_fileformats_script_separators_start_in_dos_mode() -> Result<(), ExecError> {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::new();
+    executor.execute_line(&editor, "set fileformats=")?;
+    let (runtime, _) = executor.runtime_scope_mut();
+    let lines = crate::excmd_exec::join_source_lines(
+        runtime,
+        &editor,
+        "\" LF comment\necho 1\r\necho 2\n",
+        true,
+    )?;
+    assert_eq!(
+        lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>(),
+        ["echo 1\r", "echo 2", ""]
+    );
+    assert!(executor.did_emsg());
+    let ed = editor.editor();
+    assert_eq!(ed.messages().len(), 1);
+    assert_eq!(ed.messages()[0].kind, MessageKind::Error);
+    assert_eq!(
+        message_text(&ed.messages()[0]),
+        "W15: Warning: Wrong line separator, ^M may be missing"
+    );
+    assert_eq!(
+        ed.vvars().get(&OxStr::from("errmsg")),
+        Some(&Object::String(OxStr::from(
+            "W15: Warning: Wrong line separator, ^M may be missing"
+        )))
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_fileformats_script_separators_do_not_warn_without_a_dos_transition()
+-> Result<(), ExecError> {
+    for (source, use_crnl) in [
+        ("echo 1\r\necho 2\r\n", true),
+        ("echo 1\r\necho 2\r", true),
+        ("echo 1\r", true),
+        ("echo 1\necho 2\r\n", false),
+        ("", true),
+    ] {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut executor = ExExecutor::new();
+        executor.execute_line(&editor, "set fileformats=")?;
+        let (runtime, _) = executor.runtime_scope_mut();
+        crate::excmd_exec::join_source_lines(runtime, &editor, source, use_crnl)?;
+        assert!(!executor.did_emsg(), "{source:?}");
+        assert!(editor.editor().messages().is_empty(), "{source:?}");
+    }
+    Ok(())
+}
+
 fn assert_vim_error(result: Result<ExecOutcome, ExecError>, code: &str) {
     let ExecError::Vim(exception) = result.unwrap_err() else {
         panic!("expected Vim error {code}")

@@ -25,15 +25,42 @@ fn dimension(value: i64, name: &str) -> Result<usize, ApiError> {
 }
 fn resize_current_tabpage(
     session: &ApiSession,
-    width: usize,
-    height: usize,
+    changed_channel: u64,
+    size: Option<(usize, usize)>,
 ) -> Result<(), ApiError> {
+    // Plan against every UI before changing its requested dimensions, so a
+    // failed geometry update leaves the channel registry unchanged.
+    let size = session.with_state(|state| {
+        state
+            .ui_channels
+            .iter()
+            .filter(|(id, _)| **id != changed_channel)
+            .map(|(_, channel)| channel.size())
+            .chain(size)
+            .reduce(|(width, height), (other_width, other_height)| {
+                (width.min(other_width), height.min(other_height))
+            })
+    });
+    let Some((width, height)) = size else {
+        return Ok(());
+    };
     let geometry = Geometry::new(0, 0, width, height)
         .map_err(|error| ApiError::validation(error.to_string()))?;
+    let columns = i64::try_from(width).map_err(|error| ApiError::validation(error.to_string()))?;
+    let lines = i64::try_from(height).map_err(|error| ApiError::validation(error.to_string()))?;
     session.with_editor_mut(|editor| {
         editor
             .resize_tabpage(ox_types::TabHandle::CURRENT, geometry)
-            .map_err(|error| ApiError::exception(error.to_string()))
+            .map_err(|error| ApiError::exception(error.to_string()))?;
+        // A screen resize updates the readback used by Vimscript and plugins,
+        // rather than leaving the startup defaults behind a resized grid.
+        for (name, value) in [("columns", columns), ("lines", lines)] {
+            editor
+                .options_mut()
+                .set_global(name, ox_editor::OptionValue::Number(value))
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+        }
+        Ok(())
     })
 }
 
@@ -152,7 +179,7 @@ pub fn nvim_ui_attach(
             .attach(channel, width, height, UiOptions::from_dict(&options))
             .map_err(|error| ApiError::exception(error.to_string()))
     })?;
-    if let Err(error) = resize_current_tabpage(session, width, height) {
+    if let Err(error) = resize_current_tabpage(session, channel, Some((width, height))) {
         session.with_state_mut(|state| {
             let _ = state.ui_channels.detach(channel);
         });
@@ -169,6 +196,8 @@ pub fn nvim_ui_attach(
 #[api(since = 1)]
 pub fn nvim_ui_detach(session: &ApiSession) -> Result<(), ApiError> {
     let channel = request_channel(session);
+    require_ui(session, channel)?;
+    resize_current_tabpage(session, channel, None)?;
     session.with_state_mut(|state| {
         state
             .ui_channels
@@ -188,7 +217,7 @@ pub fn nvim_ui_try_resize(session: &ApiSession, width: i64, height: i64) -> Resu
     require_ui(session, channel)?;
     let width = dimension(width, "width")?;
     let height = dimension(height, "height")?;
-    resize_current_tabpage(session, width, height)?;
+    resize_current_tabpage(session, channel, Some((width, height)))?;
     session.with_state_mut(|state| {
         state
             .ui_channels
@@ -535,15 +564,7 @@ pub fn nvim_ui_try_resize_grid(
     // `DEFAULT_GRID_HANDLE` is 1 (`grid.h:22`); it delegates to the same
     // screen resize `nvim_ui_try_resize` performs (`api/ui.c:496-497`).
     if grid == 1 {
-        let width = dimension(width, "width")?;
-        let height = dimension(height, "height")?;
-        resize_current_tabpage(session, width, height)?;
-        return session.with_state_mut(|state| {
-            state
-                .ui_channels
-                .try_resize(channel, width, height)
-                .map_err(|error| ApiError::exception(error.to_string()))
-        });
+        return nvim_ui_try_resize(session, width, height);
     }
     // `ui_grid_resize` resolves a window by grid handle and fails validation
     // when none exists (`ui.c:764-767`); the per-window grid surface is not
@@ -3286,6 +3307,93 @@ mod tests {
         );
         nvim_ui_attach(&session, 80, 24, Dict(options)).unwrap();
         session
+    }
+
+    #[test]
+    fn resizing_updates_screen_options_without_cross_session_leaks() -> Result<(), ApiError> {
+        let first = attached_session(&[]);
+        let second = attached_session(&[]);
+        nvim_ui_try_resize(&first, 32, 10)?;
+        first.with_editor(|editor| {
+            assert_eq!(
+                editor.options().get_global("columns"),
+                Ok(&ox_editor::OptionValue::Number(32))
+            );
+            assert_eq!(
+                editor.options().get_global("lines"),
+                Ok(&ox_editor::OptionValue::Number(10))
+            );
+        });
+        second.with_editor(|editor| {
+            assert_eq!(
+                editor.options().get_global("columns"),
+                Ok(&ox_editor::OptionValue::Number(80))
+            );
+            assert_eq!(
+                editor.options().get_global("lines"),
+                Ok(&ox_editor::OptionValue::Number(24))
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_uis_recompute_independent_minima_through_their_lifecycle() -> Result<(), ApiError> {
+        let session = attached_session(&[]);
+        let other_session = attached_session(&[]);
+        let assert_size = |columns, lines| {
+            session.with_editor(|editor| {
+                assert_eq!(
+                    editor.options().get_global("columns"),
+                    Ok(&ox_editor::OptionValue::Number(columns))
+                );
+                assert_eq!(
+                    editor.options().get_global("lines"),
+                    Ok(&ox_editor::OptionValue::Number(lines))
+                );
+            });
+        };
+        let second = session.enter_rpc_call(ox_rpc::ChannelId::new(2));
+        nvim_ui_attach(
+            &session,
+            200,
+            100,
+            Dict(vec![(OxStr::from("ext_linegrid"), Object::Boolean(true))]),
+        )?;
+        assert_size(80, 24);
+        nvim_ui_try_resize(&session, 60, 100)?;
+        assert_size(60, 24);
+        nvim_ui_try_resize_grid(&session, 1, 120, 10)?;
+        assert_size(80, 10);
+        session.with_state(|state| {
+            assert_eq!(
+                state.ui_channels.get(1).map(ox_ui::UiChannel::size),
+                Some((80, 24))
+            );
+            assert_eq!(
+                state.ui_channels.get(2).map(ox_ui::UiChannel::size),
+                Some((120, 10))
+            );
+        });
+        assert!(nvim_ui_try_resize(&session, 0, 40).is_err());
+        assert_size(80, 10);
+        nvim_ui_detach(&session)?;
+        assert_size(80, 24);
+        drop(second);
+        nvim_ui_detach(&session)?;
+        // With no attached UIs Neovim retains the last screen dimensions.
+        assert_size(80, 24);
+        other_session.with_editor(|editor| {
+            assert_eq!(
+                editor.options().get_global("columns"),
+                Ok(&ox_editor::OptionValue::Number(80))
+            );
+            assert_eq!(
+                editor.options().get_global("lines"),
+                Ok(&ox_editor::OptionValue::Number(24))
+            );
+        });
+        Ok(())
     }
 
     #[expect(

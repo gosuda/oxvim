@@ -1,0 +1,61 @@
+name: Terminal regressions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_TERM_COLOR: always
+
+jobs:
+  editor-pty:
+    name: Real editor PTY (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo test --locked --release -p ox-sys --lib
+      - run: cargo test --locked --release -p oxvim --test tui_e2e --test interactive_pty
+      - run: cargo test --locked --release -p ox-editor --test unicode_input
+      - run: cargo test --locked --release -p ox-editor --test platform_startup
+      - run: cargo test --locked --release -p ox-editor --lib script_separators
+      - run: cargo test --locked --release -p oxvim --test cli crlf_init_file_obeys_native_source_rules
+      - run: cargo test --locked --release -p ox-api --lib ui::tests
+      - run: cargo test --locked --release -p oxvim --bin oxvim multiple_uis_redraw
+      - run: cargo test --locked --release -p ox-tui
+      - name: Preserve failed terminal sessions
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: terminal-failures-linux
+          path: /tmp/oxvim-e2e-*/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  windows-terminal:
+    name: Native terminal library (Windows, not full editor)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo test --locked -p ox-tui --lib
+      - run: cargo test --locked -p ox-sys --lib
+      - run: rustup target add i686-pc-windows-msvc
+      - name: Preserve libuv uname behavior under WOW64
+        run: cargo test --locked -p ox-sys --lib --target i686-pc-windows-msvc
+      - run: cargo check --locked -p ox-uv --lib

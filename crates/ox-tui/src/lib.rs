@@ -39,6 +39,8 @@ use theme::{HighlightAttributes, HighlightGroup, HighlightStyle, MonoTheme, Rgb,
 use thiserror::Error;
 
 const LOOP_SLICE: Duration = Duration::from_millis(16);
+// The level-triggered terminal backend treats a zero timeout as no poll.
+const INPUT_POLL: Duration = Duration::from_millis(1);
 const NOTIFICATION_FADE_MS: u64 = 150;
 
 /// Motion policy selected from `OXVIM_TUI_MOTION`.
@@ -426,6 +428,14 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     )?;
     let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
+    // Register resize delivery before the first visible frame. A resize during
+    // startup otherwise precedes crossterm's lazy SIGWINCH registration and is
+    // lost. Poll retains any keyboard events for the regular input loop.
+    event::poll(INPUT_POLL).map_err(TuiError::Input)?;
+    let size = crossterm::terminal::size().map_err(TuiError::Input)?;
+    if size != (width, height) {
+        client.try_resize(size.0, size.1)?;
+    }
     let mut damage = DamageWriter::new(shared.clone(), capabilities.features.undercurl());
     // Registered before the palette is programmed: a terminating signal that
     // arrives between programming and the first loop turn must still reach the
@@ -506,16 +516,98 @@ fn render_current_frame(
     capabilities: TerminalCapabilities,
 ) -> Result<(), TuiError> {
     let frame = render_frame(grid, state, capabilities)?;
+    let cursor = terminal_cursor(grid, state)
+        .map(|(row, column)| {
+            Ok::<_, TuiError>((
+                u16::try_from(row)
+                    .map_err(|_| TuiError::Protocol("cursor row exceeds u16".into()))?,
+                u16::try_from(column)
+                    .map_err(|_| TuiError::Protocol("cursor column exceeds u16".into()))?,
+            ))
+        })
+        .transpose()?;
     session.begin_synchronized_output()?;
-    let rendered = damage.render(&frame);
+    let rendered = (|| -> Result<(), TuiError> {
+        session.set_cursor(None)?;
+        damage.render(&frame)?;
+        session.set_cursor(cursor)?;
+        Ok(())
+    })();
     let close_result = session.end_synchronized_output();
     rendered?;
     close_result?;
     Ok(())
 }
 
+fn terminal_cursor(grid: &ComposedGrid, state: &TuiState) -> Option<(usize, usize)> {
+    let editor_cursor = state.screen.composed_cursor();
+    let Some(cmdline) = state.chrome.cmdline.active() else {
+        return editor_cursor;
+    };
+    let rect = state
+        .chrome
+        .layout(
+            grid.width(),
+            grid.height(),
+            editor_cursor.map(|cursor| cursor.0),
+        )
+        .cmdline?;
+    let width = rect.width.checked_sub(2).filter(|width| *width != 0)?;
+    let height = rect.height.checked_sub(2).filter(|height| *height != 0)?;
+    let prefix = cmdline.first_character.as_bytes();
+    let prompt = cmdline.prompt.as_ref().map(OxStr::as_bytes);
+    let mut remaining = prefix
+        .len()
+        .saturating_add(prompt.map_or(0, <[u8]>::len))
+        .saturating_add(cmdline.indent)
+        .saturating_add(cmdline.cursor_byte);
+    let parts = std::iter::once(prefix)
+        .chain(prompt)
+        .chain(std::iter::repeat_n(
+            b" ".as_slice(),
+            cmdline.indent.min(width * height),
+        ))
+        .chain(cmdline.content.iter().map(|chunk| chunk.text.as_bytes()));
+    let (mut row, mut column) = (0, 0usize);
+    'text: for bytes in parts {
+        let mut offset = 0;
+        while offset < bytes.len() && remaining > 0 {
+            if bytes[offset] == b'\n' {
+                row += 1;
+                column = 0;
+                offset += 1;
+                remaining -= 1;
+                continue;
+            }
+            let (consumed, mut advance) = chrome::decoded_cell_width(bytes, offset, column);
+            if consumed > remaining {
+                break 'text;
+            }
+            if advance > 0 && column.saturating_add(advance) > width {
+                column = 0;
+                row += 1;
+                advance = chrome::decoded_cell_width(bytes, offset, 0).1.min(width);
+            }
+            if row >= height {
+                return None;
+            }
+            column += advance;
+            offset += consumed;
+            remaining -= consumed;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    if column >= width {
+        row += 1;
+        column = 0;
+    }
+    (row < height).then_some((rect.y + 1 + row, rect.x + 1 + column))
+}
+
 fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
-    while event::poll(Duration::ZERO).map_err(TuiError::Input)? {
+    while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
         match event::read().map_err(TuiError::Input)? {
             Event::Key(key) => {
                 state.chrome.keypress();
@@ -531,7 +623,7 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                     .ok()
                     .map(|grid| (grid.width(), grid.height()));
                 let hit_chrome = dimensions.is_some_and(|(columns, rows)| {
-                    let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
+                    let cursor_row = state.screen.composed_cursor().map(|cursor| cursor.0);
                     state
                         .chrome
                         .layout(columns, rows, cursor_row)
@@ -595,7 +687,7 @@ fn render_frame(
     let height = u16::try_from(grid.height())
         .map_err(|_| TuiError::Protocol("terminal height exceeds u16".into()))?;
     let mut cells = render_grid_cells(grid, state, capabilities);
-    let cursor_row = state.screen.cursor().map(|cursor| cursor.row);
+    let cursor_row = state.screen.composed_cursor().map(|cursor| cursor.0);
     let layout = state.chrome.layout(grid.width(), grid.height(), cursor_row);
     let mut canvas = FrameCanvas {
         cells: &mut cells,
@@ -705,6 +797,9 @@ fn paint_completion_surfaces(
         if let Some(prompt) = &cmdline.prompt {
             text.extend_from_slice(prompt.as_bytes());
         }
+        // Clipped indentation must not allocate an unbounded protocol integer.
+        let visible_cells = rect.width.saturating_sub(2) * rect.height.saturating_sub(2);
+        text.extend(std::iter::repeat_n(b' ', cmdline.indent.min(visible_cells)));
         for chunk in &cmdline.content {
             text.extend_from_slice(chunk.text.as_bytes());
         }

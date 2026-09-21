@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
+#[cfg(unix)]
 use std::time::Duration;
 
 use mio::net::{TcpListener, TcpStream, UdpSocket};

@@ -57,7 +57,7 @@ use crate::options::{
 };
 use crate::quickfix::QuickfixMove;
 use crate::register::RegisterContent;
-use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext};
+use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext, SourceFormat};
 use crate::search::{SearchDirection, SearchError, SearchState, pattern_with_case};
 use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
 use crate::userfunc::{UserFuncError, UserFunctions};
@@ -1981,11 +1981,7 @@ impl<F: FileIO> ExExecutor<F> {
         source_name: &str,
         text: &str,
     ) -> Result<ExecOutcome, ExecError> {
-        let lines = self
-            .runtime
-            .scripts
-            .join_logical_lines(text)
-            .map_err(|error| ExecError::Vim(self.runtime.exception(error.code, error.message)))?;
+        let lines = join_source_lines(&mut self.runtime, access, text, cfg!(windows))?;
         let caller_script = self.scope.script.clone();
         let caller_augroup = self.runtime.current_augroup;
         let sid = self.runtime.scripts.push_source(source_name.to_owned());
@@ -4401,6 +4397,50 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
     }
 }
 
+/// Joins sourced text and reports a DOS-to-Unix separator transition through
+/// the same message path as upstream's emsg(W15), without aborting the reader.
+///
+/// # Errors
+///
+/// Returns script-line parse failures with the current exception context.
+pub(crate) fn join_source_lines<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    text: &str,
+    use_crnl: bool,
+) -> Result<Vec<LogicalLine>, ExecError> {
+    let format = if use_crnl {
+        access.with_ex_editor(|editor| {
+            let Ok(OptionValue::String(formats)) = editor.options().get_global("fileformats")
+            else {
+                unreachable!("fileformats is a canonical global string option with a default");
+            };
+            if formats.is_empty() {
+                SourceFormat::Dos
+            } else {
+                SourceFormat::Detect
+            }
+        })
+    } else {
+        SourceFormat::Unix
+    };
+    let did_emsg = &mut runtime.did_emsg;
+    let lines = runtime
+        .scripts
+        .join_logical_lines_with_format(text, format, || {
+            *did_emsg = true;
+            access.with_ex_editor(|editor| {
+                push_text_message(
+                    editor,
+                    "W15: Warning: Wrong line separator, ^M may be missing".to_owned(),
+                    true,
+                    true,
+                );
+            });
+        });
+    lines.map_err(|error| ExecError::Vim(runtime.exception(error.code, error.message)))
+}
+
 fn source_path<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -4419,10 +4459,7 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
-    let lines = runtime
-        .scripts
-        .join_logical_lines(&text)
-        .map_err(|error| ExecError::Vim(runtime.exception(error.code, error.message)))?;
+    let lines = join_source_lines(runtime, access, &text, cfg!(windows))?;
     let name = runtime
         .scripts
         .io()
@@ -9594,13 +9631,13 @@ fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
             })
     }
     #[cfg(not(unix))]
-    let lossy: String;
+    let lossy: std::borrow::Cow<'_, str>;
     #[cfg(unix)]
     let stored: &std::ffi::OsStr = std::os::unix::ffi::OsStrExt::from_bytes(name.as_bytes());
     #[cfg(not(unix))]
     let stored: &std::ffi::OsStr = {
         lossy = String::from_utf8_lossy(name.as_bytes());
-        lossy.as_ref()
+        std::ffi::OsStr::new(lossy.as_ref())
     };
     absolute_clean(Path::new(stored)) == absolute_clean(target)
 }

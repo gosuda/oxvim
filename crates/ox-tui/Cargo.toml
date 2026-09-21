@@ -8,7 +8,8 @@ description = "redesigned bundled TUI client (crossterm)."
 [dependencies]
 ox-rpc = { path = "../ox-rpc" }
 ox-types = { path = "../ox-types" }
-crossterm.workspace = true
+# The level-triggered Unix backend retains input readiness across resize events.
+crossterm = { workspace = true, features = ["use-dev-tty"] }
 thiserror.workspace = true
 mio.workspace = true
 signal-hook.workspace = true
