@@ -652,6 +652,7 @@ fn encode_cells(cells: &[Cell]) -> Vec<Object> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::Grid;
 

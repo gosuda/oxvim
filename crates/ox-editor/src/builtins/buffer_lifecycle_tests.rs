@@ -12,7 +12,9 @@
 //! | read fails after a good probe   | none (upstream's E200)      |
 
 use crate::excmd_exec::ExExecutor;
-use crate::script::{FileIO, RealFileIO};
+use crate::script::FileIO;
+#[cfg(all(unix, not(target_os = "macos")))]
+use crate::script::RealFileIO;
 use crate::{AutocmdKind, AutocmdOptions, Event};
 use ox_types::{OxStr, Typval};
 use std::cell::RefCell;
@@ -234,7 +236,8 @@ fn bufload_missing_file_fires_bufnewfile_only() {
 /// 0xff name — so the read family fires with the file's text. A lossy
 /// reconstruction of the name would miss the file and take the `BufNewFile`
 /// path with empty text while keeping the raw name.
-#[cfg(unix)]
+/// APFS stores filenames as UTF-8, so such a name cannot exist under macOS.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn bufload_reads_file_whose_name_is_not_utf8() {
     use std::ffi::OsStr;

@@ -6,6 +6,7 @@ rust-version.workspace = true
 description = "rope buffer, line index, undo tree, swapfile, ShaDa."
 
 [dependencies]
+ox-sys = { path = "../ox-sys" }
 ropey.workspace = true
 rmpv.workspace = true
 sha2.workspace = true

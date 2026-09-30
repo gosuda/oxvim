@@ -7847,9 +7847,7 @@ fn swap_meta(editor: &Editor, buffer: BufHandle, candidate: &SwapBuffer, name: &
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default();
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|name| name.trim().to_owned())
-        .unwrap_or_default();
+    let host = swap_host_name();
     let same_dir = name.parent() == Path::new(&candidate.file_name).parent();
     let file_encoding = match editor.options().get_buffer(buffer, "fileencoding") {
         Ok(OptionValue::String(value)) => value.clone(),
@@ -7874,6 +7872,20 @@ fn swap_meta(editor: &Editor, buffer: BufHandle, candidate: &SwapBuffer, name: &
         file_encoding,
         fileformat,
     }
+}
+
+/// The `b0_uname`/`b0_fname` host field (memline.c:341-344): `gethostname(2)`
+/// via libuv upstream, informational for recovery so an empty string is fine.
+#[cfg(unix)]
+fn swap_host_name() -> String {
+    ox_sys::unix::hostname().unwrap_or_default()
+}
+
+/// The `b0_uname`/`b0_fname` host field fallback where `gethostname` is
+/// unavailable.
+#[cfg(not(unix))]
+fn swap_host_name() -> String {
+    String::new()
 }
 
 /// `b0_ino` (memline.c:688): the original file's inode where the platform

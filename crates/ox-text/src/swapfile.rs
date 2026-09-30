@@ -428,9 +428,11 @@ impl SwapFile {
     /// the ordinary `SwapFile::new(...).write_to(..., ownership)` metadata
     /// behavior unchanged; session ownership is supplied separately.
     fn owner_pid(&self) -> u32 {
-        (self.meta.pid != 0)
-            .then_some(self.meta.pid)
-            .unwrap_or_else(std::process::id)
+        if self.meta.pid != 0 {
+            self.meta.pid
+        } else {
+            std::process::id()
+        }
     }
 
     fn owner_host(&self) -> String {
@@ -442,30 +444,29 @@ impl SwapFile {
     }
 
     fn current_hostname() -> String {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            std::fs::read_to_string("/proc/sys/kernel/hostname")
-                .map_or_else(|_| String::new(), |name| name.trim().to_owned())
+            ox_sys::unix::hostname().unwrap_or_default()
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             std::env::var("HOSTNAME").unwrap_or_default()
         }
     }
 
-    /// Default liveness of a recorded creator pid. Linux checks `/proc`;
-    /// macOS and Windows (and other non-Linux targets) conservatively treat
-    /// every nonzero PID as running because their native queries require an
-    /// FFI boundary unavailable to this crate. Callers that own such a
-    /// platform probe should pass it to [`SwapOwnership::new`]. Unknown
-    /// liveness stays alive: deciding a live editor is dead would let two
-    /// processes share one swap file.
+    /// Default liveness of a recorded creator pid. Unix probes with
+    /// `kill(pid, 0)`; other targets conservatively treat every nonzero PID
+    /// as running because their native queries require an FFI boundary
+    /// unavailable to this crate. Callers that own such a platform probe
+    /// should pass it to [`SwapOwnership::new`]. Unknown liveness stays
+    /// alive: deciding a live editor is dead would let two processes share
+    /// one swap file.
     fn process_is_running(pid: u32) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
-            pid != 0 && std::fs::metadata(Path::new("/proc").join(pid.to_string())).is_ok()
+            pid != 0 && ox_sys::unix::process_alive(pid)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             pid != 0
         }
@@ -698,6 +699,7 @@ fn array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], SwapErr
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::fs;
@@ -736,13 +738,12 @@ mod tests {
     /// must survive its rejection.
     #[cfg(target_os = "linux")]
     fn live_foreign_pid() -> u32 {
-        fs::read_to_string("/proc/self/status")
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("PPid:\t"))
-            .and_then(|pid| pid.parse::<u32>().ok())
-            .filter(|&pid| pid != 0 && pid != std::process::id())
-            .unwrap_or(1)
+        let parent = ox_sys::unix::parent_pid();
+        if parent != 0 && parent != std::process::id() {
+            parent
+        } else {
+            1
+        }
     }
 
     #[test]

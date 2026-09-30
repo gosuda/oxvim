@@ -4144,10 +4144,10 @@ fn live_mode_builtin(
     Ok(Some(value))
 }
 
-struct EditorBuiltins {
-    session: Rc<ApiSession>,
-    ex: Rc<RefCell<ExExecutor>>,
-    nested_ex: Rc<RefCell<ExExecutor>>,
+pub(crate) struct EditorBuiltins {
+    pub(crate) session: Rc<ApiSession>,
+    pub(crate) ex: Rc<RefCell<ExExecutor>>,
+    pub(crate) nested_ex: Rc<RefCell<ExExecutor>>,
 }
 
 impl EditorBuiltins {
@@ -6170,6 +6170,7 @@ impl Scheduler for LuaScheduler {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
     use ox_rpc::decode;

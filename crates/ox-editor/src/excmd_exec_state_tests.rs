@@ -186,9 +186,12 @@ impl CwdFixture {
         let directory =
             std::env::temp_dir().join(format!("ox-editor-{name}-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
+        // `getcwd(3)` answers the resolved path — on macOS `/var` and `/tmp`
+        // are `/private` symlinks — so fixtures hold canonical paths, the
+        // only form a working-directory comparison can trust.
         Self {
-            original,
-            directory,
+            original: original.canonicalize().unwrap(),
+            directory: directory.canonicalize().unwrap(),
         }
     }
 
@@ -1489,6 +1492,9 @@ fn cd_changes_the_directory_observed_by_getcwd() {
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
+    // `getcwd` reports the resolved directory: `/var` is a `/private`
+    // symlink on macOS.
+    let target = target.canonicalize().unwrap();
 
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
@@ -1509,6 +1515,8 @@ fn cd_minus_toggles_and_returns_previous_directory() {
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
+    // `getcwd` and the `cd -` slot record the resolved directory.
+    let target = target.canonicalize().unwrap();
 
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();

@@ -544,7 +544,8 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
 
 /// `nvim_set_current_buf` must preserve invalid Unix filename bytes while
 /// probing and reading an unloaded buffer, rather than taking `BufNewFile`.
-#[cfg(unix)]
+/// APFS stores filenames as UTF-8, so such a name cannot exist under macOS.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn set_current_buf_reads_unloaded_non_utf8_file_name() {
     use std::os::unix::ffi::OsStrExt;

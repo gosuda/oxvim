@@ -202,6 +202,20 @@ pub fn os_get_passwd() -> Result<Passwd> {
             shell: None,
             homedir: homedir.to_string_lossy().into_owned(),
         };
+        // macOS user records live in OpenDirectory, not `/etc/passwd`;
+        // `getpwuid_r` is what libuv consults on every Unix anyway.
+        #[cfg(target_os = "macos")]
+        if let Ok(Some(entry)) = ox_sys::unix::passwd_entry(uid) {
+            passwd.username = entry.name;
+            passwd.gid = Some(entry.gid);
+            if !entry.shell.is_empty() {
+                passwd.shell = Some(entry.shell);
+            }
+            if !entry.home.is_empty() {
+                passwd.homedir = entry.home;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         if let Ok(passwd_file) = std::fs::read_to_string("/etc/passwd") {
             for line in passwd_file.lines() {
                 let fields: Vec<&str> = line.split(':').collect();
@@ -339,15 +353,16 @@ impl Rusage {
 /// Returns resource usage for the current process.
 ///
 /// On Linux the fields are populated from `/proc/self/stat`,
-/// `/proc/self/status`, and `/proc/self/io`; fields the kernel does not
-/// expose there (integral sizes, swaps, IPC, signals) are zero, matching the
-/// partially-populated tables libuv documents on macOS/Windows.
+/// `/proc/self/status`, and `/proc/self/io`; on macOS `getrusage` fills them
+/// directly. Fields the kernel does not expose (integral sizes, swaps, IPC,
+/// signals) are zero, matching the partially-populated tables libuv
+/// documents.
 ///
 /// # Errors
 ///
 /// On Linux this always succeeds, returning zero for any fields whose source
-/// file is absent or unparseable. On other platforms returns
-/// [`Error::Unsupported`].
+/// file is absent or unparseable; on macOS a failed `getrusage` surfaces as
+/// [`Error::Io`]. On other platforms returns [`Error::Unsupported`].
 pub fn getrusage() -> Result<Rusage> {
     #[cfg(target_os = "linux")]
     {
@@ -402,7 +417,37 @@ pub fn getrusage() -> Result<Rusage> {
         Ok(usage)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let usage = ox_sys::macos::resource_usage()?;
+        let seconds = |sec: i64, usec: i32| {
+            (
+                u64::try_from(sec).unwrap_or(0),
+                u32::try_from(usec).unwrap_or(u32::MAX),
+            )
+        };
+        let field = |value: i64| u64::try_from(value).unwrap_or(0);
+        Ok(Rusage {
+            utime: seconds(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec),
+            stime: seconds(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec),
+            maxrss: field(usage.ru_maxrss),
+            ixrss: field(usage.ru_ixrss),
+            idrss: field(usage.ru_idrss),
+            isrss: field(usage.ru_isrss),
+            minflt: field(usage.ru_minflt),
+            majflt: field(usage.ru_majflt),
+            nswap: field(usage.ru_nswap),
+            inblock: field(usage.ru_inblock),
+            oublock: field(usage.ru_oublock),
+            msgsnd: field(usage.ru_msgsnd),
+            msgrcv: field(usage.ru_msgrcv),
+            nsignals: field(usage.ru_nsignals),
+            nvcsw: field(usage.ru_nvcsw),
+            nivcsw: field(usage.ru_nivcsw),
+        })
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(Error::Unsupported {
             feature: "getrusage",
@@ -412,6 +457,7 @@ pub fn getrusage() -> Result<Rusage> {
 }
 
 /// Converts `/proc/self/stat` clock ticks (100 Hz) to `(sec, usec)`.
+#[cfg(target_os = "linux")]
 fn ticks_to_time(ticks: u64) -> (u64, u32) {
     const HZ_MS: u64 = 10; // 100 Hz -> 10 ms per tick
     let milliseconds = ticks * HZ_MS;
@@ -427,8 +473,9 @@ fn ticks_to_time(ticks: u64) -> (u64, u32) {
 /// # Errors
 ///
 /// On Linux returns [`Error::Io`] if `/proc/self/status` cannot be read, the
-/// `VmRSS` line is missing, or its value is unparseable. On other platforms
-/// returns [`Error::Unsupported`].
+/// `VmRSS` line is missing, or its value is unparseable; on macOS a failed
+/// `task_info` query surfaces as [`Error::Io`]. On other platforms returns
+/// [`Error::Unsupported`].
 pub fn resident_set_memory() -> Result<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -446,7 +493,12 @@ pub fn resident_set_memory() -> Result<u64> {
         Err(Error::Io(io_error("missing VmRSS")))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(ox_sys::macos::resident_set()?)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(Error::Unsupported {
             feature: "resident_set_memory",
@@ -459,12 +511,17 @@ pub fn resident_set_memory() -> Result<u64> {
 ///
 /// See `uv.get_total_memory()` in `runtime/doc/luvref.txt` (lines 4070-4074).
 /// Reads `MemTotal` (kB) from `/proc/meminfo` on Linux.
-/// Windows uses `GlobalMemoryStatusEx`, returning zero on failure as libuv does.
+/// Windows uses `GlobalMemoryStatusEx` and macOS `hw.memsize`, returning zero
+/// on failure as libuv does.
 #[must_use]
 pub fn get_total_memory() -> u64 {
     #[cfg(target_os = "linux")]
     {
         meminfo_kb("MemTotal").saturating_mul(1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ox_sys::macos::physical_memory().map_or(0, |memory| memory.total)
     }
     #[cfg(windows)]
     {
@@ -478,12 +535,17 @@ pub fn get_total_memory() -> u64 {
 /// See `uv.get_free_memory()` in `runtime/doc/luvref.txt` (lines 4076-4080).
 /// Reads `MemAvailable` (kB) from `/proc/meminfo` on Linux, falling back to
 /// `MemFree`.
-/// Windows returns available physical memory, or zero when its query fails.
+/// Windows returns available physical memory and macOS the `vm_statistics64`
+/// free count scaled by page size, or zero when the query fails.
 #[must_use]
 pub fn get_free_memory() -> u64 {
     #[cfg(target_os = "linux")]
     {
         meminfo_kb("MemAvailable").saturating_mul(1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        ox_sys::macos::physical_memory().map_or(0, |memory| memory.available)
     }
     #[cfg(windows)]
     {
@@ -579,7 +641,8 @@ fn cgroup_memory_limit() -> Option<u64> {
 }
 
 /// Returns the system load average as a triad. See `uv.loadavg()` in
-/// `runtime/doc/luvref.txt` (lines 4367-4371). Reads `/proc/loadavg` on Linux.
+/// `runtime/doc/luvref.txt` (lines 4367-4371). Reads `/proc/loadavg` on Linux
+/// and `getloadavg` on macOS.
 #[must_use]
 pub fn loadavg() -> (f64, f64, f64) {
     #[cfg(target_os = "linux")]
@@ -593,19 +656,26 @@ pub fn loadavg() -> (f64, f64, f64) {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        ox_sys::macos::load_avg()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         (0.0, 0.0, 0.0)
     }
 }
 
 /// Returns the system uptime in seconds. See `uv.uptime()` in
-/// `runtime/doc/luvref.txt` (lines 4279-4283). Reads `/proc/uptime` on Linux.
+/// `runtime/doc/luvref.txt` (lines 4279-4283). Reads `/proc/uptime` on Linux
+/// and `kern.boottime` on macOS.
 ///
 /// # Errors
 ///
 /// On Linux returns [`Error::Io`] if `/proc/uptime` cannot be read or is
-/// unparseable. On other platforms returns [`Error::Unsupported`].
+/// unparseable; on macOS a failed `kern.boottime` sysctl surfaces as
+/// [`Error::Io`]. On other platforms returns [`Error::Unsupported`].
 pub fn uptime() -> Result<f64> {
     #[cfg(target_os = "linux")]
     {
@@ -617,7 +687,12 @@ pub fn uptime() -> Result<f64> {
             .ok_or_else(|| Error::Io(io_error("unparseable /proc/uptime")))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        Ok(ox_sys::macos::uptime()?)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(Error::Unsupported {
             feature: "uptime",
@@ -659,12 +734,15 @@ pub struct CpuInfo {
 /// Returns information about the CPU(s) on the system.
 ///
 /// On Linux the model/speed come from `/proc/cpuinfo` and the times from
-/// `/proc/stat` (10 ms per `USER_HZ` tick). See `uv.cpu_info()`.
+/// `/proc/stat` (10 ms per `USER_HZ` tick); on macOS the times come from
+/// `host_processor_info` (the same 100 Hz tick) and the model from sysctl.
+/// See `uv.cpu_info()`.
 ///
 /// # Errors
 ///
 /// On Linux returns [`Error::Io`] if `/proc/stat` cannot be read or contains
-/// no CPU lines. On other platforms returns [`Error::Unsupported`].
+/// no CPU lines; on macOS a refused `host_processor_info` call surfaces as
+/// [`Error::Io`]. On other platforms returns [`Error::Unsupported`].
 pub fn cpu_info() -> Result<Vec<CpuInfo>> {
     #[cfg(target_os = "linux")]
     {
@@ -704,7 +782,28 @@ pub fn cpu_info() -> Result<Vec<CpuInfo>> {
         Ok(cpus)
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        let model = ox_sys::macos::cpu_model();
+        // `hw.cpufrequency` is absent on Apple Silicon; report MHz like libuv.
+        let speed = ox_sys::macos::cpu_frequency() as f64 / 1_000_000.0;
+        Ok(ox_sys::macos::processor_ticks()?
+            .into_iter()
+            .map(|ticks| CpuInfo {
+                model: model.clone(),
+                speed,
+                times: CpuTimes {
+                    user: ticks.user.saturating_mul(10),
+                    nice: ticks.nice.saturating_mul(10),
+                    sys: ticks.system.saturating_mul(10),
+                    idle: ticks.idle.saturating_mul(10),
+                    irq: 0,
+                },
+            })
+            .collect())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Err(Error::Unsupported {
             feature: "cpu_info",
@@ -748,6 +847,7 @@ fn cpuinfo_models() -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 fn io_error(message: &'static str) -> std::io::Error {
     std::io::Error::other(message)
 }

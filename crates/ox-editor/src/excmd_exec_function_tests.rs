@@ -1678,10 +1678,12 @@ fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
             .expect("pty job must allocate a terminal channel");
         let buffer = ed.buffer(info.buffer).expect("terminal buffer must exist");
         assert_eq!(buffer.name().to_string_lossy(), "");
+        // The slave device name is `/dev/pts/N` on Linux, `/dev/ttysNNN` on
+        // macOS — either is a real pty path.
         assert!(
-            info.pty
-                .as_ref()
-                .is_some_and(|pty| pty.starts_with("/dev/pts/")),
+            info.pty.as_ref().is_some_and(|pty| {
+                pty.starts_with("/dev/pts/") || pty.starts_with("/dev/ttys")
+            }),
             "pty slave path must be real pts, got {:?}",
             info.pty
         );

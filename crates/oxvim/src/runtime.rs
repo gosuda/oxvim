@@ -17,14 +17,12 @@ use ox_editor::{
     Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError,
     OptionValue,
 };
-use ox_eval::BuiltinHost as EvalBuiltins;
-use ox_eval::{Builtins, Scope};
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api,
-    bind_variables, bind_with,
+    ApiDispatchContext, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables,
+    bind_with,
 };
 use ox_text::Buffer;
-use ox_types::{BufHandle, Object, OxStr, Typval};
+use ox_types::{BufHandle, Object, OxStr};
 
 /// Start the terminal client against a child copy of this executable in embed mode.
 pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
@@ -784,9 +782,27 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         Ok::<(), AppError>(())
     })?;
     let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
+    // `nvim -l` runs scripts against a live editor, so `vim.fn` must route
+    // through the same editor-backed executor tier the embed path uses — a
+    // stateless builtin table reports E117 for every stateful builtin.
+    let mut primary = ExExecutor::new();
+    primary
+        .scripts_mut()
+        .set_runtime_roots_from_rtp(&default_rtp);
+    let mut nested = ExExecutor::new();
+    nested
+        .scripts_mut()
+        .set_runtime_roots_from_rtp(&default_rtp);
+    let channel_ids = session.with_editor(|editor| editor.channel_ids());
+    primary.set_channel_ids(channel_ids.clone());
+    nested.set_channel_ids(channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(ScriptBuiltins),
+        Rc::new(crate::server::EditorBuiltins {
+            session: session.clone(),
+            ex: Rc::new(RefCell::new(primary)),
+            nested_ex: Rc::new(RefCell::new(nested)),
+        }),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -810,7 +826,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         host.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
-    let ui_context = ApiDispatchContext::new(session);
+    let ui_context = ApiDispatchContext::new(session.clone());
     let ui_fast = host.fast_callbacks();
     ox_lua::bind_ui_events(host.lua(), &ui_context, &ui_fast)
         .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -832,20 +848,19 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     lua.load(&source)
         .set_name(format!("@{}", script.path))
         .exec()
-        .map_err(|error| AppError::Lua(error.to_string()))
-}
-
-struct ScriptBuiltins;
-impl BuiltinHost for ScriptBuiltins {
-    fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
-        // Pure-eval vimscript builtins with no editor state: the runtime
-        // prelude probes has('win32') during host init
-        // (runtime/lua/vim/_core/system.lua), and `-l` scripts may call any
-        // stateless builtin.
-        let mut builtins = Builtins::without_regex();
-        let mut scope = Scope::new();
-        EvalBuiltins::call(&mut builtins, name, args, &mut scope).map_err(|error| error.to_string())
-    }
+        .map_err(|error| AppError::Lua(error.to_string()))?;
+    // `print()` lands in the editor message stream via `nvim_out_write`
+    // (executor.c:nlua_print); flush it to the process's stdout/stderr like
+    // the batch path so `nvim -l` scripts emit their output.
+    let mut sink = PrintfSink::default();
+    session.with_editor(|editor| {
+        for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
+            sink.write(*destination, message).map_err(AppError::Io)?;
+        }
+        sink.finish(editor.message_routing).map_err(AppError::Io)?;
+        Ok::<(), AppError>(())
+    })?;
+    Ok(())
 }
 
 struct ImmediateScheduler;

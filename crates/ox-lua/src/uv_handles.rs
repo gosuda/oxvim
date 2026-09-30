@@ -2336,7 +2336,9 @@ fn install_udp_tty(
         uv.set(
             "new_tty",
             lua.create_function(move |lua, (fd, readable): (i32, bool)| {
-                let path = format!("/proc/self/fd/{fd}");
+                // `/dev/fd` is the self-fd path on both Linux (a symlink to
+                // `/proc/self/fd`) and macOS (a device directory of its own).
+                let path = format!("/dev/fd/{fd}");
                 let file = OpenOptions::new()
                     .read(readable)
                     .write(!readable)
@@ -2789,7 +2791,7 @@ mod fs_event_lifecycle_tests {
                 sealed.join("probe").to_string_lossy().as_ref(),
             )
             .unwrap();
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o0))
             .expect("seal directory");
         if std::fs::metadata(sealed.join("probe")).is_ok() {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))

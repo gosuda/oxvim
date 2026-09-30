@@ -377,6 +377,9 @@ fn nvim_set_current_dir_rpc_changes_global_cwd_and_preserves_previous() {
         std::env::temp_dir().join(format!("oxvim-current-dir-{}-{unique}", std::process::id())),
     );
     fs::create_dir(&directory.0).expect("create current-directory fixture");
+    // `getcwd()` reports the resolved path — `/var` is a `/private` symlink
+    // on macOS — so the fixture is canonicalized.
+    let directory = ScratchDirectory(directory.0.canonicalize().expect("canonical fixture"));
     let target = directory
         .0
         .to_str()
@@ -448,8 +451,17 @@ fn reentrant_current_dir_shares_cd_minus_state() {
     let reentrant = directory.0.join("reentrant");
     fs::create_dir_all(&first).expect("create first directory fixture");
     fs::create_dir(&reentrant).expect("create reentrant directory fixture");
-    let first = first.to_str().expect("first path must be UTF-8").to_owned();
+    // `getcwd()` reports the resolved path — `/var` is a `/private` symlink
+    // on macOS — so the fixtures are canonicalized.
+    let first = first
+        .canonicalize()
+        .expect("canonical first")
+        .to_str()
+        .expect("first path must be UTF-8")
+        .to_owned();
     let reentrant = reentrant
+        .canonicalize()
+        .expect("canonical reentrant")
         .to_str()
         .expect("reentrant path must be UTF-8")
         .to_owned();

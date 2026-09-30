@@ -4029,13 +4029,24 @@ fn gettext(value: &Typval) -> Result<Typval> {
 }
 
 fn hostname() -> Result<Typval> {
-    let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
-        .or_else(|_| std::env::var("HOSTNAME"))
+    let name = system_hostname()
         .map_err(|error| {
             EvalError::new("E500", 0, format!("Cannot determine hostname: {error}"))
         })?;
     Ok(Typval::String(OxStr::from(name.as_str())))
+}
+
+/// `f_hostname` → `mch_get_host_name` → `uv_os_gethostname`: the kernel's
+/// `gethostname(2)` answer, not an environment variable.
+#[cfg(unix)]
+fn system_hostname() -> std::io::Result<String> {
+    ox_sys::unix::hostname()
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> std::io::Result<String> {
+    std::env::var("HOSTNAME")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))
 }
 
 fn slice(args: &[Typval]) -> Result<Typval> {

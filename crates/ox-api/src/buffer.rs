@@ -1513,6 +1513,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;

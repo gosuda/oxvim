@@ -136,23 +136,6 @@ struct Job {
     /// past editor exit and terminates every other one (`channel_close_on_exit`).
     detached: bool,
 }
-/// Resolve the PTY slave path behind a child that was spawned through one.
-///
-/// `portable_pty` does not expose the slave path taken by the child, but on
-/// Linux the child ends up with the slave on one of standard input, output,
-/// or error; reading `/proc/<pid>/fd/0`'s link target is the cheapest stable
-/// lookup and mirrors what `ps`/`lsof` prints.
-#[cfg(unix)]
-fn pty_slave_path(pid: u32) -> Option<String> {
-    let link = std::fs::read_link(format!("/proc/{pid}/fd/0")).ok()?;
-    let text = link.to_string_lossy().into_owned();
-    if text.starts_with("/dev/pts/") {
-        Some(text)
-    } else {
-        None
-    }
-}
-
 /// Owns job channels and the `ox-uv` loop which drives their process handles.
 pub struct JobManager {
     loop_: UvLoop,
@@ -202,10 +185,6 @@ impl JobManager {
     /// # Errors
     ///
     /// Returns the process or stream setup error.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the Unix and non-Unix spawn paths share one resource-ownership boundary"
-    )]
     pub fn start(&mut self, id: u64, options: JobStartOptions) -> Result<u32, String> {
         let mut spawn_options = SpawnOptions::new(options.program);
         spawn_options.args = options.args;
@@ -229,7 +208,7 @@ impl JobManager {
         };
 
         #[cfg(unix)]
-        let (process, input, stdout_pipe, stderr_pipe) = if options.pty {
+        let (process, input, stdout_pipe, stderr_pipe, pty_slave) = if options.pty {
             let mut spawned =
                 process::spawn_pty(&mut self.loop_, spawn_options, options.pty_size, on_exit)
                     .map_err(|error| error.to_string())?;
@@ -240,11 +219,13 @@ impl JobManager {
                     queue_stream_event(&output_queue, id, StreamKind::Stdout, event);
                 })
                 .map_err(|error| error.to_string())?;
+            let pty_slave = spawned.pty_slave;
             (
                 spawned.process,
                 Some(JobInput::Pty(spawned.master)),
                 None,
                 None,
+                pty_slave,
             )
         } else {
             let mut spawned = process::spawn(&mut self.loop_, spawn_options, on_exit)
@@ -266,29 +247,21 @@ impl JobManager {
                 })
                 .map_err(|error| error.to_string())?;
             }
-            (spawned.process, input, stdout_pipe, stderr_pipe)
+            (spawned.process, input, stdout_pipe, stderr_pipe, None)
         };
 
         #[cfg(not(unix))]
-        let (process, input, stdout_pipe, stderr_pipe) = {
+        let (process, input, stdout_pipe, stderr_pipe, pty_slave) = {
             if options.pty {
                 return Err("jobstart pty is unavailable on this platform".to_owned());
             }
             let mut spawned = process::spawn(&mut self.loop_, spawn_options, on_exit)
                 .map_err(|error| error.to_string())?;
             let input = spawned.pipes.stdin.take().map(JobInput::Pipe);
-            (spawned.process, input, None, None)
+            (spawned.process, input, None, None, None)
         };
 
         let pid = process.pid();
-        #[cfg(unix)]
-        let pty_slave = if options.pty {
-            pty_slave_path(pid)
-        } else {
-            None
-        };
-        #[cfg(not(unix))]
-        let pty_slave = None;
         self.jobs.insert(
             id,
             Job {
@@ -988,7 +961,7 @@ mod tests {
         // gone rather than a zombie. Retry briefly: SIGTERM delivery and the
         // reap are not instantaneous.
         for _ in 0..50 {
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            if ox_uv::process::kill(pid, Some(0)).is_err() {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1049,8 +1022,14 @@ mod tests {
 
     #[test]
     fn cwd_and_environment_are_applied_to_the_spawn() {
+        // `pwd` reports the resolved directory — `/tmp` is a `/private/tmp`
+        // symlink on macOS — so the grep pattern takes the canonical path.
+        let tmp = std::fs::canonicalize("/tmp").unwrap();
         let mut job_options = options(
-            "printenv OX_JOB_VALUE | grep -qx set && pwd | grep -qx /tmp",
+            &format!(
+                "printenv OX_JOB_VALUE | grep -qx set && pwd | grep -qx {}",
+                tmp.display()
+            ),
             false,
         );
         let mut environment = std::env::vars_os().collect::<Vec<_>>();

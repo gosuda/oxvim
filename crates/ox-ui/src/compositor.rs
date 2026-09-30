@@ -1,7 +1,7 @@
 //! Server-side grid layering modeled after Neovim's UI compositor.
 
 use ox_editor::{
-    BufferStateError, Editor, EditorError, Extmark, Geometry, LayoutError,
+    BufferStateError, Editor, EditorError, Extmark, Geometry, LayoutError, OptionValue,
     extmark::ExtmarkHighlightMode,
 };
 use ox_text::BufferError;
@@ -394,8 +394,32 @@ impl Compositor {
             }
             let sign_slots = sign_slots.min(3);
             let sign_width = sign_slots.saturating_mul(2);
+            // 'number'/'relativenumber' reserve a gutter after the sign
+            // column sized like upstream's `numberwidth`: the option is the
+            // floor, a longer line count widens it to digits + 1
+            // (screen.c:win_col_off).
+            let number_on = matches!(
+                editor.options().get_window(window, "number"),
+                Ok(OptionValue::Boolean(true))
+            );
+            let relative_on = matches!(
+                editor.options().get_window(window, "relativenumber"),
+                Ok(OptionValue::Boolean(true))
+            );
+            let number_width = if number_on || relative_on {
+                let minimum = match editor.options().get_window(window, "numberwidth") {
+                    Ok(OptionValue::Number(width)) => {
+                        usize::try_from((*width).clamp(1, 20)).unwrap_or(4)
+                    }
+                    _ => 4,
+                };
+                minimum.max(digits(line_count).saturating_add(1))
+            } else {
+                0
+            };
+            let gutter = sign_width.saturating_add(number_width);
             let text_height = grid_height;
-            let text_width = geometry.width.saturating_sub(sign_width).max(1);
+            let text_width = geometry.width.saturating_sub(gutter).max(1);
             // Bin sign marks by buffer row once per redraw so each drawn
             // segment looks up its line instead of rescanning every mark.
             let mut sign_marks_by_row: std::collections::HashMap<usize, Vec<usize>> =
@@ -414,6 +438,29 @@ impl Compositor {
                     }
                 }
             }
+            // Upstream picks LineNr for plain 'number', LineNrAbove/Below
+            // around the cursor under 'relativenumber', and CursorLineNr on
+            // the cursor line when 'cursorlineopt' includes "number"
+            // (screen.c:win_draw_line / number row highlighting).
+            let cursor_hl = number_width != 0
+                && matches!(
+                    editor.options().get_window(window, "cursorlineopt"),
+                    Ok(OptionValue::String(opt)) if opt.split(',').any(|item| item == "number")
+                )
+                && matches!(
+                    editor.options().get_window(window, "cursorline"),
+                    Ok(OptionValue::Boolean(true))
+                );
+            let line_nr_ids = if number_width != 0 {
+                (
+                    highlight_or(highlights, "LineNr", 0x00_80_80)?,
+                    highlight_or(highlights, "LineNrAbove", 0x00_80_80)?,
+                    highlight_or(highlights, "LineNrBelow", 0x00_80_80)?,
+                    highlight_or(highlights, "CursorLineNr", 0x80_80_00)?,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
             let mut screen_row = 0;
             let mut line_number = state.topline;
             let mut watched_extmarks = Vec::new();
@@ -443,6 +490,44 @@ impl Compositor {
                 let available_rows = text_height.saturating_sub(screen_row);
                 let truncated = wrapped.len() > available_rows;
                 for (segment, segment_cell_start) in wrapped.iter().take(text_height - screen_row) {
+                    if number_width != 0 {
+                        // Wrapped continuation rows keep an empty number
+                        // gutter; only the first segment of a buffer line
+                        // carries digits, right-aligned with a trailing
+                        // space (screen.c:format_number).
+                        let (line_nr_id, digits_text) = if *segment_cell_start == 0 {
+                            let cursor_row = line_number == state.cursor.lnum;
+                            let id = if cursor_row && cursor_hl {
+                                line_nr_ids.3
+                            } else if relative_on && !cursor_row {
+                                if line_number < state.cursor.lnum {
+                                    line_nr_ids.1
+                                } else {
+                                    line_nr_ids.2
+                                }
+                            } else {
+                                line_nr_ids.0
+                            };
+                            let shown = if relative_on && !cursor_row {
+                                line_number.abs_diff(state.cursor.lnum)
+                            } else if relative_on && !number_on {
+                                0
+                            } else {
+                                line_number
+                            };
+                            (
+                                id,
+                                format!(
+                                    "{:>width$} ",
+                                    shown,
+                                    width = number_width.saturating_sub(1)
+                                ),
+                            )
+                        } else {
+                            (line_nr_ids.0, " ".repeat(number_width))
+                        };
+                        grid.write_text(screen_row, sign_width, &digits_text, line_nr_id)?;
+                    }
                     if sign_width != 0 {
                         grid.set_hl_span(screen_row, 0, sign_width, sign_id)?;
                         let binned = sign_marks_by_row
@@ -471,12 +556,12 @@ impl Compositor {
                             grid.write_text(screen_row, slot * 2, &text, hl_id)?;
                         }
                     }
-                    grid.write_text(screen_row, sign_width, segment, 0)?;
+                    grid.write_text(screen_row, gutter, segment, 0)?;
                     apply_extmark_highlights(
                         &mut grid,
                         screen_row,
                         line_number.saturating_sub(1),
-                        sign_width,
+                        gutter,
                         *segment_cell_start,
                         &line_text,
                         &marks,
@@ -513,7 +598,7 @@ impl Compositor {
                             namespace: mark.namespace.get(),
                             mark: mark.id.get(),
                             row,
-                            col: sign_width.saturating_add(draw_col % text_width),
+                            col: gutter.saturating_add(draw_col % text_width),
                             buffer_row: mark.position().row,
                         });
                     }
@@ -562,7 +647,7 @@ impl Compositor {
                 let cursor_col = display_column(&cursor_line, state.cursor.col);
                 (
                     before_cursor.saturating_add(cursor_col / text_width),
-                    sign_width.saturating_add(cursor_col % text_width),
+                    gutter.saturating_add(cursor_col % text_width),
                 )
             });
             self.layers.push(layer);
@@ -1014,4 +1099,41 @@ fn display_column(line: &str, byte: usize) -> usize {
         boundary -= 1;
     }
     UnicodeWidthStr::width(&line[..boundary])
+}
+
+/// Decimal digit count of a line count, for the 'number' gutter's upstream
+/// widening rule (`numberwidth` is the floor, a longer buffer adds one cell
+/// past the digits).
+fn digits(count: usize) -> usize {
+    let mut count = count.max(1);
+    let mut width = 0;
+    while count > 0 {
+        count /= 10;
+        width += 1;
+    }
+    width
+}
+
+/// Resolves a highlight group, defining a dim fallback when the colorscheme
+/// has not — the same pattern the sign column uses for `SignColumn`.
+fn highlight_or(
+    highlights: &mut HlState,
+    name: &str,
+    fallback_rgb: u32,
+) -> Result<u64, CompositorError> {
+    if let Some(id) = highlights.group_id(&OxStr::from(name)) {
+        return Ok(id);
+    }
+    highlights
+        .define_group(
+            name,
+            Highlight {
+                rgb: HlAttrs {
+                    foreground: Some(fallback_rgb),
+                    ..HlAttrs::default()
+                },
+                ..Highlight::default()
+            },
+        )
+        .map_err(CompositorError::from)
 }
