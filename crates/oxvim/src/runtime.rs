@@ -427,8 +427,9 @@ fn apply_startup_file_overlays(
     editor: &mut Editor,
     handle: BufHandle,
     flags: StartupFlags,
+    readonly_perm: bool,
 ) -> Result<(), AppError> {
-    if flags.readonly {
+    if flags.readonly || readonly_perm {
         editor
             .options_mut()
             .set_buffer(handle, "readonly", OptionValue::Boolean(true))
@@ -463,6 +464,18 @@ fn open_startup_files(
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
         let text = read_startup_file(file)?;
+        // `file_readonly` (fileio.c:462): a file with no write permission
+        // bit loads 'readonly'; a file that does not exist yet stays
+        // writable as a new buffer.
+        #[cfg(unix)]
+        let readonly_perm = fs::metadata(file)
+            .map(|meta| {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o222 == 0
+            })
+            .unwrap_or(false);
+        #[cfg(not(unix))]
+        let readonly_perm = false;
         if index == 0 && first_into_current {
             let current = editor
                 .current_buffer()
@@ -471,7 +484,7 @@ fn open_startup_files(
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
             }
-            apply_startup_file_overlays(editor, current, flags)?;
+            apply_startup_file_overlays(editor, current, flags, readonly_perm)?;
             handles.push(current);
             continue;
         }
@@ -482,7 +495,7 @@ fn open_startup_files(
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
         }
-        apply_startup_file_overlays(editor, handle, flags)?;
+        apply_startup_file_overlays(editor, handle, flags, readonly_perm)?;
         handles.push(handle);
     }
     Ok(handles)
