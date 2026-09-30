@@ -51,6 +51,24 @@ pub struct InsertState;
 /// Replace mode has no extra retained state beyond the insert session.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplaceState;
+/// In-progress `i_CTRL-V`/`i_CTRL-Q` literal insertion (`edit.c`
+/// `ins_literal`): after the chord, the next key inserts literally, or a
+/// digit run / `x`/`o`/`u`/`U` prefix forms a charcode.
+#[derive(Clone, Debug)]
+enum InsertLiteral {
+    /// Waiting for the literal key or the first digit/prefix.
+    Awaiting,
+    /// Collecting a charcode of at most `max` digits in `radix`.
+    Digits {
+        /// Number base: 8, 10, or 16.
+        radix: u32,
+        /// Maximum digit count (3 decimal/octal, 2/4/8 hex).
+        max: usize,
+        /// Collected digits so far.
+        digits: String,
+    },
+}
+
 /// Outcome of the shared `CTRL-\` second-key arm (`insert.c:640`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CtrlBslash {
@@ -245,6 +263,15 @@ pub struct ModeMachine {
     /// Insert mode temporarily yielded to one Normal-mode command with
     /// `CTRL-O`.
     one_normal_command: bool,
+    /// `i_CTRL-V`/`i_CTRL-Q` seen, waiting for the literal key or charcode
+    /// digits (`edit.c` `ins_literal`).
+    insert_literal: Option<InsertLiteral>,
+    /// `i_CTRL-R` seen, waiting for the register-name key
+    /// (`edit.c` `insert_reg`).
+    pending_insert_ctrl_r: bool,
+    /// Where the current insert session began (`Ins.start_orig`):
+    /// `i_CTRL-U` deletes back to this position.
+    insert_anchor: Option<Position>,
     /// Register currently recording macros, if any (`reg_recording`).
     recording: Option<char>,
     /// Encoded keys captured for the active recording (`recordbuff`).
@@ -278,6 +305,9 @@ impl Default for ModeMachine {
             completion: CompletionSession::new(),
             pending_cmdline_literal: false,
             one_normal_command: false,
+            insert_literal: None,
+            pending_insert_ctrl_r: false,
+            insert_anchor: None,
             recording: None,
             recordbuff: Vec::new(),
             redo_buf: Vec::new(),
@@ -464,6 +494,9 @@ impl ModeMachine {
         self.record_insert_transition(was_insert);
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
+        self.insert_literal = None;
+        self.pending_insert_ctrl_r = false;
+        self.insert_anchor = None;
     }
 
     /// Moves to the end of the current line and enters Insert mode.
@@ -486,6 +519,9 @@ impl ModeMachine {
         self.record_insert_transition(was_insert);
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
+        self.insert_literal = None;
+        self.pending_insert_ctrl_r = false;
+        self.insert_anchor = None;
     }
 
     /// Leaves Insert, Replace, or terminal-input mode without applying a cursor motion.
@@ -497,6 +533,9 @@ impl ModeMachine {
         }
         self.pending_ctrl_bslash = false;
         self.pending_cmdline_literal = false;
+        self.insert_literal = None;
+        self.pending_insert_ctrl_r = false;
+        self.insert_anchor = None;
     }
 
     /// Ends active Visual mode for an API focus change, retaining the saved
@@ -2290,6 +2329,11 @@ impl ModeMachine {
         key: char,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
+        let ctx = cursor_context(editor)?;
+        if self.insert_literal.is_some() || self.pending_insert_ctrl_r {
+            return self.insert_pending(editor, &ctx, _state, key, eval);
+        }
+        self.insert_anchor.get_or_insert(ctx.cursor);
         if key == '\u{0f}' {
             self.completion.reset();
             self.one_normal_command = true;
@@ -2320,6 +2364,7 @@ impl ModeMachine {
     }
 
     /// Ordinary Insert input once the `CTRL-\` arm has run.
+    #[allow(clippy::too_many_lines)] // one match arm per control key, like `edit.c` `insert()`
     fn insert_plain(
         &mut self,
         editor: &mut Editor,
@@ -2401,6 +2446,67 @@ impl ModeMachine {
                 )?;
                 Ok(None)
             }
+            '\u{3}' => {
+                // `i_CTRL-C`: quit Insert like Esc (upstream skips
+                // InsertLeave here — oxvim runs no autocommands either way).
+                self.completion.reset();
+                insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
+                Ok(Some(Mode::default()))
+            }
+            '\u{5}' => {
+                insert::sibling_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    true,
+                    self.timestamp,
+                )?;
+                Ok(None)
+            }
+            '\u{11}' | '\u{16}' => {
+                self.insert_literal = Some(InsertLiteral::Awaiting);
+                Ok(None)
+            }
+            '\u{12}' => {
+                self.pending_insert_ctrl_r = true;
+                Ok(None)
+            }
+            '\u{15}' => {
+                let anchor = self.insert_anchor.unwrap_or(ctx.cursor);
+                insert::ctrl_u(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    anchor,
+                    option_contains(editor, "backspace", "eol", true),
+                    self.timestamp,
+                )?;
+                Ok(None)
+            }
+            '\u{17}' => {
+                insert::ctrl_w(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    option_contains(editor, "backspace", "eol", true),
+                    self.timestamp,
+                )?;
+                Ok(None)
+            }
+            '\u{19}' => {
+                insert::sibling_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    false,
+                    self.timestamp,
+                )?;
+                Ok(None)
+            }
             ch if !ch.is_control() => {
                 insert::insert_char(
                     editor,
@@ -2414,6 +2520,187 @@ impl ModeMachine {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Feeds a key into an in-progress `i_CTRL-V`/`i_CTRL-Q` literal insert
+    /// or the `i_CTRL-R` register-name wait (`edit.c` `ins_literal`,
+    /// `insert_reg`). Pending keys bypass completion, `CTRL-\`, and the
+    /// ordinary insert arms.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the literal character or register text cannot
+    /// be inserted.
+    fn insert_pending(
+        &mut self,
+        editor: &mut Editor,
+        ctx: &CursorContext,
+        state: &mut InsertState,
+        key: char,
+        eval: &mut dyn ExprEval,
+    ) -> Result<Option<Mode>, ModeError> {
+        if self.pending_insert_ctrl_r {
+            self.pending_insert_ctrl_r = false;
+            return self.insert_register(editor, ctx, key, eval);
+        }
+        match self.insert_literal.take().unwrap_or(InsertLiteral::Awaiting) {
+            InsertLiteral::Awaiting => {
+                let digits = match key {
+                    'x' | 'X' => Some((16, 2)),
+                    'o' | 'O' => Some((8, 3)),
+                    'u' => Some((16, 4)),
+                    'U' => Some((16, 8)),
+                    _ => None,
+                };
+                match digits {
+                    Some((radix, max)) => {
+                        self.insert_literal = Some(InsertLiteral::Digits {
+                            radix,
+                            max,
+                            digits: String::new(),
+                        });
+                    }
+                    None if key.is_ascii_digit() => {
+                        self.insert_literal = Some(InsertLiteral::Digits {
+                            radix: 10,
+                            max: 3,
+                            digits: key.to_string(),
+                        });
+                    }
+                    None => {
+                        insert::insert_char(
+                            editor,
+                            ctx.buffer,
+                            ctx.window,
+                            ctx.cursor,
+                            key,
+                            self.timestamp,
+                        )?;
+                    }
+                }
+            }
+            InsertLiteral::Digits {
+                radix,
+                max,
+                mut digits,
+            } => {
+                if key.is_digit(radix) {
+                    digits.push(key);
+                }
+                if digits.len() == max {
+                    self.emit_literal_digits(editor, ctx, &digits, radix)?;
+                } else if !key.is_digit(radix) {
+                    // A non-digit ends the run and is pushed back upstream
+                    // (`getdigits` `vungetc`): emit the charcode, then the
+                    // key is re-dispatched as a fresh insert key.
+                    self.emit_literal_digits(editor, ctx, &digits, radix)?;
+                    return self.insert(editor, state, key, eval);
+                } else {
+                    self.insert_literal = Some(InsertLiteral::Digits {
+                        radix,
+                        max,
+                        digits,
+                    });
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Inserts the charcode an `i_CTRL-V` digit run formed
+    /// (`edit.c` `ins_literal` emit): empty runs and unrepresentable values
+    /// insert nothing, values above the codepoint ceiling take the low
+    /// byte like the C `char` cast upstream applies.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the character cannot be inserted.
+    fn emit_literal_digits(
+        &mut self,
+        editor: &mut Editor,
+        ctx: &CursorContext,
+        digits: &str,
+        radix: u32,
+    ) -> Result<(), ModeError> {
+        if let Ok(value) = u32::from_str_radix(digits, radix)
+            && let Some(ch) = char::from_u32(value).or_else(|| char::from_u32(value & 0xff))
+        {
+            insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?;
+        }
+        Ok(())
+    }
+
+    /// `i_CTRL-R`: inserts the named register's content (`edit.c`
+    /// `insert_reg`). Characterwise text splices at the cursor with typed
+    /// newline semantics; linewise replaces the current line and leaves the
+    /// cursor on a fresh line below it, like upstream's linewise path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the register text cannot be inserted or the
+    /// line splice fails.
+    fn insert_register(
+        &mut self,
+        editor: &mut Editor,
+        ctx: &CursorContext,
+        name: char,
+        eval: &mut dyn ExprEval,
+    ) -> Result<Option<Mode>, ModeError> {
+        let content = editor
+            .registers()
+            .get(name)
+            .ok()
+            .flatten()
+            .map(|content| (content.kind(), content.getreg_lines()));
+        let Some((kind, lines)) = content else {
+            return Ok(None);
+        };
+        match kind {
+            RegisterKind::LineWise => {
+                let mut replacement = lines;
+                replacement.push(Vec::new());
+                let after = Position {
+                    lnum: ctx.cursor.lnum + replacement.len() - 1,
+                    col: 0,
+                };
+                editor.replace_buffer_lines(crate::LineReplaceRequest {
+                    buffer: ctx.buffer,
+                    start: ctx.cursor.lnum,
+                    end: ctx.cursor.lnum,
+                    lines: &replacement,
+                    cursor_before: ctx.cursor,
+                    cursor_after: after,
+                    timestamp: self.timestamp,
+                })?;
+                editor.set_window_cursor(ctx.window, after)?;
+            }
+            RegisterKind::CharacterWise | RegisterKind::BlockWise { .. } => {
+                let mut cursor = ctx.cursor;
+                for (index, line) in lines.iter().enumerate() {
+                    if index > 0 {
+                        cursor = insert::newline(
+                            editor,
+                            ctx.buffer,
+                            ctx.window,
+                            cursor,
+                            self.timestamp,
+                            eval,
+                        )?;
+                    }
+                    for ch in String::from_utf8_lossy(line).chars() {
+                        cursor = insert::insert_char(
+                            editor,
+                            ctx.buffer,
+                            ctx.window,
+                            cursor,
+                            ch,
+                            self.timestamp,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Replace mode: like Insert, but a typed scalar overwrites the existing

@@ -94,7 +94,7 @@ pub fn prev_char_boundary(line: &[u8], col: usize) -> usize {
     previous
 }
 
-fn classify(byte: u8, big: bool) -> u8 {
+pub(crate) fn classify(byte: u8, big: bool) -> u8 {
     if byte.is_ascii_whitespace() {
         0
     } else if big || byte.is_ascii_alphanumeric() || byte == b'_' {
