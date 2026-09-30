@@ -2764,6 +2764,7 @@ fn method_is_mutating(method: &str) -> bool {
                 | "nvim_input_mouse"
                 | "nvim_feedkeys"
                 | "nvim_paste"
+                | "nvim_mcursor"
                 | "nvim_put"
                 | "nvim_ui_set_option"
         )
