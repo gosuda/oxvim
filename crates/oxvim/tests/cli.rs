@@ -587,6 +587,11 @@ fn readonly_mode_reaches_every_loaded_startup_buffer() {
 /// `-h` pointer and exits 1, and a repeated script file exits 2.
 #[test]
 fn usage_failures_match_upstream_text_and_status() {
+    // `mainerr` uses the argv[0] basename, which keeps the .exe on Windows.
+    let prog = std::path::Path::new(env!("CARGO_BIN_EXE_oxvim"))
+        .file_name()
+        .expect("binary file name")
+        .to_string_lossy();
     for (arguments, message) in [
         (vec!["--bogus"], "Unknown option argument: \"--bogus\""),
         (vec!["-Q"], "Unknown option argument: \"-Q\""),
@@ -610,7 +615,7 @@ fn usage_failures_match_upstream_text_and_status() {
         assert_eq!(output.status.code(), Some(1), "{arguments:?}: {stderr}");
         assert!(stderr.contains(message), "{arguments:?}: {stderr}");
         assert!(
-            stderr.contains("More info with \"oxvim -h\""),
+            stderr.contains(&format!("More info with \"{prog} -h\"")),
             "{arguments:?}: {stderr}"
         );
     }
@@ -1045,11 +1050,12 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
         ),
         ("bufnr('%')", "vim.fn.bufnr('%')".to_owned()),
     ];
-    let path = scratch.text();
+    // `/` spellings keep the path a legal literal inside Lua quotes too.
+    let path = scratch.text().replace('\\', "/");
     let vimscript = calls
         .iter()
         .enumerate()
-        .map(|(index, (call, _))| format!("echo '{index} ' . string({})", call.replace('@', path)))
+        .map(|(index, (call, _))| format!("echo '{index} ' . string({})", call.replace('@', &path)))
         .collect::<Vec<_>>()
         .join("\n");
     let lua = calls
@@ -1058,7 +1064,7 @@ fn lua_and_vimscript_answer_the_same_builtin_identically() {
         .map(|(index, (_, call))| {
             format!(
                 "print('{index} ' .. vim.fn.string({}))",
-                call.replace('@', path)
+                call.replace('@', &path)
             )
         })
         .collect::<Vec<_>>()

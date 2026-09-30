@@ -13,15 +13,15 @@ use ox_api::{
     ApiSession, AutocmdExecution, AutocmdExecutor, ChannelInfo, CommandExecutor, DispatchFn,
     LuaExecutor, Registry, close_channel, register_channel,
 };
+use ox_editor::editor::{MessageIdentity, RedrawRequest};
 use ox_editor::job::JobEvent;
+use ox_editor::mode::InsertTransition;
 use ox_editor::{
-    mode::InsertTransition,
     AutocmdAction, AutocmdContext, AutocmdKind, ChannelIds, CmdlineKind, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Keys, LuaExec, LuaExecError, MessageDestination, MessageKind,
     Mode, ModeMachine, OptionValue, PendingEditMode, ServerHost, TypeaheadFlags, UserCommand,
     VisualKind, vim_variable_is_writable,
 };
-use ox_editor::editor::{MessageIdentity, RedrawRequest};
 use ox_lua::{
     ApiDispatchContext, BuiltinHost, EventLoopPump, LuaHost, RuntimeRoot as LuaRuntimeRoot,
     Scheduler, VariableHost, VariableScope, Work, bind_api, bind_variables, bind_with,
@@ -35,10 +35,8 @@ use ox_ui::{
     MessageState, PopupItem, PopupmenuState, RedrawOutput,
 };
 #[cfg(unix)]
-use ox_uv::dns;
-#[cfg(unix)]
 use ox_uv::net::Pipe;
-use ox_uv::{Handle, HandleId, NetEvent, RunMode, Tcp, UvLoop};
+use ox_uv::{Handle, HandleId, NetEvent, RunMode, Tcp, UvLoop, dns};
 #[cfg(unix)]
 use ox_uv::{Poll, PollEvents};
 
@@ -351,17 +349,14 @@ impl RedrawPlan {
             flush_ui: false,
         };
         for request in requests {
-            let statusline_redraw =
-                request.statusline || request.statuscolumn || request.winbar;
+            let statusline_redraw = request.statusline || request.statuscolumn || request.winbar;
             let resolved_flush = request
                 .flush
                 .unwrap_or(request.valid.is_some() || request.range.is_some())
                 || statusline_redraw;
             plan.update_screen |= resolved_flush;
-            plan.flush_ui |= resolved_flush
-                || request.cursor
-                || request.tabline
-                || statusline_redraw;
+            plan.flush_ui |=
+                resolved_flush || request.cursor || request.tabline || statusline_redraw;
         }
         plan
     }
@@ -533,7 +528,8 @@ pub(crate) fn build_embedded_core(
                 Ok(Value::Nil)
             })
             .map_err(to_app_error)?;
-        api.set("nvim_ui_send", ui_send_bind).map_err(to_app_error)?;
+        api.set("nvim_ui_send", ui_send_bind)
+            .map_err(to_app_error)?;
     }
     bind_with(
         lua.lua(),
@@ -1197,8 +1193,7 @@ impl AppState {
             let host = self.lua.borrow();
             host.lua().clone()
         };
-        ox_lua::buf_attach::drain_buffer_callbacks(&lua, &self.session)
-            .map_err(ApiError::exception)
+        ox_lua::buf_attach::drain_buffer_callbacks(&lua, &self.session).map_err(ApiError::exception)
     }
 
     /// One `nvim_call_atomic` item under the per-call RPC caller scope the
@@ -1408,7 +1403,6 @@ impl AppState {
         Ok(result)
     }
 
-
     /// Mirrors `ui_active()` into the message sink: `msg_use_printf`
     /// (`message.c` line 3013) stops printing as soon as a UI can display the
     /// text, and starts again when the last one detaches.
@@ -1438,7 +1432,6 @@ impl AppState {
         result
     }
 
-
     /// Whether any `nvim_ui_send` payload awaits the next redraw pass.
     fn has_pending_ui_sends(&self) -> bool {
         self.session.with_editor(|editor| editor.ui_sends_pending())
@@ -1460,11 +1453,9 @@ impl AppState {
         let requests = self.session.with_editor_mut(|editor| editor.take_redraws());
         let plan = RedrawPlan::from_requests(&requests);
         if requests.iter().any(|request| request.valid == Some(false)) {
-            let targets: Vec<u64> = self
-                .session
-                .with_render_state(|ui_channels, _, _| {
-                    ui_channels.iter().map(|(id, _)| *id).collect()
-                });
+            let targets: Vec<u64> = self.session.with_render_state(|ui_channels, _, _| {
+                ui_channels.iter().map(|(id, _)| *id).collect()
+            });
             for id in targets {
                 self.emitter.detach(id);
             }
@@ -1499,9 +1490,7 @@ impl AppState {
                         "nvim_list_uis returned an invalid channel id",
                     ));
                 };
-                let Some(Object::Boolean(stdout_tty)) =
-                    ui.get(&OxStr::from("stdout_tty"))
-                else {
+                let Some(Object::Boolean(stdout_tty)) = ui.get(&OxStr::from("stdout_tty")) else {
                     return Err(ApiError::exception(
                         "nvim_list_uis returned an invalid stdout_tty option",
                     ));
@@ -1524,7 +1513,9 @@ impl AppState {
     /// channel — a `ui_send` entry per payload, closed by `flush` — keeps
     /// every payload in this turn's frame regardless of grid state.
     fn drain_ui_sends(&mut self, frames: &mut BTreeMap<u64, Vec<u8>>) -> Result<(), ApiError> {
-        let pending = self.session.with_editor_mut(|editor| editor.take_ui_sends());
+        let pending = self
+            .session
+            .with_editor_mut(|editor| editor.take_ui_sends());
         if pending.is_empty() {
             return Ok(());
         }
@@ -1538,14 +1529,12 @@ impl AppState {
             .pack()
             .map_err(|error| ApiError::exception(error.to_string()))?;
         let stdout_tty_ids = self.stdout_tty_ui_ids()?;
-        let targets: Vec<u64> = self
-            .session
-            .with_render_state(|ui_channels, _, _| {
-                ui_channels
-                    .iter()
-                    .filter_map(|(id, _)| stdout_tty_ids.contains(id).then_some(*id))
-                    .collect()
-            });
+        let targets: Vec<u64> = self.session.with_render_state(|ui_channels, _, _| {
+            ui_channels
+                .iter()
+                .filter_map(|(id, _)| stdout_tty_ids.contains(id).then_some(*id))
+                .collect()
+        });
         for id in targets {
             frames.entry(id).or_default().extend_from_slice(&bytes);
         }
@@ -1920,11 +1909,7 @@ impl AppState {
         }
     }
 
-    fn show_in_chrome(
-        &mut self,
-        message: &ox_editor::Message,
-        identity: &MessageIdentity,
-    ) {
+    fn show_in_chrome(&mut self, message: &ox_editor::Message, identity: &MessageIdentity) {
         show_message_in_chrome(&self.session, message, identity);
     }
 
@@ -1964,8 +1949,6 @@ impl AppState {
             &mut self.exit_code,
         );
     }
-
-
 
     /// Whether unprocessed keys sit in typeahead after this message.
     ///
@@ -2019,7 +2002,6 @@ impl AppState {
             }
         }
     }
-
 
     #[expect(
         clippy::too_many_lines,
@@ -2143,10 +2125,11 @@ impl AppState {
                                     let (frames, failure) = self.redraw_reporting();
                                     merge_redraw_frames(&mut redraws, frames);
                                     if let Some(message) = failure {
-                                        let event = ox_rpc::nvim_error_event(
-                                            &ApiError::exception(message),
-                                        )
-                                        .map_err(|error| AppError::Server(error.to_string()))?;
+                                        let event =
+                                            ox_rpc::nvim_error_event(&ApiError::exception(message))
+                                                .map_err(|error| {
+                                                    AppError::Server(error.to_string())
+                                                })?;
                                         writes.push((channel.get(), event));
                                     }
                                 }
@@ -2167,10 +2150,11 @@ impl AppState {
                                     writes.push((channel.get(), event));
                                     writes.extend(frames);
                                     if let Some(message) = failure {
-                                        let event = ox_rpc::nvim_error_event(
-                                            &ApiError::exception(message),
-                                        )
-                                        .map_err(|error| AppError::Server(error.to_string()))?;
+                                        let event =
+                                            ox_rpc::nvim_error_event(&ApiError::exception(message))
+                                                .map_err(|error| {
+                                                    AppError::Server(error.to_string())
+                                                })?;
                                         writes.push((channel.get(), event));
                                     }
                                     let _ = self.drain_lua_work();
@@ -2256,9 +2240,7 @@ fn drain_buffer_callbacks_for_state(
 /// redundant: transition autocmds run user code that can queue another buffer
 /// event. A listener failure is returned rather than raised here so the
 /// caller can still write the reply the msgid is owed.
-fn drain_turn_boundary(
-    state: &Rc<RefCell<AppState>>,
-) -> (Vec<(u64, Vec<u8>)>, Result<(), String>) {
+fn drain_turn_boundary(state: &Rc<RefCell<AppState>>) -> (Vec<(u64, Vec<u8>)>, Result<(), String>) {
     let (mut writes, first) = drain_buffer_callbacks_for_state(state);
     fire_pending_transitions_for_state(state);
     let (more, second) = drain_buffer_callbacks_for_state(state);
@@ -2268,6 +2250,127 @@ fn drain_turn_boundary(
         (Ok(()), result) => result,
     };
     (writes, drained)
+}
+
+/// One turn of the event-loop-independent background work
+/// [`NetworkRuntime::poll_background`] drives every 10 ms on unix: PTY flush,
+/// deferred job events, scheduled Lua work, pending typeahead, quit
+/// absorption, transition and buffer-callback drains — then a redraw, but
+/// only when the turn produced progress (an unconditional redraw re-emits
+/// cursor and window events every tick, which toggles `DECSCUSR`/`?25` on
+/// the wire and hides the cursor between frames on ConPTY).
+///
+/// `writes` carries the `(channel, bytes)` batches emitted this turn; the
+/// caller owns transport (uv streams on unix, locked stdout in the embed
+/// pump). `exiting` marks that a quit was absorbed this turn.
+struct BackgroundTick {
+    writes: Vec<(u64, Vec<u8>)>,
+    exiting: bool,
+}
+
+/// Runs the background tick body independent of any event loop. An empty
+/// `writes` means the turn produced no progress worth flushing.
+///
+/// # Errors
+///
+/// Returns the PTY flush or redraw failure as a [`ox_uv::CallbackError`].
+fn poll_background_work(
+    state: &Rc<RefCell<AppState>>,
+    hostless_job_event_passes: &mut usize,
+) -> Result<BackgroundTick, ox_uv::CallbackError> {
+    let (session, ex, nested_ex, mode, lua_work, typeahead_pending, mut exiting, mut exit_code) = {
+        let state = state.borrow();
+        (
+            state.session.clone(),
+            state.ex.clone(),
+            state.nested_ex.clone(),
+            state.mode.clone(),
+            state.lua_work.clone(),
+            state.typeahead_pending(),
+            state.exiting,
+            state.exit_code,
+        )
+    };
+    let changed = ex
+        .borrow_mut()
+        .flush_pty_output(&*session)
+        .map_err(ox_uv::CallbackError::new)?;
+    let delivered =
+        match deliver_deferred_job_events(&session, &ex, &nested_ex, hostless_job_event_passes) {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                report_job_callback_error(&session, &error);
+                false
+            }
+        };
+    // A jobwait flush that no Lua boundary claimed (Vimscript caller)
+    // is served here; the events are already delivered, so only the
+    // marker is taken.
+    let _ = ex.borrow_mut().take_lua_flush_pending();
+    // Run scheduled callbacks without keeping an AppState borrow alive:
+    // callbacks can pump the accept loop and re-enter this state.
+    let worked = drain_lua_work_queue(&lua_work, &session);
+    // Timers and job callbacks feed keys outside any RPC turn; upstream
+    // services pending typeahead on the same main-loop turn
+    // (state.c:100-113), so the tick drives it the same way.
+    let drove = if typeahead_pending {
+        match drive_input_parts(
+            &session,
+            &ex,
+            &nested_ex,
+            &mode,
+            &mut exiting,
+            &mut exit_code,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                report_server_error(&session, error.message());
+                true
+            }
+        }
+    } else {
+        false
+    };
+    // Job `on_exit` and scheduled callbacks above run user code that
+    // can record quits; promote them before the exit check stops us.
+    absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
+    // Setter- or startup-recorded transitions drain on the background
+    // tick the same way key-driven ones do, still with no AppState
+    // borrow held.
+    fire_pending_transitions_for_state(state);
+    let (buffer_writes, drained) = drain_buffer_callbacks_for_state(state);
+    if let Err(error) = &drained {
+        report_server_error(&session, error);
+    }
+    // Buffer callbacks can re-enter and request a quit after the first
+    // promotion above, so promote their result before checking state.
+    absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
+    if exiting {
+        let mut state = state.borrow_mut();
+        state.exiting = true;
+        state.exit_code = exit_code;
+    }
+    if state.borrow().should_exit() {
+        return Ok(BackgroundTick {
+            writes: Vec::new(),
+            exiting: true,
+        });
+    }
+    if !delivered && !changed && !worked && !drove && buffer_writes.is_empty() && drained.is_ok() {
+        return Ok(BackgroundTick {
+            writes: Vec::new(),
+            exiting: false,
+        });
+    }
+    let redraw_writes = state
+        .borrow_mut()
+        .redraw()
+        .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
+    let writes = buffer_writes.into_iter().chain(redraw_writes).collect();
+    Ok(BackgroundTick {
+        writes,
+        exiting: false,
+    })
 }
 /// Drains insert-lifecycle transitions and staged mode switches recorded
 /// during a dispatch without holding an `AppState` borrow: transition
@@ -2299,7 +2402,6 @@ fn fire_pending_transitions_for_state(state: &Rc<RefCell<AppState>>) {
         state.exit_code = exit_code;
     }
 }
-
 
 fn drive_input_parts(
     session: &Rc<ApiSession>,
@@ -2393,7 +2495,6 @@ fn push_error_message(session: &Rc<ApiSession>, error: impl std::fmt::Display) {
     });
 }
 
-
 fn fire_recorded_insert_transitions(
     session: &Rc<ApiSession>,
     ex: &Rc<RefCell<ExExecutor>>,
@@ -2442,7 +2543,6 @@ fn fire_recorded_insert_transitions(
         absorb_pending_quit_parts(ex, nested_ex, exiting, exit_code);
     }
 }
-
 
 /// Drains queued Lua work (`vim.schedule` callbacks, deferred channel
 /// sends) until the queue empties. Runs on the RPC turn and on the
@@ -2617,12 +2717,7 @@ fn echo_explicit_id(params: &[Object]) -> Option<Object> {
 /// callbacks could reenter. Only an automatically allocated id needs a
 /// post-handler stamp, and that stamp addresses the original append directly;
 /// searching earlier entries would reintroduce the reentrancy bug.
-fn settle_echo(
-    session: &ApiSession,
-    pushed_at: usize,
-    kind: OxStr,
-    generated_id: Option<Object>,
-) {
+fn settle_echo(session: &ApiSession, pushed_at: usize, kind: OxStr, generated_id: Option<Object>) {
     let replacements = session.with_editor_mut(|editor| {
         editor.cancel_echo_identity();
         if let Some(id) = generated_id {
@@ -2679,10 +2774,7 @@ fn dispatch_echo(
     let kind = echo_ui_kind(params);
     let explicit_id = echo_explicit_id(params);
     session.with_editor_mut(|editor| {
-        editor.arm_echo_identity(
-            kind.clone(),
-            explicit_id.clone().unwrap_or(Object::Nil),
-        );
+        editor.arm_echo_identity(kind.clone(), explicit_id.clone().unwrap_or(Object::Nil));
     });
     let result = match dispatch(session, params) {
         Ok(result) => result,
@@ -2694,6 +2786,21 @@ fn dispatch_echo(
     let generated_id = explicit_id.is_none().then(|| result.clone());
     settle_echo(session, pushed_at, kind, generated_id);
     Ok(result)
+}
+
+/// The generated-dispatcher error a malformed `nvim_ui_send` call gets:
+/// every count other than one is the arity error — the legacy leading
+/// `channel_id` shape included, because `channel_id` is an implicit API
+/// parameter, not part of the wire signature — and a one-argument call
+/// fails the `String` type check.
+fn ui_send_validation_error(params: &[Object]) -> ApiError {
+    let [_] = params else {
+        return ApiError::exception(format!(
+            "Wrong number of arguments: expecting 1 but got {}",
+            params.len(),
+        ));
+    };
+    ApiError::exception("Wrong type for argument 1 when calling nvim_ui_send, expecting String")
 }
 
 /// Queues raw `nvim_ui_send` content for the next redraw pass
@@ -2711,24 +2818,6 @@ fn dispatch_echo(
 /// advertised level-15 API. The queue rides the editor sink, so all paths
 /// share one queue and `AppState::drain_ui_sends` stays the one owner of
 /// frame assembly.
-
-/// The generated-dispatcher error a malformed `nvim_ui_send` call gets:
-/// every count other than one is the arity error — the legacy leading
-/// `channel_id` shape included, because `channel_id` is an implicit API
-/// parameter, not part of the wire signature — and a one-argument call
-/// fails the `String` type check.
-fn ui_send_validation_error(params: &[Object]) -> ApiError {
-    let [_] = params else {
-        return ApiError::exception(format!(
-            "Wrong number of arguments: expecting 1 but got {}",
-            params.len(),
-        ));
-    };
-    ApiError::exception(
-        "Wrong type for argument 1 when calling nvim_ui_send, expecting String",
-    )
-}
-
 fn queue_ui_send(session: &ApiSession, params: &[Object]) -> Result<Object, ApiError> {
     let [Object::String(content)] = params else {
         return Err(ui_send_validation_error(params));
@@ -2787,6 +2876,15 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
     }
     fire_pending_transitions_for_state(&state);
 
+    // Non-unix platforms serve embed over a pumped stdio loop: `Poll` cannot
+    // watch anonymous pipes there and no listen server runs, so a reader
+    // thread feeds a channel and the main loop drains pending redraws and
+    // callbacks on every timeout — the same turn boundaries the unix
+    // `poll_background` timers reach.
+    #[cfg(not(unix))]
+    if cli.embed {
+        return run_embed_stdio_pump(&state);
+    }
     if !cli.embed {
         let mut decoder = IncrementalDecoder::new();
         let mut input = io::stdin().lock();
@@ -2892,15 +2990,110 @@ pub fn run_stdio(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
         if let Some(error) = runtime.borrow_mut().error.take() {
             return Err(AppError::Server(error));
         }
+        state.borrow_mut().run_exit()?;
+        Ok(state.borrow().exit_code())
     }
 
     #[cfg(not(unix))]
     {
-        return Err(AppError::Server(
-            "--embed is unsupported on this platform".into(),
-        ));
+        let _ = adopted_listen;
+        Err(AppError::Server(
+            "non-unix embed must return through the blocking stdio loop".into(),
+        ))
     }
+}
 
+/// Non-unix embed transport: stdin cannot be polled, so a reader thread feeds
+/// a channel while the main loop drains pending redraws and callbacks on
+/// every timeout — the same turn boundaries the unix `poll_background`
+/// timers reach, so UI notifications queued between requests still flush.
+///
+/// # Errors
+///
+/// Returns stdin/stdout I/O failures, decode failures, message-processing
+/// errors, or listener errors reported by the turn-boundary drains.
+#[cfg(not(unix))]
+fn run_embed_stdio_pump(state: &Rc<RefCell<AppState>>) -> Result<i64, AppError> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    use std::time::Duration;
+
+    let (sender, incoming) = channel::<io::Result<Vec<u8>>>();
+    std::thread::Builder::new()
+        .name("oxvim-stdin".into())
+        .spawn(move || {
+            let mut input = io::stdin().lock();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let read = input.read(&mut chunk).map(|count| chunk[..count].to_vec());
+                let done = match &read {
+                    Err(_) => true,
+                    Ok(chunk) => chunk.is_empty(),
+                };
+                if sender.send(read).is_err() || done {
+                    break;
+                }
+            }
+        })
+        .map_err(AppError::Io)?;
+    let mut decoder = IncrementalDecoder::new();
+    let mut output = io::stdout().lock();
+    let mut hostless_job_event_passes = 0;
+    'pump: loop {
+        match incoming.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(chunk)) => {
+                let (messages, decode_error) = match decoder.feed(&chunk) {
+                    Ok(messages) => (messages, None),
+                    Err(failure) => (failure.messages, Some(failure.error)),
+                };
+                for message in messages {
+                    if state.borrow().should_exit() {
+                        break;
+                    }
+                    let processed = state.borrow_mut().process_message(CHAN_STDIO, message);
+                    let (buffer_writes, drained) = drain_turn_boundary(state);
+                    for (channel, bytes) in buffer_writes.into_iter().chain(processed?) {
+                        if channel == CHAN_STDIO.get() {
+                            output.write_all(&bytes).map_err(AppError::Io)?;
+                        }
+                    }
+                    drained.map_err(AppError::Server)?;
+                }
+                if let Some(error) = decode_error {
+                    output.flush().map_err(AppError::Io)?;
+                    return Err(AppError::Server(error.to_string()));
+                }
+            }
+            Ok(Err(error)) => return Err(AppError::Io(error)),
+            Err(RecvTimeoutError::Disconnected) => {
+                state.borrow_mut().primary_channel_closed();
+                break 'pump;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if state.borrow().should_exit() {
+            break 'pump;
+        }
+        // Idle boundary: run the same background tick `poll_background`
+        // serves on unix — deferred job events, scheduled Lua work, pending
+        // typeahead, transitions and buffer callbacks all progress without
+        // an RPC — then flush the turn's stdio writes. An empty turn emits
+        // nothing; see `poll_background_work` for why redraws stay gated on
+        // progress.
+        match poll_background_work(state, &mut hostless_job_event_passes) {
+            Ok(tick) => {
+                for (channel, bytes) in tick.writes {
+                    if channel == CHAN_STDIO.get() {
+                        output.write_all(&bytes).map_err(AppError::Io)?;
+                    }
+                }
+            }
+            Err(error) => {
+                output.flush().map_err(AppError::Io)?;
+                return Err(AppError::Server(error.to_string()));
+            }
+        }
+        output.flush().map_err(AppError::Io)?;
+    }
     state.borrow_mut().run_exit()?;
     Ok(state.borrow().exit_code())
 }
@@ -2946,6 +3139,7 @@ fn take_listen_env() -> Option<String> {
 /// (server.c:61-73). Only the autogenerated address degrades to a
 /// report: a broken `$XDG_RUNTIME_DIR` must not refuse the editor
 /// (#30282).
+#[cfg(unix)]
 fn bind_primary_server(
     server: &ListenServer,
     state: &Rc<RefCell<AppState>>,
@@ -3131,8 +3325,7 @@ fn bind_stdio(
                                 uv_loop.stop();
                                 return output.flush().map_err(AppError::Io);
                             }
-                            let processed =
-                                state.borrow_mut().process_message(CHAN_STDIO, message);
+                            let processed = state.borrow_mut().process_message(CHAN_STDIO, message);
                             let (mut buffer_writes, first_drain) =
                                 drain_buffer_callbacks_for_state(&state);
                             fire_pending_transitions_for_state(&state);
@@ -3144,9 +3337,7 @@ fn bind_stdio(
                                 (Ok(()), result) => result,
                             };
 
-                            for (channel, bytes) in
-                                buffer_writes.into_iter().chain(processed?)
-                            {
+                            for (channel, bytes) in buffer_writes.into_iter().chain(processed?) {
                                 if channel == CHAN_STDIO.get() {
                                     output.write_all(&bytes).map_err(AppError::Io)?;
                                 }
@@ -3239,10 +3430,7 @@ fn make_private_listen_directory(directory: &std::path::Path) -> Result<(), AppE
 fn make_listen_directory(directory: &std::path::Path) -> Result<(), AppError> {
     #[cfg(unix)]
     use std::os::unix::fs::DirBuilderExt as _;
-    #[cfg(unix)]
     let mut builder = std::fs::DirBuilder::new();
-    #[cfg(not(unix))]
-    let builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     builder.mode(0o700);
@@ -3406,9 +3594,7 @@ impl ListenServer {
             .collect();
         if let Ok(mut uv) = self.uv.try_borrow_mut() {
             for id in ids {
-                self.runtime
-                    .borrow_mut()
-                    .remove_listener(&mut uv, id);
+                self.runtime.borrow_mut().remove_listener(&mut uv, id);
             }
             // Flush deferred closes so bound pipe paths unlink before exit.
             let _ = uv.run(RunMode::NoWait);
@@ -3803,96 +3989,14 @@ impl NetworkRuntime {
             uv_loop.stop();
             return Ok(());
         }
-        let (session, ex, nested_ex, mode, lua_work, typeahead_pending, mut exiting, mut exit_code) = {
-            let state = self.state.borrow();
-            (
-                state.session.clone(),
-                state.ex.clone(),
-                state.nested_ex.clone(),
-                state.mode.clone(),
-                state.lua_work.clone(),
-                state.typeahead_pending(),
-                state.exiting,
-                state.exit_code,
-            )
-        };
-        let changed = ex
-            .borrow_mut()
-            .flush_pty_output(&*session)
-            .map_err(ox_uv::CallbackError::new)?;
-        let delivered = match deliver_deferred_job_events(
-            &session,
-            &ex,
-            &nested_ex,
-            &mut self.hostless_job_event_passes,
-        ) {
-            Ok(delivered) => delivered,
-            Err(error) => {
-                report_job_callback_error(&session, &error);
-                false
-            }
-        };
-        // A jobwait flush that no Lua boundary claimed (Vimscript caller)
-        // is served here; the events are already delivered, so only the
-        // marker is taken.
-        let _ = ex.borrow_mut().take_lua_flush_pending();
-        // Run scheduled callbacks without keeping an AppState borrow alive:
-        // callbacks can pump the accept loop and re-enter this state.
-        let worked = drain_lua_work_queue(&lua_work, &session);
-        // Timers and job callbacks feed keys outside any RPC turn; upstream
-        // services pending typeahead on the same main-loop turn
-        // (state.c:100-113), so the tick drives it the same way.
-        let drove = if typeahead_pending {
-            match drive_input_parts(
-                &session,
-                &ex,
-                &nested_ex,
-                &mode,
-                &mut exiting,
-                &mut exit_code,
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    report_server_error(&session, error.message());
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        // Job `on_exit` and scheduled callbacks above run user code that
-        // can record quits; promote them before the exit check stops us.
-        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
-        // Setter- or startup-recorded transitions drain on the background
-        // tick the same way key-driven ones do, still with no AppState
-        // borrow held.
-        fire_pending_transitions_for_state(&self.state);
-        let (buffer_writes, drained) = drain_buffer_callbacks_for_state(&self.state);
-        if let Err(error) = &drained {
-            report_server_error(&session, error);
-        }
-        // Buffer callbacks can re-enter and request a quit after the first
-        // promotion above, so promote their result before checking state.
-        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
-        if exiting {
-            let mut state = self.state.borrow_mut();
-            state.exiting = true;
-            state.exit_code = exit_code;
-        }
-        if self.shutdown || self.state.borrow().should_exit() {
+        let tick = poll_background_work(&self.state, &mut self.hostless_job_event_passes)?;
+        if tick.exiting {
             uv_loop.stop();
             return Ok(());
         }
-        if !delivered && !changed && !worked && !drove && buffer_writes.is_empty() && drained.is_ok()
-        {
+        if tick.writes.is_empty() {
             return Ok(());
         }
-        let redraw_writes = self
-            .state
-            .borrow_mut()
-            .redraw()
-            .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
-        let writes = buffer_writes.into_iter().chain(redraw_writes);
         // Peers live on the accept loop, so their writes go through it, not
         // the main-loop `uv_loop` this tick received. The pump timer and
         // this tick are both main-loop callbacks, so the borrow is free.
@@ -3901,7 +4005,7 @@ impl NetworkRuntime {
         // would forbid the `&mut self` that `remove_peer` takes below.
         let accept_uv = Rc::clone(&self.accept_uv);
         let mut accept_uv = accept_uv.borrow_mut();
-        for (channel, bytes) in writes {
+        for (channel, bytes) in tick.writes {
             if channel == CHAN_STDIO.get() {
                 let mut output = io::stdout().lock();
                 output
@@ -4417,10 +4521,7 @@ impl LuaExec for ServerLuaExec {
         )
     }
 
-    fn invoke_callback(&self,
-        reference: usize,
-        args: Vec<Object>,
-    ) -> Result<Object, LuaExecError> {
+    fn invoke_callback(&self, reference: usize, args: Vec<Object>) -> Result<Object, LuaExecError> {
         let _guard = UserCodeGuard::enter(&self.user_code_depth);
         let reference = i32::try_from(reference).map_err(|_| {
             LuaExecError::Conversion("Lua callback reference is out of range".to_owned())
@@ -4477,7 +4578,8 @@ impl LuaExec for ServerLuaExec {
         free_object_refs(&self.lua, &result);
     }
 
-    fn eval_expression(&self,
+    fn eval_expression(
+        &self,
         expression: &str,
         arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
@@ -4686,7 +4788,8 @@ impl LuaExecutor for ApiLuaExecutor {
         .map_err(lua_exec_error_text)
     }
 
-    fn invoke_callback(&mut self,
+    fn invoke_callback(
+        &mut self,
         session: &ApiSession,
         reference: usize,
         args: Vec<Object>,
@@ -4886,11 +4989,9 @@ impl AutocmdExecutor for ServerAutocmdHost {
     ) -> Result<AutocmdExecution, String> {
         let pair = self.action_pair()?;
         match &action.kind {
-            AutocmdKind::ExString(source) => {
-                self.execute_vimscript(action, &pair, |executor| {
-                    executor.execute_autocmd_command(session, action, source)
-                })
-            }
+            AutocmdKind::ExString(source) => self.execute_vimscript(action, &pair, |executor| {
+                executor.execute_autocmd_command(session, action, source)
+            }),
             AutocmdKind::VimscriptFunction(name) => {
                 self.execute_vimscript(action, &pair, |executor| {
                     executor.execute_autocmd_function(session, action, name)
@@ -5056,8 +5157,6 @@ struct ServerCommandHost {
     channel_ids: ChannelIds,
     event_loop: EventLoopPump,
 }
-
-
 
 impl ServerCommandHost {
     fn ensure_textlock_allows(&self) -> Result<(), ApiError> {
@@ -5645,7 +5744,6 @@ fn execute_scoped_ex(
     result.map_err(|error| map_api_exec_error(operation, error))
 }
 
-
 /// Executes the deprecated string command API on the selected pair.
 fn dispatch_scoped_nvim_command(
     session: &ApiSession,
@@ -5721,7 +5819,10 @@ fn dispatch_scoped_nvim_exec2(
     session.with_editor_mut(|editor| editor.truncate_messages(message_start));
     let captured = captured?;
     Ok(Dict(if output {
-        vec![(OxStr::from("output"), Object::String(OxStr(captured.into_bytes())))]
+        vec![(
+            OxStr::from("output"),
+            Object::String(OxStr(captured.into_bytes())),
+        )]
     } else {
         Vec::new()
     }))
@@ -6216,9 +6317,10 @@ impl Scheduler for LuaScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use ox_rpc::decode;
     use ox_types::Funcref;
+
+    use super::*;
 
     #[test]
     fn multiple_uis_redraw_at_the_shared_minimum_after_resize_and_detach()
@@ -6284,7 +6386,8 @@ mod tests {
                 ),
                 ("nvim_ui_detach", Vec::new(), (80, 24)),
             ] {
-                let (_, frames) = state.dispatch(ChannelId::new(2), &OxStr::from(method), &params)?;
+                let (_, frames) =
+                    state.dispatch(ChannelId::new(2), &OxStr::from(method), &params)?;
                 assert_eq!(
                     (state.compositor.width(), state.compositor.height()),
                     expected,
@@ -6774,11 +6877,7 @@ mod tests {
             ("ox_lua_callback_table_cmd", 4),
             ("ox_lua_callback_string_cmd", 5),
         ] {
-            let value = get_var(
-                &core.session,
-                &[Object::String(OxStr::from(name))],
-            )
-            .unwrap();
+            let value = get_var(&core.session, &[Object::String(OxStr::from(name))]).unwrap();
             assert_eq!(value, Object::Integer(expected));
         }
     }
@@ -6881,7 +6980,9 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            if deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0).unwrap() {
+            if deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap()
+            {
                 delivered = true;
                 break;
             }
@@ -6991,13 +7092,11 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let process_id = std::process::id();
-        let output =
-            std::env::temp_dir().join(format!("oxvim-deferred-callback-{process_id}.txt"));
+        let output = std::env::temp_dir().join(format!("oxvim-deferred-callback-{process_id}.txt"));
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua
-            .execute_chunk(
-                &format!(
-                    r#"
+        lua.execute_chunk(
+            &format!(
+                r#"
                 vim.g.deferred_nested_autocmd = 0
                 vim.api.nvim_create_autocmd('BufWritePost', {{
                   pattern = '*',
@@ -7010,11 +7109,11 @@ mod tests {
                 end
                 vim.fn.jobstart({{'sh', '-c', 'exit 0'}}, {{on_exit = on_exit}})
                 "#,
-                    output = output.display(),
-                ),
-                Vec::new(),
-            )
-            .unwrap();
+                output = output.to_string_lossy().replace('\\', "/"),
+            ),
+            Vec::new(),
+        )
+        .unwrap();
 
         let mut observed = Typval::Number(0);
         for _ in 0..500 {
@@ -7022,13 +7121,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-            let _ = deliver_deferred_job_events(
-                &core.session,
-                &core.ex,
-                &core.nested_ex,
-                &mut 0,
-            )
-            .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap();
             observed = core
                 .ex
                 .borrow_mut()
@@ -7064,9 +7158,8 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua
-            .execute_chunk(
-                "
+        lua.execute_chunk(
+            "
                 vim.g.exit_count = 0
                 local exits = {}
                 local function on_exit(id, status, event)
@@ -7078,9 +7171,9 @@ mod tests {
                 end
                 vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
                 ",
-                Vec::new(),
-            )
-            .unwrap();
+            Vec::new(),
+        )
+        .unwrap();
         let mut exit_count = Typval::Number(0);
         for _ in 0..500 {
             let _ = core
@@ -7088,8 +7181,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
-            .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap();
             exit_count = core
                 .ex
                 .borrow_mut()
@@ -7127,9 +7220,8 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua
-            .execute_chunk(
-                r#"
+        lua.execute_chunk(
+            r#"
                 vim.g.send_ok = 0
                 local primary_id = vim.fn.jobstart({'cat'})
                 local function on_exit(id, status, event)
@@ -7139,9 +7231,9 @@ mod tests {
                 end
                 vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
                 "#,
-                Vec::new(),
-            )
-            .unwrap();
+            Vec::new(),
+        )
+        .unwrap();
         let mut send_ok = Typval::Number(0);
         for _ in 0..500 {
             let _ = core
@@ -7149,8 +7241,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
-            .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap();
             send_ok = core
                 .ex
                 .borrow_mut()
@@ -7187,9 +7279,8 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua
-            .execute_chunk(
-                "
+        lua.execute_chunk(
+            "
                 vim.g.nested_exited = 0
                 local exits = 0
                 local function on_exit(id, status, event)
@@ -7203,9 +7294,9 @@ mod tests {
                 local id = vim.fn.jobstart({'sh', '-c', 'exit 0'}, {on_exit = on_exit})
                 vim.fn.jobwait({id}, 2000)
                 ",
-                Vec::new(),
-            )
-            .unwrap();
+            Vec::new(),
+        )
+        .unwrap();
         let mut nested_exited = Typval::Number(0);
         for _ in 0..500 {
             let _ = core
@@ -7213,8 +7304,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
-            .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap();
             nested_exited = core
                 .ex
                 .borrow_mut()
@@ -7254,9 +7345,8 @@ mod tests {
             .unwrap();
         let core = build_embedded_core(editor, true).unwrap();
         let lua = core.ex.borrow().lua_host().unwrap();
-        lua
-            .execute_chunk(
-                r#"
+        lua.execute_chunk(
+            r#"
                 vim.g.stdout_seen = 0
                 vim.g.chan_ok = 0
                 local function on_stdout(id, data, event)
@@ -7265,9 +7355,9 @@ mod tests {
                 local id = vim.fn.jobstart({'cat'}, {on_stdout = on_stdout})
                 vim.g.chan_ok = vim.fn.chansend(id, "ping\n") > 0
                 "#,
-                Vec::new(),
-            )
-            .unwrap();
+            Vec::new(),
+        )
+        .unwrap();
         let chan_ok = core
             .ex
             .borrow_mut()
@@ -7285,8 +7375,8 @@ mod tests {
                 .borrow_mut()
                 .flush_pty_output(&*core.session)
                 .unwrap();
-        let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
-            .unwrap();
+            let _ = deliver_deferred_job_events(&core.session, &core.ex, &core.nested_ex, &mut 0)
+                .unwrap();
             stdout_seen = core
                 .ex
                 .borrow_mut()
@@ -7337,7 +7427,8 @@ mod tests {
             args: Vec::new(),
         };
         ex.borrow_mut().defer_job_events(vec![event]);
-        let error = deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).unwrap_err();
+        let error =
+            deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).unwrap_err();
         assert!(error.contains("E5108"), "{error}");
         let requeued = ex.borrow_mut().take_deferred_job_events();
         assert_eq!(
@@ -7352,9 +7443,7 @@ mod tests {
         // Redelivery of the requeued batch is stable: same report, same
         // requeue, no duplication.
         ex.borrow_mut().defer_job_events(requeued);
-        assert!(
-            deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).is_err()
-        );
+        assert!(deliver_deferred_job_events(&session, &ex, &ex, &mut hostless_passes).is_err());
         assert_eq!(ex.borrow_mut().take_deferred_job_events().len(), 1);
     }
 
@@ -7362,6 +7451,10 @@ mod tests {
     /// leave the event queued without consuming the hostless retry budget,
     /// then deliver it exactly once after the host becomes available.
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "the test requires editor and Lua dispatch setup to succeed"
+    )]
     fn busy_lua_host_parks_event_until_a_later_delivery() {
         struct BusyLua {
             busy: Cell<bool>,
@@ -7439,18 +7532,16 @@ mod tests {
         assert_eq!(host.calls.get(), 0);
 
         host.busy.set(false);
-        assert!(deliver_deferred_job_events(
-            &core.session,
-            &core.ex,
-            &core.nested_ex,
-            &mut hostless_passes,
-        )
-        .unwrap());
-        assert!(core
-            .ex
-            .borrow_mut()
-            .take_deferred_job_events()
-            .is_empty());
+        assert!(
+            deliver_deferred_job_events(
+                &core.session,
+                &core.ex,
+                &core.nested_ex,
+                &mut hostless_passes,
+            )
+            .unwrap()
+        );
+        assert!(core.ex.borrow_mut().take_deferred_job_events().is_empty());
     }
 
     // The tick's borrow-free phase services the Lua work queue, so an idle
@@ -7699,6 +7790,7 @@ mod tests {
     }
 
     /// A unique pipe path under the temp dir; tests never share names.
+    #[cfg(unix)] // pipe addresses are Unix-domain sockets
     fn pipe_path(label: &str) -> String {
         std::env::temp_dir()
             .join(format!("oxvim-w2b-{}.{}.sock", std::process::id(), label))
@@ -7706,6 +7798,7 @@ mod tests {
             .into_owned()
     }
 
+    #[cfg(unix)] // pipe addresses are Unix-domain sockets
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -7723,6 +7816,7 @@ mod tests {
         server.close_all();
     }
 
+    #[cfg(unix)] // pipe addresses are Unix-domain sockets
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -7745,6 +7839,7 @@ mod tests {
         server.close_all();
     }
 
+    #[cfg(unix)] // pipe addresses are Unix-domain sockets
     #[test]
     #[expect(
         clippy::unwrap_used,
@@ -7798,7 +7893,10 @@ mod tests {
                 &[
                     Object::Integer(80),
                     Object::Integer(24),
-                    Object::Dict(Dict(vec![(OxStr::from("ext_linegrid"), Object::Boolean(true))])),
+                    Object::Dict(Dict(vec![(
+                        OxStr::from("ext_linegrid"),
+                        Object::Boolean(true),
+                    )])),
                 ],
             )
             .unwrap();
@@ -7853,20 +7951,10 @@ mod tests {
             state.attach_lua(ox_editor::BufferAttachSubscription {
                 channel_id: 0,
                 send_buffer: false,
-                options: Dict(vec![(
-                    OxStr::from("on_bytes"),
-                    Object::LuaRef(reference),
-                )]),
+                options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(reference))]),
             });
             state
-                .replace_lines(
-                    1,
-                    1,
-                    &[b"reentered".to_vec()],
-                    cursor,
-                    cursor,
-                    0,
-                )
+                .replace_lines(1, 1, &[b"reentered".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
 
@@ -8039,14 +8127,7 @@ mod tests {
             editor
                 .buffer_mut(buffer)
                 .unwrap()
-                .replace_lines(
-                    1,
-                    1,
-                    &[b"queued".to_vec()],
-                    cursor,
-                    cursor,
-                    0,
-                )
+                .replace_lines(1, 1, &[b"queued".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
         state
@@ -8091,10 +8172,7 @@ mod tests {
             )
             .unwrap();
         let call = |name: &str, args: Vec<Object>| {
-            Object::Array(vec![
-                Object::String(OxStr::from(name)),
-                Object::Array(args),
-            ])
+            Object::Array(vec![Object::String(OxStr::from(name)), Object::Array(args)])
         };
         state
             .dispatch(
@@ -8275,7 +8353,9 @@ mod tests {
             .unwrap();
         drain_turn_boundary(&state).1.unwrap();
 
-        let buffer = session.with_editor(|editor| editor.current_buffer()).unwrap();
+        let buffer = session
+            .with_editor(|editor| editor.current_buffer())
+            .unwrap();
         session.with_editor_mut(|editor| {
             editor
                 .buffer_mut(buffer)
@@ -8283,10 +8363,7 @@ mod tests {
                 .attach_lua(ox_editor::BufferAttachSubscription {
                     channel_id: 0,
                     send_buffer: false,
-                    options: Dict(vec![(
-                        OxStr::from("on_reload"),
-                        Object::LuaRef(reference),
-                    )]),
+                    options: Dict(vec![(OxStr::from("on_reload"), Object::LuaRef(reference))]),
                 });
         });
 
@@ -8675,9 +8752,7 @@ mod tests {
                 tty,
                 &OxStr::from("nvim_exec_lua"),
                 &[
-                    Object::String(OxStr::from(
-                        r#"vim.api.nvim_ui_send("\27]52;c;QUJD")"#,
-                    )),
+                    Object::String(OxStr::from(r#"vim.api.nvim_ui_send("\27]52;c;QUJD")"#)),
                     Object::Array(Vec::new()),
                 ],
             )
@@ -8689,10 +8764,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the startup fixture must succeed"
-    )]
+    #[expect(clippy::unwrap_used, reason = "the startup fixture must succeed")]
     fn ui_send_without_eligible_ui_still_succeeds() {
         let cli = Cli::default();
         let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
@@ -8704,10 +8776,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, Object::Nil);
-        assert!(
-            frames.is_empty(),
-            "no attached UI means nothing is written"
-        );
+        assert!(frames.is_empty(), "no attached UI means nothing is written");
     }
 
     #[test]
@@ -8738,7 +8807,10 @@ mod tests {
             .dispatch(
                 CHAN_STDIO,
                 &OxStr::from("nvim_call_atomic"),
-                &[Object::Array(vec![atomic_echo("first"), atomic_echo("second")])],
+                &[Object::Array(vec![
+                    atomic_echo("first"),
+                    atomic_echo("second"),
+                ])],
             )
             .unwrap();
         state
@@ -8770,10 +8842,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the startup fixture must succeed"
-    )]
+    #[expect(clippy::unwrap_used, reason = "the startup fixture must succeed")]
     fn ui_send_malformed_shapes_fail_like_the_generated_dispatcher() {
         let cli = Cli::default();
         let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
@@ -8791,7 +8860,11 @@ mod tests {
             ApiError::exception("Wrong number of arguments: expecting 1 but got 2")
         );
         let error = state
-            .dispatch(CHAN_STDIO, &OxStr::from("nvim_ui_send"), &[Object::Integer(7)])
+            .dispatch(
+                CHAN_STDIO,
+                &OxStr::from("nvim_ui_send"),
+                &[Object::Integer(7)],
+            )
             .unwrap_err();
         assert_eq!(
             error,
@@ -8824,10 +8897,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the startup fixture must succeed"
-    )]
+    #[expect(clippy::unwrap_used, reason = "the startup fixture must succeed")]
     fn ui_send_malformed_in_call_atomic_reports_the_error() {
         let cli = Cli::default();
         let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
@@ -8891,10 +8961,7 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::unwrap_used,
-        reason = "the startup fixture must succeed"
-    )]
+    #[expect(clippy::unwrap_used, reason = "the startup fixture must succeed")]
     fn ui_send_malformed_lua_reports_the_validation_error() {
         let cli = Cli::default();
         let mut state = AppState::new(&cli, &mut StartupTimer::start()).unwrap();
@@ -8909,9 +8976,9 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            error.message().contains(
-                "Wrong type for argument 1 when calling nvim_ui_send, expecting String",
-            ),
+            error
+                .message()
+                .contains("Wrong type for argument 1 when calling nvim_ui_send, expecting String",),
             "Lua must surface the generated dispatcher's error, got {}",
             error.message()
         );
@@ -8960,10 +9027,7 @@ mod tests {
                 .dispatch(
                     tty,
                     &OxStr::from("nvim_exec_lua"),
-                    &[
-                        Object::String(OxStr::from(code)),
-                        Object::Array(Vec::new()),
-                    ],
+                    &[Object::String(OxStr::from(code)), Object::Array(Vec::new())],
                 )
                 .unwrap();
             frames
@@ -9041,10 +9105,7 @@ mod tests {
                 .dispatch(
                     tty,
                     &OxStr::from("nvim_exec_lua"),
-                    &[
-                        Object::String(OxStr::from(code)),
-                        Object::Array(Vec::new()),
-                    ],
+                    &[Object::String(OxStr::from(code)), Object::Array(Vec::new())],
                 )
                 .unwrap();
             frames
@@ -9078,10 +9139,7 @@ mod tests {
                 .dispatch(
                     tty,
                     &OxStr::from("nvim_exec_lua"),
-                    &[
-                        Object::String(OxStr::from(code)),
-                        Object::Array(Vec::new()),
-                    ],
+                    &[Object::String(OxStr::from(code)), Object::Array(Vec::new())],
                 )
                 .unwrap();
             frames
@@ -9183,11 +9241,7 @@ mod tests {
                 .dispatch(
                     CHAN_STDIO,
                     &OxStr::from("nvim_echo"),
-                    &[
-                        echo_chunks(text),
-                        Object::Boolean(true),
-                        id_opts(),
-                    ],
+                    &[echo_chunks(text), Object::Boolean(true), id_opts()],
                 )
                 .unwrap();
         }
@@ -9272,10 +9326,7 @@ mod tests {
                 1,
                 "progress updates must not stack"
             );
-            assert_eq!(
-                editor.message_identities()[0].kind.as_bytes(),
-                b"progress"
-            );
+            assert_eq!(editor.message_identities()[0].kind.as_bytes(), b"progress");
             assert_eq!(editor.message_identities()[0].id, Object::Integer(id));
         });
     }
@@ -9312,7 +9363,10 @@ mod tests {
         let opts = Object::Dict(Dict(vec![
             (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
             (OxStr::from("source"), Object::String(OxStr::from("test"))),
-            (OxStr::from("status"), Object::String(OxStr::from("running"))),
+            (
+                OxStr::from("status"),
+                Object::String(OxStr::from("running")),
+            ),
             (OxStr::from("id"), Object::String(OxStr::from("outer"))),
         ]));
 
@@ -9320,11 +9374,7 @@ mod tests {
             .dispatch(
                 CHAN_STDIO,
                 &OxStr::from("nvim_echo"),
-                &[
-                    echo_chunks("outer"),
-                    Object::Boolean(false),
-                    opts.clone(),
-                ],
+                &[echo_chunks("outer"), Object::Boolean(false), opts.clone()],
             )
             .unwrap();
         state.session.with_editor(|editor| {
@@ -9385,7 +9435,10 @@ mod tests {
         let outer_opts = Object::Dict(Dict(vec![
             (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
             (OxStr::from("source"), Object::String(OxStr::from("test"))),
-            (OxStr::from("status"), Object::String(OxStr::from("running"))),
+            (
+                OxStr::from("status"),
+                Object::String(OxStr::from("running")),
+            ),
             (OxStr::from("id"), Object::String(OxStr::from("outer"))),
         ]));
 
@@ -9393,11 +9446,7 @@ mod tests {
             .dispatch(
                 CHAN_STDIO,
                 &OxStr::from("nvim_echo"),
-                &[
-                    echo_chunks("outer"),
-                    Object::Boolean(false),
-                    outer_opts,
-                ],
+                &[echo_chunks("outer"), Object::Boolean(false), outer_opts],
             )
             .unwrap();
         let nested_id = state.session.with_editor(|editor| {
@@ -9421,7 +9470,10 @@ mod tests {
                     Object::Dict(Dict(vec![
                         (OxStr::from("kind"), Object::String(OxStr::from("progress"))),
                         (OxStr::from("source"), Object::String(OxStr::from("test"))),
-                        (OxStr::from("status"), Object::String(OxStr::from("running"))),
+                        (
+                            OxStr::from("status"),
+                            Object::String(OxStr::from("running")),
+                        ),
                         (OxStr::from("id"), Object::Integer(nested_id)),
                     ])),
                 ],
@@ -9429,10 +9481,7 @@ mod tests {
             .unwrap();
         state.session.with_editor(|editor| {
             assert_eq!(editor.messages().len(), 2);
-            assert_eq!(
-                editor.messages()[1].content,
-                echo_chunks("nested later")
-            );
+            assert_eq!(editor.messages()[1].content, echo_chunks("nested later"));
             assert_eq!(
                 editor.message_identities()[1].id,
                 Object::Integer(nested_id)
@@ -9497,7 +9546,10 @@ mod tests {
             )
             .unwrap();
         state.session.with_render_state(|_, _, chrome| {
-            let message = chrome.message.as_ref().expect("progress reaches the chrome");
+            let message = chrome
+                .message
+                .as_ref()
+                .expect("progress reaches the chrome");
             assert_eq!(message.kind.as_bytes(), b"progress");
             assert_eq!(message.id, Object::Integer(id));
         });
@@ -9578,9 +9630,9 @@ mod tests {
                 msgid: 7,
                 result: Err(_),
             }) => {}
-            other => panic!(
-                "the errored request must be answered with an error response, got {other:?}"
-            ),
+            other => {
+                panic!("the errored request must be answered with an error response, got {other:?}")
+            }
         }
         assert!(
             state
@@ -9618,7 +9670,13 @@ mod tests {
         let messages = decoder.feed(bytes).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(
-            matches!(&messages[0], Message::Response { msgid: 9, result: Ok(_) }),
+            matches!(
+                &messages[0],
+                Message::Response {
+                    msgid: 9,
+                    result: Ok(_)
+                }
+            ),
             "the input request must be answered successfully, got {:?}",
             messages[0]
         );

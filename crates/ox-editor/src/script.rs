@@ -7,11 +7,9 @@
 //! `src/nvim/runtime.c:3012-3031`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::{fmt, fs, io};
 
 use ox_eval::Scope;
 use ox_eval::scope::ScopeMap;
@@ -408,6 +406,8 @@ impl FileIO for RealFileIO {
             use std::os::unix::fs::DirBuilderExt as _;
             builder.mode(mode);
         }
+        #[cfg(not(unix))]
+        let _ = mode;
         builder.create(path)
     }
 
@@ -714,7 +714,7 @@ pub(crate) fn build_runtimepath(
     // An unresolved runtime tree contributes no entry (an empty path
     // would render as an empty comma-list item, which the option setter
     // rejects at startup).
-    let raw_vimruntime = vimruntime.to_string_lossy();
+    let raw_vimruntime = to_slash(vimruntime.to_string_lossy().into_owned());
     let vimruntime = raw_vimruntime.trim_end_matches('/');
     if !vimruntime.is_empty() {
         entries.push(vimruntime.to_owned());
@@ -738,6 +738,16 @@ pub(crate) fn build_runtimepath(
     entries.join(",")
 }
 
+/// Upstream `TO_SLASH` (`os/stdpaths.c:stdpaths_get_xdg_var`): env-derived
+/// paths are normalized to forward slashes on Windows.
+fn to_slash(path: String) -> String {
+    if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path
+    }
+}
+
 /// Resolves one single-directory XDG variable, falling back to the
 /// upstream default with `~` expanded through `$HOME` (stdpaths.c
 /// `stdpaths_get_xdg_var` + `expand_env_save`). An unset-but-present
@@ -746,36 +756,91 @@ fn xdg_home_dir(env: &str, fallback: &str) -> Option<String> {
     match std::env::var_os(env) {
         Some(value) => {
             let text = value.to_string_lossy().into_owned();
-            (!text.is_empty()).then_some(text)
+            (!text.is_empty()).then_some(to_slash(text))
         }
-        None => Some(expand_home(fallback)),
+        None => Some(to_slash(xdg_home_fallback(env, fallback))),
     }
 }
 
-/// Resolves one colon-separated XDG list, dropping empty entries.
+/// The root an unset XDG single-directory variable resolves to. Upstream's
+/// `xdg_defaults` table (`os/stdpaths.c`) maps the Windows homes to
+/// `%LOCALAPPDATA%` (cache to `%TEMP%`) instead of the `~` spellings, so a
+/// stock native launch without `HOME` finds `%LOCALAPPDATA%\nvim` rather
+/// than a cwd-relative literal `~/.config`. `XDG_RUNTIME_DIR` has no
+/// upstream fallback at all.
+#[cfg(windows)]
+fn xdg_home_fallback(env: &str, fallback: &str) -> String {
+    let root = match env {
+        "XDG_CACHE_HOME" => "TEMP",
+        "XDG_RUNTIME_DIR" => return expand_home(fallback),
+        _ => "LOCALAPPDATA",
+    };
+    if let Some(value) = std::env::var_os(root) {
+        let text = value.to_string_lossy().into_owned();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    if root == "LOCALAPPDATA"
+        && let Some(profile) = std::env::var_os("USERPROFILE")
+    {
+        return Path::new(&profile)
+            .join("AppData")
+            .join("Local")
+            .to_string_lossy()
+            .into_owned();
+    }
+    expand_home(fallback)
+}
+
+#[cfg(not(windows))]
+fn xdg_home_fallback(_env: &str, fallback: &str) -> String {
+    expand_home(fallback)
+}
+
+/// Resolves one list-form XDG variable, dropping empty entries. The list
+/// separator is `:` on Unix and `;` on Windows (upstream `x_separators`,
+/// PR #12829), where `:` belongs to drive letters.
 fn xdg_dir_list(env: &str, fallback: &str) -> Vec<String> {
     let raw = std::env::var_os(env).map_or_else(
         || fallback.to_owned(),
         |value| value.to_string_lossy().into_owned(),
     );
-    raw.split(':')
+    raw.split(if cfg!(windows) { ';' } else { ':' })
         .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
+        .map(|entry| to_slash(entry.to_owned()))
         .collect()
 }
 
-/// Expands a leading `~/` through `$HOME`, leaving other paths untouched.
+/// Expands a leading `~/` through `$HOME` (on Windows also `%USERPROFILE%`,
+/// which is where `~` resolves natively when `HOME` is absent), leaving
+/// other paths untouched.
 #[must_use]
 pub fn expand_home(path: &str) -> String {
     path.strip_prefix("~/").map_or_else(
         || path.to_owned(),
         |rest| {
-            std::env::var_os("HOME").map_or_else(
+            home_dir().map_or_else(
                 || path.to_owned(),
                 |home| Path::new(&home).join(rest).to_string_lossy().into_owned(),
             )
         },
     )
+}
+
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                std::env::var_os("USERPROFILE").filter(|home| !home.is_empty())
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
 }
 
 /// One `stdpath()` selector, `f_stdpath`'s `what` argument
@@ -860,8 +925,7 @@ pub fn stdpath(what: StdPath) -> Vec<String> {
             xdg_home_dir("XDG_RUNTIME_DIR", "")
                 .filter(|dir| !dir.is_empty())
                 .unwrap_or_else(|| {
-                    std::env::temp_dir()
-                        .to_string_lossy()
+                    to_slash(std::env::temp_dir().to_string_lossy().into_owned())
                         .trim_end_matches('/')
                         .to_owned()
                 }),
@@ -1714,8 +1778,7 @@ mod tests {
         exec.scripts_mut()
             .add_runtime_root(RuntimeRoot::new(PathBuf::from("/rt")));
 
-        exec.execute_line(&editor, "echo 1foo#bar()")
-            .unwrap_err();
+        exec.execute_line(&editor, "echo 1foo#bar()").unwrap_err();
         assert_eq!(global_number(&exec, "onefoo_loaded"), None);
     }
 }

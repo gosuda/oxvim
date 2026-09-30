@@ -142,7 +142,7 @@ fn exec_results_stay_bounded_when_caller_releases_refs() {
 }
 
 #[test]
-fn uv_timer_and_pipe_callback_cycles_stay_bounded() {
+fn uv_timer_callback_cycles_stay_bounded() {
     let (mut host, scheduler) = host();
     let lua = host.lua().clone();
     let mut baseline = None;
@@ -152,13 +152,10 @@ fn uv_timer_and_pipe_callback_cycles_stay_bounded() {
              t:start(1, 0, function() end) \
              vim._core.loop_poll(-1) \
              t:close() \
-             vim._core.loop_poll(-1) \
-             local p = vim.uv.new_pipe() \
-             p:write('x', function() end) \
-             p:close()",
+             vim._core.loop_poll(-1)",
             vec![],
         )
-        .expect("timer/pipe cycle");
+        .expect("timer cycle");
         scheduler.drain();
         if cycle == 1_000 {
             baseline = Some(settled_memory(&lua));
@@ -167,7 +164,35 @@ fn uv_timer_and_pipe_callback_cycles_stay_bounded() {
     let growth = settled_memory(&lua).saturating_sub(baseline.expect("baseline"));
     assert!(
         growth <= GROWTH_BUDGET_BYTES,
-        "timer/pipe callback cycles leaked {growth} bytes"
+        "timer callback cycles leaked {growth} bytes"
+    );
+}
+
+// `vim.uv.new_pipe` is unix-only for now: ox-uv has no Windows named-pipe
+// backend yet.
+#[cfg(unix)]
+#[test]
+fn uv_pipe_callback_cycles_stay_bounded() {
+    let (mut host, scheduler) = host();
+    let lua = host.lua().clone();
+    let mut baseline = None;
+    for cycle in 0..CYCLES {
+        host.exec(
+            "local p = vim.uv.new_pipe() \
+             p:write('x', function() end) \
+             p:close()",
+            vec![],
+        )
+        .expect("pipe cycle");
+        scheduler.drain();
+        if cycle == 1_000 {
+            baseline = Some(settled_memory(&lua));
+        }
+    }
+    let growth = settled_memory(&lua).saturating_sub(baseline.expect("baseline"));
+    assert!(
+        growth <= GROWTH_BUDGET_BYTES,
+        "pipe callback cycles leaked {growth} bytes"
     );
 }
 

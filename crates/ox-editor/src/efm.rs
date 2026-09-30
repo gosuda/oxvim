@@ -981,12 +981,12 @@ fn guess_filepath(state: &mut EfmState, filename: &str) -> Option<String> {
     found.map(|i| state.dir_stack[i].clone())
 }
 
-/// `concat_fnames(dir, file, true)`: joins with one path separator.
+/// `concat_fnames(dir, file, true)`: joins with one platform path separator.
 fn join_fnames(dir: &str, file: &str) -> String {
     if dir.ends_with('/') || dir.ends_with('\\') {
         format!("{dir}{file}")
     } else {
-        format!("{dir}/{file}")
+        format!("{dir}{}{file}", std::path::MAIN_SEPARATOR)
     }
 }
 

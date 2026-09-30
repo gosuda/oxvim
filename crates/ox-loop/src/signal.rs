@@ -75,8 +75,13 @@ mod platform {
     pub struct Signals;
 
     impl Signals {
-        /// Reports that this platform has no signal adapter yet.
-        pub fn new(_signal_numbers: &[i32]) -> Result<Self> {
+        /// An empty subscription list needs no adapter: `Loop::new` always
+        /// constructs one, so only an actual signal number reports that this
+        /// platform has no signal delivery.
+        pub fn new(signal_numbers: &[i32]) -> Result<Self> {
+            if signal_numbers.is_empty() {
+                return Ok(Self);
+            }
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "signal delivery is not available on this platform",

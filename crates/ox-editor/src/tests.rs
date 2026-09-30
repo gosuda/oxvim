@@ -5,8 +5,6 @@ use std::fs;
 use ox_text::{Buffer, Position};
 use ox_types::{BufHandle, WinHandle};
 
-use crate::BufferRelease;
-use crate::Editor;
 use crate::layout::{
     Anchor, CursorScreenPosition, Frame, Geometry, Layout, RelativeTo, TabpageState, WinConfig,
     WindowState,
@@ -14,6 +12,7 @@ use crate::layout::{
 use crate::marks::{Changelists, Jumplist, LocalMarks, MarkLocation};
 use crate::options::{OPTION_COUNT, OPTION_METADATA, OptionError, OptionStore, OptionValue};
 use crate::register::{ClipboardProvider, RegisterContent, RegisterError, Registers, Selection};
+use crate::{BufferRelease, Editor};
 
 fn buffer_handle(value: i64) -> BufHandle {
     BufHandle::try_from(value).unwrap()
@@ -458,7 +457,7 @@ fn option_defaults_aliases_scopes_and_validation_work() {
     );
     assert_eq!(
         store.get_global("shell").unwrap(),
-        &OptionValue::String("sh".into())
+        &OptionValue::String(if cfg!(windows) { "cmd.exe" } else { "sh" }.into())
     );
     assert_eq!(
         store.get_buffer(buffer, "ts").unwrap(),

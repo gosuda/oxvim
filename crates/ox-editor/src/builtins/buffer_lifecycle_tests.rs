@@ -11,15 +11,19 @@
 //! | unreadable or non-regular name  | none                        |
 //! | read fails after a good probe   | none (upstream's E200)      |
 
-use crate::excmd_exec::ExExecutor;
-use crate::script::{FileIO, RealFileIO};
-use crate::{AutocmdKind, AutocmdOptions, Event};
-use ox_types::{OxStr, Typval};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+
+use ox_types::{OxStr, Typval};
+
+use crate::excmd_exec::ExExecutor;
+use crate::script::FileIO;
+#[cfg(unix)]
+use crate::script::RealFileIO;
+use crate::{AutocmdKind, AutocmdOptions, Event};
 
 /// In-memory [`FileIO`] that can force a `read_to_string` failure on demand:
 /// `locked` paths fail with `PermissionDenied` (present but unreadable), and
@@ -158,13 +162,12 @@ fn buffer_lines<F: FileIO>(executor: &ExExecutor<F>) -> Vec<String> {
     global_list(executor, "lines")
 }
 
-fn load<F: FileIO>(
-    executor: &mut ExExecutor<F>,
-    access: &crate::TestEditorAccess,
-    name: &str,
-) {
+fn load<F: FileIO>(executor: &mut ExExecutor<F>, access: &crate::TestEditorAccess, name: &str) {
     executor
-        .execute_line(access, &format!("let g:buf = bufadd('{name}') | call bufload(g:buf)"))
+        .execute_line(
+            access,
+            &format!("let g:buf = bufadd('{name}') | call bufload(g:buf)"),
+        )
         .unwrap();
     executor
         .execute_line(access, "let g:lines = getbufline(g:buf, 1, '$')")

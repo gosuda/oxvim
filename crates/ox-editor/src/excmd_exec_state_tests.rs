@@ -24,13 +24,12 @@ use ox_eval::ScopeKind;
 use ox_text::Position;
 use ox_types::{Object, OxStr, Typval, WinHandle};
 
-use crate::TestEditorAccess;
 use crate::excmd_exec::{ExecError, ExecOutcome};
 use crate::register::RegisterContent;
 use crate::{
     AutocmdKind, AutocmdOptions, DirectoryScope, Editor, Event, ExExecutor, Geometry,
-    LineReplaceRequest, LuaExec, LuaExecError, MessageKind, OptionValue, VimExceptionKind,
-    vim_variable_is_writable,
+    LineReplaceRequest, LuaExec, LuaExecError, MessageKind, OptionValue, TestEditorAccess,
+    VimExceptionKind, vim_variable_is_writable,
 };
 
 /// Build an editor with one listed buffer and a tabpage so window-local
@@ -281,9 +280,7 @@ fn unlet_removes_variable_and_bang_suppresses_e108() {
 #[test]
 fn unlet_env_target_measures_the_name_before_unsetting() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["OX_UNLET_KEEP"]);
     let mut exec = ExExecutor::new();
 
@@ -1124,9 +1121,7 @@ fn execute_keeps_spaced_operators_inside_each_expression() {
 
 #[test]
 fn lcd_without_a_current_window_is_atomic_e16() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-no-window");
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
@@ -1140,9 +1135,7 @@ fn lcd_without_a_current_window_is_atomic_e16() {
 
 #[test]
 fn window_local_directory_survives_buffer_replacement() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-buffer-replacement");
     let displaced = fixture.child("displaced");
     let (editor, original_buffer, _) = editor_with_window();
@@ -1163,9 +1156,7 @@ fn window_local_directory_survives_buffer_replacement() {
 
 #[test]
 fn switching_between_local_and_global_windows_restores_destination_directory() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-window-switch");
     let (editor, _, global_window) = editor_with_window();
 
@@ -1189,9 +1180,7 @@ fn switching_between_local_and_global_windows_restores_destination_directory() {
 
 #[test]
 fn windows_maintain_independent_lcd_minus_history() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-window-history");
     let first = fixture.child("first");
     let second = fixture.child("second");
@@ -1226,9 +1215,7 @@ fn windows_maintain_independent_lcd_minus_history() {
 
 #[test]
 fn closing_current_local_window_restores_destination_directory() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-close-window");
     let (editor, _, destination) = editor_with_window();
 
@@ -1246,9 +1233,7 @@ fn closing_current_local_window_restores_destination_directory() {
 
 #[test]
 fn closing_current_local_tabpage_restores_destination_directory() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-close-tabpage");
     let (editor, _, _) = editor_with_window();
 
@@ -1271,9 +1256,7 @@ fn closing_current_local_tabpage_restores_destination_directory() {
 
 #[test]
 fn chdir_coerces_numeric_scope_before_rejecting_it_with_e475() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("chdir-numeric-scope");
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
@@ -1297,9 +1280,7 @@ fn chdir_coerces_numeric_scope_before_rejecting_it_with_e475() {
 
 #[test]
 fn switching_to_removed_local_directory_keeps_prior_process_directory() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-removed-window");
     let removed = fixture.child("removed");
     let (editor, _, destination) = editor_with_window();
@@ -1325,9 +1306,7 @@ fn switching_to_removed_local_directory_keeps_prior_process_directory() {
 
 #[test]
 fn fresh_executors_share_editor_global_cd_minus_history() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("shared-directory-state");
     let editor = TestEditorAccess::new(Editor::new());
     let mut first = ExExecutor::new();
@@ -1343,9 +1322,7 @@ fn fresh_executors_share_editor_global_cd_minus_history() {
 
 #[test]
 fn lcd_does_not_disturb_global_cd_minus_history() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-global-history");
     let local = fixture.child("local");
     let (editor, _, _) = editor_with_window();
@@ -1364,9 +1341,7 @@ fn lcd_does_not_disturb_global_cd_minus_history() {
 
 #[test]
 fn split_inherits_source_window_local_history() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-split-history");
     let first = fixture.child("first");
     let second = fixture.child("second");
@@ -1397,9 +1372,7 @@ fn split_inherits_source_window_local_history() {
 
 #[test]
 fn tabnew_inherits_source_window_local_history() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("lcd-tabnew-history");
     let first = fixture.child("first");
     let second = fixture.child("second");
@@ -1442,9 +1415,7 @@ fn tabnew_inherits_source_window_local_history() {
 
 #[test]
 fn direct_directory_change_is_global_and_preserves_cd_minus() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("direct-cd");
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
@@ -1459,9 +1430,7 @@ fn direct_directory_change_is_global_and_preserves_cd_minus() {
 
 #[test]
 fn direct_directory_change_reuses_cd_e344() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let fixture = CwdFixture::new("direct-cd-error");
     let missing = fixture.directory.join("missing");
     let missing = missing.to_str().unwrap();
@@ -1483,9 +1452,7 @@ fn direct_directory_change_reuses_cd_e344() {
 
 #[test]
 fn cd_changes_the_directory_observed_by_getcwd() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
@@ -1503,9 +1470,7 @@ fn cd_changes_the_directory_observed_by_getcwd() {
 
 #[test]
 fn cd_minus_toggles_and_returns_previous_directory() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
@@ -1537,11 +1502,12 @@ fn cd_minus_toggles_and_returns_previous_directory() {
 /// `exe 'cd ' . save_cwd`. When that restore is refused, `FinishTesting`'s
 /// write of the relative `test.log` dies with E212 and the whole file's results
 /// go with it, which is what `test_alot.vim` and `test_expand.vim` did.
+/// Unix-only: Windows refuses `remove_dir` on the process's own cwd, so the
+/// deleted-underneath setup cannot be constructed.
+#[cfg(unix)]
 #[test]
 fn cd_out_of_a_deleted_directory_still_moves() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-gone-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
@@ -1967,7 +1933,9 @@ struct FakeLua {
 
 impl LuaExec for FakeLua {
     fn execute_chunk(&self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
-        self.chunks.borrow_mut().push((code.to_owned(), args.clone()));
+        self.chunks
+            .borrow_mut()
+            .push((code.to_owned(), args.clone()));
         if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
@@ -1984,15 +1952,22 @@ impl LuaExec for FakeLua {
         self.error.borrow().clone().map_or(Ok(()), Err)
     }
 
-    fn eval_expression(&self,
+    fn eval_expression(
+        &self,
         expression: &str,
         arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
-        self.evals.borrow_mut().push((expression.to_owned(), arg.cloned()));
+        self.evals
+            .borrow_mut()
+            .push((expression.to_owned(), arg.cloned()));
         if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
-        Ok(self.eval_result.borrow().clone().unwrap_or(Typval::Number(0)))
+        Ok(self
+            .eval_result
+            .borrow()
+            .clone()
+            .unwrap_or(Typval::Number(0)))
     }
 }
 
@@ -2887,9 +2862,7 @@ fn virtcol_counts_showbreak_on_wrapped_continuation_rows() {
 /// duration and puts it back; `--test-threads=1` is how the suite runs.
 #[test]
 fn stdpath_resolves_every_selector_from_the_xdg_environment() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let names = [
         "XDG_CACHE_HOME",
         "XDG_CONFIG_HOME",
@@ -2916,9 +2889,16 @@ fn stdpath_resolves_every_selector_from_the_xdg_environment() {
         "let g:cache = stdpath('cache')\nlet g:config = stdpath('config')\nlet g:data = stdpath('data')\nlet g:state = stdpath('state')\nlet g:log = stdpath('log')\nlet g:run = stdpath('run')\nlet g:dirs = stdpath('config_dirs')",
     )
     .unwrap();
+    // Upstream applies TO_SLASH to env-derived paths (`stdpaths_get_xdg_var`,
+    // os/stdpaths.c), so the result is `/`-separated on every platform.
     let expect = |name: &str, tail: &str| {
         Typval::String(OxStr::from(
-            root.join(name).join(tail).to_string_lossy().as_ref(),
+            format!(
+                "{}/{}",
+                root.join(name).to_string_lossy().replace('\\', "/"),
+                tail
+            )
+            .as_str(),
         ))
     };
     assert_eq!(
@@ -2946,7 +2926,10 @@ fn stdpath_resolves_every_selector_from_the_xdg_environment() {
     assert_eq!(
         exec.scope().get_scoped(ScopeKind::Global, b"run", 0),
         Ok(&Typval::String(OxStr::from(
-            root.join("runtime_dir").to_string_lossy().as_ref()
+            root.join("runtime_dir")
+                .to_string_lossy()
+                .replace('\\', "/")
+                .as_str()
         ))),
     );
     assert_eq!(

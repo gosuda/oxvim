@@ -123,6 +123,42 @@ pub use visual::{VisualKind, VisualState};
 pub(crate) static PROCESS_STATE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+thread_local! {
+    static PROCESS_STATE_HOLDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread currently holds [`PROCESS_STATE_GUARD`].
+#[cfg(test)]
+pub(crate) fn holds_process_state_guard() -> bool {
+    PROCESS_STATE_HOLDER.with(std::cell::Cell::get)
+}
+
+/// Locks [`PROCESS_STATE_GUARD`] and marks this thread as its owner until
+/// the returned guard drops, so advisory process-state writes (e.g. the cwd
+/// reapply in `apply_effective_directory`) can tell "held by me" from
+/// "held by a sibling test" without deadlocking on the non-reentrant mutex.
+#[cfg(test)]
+pub(crate) fn lock_process_state() -> ProcessStateGuard {
+    let guard = PROCESS_STATE_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    PROCESS_STATE_HOLDER.with(|h| h.set(true));
+    ProcessStateGuard { _guard: guard }
+}
+
+#[cfg(test)]
+pub(crate) struct ProcessStateGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ProcessStateGuard {
+    fn drop(&mut self) {
+        PROCESS_STATE_HOLDER.with(|h| h.set(false));
+    }
+}
+
+#[cfg(test)]
 mod eval_lang_contract_tests;
 #[cfg(test)]
 mod excmd_exec_control_tests;

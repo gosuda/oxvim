@@ -742,7 +742,10 @@ pub(crate) fn swapfilelist(
                 // Upstream expands the bare relative patterns of the "."
                 // branch, so names carry no "./" prefix (memline.c 1339-1343);
                 // our globber anchors at the current directory instead.
-                name.strip_prefix("./").map(str::to_owned).unwrap_or(name)
+                let current_dir = format!(".{}", std::path::MAIN_SEPARATOR);
+                name.strip_prefix(&current_dir)
+                    .map(str::to_owned)
+                    .unwrap_or(name)
             }));
         }
     }
@@ -987,10 +990,11 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use ox_eval::ScopeKind;
+
     use super::*;
     use crate::script::RealFileIO;
     use crate::{Editor, ExExecutor, TestEditorAccess};
-    use ox_eval::ScopeKind;
 
     struct TempRoot(PathBuf);
 
@@ -1679,18 +1683,21 @@ mod tests {
         fs::write(root.0.join("two/c.vim"), b"").unwrap();
         let pattern = root.0.join("**/*.vim");
         let expected = Typval::list(vec![
-            path(&root.0.join("one/a.vim")),
-            path(&root.0.join("one/deep/b.vim")),
-            path(&root.0.join("two/c.vim")),
+            path(&root.0.join("one").join("a.vim")),
+            path(&root.0.join("one").join("deep").join("b.vim")),
+            path(&root.0.join("two").join("c.vim")),
         ]);
         assert_eq!(
             call(&RealFileIO, "glob", &[path(&pattern), number(0), number(1)]).unwrap(),
             expected
         );
+        // `globpath`'s list syntax escapes with `\` (option-part rules), so
+        // a Windows `\` path would lose its separators; `/` is the portable
+        // spelling nvim accepts on Windows too.
         let paths = format!(
             "{},{}",
-            root.0.join("one").display(),
-            root.0.join("two").display()
+            root.0.join("one").display().to_string().replace('\\', "/"),
+            root.0.join("two").display().to_string().replace('\\', "/")
         );
         assert_eq!(
             call(
@@ -1700,8 +1707,8 @@ mod tests {
             )
             .unwrap(),
             Typval::list(vec![
-                path(&root.0.join("one/a.vim")),
-                path(&root.0.join("two/c.vim"))
+                path(&root.0.join("one").join("a.vim")),
+                path(&root.0.join("two").join("c.vim"))
             ])
         );
     }
@@ -1719,7 +1726,13 @@ mod tests {
         fs::write(sub.join(".nested.swp"), b"").unwrap();
         // 'directory' entries are scanned in order; per pattern (*.sw?,
         // .*.sw?, .sw?) matches follow sorted, and non-swap names never match.
-        let directories = format!("{},{}", root.0.display(), sub.display());
+        // The option-part escape is `\`, so entries are written with `/` —
+        // the portable spelling for Windows paths.
+        let directories = format!(
+            "{},{}",
+            root.0.display().to_string().replace('\\', "/"),
+            sub.display().to_string().replace('\\', "/")
+        );
         let expected = Typval::list(vec![
             path(&root.0.join("plain.swp")),
             path(&root.0.join(".hidden.swo")),
@@ -1735,9 +1748,7 @@ mod tests {
 
     #[test]
     fn swapfilelist_current_directory_entry_yields_relative_names() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let root = TempRoot::new("swapfilelist-dot");
         fs::write(root.0.join(".one.swp"), b"").unwrap();
         fs::write(root.0.join("plain"), b"").unwrap();
@@ -1763,7 +1774,7 @@ mod tests {
                 "<swapfilelist-test>",
                 &format!(
                     "let &directory = '{}'\nlet g:swaps = swapfilelist()",
-                    root.0.display()
+                    root.0.display().to_string().replace('\\', "/")
                 ),
             )
             .unwrap();
@@ -1892,11 +1903,11 @@ mod tests {
         );
         assert_eq!(fs::read(&to).unwrap(), b"data");
 
-        let link = root.0.join("link");
-        let link_target = root.0.join("target");
-        fs::write(&link_target, b"via link").unwrap();
         #[cfg(unix)]
         {
+            let link = root.0.join("link");
+            let link_target = root.0.join("target");
+            fs::write(&link_target, b"via link").unwrap();
             std::os::unix::fs::symlink(&link_target, &link).unwrap();
             let link_copy = root.0.join("link-copy");
             assert_eq!(

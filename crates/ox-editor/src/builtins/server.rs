@@ -8,11 +8,12 @@
 //! `v:servername` bookkeeping upstream does inside `server_start`/`server_stop`
 //! (`server.c:206-209,250-253`).
 
+use ox_eval::{EvalError, Scope, ScopeKind, builtin_spec};
+use ox_types::{OxStr, Typval};
+
 use crate::excmd_exec::{EvalHost, ExEditorAccess};
 use crate::script::FileIO;
 use crate::server::{prepare_server_address, server_address_new};
-use ox_eval::{EvalError, Scope, ScopeKind, builtin_spec};
-use ox_types::{OxStr, Typval};
 
 /// Routes one server builtin.
 ///
@@ -166,13 +167,15 @@ fn start_failed(suffix: impl std::fmt::Display) -> EvalError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use ox_eval::Scope;
+    use ox_types::Object;
+
     use super::*;
     use crate::server::ServerHost;
     use crate::{Editor, ExExecutor, ExecError, TestEditorAccess, VimExceptionKind};
-    use ox_eval::Scope;
-    use ox_types::Object;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     /// A `ServerHost` that records calls and answers from an in-memory
     /// address book — no sockets, no loop.
@@ -289,7 +292,11 @@ mod tests {
         match global(exec.scope(), "addr") {
             Some(Typval::String(text)) => {
                 let addr = text.to_string_lossy().into_owned();
-                assert!(addr.contains("/nvim."), "{addr}");
+                // `\\.\pipe\nvim.<pid>.<n>` on Windows, `<run dir>/nvim.*` else.
+                assert!(
+                    addr.contains(if cfg!(windows) { "\\nvim." } else { "/nvim." }),
+                    "{addr}"
+                );
                 assert!(
                     addr.contains(&format!(".{}.", std::process::id())),
                     "{addr}"
@@ -309,7 +316,14 @@ mod tests {
         )
         .unwrap();
         let addr = state.borrow().addresses[0].clone();
-        assert!(addr.contains("/xtest1.2.3.4."), "{addr}");
+        assert!(
+            addr.contains(if cfg!(windows) {
+                "\\xtest1.2.3.4."
+            } else {
+                "/xtest1.2.3.4."
+            }),
+            "{addr}"
+        );
     }
 
     #[test]

@@ -27,12 +27,11 @@ use ox_eval::{BUILTINS, Scope, ScopeKind};
 use ox_text::Buffer;
 use ox_types::{Object, OxStr, Typval};
 
-use crate::TestEditorAccess;
 use crate::script::{FileIO, ScriptCtx, SourceContext};
 use crate::userfunc::{MAX_FUNC_DEPTH, UserFunctions};
 use crate::{
     AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor, ExecError, Geometry,
-    LuaExec, LuaExecError, RuntimeRoot, VimExceptionKind,
+    LuaExec, LuaExecError, RuntimeRoot, TestEditorAccess, VimExceptionKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -1236,9 +1235,7 @@ fn runtime_lookups_follow_runtimepath_option() {
 fn set_write_is_scope_visible_and_expands_env_vars() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["OXVIM_TEST_SET_EXPAND"]);
 
     exec.execute_script(
@@ -1293,12 +1290,11 @@ fn set_write_is_scope_visible_and_expands_env_vars() {
 ///
 /// The child here is the shell `system()` uses, and HOME is a throwaway path
 /// that is never written to.
+#[cfg(unix)]
 #[test]
 fn let_env_assignment_reaches_child_processes() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["HOME"]);
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
     let sandbox = std::env::temp_dir().join(format!("ox-editor-fakehome-{}", std::process::id()));
@@ -1327,14 +1323,46 @@ fn let_env_assignment_reaches_child_processes() {
     assert_eq!(child_tilde.as_deref(), Some(sandbox.as_str()));
 }
 
+/// Windows counterpart: `cmd.exe` expands `%VAR%` in the command line, so the
+/// same `let $HOME` reaches the child through the default `cmd /s /c` shell.
+#[cfg(windows)]
+#[test]
+fn let_env_assignment_reaches_child_processes_on_windows() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let _guard = crate::lock_process_state();
+    let _env = crate::test_guard::EnvGuard::new(&["HOME"]);
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    let sandbox = std::env::temp_dir().join(format!("ox-editor-fakehome-{}", std::process::id()));
+    let sandbox = sandbox.to_string_lossy().into_owned();
+
+    exec.execute_script(
+        &editor,
+        "<let-env>",
+        &format!(
+            "let $HOME = '{sandbox}'\n\
+             let g:vim_side = $HOME\n\
+             let g:child_side = substitute(system('echo %HOME%'), '\\r\\|\\n', '', 'g')"
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        global_string(exec.scope(), "vim_side").as_deref(),
+        Some(sandbox.as_str())
+    );
+    assert_eq!(
+        global_string(exec.scope(), "child_side").as_deref(),
+        Some(sandbox.as_str())
+    );
+}
+
 /// `unlet $VAR` is the process-wide unset (`vim_unsetenv_ext`), so a child no
 /// longer sees it either.
+#[cfg(unix)]
 #[test]
 fn unlet_env_removes_the_variable_from_child_processes() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["OXVIM_TEST_UNLET"]);
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
 
@@ -1443,7 +1471,8 @@ impl LuaExec for ColorschemeLua {
         Ok(())
     }
 
-    fn invoke_callback(&self,
+    fn invoke_callback(
+        &self,
         _reference: usize,
         args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -1500,9 +1529,7 @@ fn colorscheme_lua_autocmd_observes_and_preserves_new_global_name() {
 fn job_callbacks_bind_the_options_dictionary_as_self() {
     let editor = TestEditorAccess::new(editor_with_lines(&[""]));
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     script(
         &mut exec,
         &editor,
@@ -1524,13 +1551,12 @@ fn job_callbacks_bind_the_options_dictionary_as_self() {
 /// regex-backed typval-only name (which also proves the host carries a regex
 /// engine rather than `Builtins::without_regex`), and an unknown name, which
 /// must raise `E117` instead of aborting the process.
+#[cfg(unix)]
 #[test]
 fn call_builtin_serves_every_family_instead_of_panicking_outside_the_job_arms() {
     let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let call =
         |exec: &mut ExExecutor<MemoryFileIO>,
          editor: &TestEditorAccess,
@@ -1641,9 +1667,7 @@ fn call_builtin_serves_every_family_instead_of_panicking_outside_the_job_arms() 
 #[test]
 fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
     let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
     let call =
         |exec: &mut ExExecutor<MemoryFileIO>,
@@ -1701,9 +1725,7 @@ fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
 #[cfg(unix)]
 #[test]
 fn pty_output_reaches_terminal_buffer_after_chansend() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
     let call =
@@ -1886,12 +1908,11 @@ fn execute_script_restores_caller_augroup_after_error() {
     assert_eq!(names, ["after"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn system_builtin_captures_stdout_and_exit_status() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let mut exec = ExExecutor::new();
 
     exec.execute_line(&editor, "let g:out = system('printf oxvim')")
@@ -1918,6 +1939,7 @@ fn system_builtin_captures_stdout_and_exit_status() {
     ));
 }
 
+#[cfg(unix)]
 #[test]
 fn systemlist_uses_job_channels_for_shell_and_argv_forms() {
     let editor = TestEditorAccess::new(Editor::new());
@@ -1932,9 +1954,7 @@ fn systemlist_uses_job_channels_for_shell_and_argv_forms() {
     // diagnostic in a deleted cwd, so suppressing it in production would
     // diverge from the spec; the isolation belongs here, not in the
     // implementation.
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let mut exec = ExExecutor::new();
 
     exec.execute_line(
@@ -2300,9 +2320,7 @@ fn expand_builtin_restores_autocmd_context_after_nested_event() {
 #[test]
 fn expand_builtin_resolves_home_and_environment_variables() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let buffer = editor.editor_mut().create_buffer(true).unwrap();
     editor
         .editor_mut()
@@ -2370,9 +2388,7 @@ fn vim_string(scope: &Scope, name: &str) -> Option<String> {
 #[test]
 fn language_messages_sets_env_and_vim_vars() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["LC_ALL", "LC_MESSAGES", "LANG", "LANGUAGE"]);
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
 
@@ -2396,9 +2412,7 @@ fn language_messages_sets_env_and_vim_vars() {
 
 #[test]
 fn language_without_keyword_sets_lang_and_language_env() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"]);
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
@@ -2426,9 +2440,7 @@ fn language_without_keyword_sets_lang_and_language_env() {
 
 #[test]
 fn language_ctype_leaves_lang_and_messages_env_untouched() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["LANG", "LC_MESSAGES", "LC_ALL", "LANGUAGE"]);
     ox_sys::set_env("LANG", "ox-language-sentinel");
     ox_sys::set_env("LC_MESSAGES", "ox-language-sentinel");
@@ -2472,9 +2484,7 @@ fn language_rejected_locale_is_e197_for_ctype_and_time() {
 
 #[test]
 fn language_without_name_reports_current_locale() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let _env = crate::test_guard::EnvGuard::new(&["LANG", "LANGUAGE", "LC_ALL", "LC_MESSAGES"]);
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
@@ -2803,12 +2813,11 @@ fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
 // otherwise never exit), 'shellcmdflag' (a flag the option names and nothing
 // else supplies), and an unreachable 'shell' (which must not raise and must
 // report -1).
+#[cfg(unix)]
 #[test]
 fn system_uses_the_shell_options_feeds_input_and_never_raises_on_a_bad_shell() {
     let editor = TestEditorAccess::new(Editor::new());
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let mut exec = ExExecutor::new();
     exec.execute_script(
         &editor,

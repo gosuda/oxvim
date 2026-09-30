@@ -1,3 +1,4 @@
+//! TUI smoke tests driving the PTY harness end to end (Unix only).
 #![cfg(unix)]
 // Pure integration test: expect/panic on harness failures IS the assertion.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -8,6 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use differential::{OXVIM, binary};
 use ox_rpc::RedrawEvent;
 use ox_tui::chrome::{
     Chrome, MessageFlag, MessageFlags, MessageLifetime, MessageUpdate, PopupItem, TextChunk, TimeMs,
@@ -15,8 +17,6 @@ use ox_tui::chrome::{
 use ox_tui::{MotionPolicy, TuiState};
 use ox_types::{Dict, Object, OxStr};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-
-use differential::{OXVIM, binary};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 

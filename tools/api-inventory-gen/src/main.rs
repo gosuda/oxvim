@@ -357,7 +357,9 @@ fn run(check: bool, write: bool) -> Result<(), GenError> {
     let path = std::path::Path::new(manifest_dir).join(TARGET);
 
     if check {
-        let existing = std::fs::read_to_string(&path)?;
+        // The generated file is LF-canonical; a CRLF checkout (Windows
+        // `core.autocrlf`) carries the same content.
+        let existing = std::fs::read_to_string(&path)?.replace("\r\n", "\n");
         if existing != output {
             eprintln!(
                 "ox-api-inventory-gen: checked-in file does not match generated output.\n\

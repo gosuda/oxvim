@@ -412,6 +412,7 @@ pub fn getrusage() -> Result<Rusage> {
 }
 
 /// Converts `/proc/self/stat` clock ticks (100 Hz) to `(sec, usec)`.
+#[cfg(target_os = "linux")]
 fn ticks_to_time(ticks: u64) -> (u64, u32) {
     const HZ_MS: u64 = 10; // 100 Hz -> 10 ms per tick
     let milliseconds = ticks * HZ_MS;
@@ -617,7 +618,16 @@ pub fn uptime() -> Result<f64> {
             .ok_or_else(|| Error::Io(io_error("unparseable /proc/uptime")))
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "uptime fits comfortably in the double mantissa"
+        )]
+        Ok(ox_sys::windows::uptime_ms() as f64 / 1000.0)
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
     {
         Err(Error::Unsupported {
             feature: "uptime",
@@ -748,6 +758,7 @@ fn cpuinfo_models() -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 fn io_error(message: &'static str) -> std::io::Error {
     std::io::Error::other(message)
 }

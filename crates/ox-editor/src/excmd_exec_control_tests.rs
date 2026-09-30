@@ -18,8 +18,7 @@
 use ox_eval::ScopeKind;
 use ox_types::Typval;
 
-use crate::TestEditorAccess;
-use crate::{Editor, ExExecutor, ExecError, VimExceptionKind};
+use crate::{Editor, ExExecutor, ExecError, TestEditorAccess, VimExceptionKind};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -963,6 +962,9 @@ fn the_emptiness_test_and_the_comment_cut_see_the_carriage_return_too() {
 /// The block-opening commands read their condition from a different place
 /// (`find_if`, the `:while` loop head, `split_for`), so they need their own
 /// rows. Oracle: `Vim(if)`, `Vim(while)` and `Vim(for)` all raise E488.
+/// CR rejection applies only to non-CRNL builds: under `USE_CRNL` a CRLF
+/// script is `EOL_DOS` and the CR is stripped before eval sees it.
+#[cfg(unix)]
 #[test]
 fn block_openers_reject_a_trailing_carriage_return_in_the_condition() {
     let editor = TestEditorAccess::new(Editor::new());
@@ -1055,8 +1057,9 @@ fn a_nargs_zero_user_command_rejects_any_argument_with_e488() {
 /// The sourced-line reader stripped a trailing CR from every line, which hid
 /// the whole class from any file-based probe. `get_one_sourceline`
 /// (`runtime.c:2891-2905`) strips it only for an `EOL_DOS` file, and that
-/// branch is inside `#ifdef USE_CRNL` — a Windows-only define. Oracle on this
-/// platform: even a wholly CRLF script is `E488` on the first line.
+/// branch is inside `#ifdef USE_CRNL` — a Windows-only define. Oracle on
+/// non-CRNL platforms: even a wholly CRLF script is `E488` on the first line.
+#[cfg(unix)]
 #[test]
 fn a_sourced_line_keeps_its_trailing_carriage_return() {
     let editor = TestEditorAccess::new(Editor::new());
@@ -1075,6 +1078,25 @@ fn a_sourced_line_keeps_its_trailing_carriage_return() {
     executor
         .execute_script(&editor, "t.vim", "let g:w = 7\n")
         .unwrap();
+    assert_eq!(gnum(&executor, "w"), 7);
+}
+
+/// The `USE_CRNL` counterpart: on Windows `get_one_sourceline` strips the CR
+/// of every `EOL_DOS` line, so a wholly CRLF script parses like a Unix one —
+/// including inside block conditions and function bodies.
+#[cfg(windows)]
+#[test]
+fn a_sourced_line_strips_its_trailing_carriage_return() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &editor,
+            "t.vim",
+            "let g:v = 4\r\nif g:v\r\nlet g:w = 7\r\nendif\r\n",
+        )
+        .unwrap();
+    assert_eq!(gnum(&executor, "v"), 4);
     assert_eq!(gnum(&executor, "w"), 7);
 }
 
