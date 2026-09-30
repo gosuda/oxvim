@@ -419,6 +419,10 @@ pub enum TuiError {
 ///
 /// Returns an error when attachment, terminal setup or restoration, RPC or input
 /// handling, redraw decoding, frame construction, or terminal output fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the interactive loop is one indivisible terminal protocol transaction"
+)]
 pub fn run(mut client: Client) -> Result<(), TuiError> {
     // This full-screen client owns its palette; NO_COLOR must not strip its SGR output.
     crossterm::style::force_color_output(true);
@@ -449,7 +453,14 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     event::poll(INPUT_POLL).map_err(TuiError::Input)?;
     let size = crossterm::terminal::size().map_err(TuiError::Input)?;
     if size != (width, height) {
-        client.try_resize(size.0, size.1)?;
+        // Same clean-exit race as attach: a startup-quit child may be gone
+        // before this resize request.
+        if let Err(error) = client.try_resize(size.0, size.1) {
+            if finish_run(&mut session, &mut shared, false, &mut client, &error)? {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
     }
     let mut damage = DamageWriter::new(shared.clone(), capabilities.features.undercurl());
     // Registered before the palette is programmed: a terminating signal that
