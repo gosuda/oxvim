@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::rc::Rc;
 
 use crate::AppError;
@@ -27,14 +27,29 @@ use ox_text::Buffer;
 use ox_types::{BufHandle, Object, OxStr, Typval};
 
 /// Start the terminal client against a child copy of this executable in embed mode.
-pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
+pub fn run_interactive(cli: &Cli) -> Result<ExitCode, AppError> {
     let executable = std::env::current_exe().map_err(AppError::Io)?;
     let mut command = Command::new(executable);
     command.arg("--embed");
     for argument in interactive_child_arguments(cli) {
         command.arg(argument);
     }
-    ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
+    match ox_tui::run_command(command) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        // The child chose its own exit status (`:cq 3`, `-c cquit`): its
+        // stderr was already relayed verbatim, so take the code.
+        Err(ox_tui::TuiError::Client(
+            ox_tui::client::ClientError::Eof {
+                exit_code: Some(code),
+                ..
+            }
+            | ox_tui::client::ClientError::NonZeroExit {
+                exit_code: Some(code),
+                ..
+            },
+        )) => Ok(crate::process_code(i64::from(code))),
+        Err(error) => Err(AppError::Tui(error.to_string())),
+    }
 }
 /// Seeds `v:argv` (main.c `build_argv_list`): the command line as the
 /// process saw it, `argv[0]` included.

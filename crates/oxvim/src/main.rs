@@ -81,7 +81,7 @@ fn main() -> ExitCode {
 
 /// Maps a requested exit code onto a process status the way C `exit()`
 /// does: truncated to the low eight bits.
-fn process_code(code: i64) -> ExitCode {
+pub(crate) fn process_code(code: i64) -> ExitCode {
     u8::try_from(code.rem_euclid(256)).map_or(ExitCode::FAILURE, ExitCode::from)
 }
 
@@ -141,5 +141,5 @@ fn run_editor(cli: &Cli, timer: &mut startuptime::StartupTimer) -> Result<ExitCo
     if cli.embed || cli.headless {
         return server::run_stdio(cli, timer).map(process_code);
     }
-    runtime::run_interactive(cli).map(|()| ExitCode::SUCCESS)
+    runtime::run_interactive(cli)
 }

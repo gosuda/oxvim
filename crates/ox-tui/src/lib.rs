@@ -574,7 +574,28 @@ fn finish_run(
     {
         return Ok(true);
     }
-    process_failure(error).write_diagnostic(&mut io::stderr())?;
+    // A child that exited with a status chose its own exit code (`:cq 3`):
+    // the caller maps it onto the process status, so its stderr is relayed
+    // verbatim rather than wrapped in the transport diagnostic.
+    match error {
+        ClientError::Eof {
+            exit_code: Some(_),
+            stderr,
+        }
+        | ClientError::NonZeroExit {
+            exit_code: Some(_),
+            stderr,
+        } => {
+            let mut out = io::stderr();
+            out.write_all(stderr).map_err(TuiError::Input)?;
+            if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                out.write_all(b"\n").map_err(TuiError::Input)?;
+            }
+        }
+        _ => {
+            process_failure(error).write_diagnostic(&mut io::stderr())?;
+        }
+    }
     Ok(false)
 }
 
