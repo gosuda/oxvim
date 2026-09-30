@@ -2206,7 +2206,6 @@ impl AppState {
     /// `preserve_exit` (msgpack_rpc/channel.c:528-529,
     /// event/proc.c:426-433) keeps modified buffers' swapfiles, and
     /// `getout(1)` exits with status 1 (main.c:888-936).
-    #[cfg(unix)]
     fn primary_channel_closed(&mut self) {
         if !self.exiting {
             self.exiting = true;
@@ -3021,7 +3020,7 @@ fn run_embed_stdio_pump(state: &Rc<RefCell<AppState>>) -> Result<i64, AppError> 
             }
             Ok(Err(error)) => return Err(AppError::Io(error)),
             Err(RecvTimeoutError::Disconnected) => {
-                state.borrow_mut().stdio_closed();
+                state.borrow_mut().primary_channel_closed();
                 break 'pump;
             }
             Err(RecvTimeoutError::Timeout) => {}

@@ -854,7 +854,9 @@ fn has_wildcard(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'\\' && cursor + 1 < bytes.len() {
+        // `\` escapes the next byte on Unix; on Windows a doubled `\\`
+        // escapes a literal separator while a single `\` separates.
+        if bytes[cursor] == b'\\' && (!cfg!(windows) || bytes.get(cursor + 1) == Some(&b'\\')) {
             cursor += 2;
             continue;
         }

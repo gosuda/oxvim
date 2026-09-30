@@ -500,13 +500,16 @@ fn open_for_stat(path: &Path, nofollow: bool) -> io::Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     let flags = if nofollow {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
     } else {
         FILE_FLAG_BACKUP_SEMANTICS
     };
+    // Attribute-only access: `read(true)` requests GENERIC_READ, which an
+    // ACL can deny while still permitting metadata queries.
     fs::OpenOptions::new()
-        .read(true)
+        .access_mode(FILE_READ_ATTRIBUTES)
         .custom_flags(flags)
         .open(path)
 }

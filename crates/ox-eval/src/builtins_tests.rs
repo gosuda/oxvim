@@ -3044,6 +3044,26 @@ fn simplify_preserves_only_explicit_current_directory_prefixes() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn simplify_keeps_the_drive_root_above_dotdot() {
+    for (input, expected) in [
+        ("C:\\foo\\..", "C:\\"),
+        ("C:\\..", "C:\\"),
+        ("C:\\foo\\bar\\..\\..", "C:\\"),
+        ("C:\\foo\\..\\bar", "C:\\bar"),
+        ("C:\\a\\..\\..\\b", "C:\\b"),
+        ("c:/foo/../bar", "c:/bar"),
+        ("C:foo\\..", "C:"),
+    ] {
+        assert_eq!(
+            call("simplify", vec![text(input)]).unwrap(),
+            text(expected),
+            "input: {input}",
+        );
+    }
+}
+
 #[test]
 fn resolve_uses_real_file_types() {
     let root = std::env::temp_dir().join(format!("ox-eval-path-{}", std::process::id()));

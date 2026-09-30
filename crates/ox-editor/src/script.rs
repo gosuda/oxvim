@@ -758,8 +758,44 @@ fn xdg_home_dir(env: &str, fallback: &str) -> Option<String> {
             let text = value.to_string_lossy().into_owned();
             (!text.is_empty()).then_some(to_slash(text))
         }
-        None => Some(to_slash(expand_home(fallback))),
+        None => Some(to_slash(xdg_home_fallback(env, fallback))),
     }
+}
+
+/// The root an unset XDG single-directory variable resolves to. Upstream's
+/// `xdg_defaults` table (`os/stdpaths.c`) maps the Windows homes to
+/// `%LOCALAPPDATA%` (cache to `%TEMP%`) instead of the `~` spellings, so a
+/// stock native launch without `HOME` finds `%LOCALAPPDATA%\nvim` rather
+/// than a cwd-relative literal `~/.config`. `XDG_RUNTIME_DIR` has no
+/// upstream fallback at all.
+#[cfg(windows)]
+fn xdg_home_fallback(env: &str, fallback: &str) -> String {
+    let root = match env {
+        "XDG_CACHE_HOME" => "TEMP",
+        "XDG_RUNTIME_DIR" => return expand_home(fallback),
+        _ => "LOCALAPPDATA",
+    };
+    if let Some(value) = std::env::var_os(root) {
+        let text = value.to_string_lossy().into_owned();
+        if !text.is_empty() {
+            return text;
+        }
+    }
+    if root == "LOCALAPPDATA" {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return Path::new(&profile)
+                .join("AppData")
+                .join("Local")
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    expand_home(fallback)
+}
+
+#[cfg(not(windows))]
+fn xdg_home_fallback(_env: &str, fallback: &str) -> String {
+    expand_home(fallback)
 }
 
 /// Resolves one list-form XDG variable, dropping empty entries. The list
@@ -776,18 +812,35 @@ fn xdg_dir_list(env: &str, fallback: &str) -> Vec<String> {
         .collect()
 }
 
-/// Expands a leading `~/` through `$HOME`, leaving other paths untouched.
+/// Expands a leading `~/` through `$HOME` (on Windows also `%USERPROFILE%`,
+/// which is where `~` resolves natively when `HOME` is absent), leaving
+/// other paths untouched.
 #[must_use]
 pub fn expand_home(path: &str) -> String {
     path.strip_prefix("~/").map_or_else(
         || path.to_owned(),
         |rest| {
-            std::env::var_os("HOME").map_or_else(
+            home_dir().map_or_else(
                 || path.to_owned(),
                 |home| Path::new(&home).join(rest).to_string_lossy().into_owned(),
             )
         },
     )
+}
+
+fn home_dir() -> Option<std::ffi::OsString> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| {
+            #[cfg(windows)]
+            {
+                std::env::var_os("USERPROFILE").filter(|home| !home.is_empty())
+            }
+            #[cfg(not(windows))]
+            {
+                None
+            }
+        })
 }
 
 /// One `stdpath()` selector, `f_stdpath`'s `what` argument

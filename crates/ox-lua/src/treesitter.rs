@@ -1602,7 +1602,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "needs a built tree-sitter parser: OXVIM_TREE_SITTER_PARSER or .references/neovim"]
+    #[cfg_attr(
+        windows,
+        ignore = "needs a built tree-sitter parser: OXVIM_TREE_SITTER_PARSER or .references/neovim"
+    )]
     fn buffer_timeout_returns_nil_and_string_timeout_is_ignored() {
         let (path, language) = parser_from_environment();
         // SAFETY: this test exercises the userdata shim, which requires Lua's

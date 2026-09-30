@@ -696,6 +696,23 @@ pub(crate) fn simplify_name(name: &str) -> String {
         components.push((&name[start..], sep_before));
     }
 
+    // A drive prefix followed by a separator (`C:\`) is the volume root
+    // `..` can never remove — `C:` alone is a drive-relative component,
+    // and `X:` carries no drive meaning on POSIX. Upstream `simplify_path`
+    // skips the drive letter the same way (`path.c`). UNC shares are NOT
+    // protected: upstream treats `//` as a verbatim prefix over ordinary
+    // poppable components (`//a/../b` -> `//b` on every platform).
+    let protected = usize::from(
+        cfg!(windows)
+            && !absolute
+            && components.len() > 1
+            && components.first().is_some_and(|(text, _)| {
+                text.len() == 2
+                    && text.as_bytes()[0].is_ascii_alphabetic()
+                    && text.as_bytes()[1] == b':'
+            }),
+    );
+
     let mut current_prefix = false;
     // A separator the `..` machinery keeps: removing `part/../` deletes the
     // `..` and the separator after it, so the next component inherits the
@@ -707,22 +724,33 @@ pub(crate) fn simplify_name(name: &str) -> String {
             "." => {
                 current_prefix |= !absolute && parts.is_empty();
             }
-            ".." => match parts.last() {
-                Some((popped_sep, popped)) if *popped != ".." => {
-                    inherited_sep = *popped_sep;
-                    parts.pop();
-                }
-                _ => {
-                    if absolute {
-                        // A `..` off the root is dropped; the separator
-                        // before it separates what follows from the root.
-                        inherited_sep = sep;
-                    } else {
-                        current_prefix = false;
-                        parts.push((inherited_sep.take().or(sep), ".."));
+            ".." => {
+                let poppable =
+                    parts.len() > protected && parts.last().is_some_and(|(_, part)| *part != "..");
+                if poppable {
+                    if let Some((popped_sep, popped)) = parts.pop() {
+                        inherited_sep = popped_sep;
+                        // A drive-relative first component (`C:foo`)
+                        // reduces to its volume root rather than
+                        // disappearing entirely.
+                        if cfg!(windows)
+                            && parts.is_empty()
+                            && popped.len() > 2
+                            && popped.as_bytes()[0].is_ascii_alphabetic()
+                            && popped.as_bytes()[1] == b':'
+                        {
+                            parts.push((None, &popped[..2]));
+                        }
                     }
+                } else if absolute || protected > 0 {
+                    // A `..` off the root is dropped; the separator
+                    // before it separates what follows from the root.
+                    inherited_sep = sep;
+                } else {
+                    current_prefix = false;
+                    parts.push((inherited_sep.take().or(sep), ".."));
                 }
-            },
+            }
             _ => parts.push((inherited_sep.take().or(sep), text)),
         }
     }
@@ -746,6 +774,16 @@ pub(crate) fn simplify_name(name: &str) -> String {
                 output.push(char::from(sep.unwrap_or(b'/')));
             }
             output.push_str(text);
+        }
+    }
+    // A `..` reduction ending exactly on a drive root keeps the separator
+    // the removed pair consumed: `C:\foo\..` simplifies to `C:\`, not the
+    // drive-relative `C:`.
+    if protected > 0 && parts.len() == protected && !absolute {
+        if let Some(sep) = inherited_sep {
+            if !output.bytes().last().is_some_and(is_path_sep) {
+                output.push(char::from(sep));
+            }
         }
     }
     if trailing_separator && !output.bytes().last().is_some_and(is_path_sep) {

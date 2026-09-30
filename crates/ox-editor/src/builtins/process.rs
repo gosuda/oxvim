@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ox_eval::{EvalError, Scope};
@@ -143,10 +143,17 @@ fn shell_argv(editor: &Editor) -> Vec<String> {
     let shell = read("shell", if cfg!(windows) { "cmd.exe" } else { "sh" });
     let mut argv = split_shell_words(&shell);
     // Upstream `set_init_default_shell` derives 'shellcmdflag' from 'shell':
-    // a shell containing "cmd" gets "/s /c". The generated option table can
+    // a cmd-family shell gets "/s /c". The generated option table can
     // only hold the unconditional `-c` default, so on Windows a still-default
-    // `-c` under a cmd-family shell resolves here.
-    let cmd_family = cfg!(windows) && shell.to_ascii_lowercase().contains("cmd");
+    // `-c` under a cmd-family shell resolves here. The check is the
+    // executable basename like upstream's `mch_check_shell` — a `cmd`
+    // substring anywhere in the path (e.g. `cmd-wrapper\bash.exe`) is
+    // not cmd.
+    let cmd_family = cfg!(windows)
+        && argv
+            .first()
+            .and_then(|word| Path::new(word.trim_matches('"')).file_stem())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("cmd"));
     let shellcmdflag = read("shellcmdflag", "-c");
     argv.extend(split_shell_words(if cmd_family && shellcmdflag == "-c" {
         "/s /c"
