@@ -414,7 +414,6 @@ impl Compositor {
                 sign_slots = sign_slots.max(live);
             }
             let sign_slots = sign_slots.min(3);
-            let sign_width = sign_slots.saturating_mul(2);
             // 'number'/'relativenumber' reserve a gutter after the sign
             // column sized like upstream's `numberwidth`: the option is the
             // floor, a longer line count widens it to digits + 1
@@ -429,6 +428,24 @@ impl Compositor {
                 editor.options().get_window(window, "relativenumber"),
                 Ok(OptionValue::Boolean(true))
             );
+            // 'signcolumn' bounds (optionstr.c set-time parsing): the option
+            // reserves [min, max] dedicated columns and the live sign depth
+            // clamps into that range (drawscreen.c `compute_signcolumn`:
+            // `w_scwidth = MAX(w_minscwidth, MIN(w_maxscwidth, max_signs))`).
+            // "number" draws signs inside the number column — no dedicated
+            // cells; without numbers it degrades to "auto".
+            let signcolumn = match editor.options().get_window(window, "signcolumn") {
+                Ok(OptionValue::String(value)) => value.clone(),
+                _ => String::from("auto"),
+            };
+            let statuscolumn_on = matches!(
+                editor.options().get_window(window, "statuscolumn"),
+                Ok(OptionValue::String(value)) if !value.is_empty()
+            );
+            let numbers = number_on || relative_on || statuscolumn_on;
+            let (min_sc, max_sc) = signcolumn_bounds(&signcolumn, numbers);
+            let sign_slots = min_sc.max(max_sc.min(sign_slots));
+            let sign_width = sign_slots.saturating_mul(2);
             let number_width = if number_on || relative_on {
                 let minimum = match editor.options().get_window(window, "numberwidth") {
                     Ok(OptionValue::Number(width)) => {
@@ -1151,6 +1168,39 @@ fn digits(count: usize) -> usize {
         width += 1;
     }
     width
+}
+
+/// 'signcolumn' bounds (optionstr.c set-time parsing): (minimum, maximum)
+/// dedicated columns. "number" draws signs inside the number column and
+/// contributes no dedicated columns; without numbers it degrades to
+/// "auto". Mirrors `signcolumn_bounds` in ox-api/src/window.rs.
+fn signcolumn_bounds(value: &str, numbers: bool) -> (usize, usize) {
+    let first_digit = |rest: &str| -> usize {
+        rest.chars()
+            .find_map(|character| character.to_digit(10))
+            .map_or(1, |digit| usize::try_from(digit).unwrap_or(1))
+    };
+    if let Some(rest) = value.strip_prefix("yes:") {
+        let width = first_digit(rest);
+        return (width, width);
+    }
+    if value == "yes" {
+        return (1, 1);
+    }
+    if value == "no" {
+        return (0, 0);
+    }
+    if value.starts_with("number") && numbers {
+        return (0, 0);
+    }
+    if let Some(rest) = value.strip_prefix("auto:") {
+        let rest = rest.trim_matches(|character| character == '[' || character == ']');
+        return match rest.split_once('-') {
+            Some((low, high)) => (first_digit(low), first_digit(high)),
+            None => (0, first_digit(rest)),
+        };
+    }
+    (0, 1)
 }
 
 /// Resolves a highlight group, defining a dim fallback when the colorscheme

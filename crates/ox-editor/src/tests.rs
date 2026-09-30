@@ -603,8 +603,10 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
         editor.local_mark(buffer, 'a').unwrap(),
         Some(position(4, 0))
     );
-    assert_eq!(editor.window(window).unwrap().cursor, position(4, 1));
-    assert_eq!(editor.window(window).unwrap().topline, 4);
+    // `u` restores the pre-change cursor like upstream `uh_cursor`
+    // (undo.c:2518-2560) and the viewport scrolls it back into view.
+    assert_eq!(editor.window(window).unwrap().cursor, position(2, 0));
+    assert_eq!(editor.window(window).unwrap().topline, 2);
     assert_eq!(editor.changelists().len(buffer), 2);
 
     assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
@@ -619,8 +621,10 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
         editor.local_mark(buffer, 'a').unwrap(),
         Some(position(5, 0))
     );
-    assert_eq!(editor.window(window).unwrap().cursor, position(5, 1));
-    assert_eq!(editor.window(window).unwrap().topline, 5);
+    // `CTRL-R` restores `uh_cursor_after`; it is already visible in the
+    // viewport, so the topline does not move.
+    assert_eq!(editor.window(window).unwrap().cursor, position(5, 0));
+    assert_eq!(editor.window(window).unwrap().topline, 2);
     assert_eq!(editor.changelists().len(buffer), 3);
 
     assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));

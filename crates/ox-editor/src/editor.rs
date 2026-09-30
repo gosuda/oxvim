@@ -9,19 +9,19 @@ use ox_text::{Buffer, Position, UndoTree};
 use ox_types::{BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 use thiserror::Error;
 
-use crate::builtins::position::cursor_vcol;
-use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{
     BufferState, BufferStateError, BufferSubscriptionRelease, BufferTextEditRequest,
 };
+use crate::builtins::position::cursor_vcol;
 use crate::decoration::Decorations;
+use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
+use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{
     CursorScreenPosition, Geometry, Layout, LayoutError, RelativeTo, TabpageState, WinConfig,
     WindowState,
 };
-use crate::fold::{FoldError, Position as FoldPosition};
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
@@ -30,7 +30,6 @@ use crate::register::{RegisterError, RegisterKind, Registers};
 use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
-
 
 /// Cloneable allocator for the process-wide dynamic channel key space.
 #[derive(Clone, Debug)]
@@ -164,7 +163,11 @@ impl MessageIdentity {
     #[must_use]
     pub fn of(kind: MessageKind) -> Self {
         Self {
-            kind: OxStr::from(if kind == MessageKind::Error { "emsg" } else { "echo" }),
+            kind: OxStr::from(if kind == MessageKind::Error {
+                "emsg"
+            } else {
+                "echo"
+            }),
             id: Object::Nil,
             history_show: false,
         }
@@ -470,6 +473,12 @@ pub struct Editor {
     /// Identity armed by the server before an `nvim_echo` handler pushes its
     /// message. The push consumes this marker before Progress callbacks run.
     pending_echo_identity: Option<MessageIdentity>,
+    /// `write_msg` line buffers (api/deprecated.c:922-923): the deprecated
+    /// `nvim_out_write`/`nvim_err_write` calls accumulate text until a
+    /// newline completes a line; content still buffered when the editor
+    /// exits is dropped, like upstream's `out_line_buf`/`err_line_buf`.
+    out_line_buf: Vec<u8>,
+    err_line_buf: Vec<u8>,
     /// In-place echo replacements waiting for the server's render pass.
     echo_replacements: Vec<(Message, MessageIdentity)>,
     /// Raw `nvim_ui_send` payloads staged for the server's redraw pass.
@@ -612,6 +621,8 @@ impl Editor {
             message_destinations: Vec::new(),
             message_identities: Vec::new(),
             pending_echo_identity: None,
+            out_line_buf: Vec::new(),
+            err_line_buf: Vec::new(),
             echo_replacements: Vec::new(),
             ui_sends: Vec::new(),
             message_routing: MessageRouting::default(),
@@ -1016,7 +1027,11 @@ impl Editor {
         let state = self.buffer_mut(buffer)?;
         state.extmarks.ensure_namespace(namespace)?;
         let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
-        if !state.extmarks.query(namespace, point, point, Some(1))?.is_empty() {
+        if !state
+            .extmarks
+            .query(namespace, point, point, Some(1))?
+            .is_empty()
+        {
             return Ok(false);
         }
         state
@@ -2341,6 +2356,43 @@ impl Editor {
         }
     }
 
+    /// `write_msg` (api/deprecated.c:919-951): the buffered emit behind
+    /// `nvim_out_write`, `nvim_err_write` and `nvim_err_writeln`. Text
+    /// accumulates in the out or error line buffer; each newline completes
+    /// a line and emits it as one message, `NUL` turns into a newline, and
+    /// `writeln` terminates whatever remains buffered.
+    pub fn write_msg(&mut self, text: &[u8], to_err: bool, writeln: bool) {
+        let line_buf = if to_err {
+            &mut self.err_line_buf
+        } else {
+            &mut self.out_line_buf
+        };
+        let mut lines = Vec::new();
+        for &byte in text {
+            if byte == b'\n' {
+                lines.push(std::mem::take(line_buf));
+            } else {
+                line_buf.push(if byte == 0 { b'\n' } else { byte });
+            }
+        }
+        if writeln {
+            lines.push(std::mem::take(line_buf));
+        }
+        let kind = if to_err {
+            MessageKind::Error
+        } else {
+            MessageKind::Echo
+        };
+        for line in lines {
+            self.push_message(Message {
+                kind,
+                content: Object::String(OxStr::from(line.as_slice())),
+                history: true,
+                leading_newline: true,
+            });
+        }
+    }
+
     /// Stores a message without claiming that a UI has rendered it, together
     /// with the sink decision that applies to it.
     pub fn push_message(&mut self, message: Message) {
@@ -3328,9 +3380,8 @@ impl Editor {
         };
         let text = self.buffer(buffer)?.text()?;
         let cursor_line = text.line(cursor.lnum).map_err(BufferStateError::from)?;
-        let virtual_column = cursor_vcol(&cursor_line, cursor.col, tabstop).saturating_add(
-            usize::try_from(coladd.max(0)).unwrap_or(usize::MAX),
-        );
+        let virtual_column = cursor_vcol(&cursor_line, cursor.col, tabstop)
+            .saturating_add(usize::try_from(coladd.max(0)).unwrap_or(usize::MAX));
         if !wrap || geometry.width == 0 {
             return Ok(CursorScreenPosition {
                 row: cursor.lnum.saturating_sub(topline),
@@ -3764,6 +3815,28 @@ impl Editor {
         }
         if let Some(last) = replayed.last() {
             self.changelists.push(buffer, last.cursor);
+            // Upstream `u_undo_end` restores `curwin->w_cursor` from the undo
+            // header — `uh_cursor` on undo, `uh_cursor_after` on redo
+            // (undo.c:2518-2560), bounds-checked like its `check_cursor`.
+            if let Some(window) = self.current_window()
+                && self
+                    .window(window)
+                    .is_ok_and(|state| state.buffer == buffer)
+            {
+                let clamped = self
+                    .buffer(buffer)
+                    .ok()
+                    .and_then(|state| state.text().ok())
+                    .map_or(last.cursor, |text| {
+                        let lnum = last.cursor.lnum.clamp(1, text.line_count().max(1));
+                        let col = text.line(lnum).map_or(0, |line| line.len());
+                        Position {
+                            lnum,
+                            col: last.cursor.col.min(col),
+                        }
+                    });
+                let _ = self.set_window_cursor(window, clamped);
+            }
         }
     }
 
@@ -4852,8 +4925,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let config =
-            WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
+        let config = WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
         let float = editor.open_float(tab, buffer, config).unwrap();
         let geometry = editor.window_geometry(float).unwrap();
         (geometry.row, geometry.col)

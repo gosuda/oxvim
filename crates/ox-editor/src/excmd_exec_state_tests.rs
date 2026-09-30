@@ -813,9 +813,9 @@ fn wincmd_two_key_form_gates_the_tail_on_the_window_command() {
     );
 }
 
-// A literal `|` is the window-command key itself: only the second bar
-// separates the next command, so the key is dispatched (and rejected as
-// unimplemented, naming the key) instead of being read as trailing garbage.
+// A literal `|` is the window-command key itself (maximize width): only the
+// second bar separates the next command, which then runs normally — the
+// oracle maximizes the window and applies `setlocal modified`, no E474.
 #[test]
 fn wincmd_pipe_key_consumes_the_first_bar_only() {
     let (editor, buffer, _) = editor_with_window();
@@ -824,20 +824,10 @@ fn wincmd_pipe_key_consumes_the_first_bar_only() {
     let mut exec = ExExecutor::new();
     editor.editor_mut().buffer_mut(buffer).unwrap().mark_saved();
 
-    let ExecError::Vim(exception) = exec
-        .execute_line(&editor, "wincmd | | setlocal modified")
-        .unwrap_err()
-    else {
-        panic!("expected E474 for the pipe key")
-    };
-    assert_eq!(exception.kind, VimExceptionKind::Error("E474".to_owned()));
+    exec.execute_line(&editor, "wincmd | | setlocal modified")
+        .unwrap();
     assert!(
-        exception.message().contains("Invalid argument: |"),
-        "{}",
-        exception.message()
-    );
-    assert!(
-        !editor
+        editor
             .editor()
             .buffer(buffer)
             .unwrap()
@@ -1975,7 +1965,9 @@ struct FakeLua {
 
 impl LuaExec for FakeLua {
     fn execute_chunk(&self, code: &str, args: Vec<Object>) -> Result<Object, LuaExecError> {
-        self.chunks.borrow_mut().push((code.to_owned(), args.clone()));
+        self.chunks
+            .borrow_mut()
+            .push((code.to_owned(), args.clone()));
         if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
@@ -1992,15 +1984,22 @@ impl LuaExec for FakeLua {
         self.error.borrow().clone().map_or(Ok(()), Err)
     }
 
-    fn eval_expression(&self,
+    fn eval_expression(
+        &self,
         expression: &str,
         arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
-        self.evals.borrow_mut().push((expression.to_owned(), arg.cloned()));
+        self.evals
+            .borrow_mut()
+            .push((expression.to_owned(), arg.cloned()));
         if let Some(error) = self.error.borrow().clone() {
             return Err(error);
         }
-        Ok(self.eval_result.borrow().clone().unwrap_or(Typval::Number(0)))
+        Ok(self
+            .eval_result
+            .borrow()
+            .clone()
+            .unwrap_or(Typval::Number(0)))
     }
 }
 

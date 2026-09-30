@@ -18,8 +18,7 @@ use ox_editor::{
     OptionValue,
 };
 use ox_lua::{
-    ApiDispatchContext, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables,
-    bind_with,
+    ApiDispatchContext, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables, bind_with,
 };
 use ox_text::Buffer;
 use ox_types::{BufHandle, Object, OxStr};
@@ -746,6 +745,7 @@ fn split_commands(line: &str) -> Vec<&str> {
 }
 
 /// Run a Lua file with its trailing argv exposed in `_G.arg`.
+#[allow(clippy::too_many_lines)] // One `-l` startup wiring pass, like `nvim -es`'s.
 pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     let source = if script.path == "-" {
         let mut source = Vec::new();
@@ -755,6 +755,19 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         fs::read(&script.path).map_err(AppError::Io)?
     };
     let mut editor = Editor::new();
+    // Upstream `-l` sets `silent_mode` and `p_verbose = 1` together
+    // (main.c `command_line_scan`): the nonzero `'verbose'` keeps
+    // `msg_puts_printf` from dropping output (message.c:3038), and the
+    // stream ends with the batch-mode trailing newline that
+    // `PrintfSink::finish` adds only under silent routing.
+    editor.message_routing = MessageRouting {
+        silent: true,
+        ..MessageRouting::default()
+    };
+    editor
+        .options_mut()
+        .set_global("verbose", OptionValue::Number(1))
+        .map_err(|error| AppError::Editor(error.to_string()))?;
     let buffer = editor
         .create_buffer(true)
         .map_err(|error| AppError::Editor(error.to_string()))?;
@@ -793,7 +806,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     nested
         .scripts_mut()
         .set_runtime_roots_from_rtp(&default_rtp);
-    let channel_ids = session.with_editor(|editor| editor.channel_ids());
+    let channel_ids = session.with_editor(ox_editor::Editor::channel_ids);
     primary.set_channel_ids(channel_ids.clone());
     nested.set_channel_ids(channel_ids);
     // The nested executor shares durable definitions with the primary so
@@ -852,15 +865,57 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     lua.globals()
         .set("arg", arguments)
         .map_err(|error| AppError::Lua(error.to_string()))?;
-    let executed = lua
+    // Stock `os.exit` exits the real process mid-script, bypassing the
+    // post-exec print flush below; drain the editor's output first like
+    // upstream's exit path, then honour the requested status.
+    let flush_session = session.clone();
+    lua.globals()
+        .get::<mlua::Table>("os")
+        .and_then(|os| {
+            let exit =
+                lua.create_function(move |_, status: Option<mlua::Value>| -> mlua::Result<()> {
+                    let code = match status {
+                        Some(mlua::Value::Integer(code)) => i32::try_from(code).unwrap_or(1),
+                        Some(mlua::Value::Number(code)) => code as i32,
+                        Some(mlua::Value::Boolean(false)) => 1,
+                        _ => 0,
+                    };
+                    let _ = flush_lua_prints(&flush_session);
+                    std::process::exit(code);
+                })?;
+            os.set("exit", exit)
+        })
+        .map_err(|error| AppError::Lua(error.to_string()))?;
+    if let Err(error) = lua
         .load(&source)
         .set_name(format!("@{}", script.path))
         .exec()
-        .map_err(|error| AppError::Lua(error.to_string()));
+    {
+        // `nlua_error` reports the chunk failure through `semsg_multiline`
+        // — an ordinary emsg on the message stream, never a process
+        // wrapper prefix (executor.c:305-312).
+        session.with_editor_mut(|editor| {
+            editor.push_message(ox_editor::Message {
+                kind: ox_editor::MessageKind::Error,
+                content: Object::String(OxStr::from(lua_chunk_error(&error).as_str())),
+                history: true,
+                leading_newline: true,
+            });
+        });
+        flush_lua_prints(&session)?;
+        std::process::exit(1);
+    }
     // `print()` lands in the editor message stream via `nvim_out_write`
     // (executor.c:nlua_print); flush it to the process's stdout/stderr like
     // the batch path so `nvim -l` scripts emit their output — including the
     // output a script printed before failing, which upstream still emits.
+    flush_lua_prints(&session)?;
+    Ok(())
+}
+
+/// Drains the editor's message stream through the process's stdout/stderr,
+/// the way upstream's `os_out` emits `nvim -l` script output.
+fn flush_lua_prints(session: &ApiSession) -> Result<(), AppError> {
     let mut sink = PrintfSink::default();
     session.with_editor(|editor| {
         for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
@@ -868,8 +923,19 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         }
         sink.finish(editor.message_routing).map_err(AppError::Io)?;
         Ok::<(), AppError>(())
-    })?;
-    executed
+    })
+}
+
+/// Formats an `-l` script failure like upstream's `nlua_error`: a compile
+/// failure is `E5112: Lua chunk: ...` and a runtime failure `E5113: Lua
+/// chunk: ...` (message.c; executor.c `nlua_call_prepare`/`nlua_pcall`).
+/// mlua embeds the traceback in the error message, matching upstream's.
+fn lua_chunk_error(error: &mlua::Error) -> String {
+    match error {
+        mlua::Error::SyntaxError { message, .. } => format!("E5112: Lua chunk: {message}"),
+        mlua::Error::RuntimeError(message) => format!("E5113: Lua chunk: {message}"),
+        other => format!("E5113: Lua chunk: {other}"),
+    }
 }
 
 struct ImmediateScheduler;

@@ -38,10 +38,10 @@ use crate::autocmd::{
 use crate::buffer::BufferTextEditRequest;
 use crate::builtins::position::cell_width;
 use crate::decoration::{CallbackPhase, RedrawEntry};
+use crate::editor::is_nofileread;
 use crate::extmark::{
     ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup,
 };
-use crate::editor::is_nofileread;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::fs_builtins::split_path_list;
 use crate::lvalue::{
@@ -247,7 +247,8 @@ pub trait LuaExec {
     /// Hosts wrap the expression exactly like upstream `nlua_call_luaeval`
     /// (`local _A=select(1,...) return (<expr>)`) and convert the argument
     /// and result with typval semantics.
-    fn eval_expression(&self,
+    fn eval_expression(
+        &self,
         _expression: &str,
         _arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
@@ -261,7 +262,8 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's runtime or value-conversion failure.
-    fn invoke_callback(&self,
+    fn invoke_callback(
+        &self,
         _reference: usize,
         _args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -3293,9 +3295,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         ),
         "args" => command_args(runtime, access, scope, lua, command),
         "next" => command_next(runtime, access, scope, lua, command),
-        "first" | "rewind" => {
-            command_argument_absolute(runtime, access, scope, lua, command, 0)
-        }
+        "first" | "rewind" => command_argument_absolute(runtime, access, scope, lua, command, 0),
         "last" => command_argument_absolute(runtime, access, scope, lua, command, i64::MAX),
         "argument" => command_argument(runtime, access, scope, lua, command),
         "previous" | "Next" => command_previous(runtime, access, scope, lua, command),
@@ -3621,8 +3621,7 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
         self.access
             .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
             .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
-        let result = lua
-            .execute_chunk("return vim.api[select(1, ...)](select(2, ...))", call);
+        let result = lua.execute_chunk("return vim.api[select(1, ...)](select(2, ...))", call);
         let sync = self
             .access
             .with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
@@ -3695,14 +3694,15 @@ fn command_resize<F: FileIO>(
     let extent = if relative {
         signed + current_extent.cast_signed()
     } else if args.is_empty() {
-        tabpage.map_or(if vertical { 80 } else { 24 }, |tabpage| {
-            let size = tabpage.layout().size();
-            if vertical {
-                size.width
-            } else {
-                size.height.saturating_sub(1)
-            }
-        })
+        tabpage
+            .map_or(if vertical { 80 } else { 24 }, |tabpage| {
+                let size = tabpage.layout().size();
+                if vertical {
+                    size.width
+                } else {
+                    size.height.saturating_sub(1)
+                }
+            })
             .max(1)
             .cast_signed()
     } else {
@@ -3760,6 +3760,38 @@ fn command_wincmd<F: FileIO>(
     let Some(current) = editor.current_window() else {
         return Flow::Normal;
     };
+    if matches!(key, '<' | '>' | '+' | '-' | '_' | '|' | '=') {
+        // `do_window` (window.c:5193-5380): < > grow/shrink columns, + -
+        // rows, _ and | maximize, = equalizes — the same chords the
+        // Normal-mode `CTRL-W` prefix takes through `nv_window`.
+        let count = wincmd_range_count(command).unwrap_or(1).max(1);
+        if key == '=' {
+            return match editor.equalize_tabpage(tab) {
+                Ok(()) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E957", error.to_string()),
+            };
+        }
+        let Ok(geometry) = editor.window_geometry(current) else {
+            return Flow::Normal;
+        };
+        let (extent, vertical) = match key {
+            '<' => (geometry.width.saturating_sub(count).max(1), true),
+            '>' => (geometry.width.saturating_add(count), true),
+            '+' => (geometry.height.saturating_add(count), false),
+            '-' => (geometry.height.saturating_sub(count).max(1), false),
+            '_' => (usize::MAX, false),
+            '|' => (usize::MAX, true),
+            _ => return error_flow(runtime, "E474", format!("Invalid argument: {key}")),
+        };
+        return match if vertical {
+            editor.set_window_width(current, extent)
+        } else {
+            editor.set_window_height(current, extent)
+        } {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E957", error.to_string()),
+        };
+    }
     let next = match key {
         'w' => windows
             .iter()
@@ -5028,7 +5060,8 @@ fn command_version(editor: &mut Editor) -> Flow {
                 let Object::Dict(dict) = dict else {
                     return None;
                 };
-                dict.0.iter()
+                dict.0
+                    .iter()
                     .find(|(key, _)| key.as_bytes() == name.as_bytes())
                     .map(|(_, value)| value)
             }
@@ -5110,11 +5143,10 @@ fn command_help<F: FileIO, E: ExEditorAccess>(
             };
             (path, matched.cmd.clone())
         };
-        let (handle, origin) =
-            match buffer_from_file(runtime, access, &path) {
-                Ok((handle, origin)) => (handle, origin),
-                Err(flow) => return flow,
-            };
+        let (handle, origin) = match buffer_from_file(runtime, access, &path) {
+            Ok((handle, origin)) => (handle, origin),
+            Err(flow) => return flow,
+        };
         let existing_tabs = access.with_ex_editor(|editor| editor.tabpages());
         let existing_windows = access.with_ex_editor(|editor| editor.windows());
         let old_tab = access.with_ex_editor(|editor| editor.current_tabpage());
@@ -6932,8 +6964,8 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
     } else if matches!(outcome, LoadSwitchOutcome::Resident)
-        && let Err(error) =
-            access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+        && let Err(error) = access
+            .with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E948", error.to_string());
     }
@@ -8018,8 +8050,7 @@ fn preserve_one_swapfile<F: FileIO>(
         .write_to(
             &name,
             ox_text::swapfile::SwapOwnership::for_session(session_owns_swapfile),
-        )
-    {
+        ) {
         Ok(()) => {
             runtime.swap_written.borrow_mut().insert(name);
             if report {
@@ -8458,9 +8489,7 @@ fn command_pop<F: FileIO, E: ExEditorAccess>(
         lnum: item.from_lnum.max(1),
         col: item.from_col.saturating_sub(1),
     };
-    if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_window_cursor(window, target))
-    {
+    if let Err(error) = access.with_ex_editor(|editor| editor.set_window_cursor(window, target)) {
         restore_curidx(access);
         return error_flow(runtime, "E16", error.to_string());
     }
@@ -9562,9 +9591,8 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         // Keep the exact name bytes: a lossy round-trip here would redirect
         // the write, the existence gate, and the overwrite bookkeeping to a
         // replacement-character filename for non-UTF-8 buffer names.
-        let existing = access.with_ex_editor(|editor| {
-            editor.buffer(buffer).map(|state| state.name().clone())
-        });
+        let existing =
+            access.with_ex_editor(|editor| editor.buffer(buffer).map(|state| state.name().clone()));
         let target = match existing {
             Ok(name) => name,
             Err(error) => return error_flow(runtime, "E32", error.to_string()),
@@ -9697,9 +9725,7 @@ fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
         for component in absolute.components() {
             match component {
                 Component::CurDir => {}
-                Component::ParentDir
-                    if matches!(components.last(), Some(Component::Normal(_))) =>
-                {
+                Component::ParentDir if matches!(components.last(), Some(Component::Normal(_))) => {
                     components.pop();
                 }
                 Component::ParentDir if !anchored => components.push(component),
@@ -10146,6 +10172,13 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     vertical: bool,
 ) -> Flow {
+    // `P_VERT` on `:split`/`:new` splits vertically too (`ex_splitview`,
+    // ex_docmd.c:7890-7896: `cmdmod.split & WSP_VERT`).
+    let vertical = vertical
+        || command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Vertical);
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E749", "Empty buffer");
     };
@@ -10187,13 +10220,10 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             LoadSwitchFocus::Revalidate,
             |_runtime| {
                 let created = if vertical {
-                    access.with_ex_editor(|editor| {
-                        editor.split_left(tab, window, new_buffer, true)
-                    })
+                    access.with_ex_editor(|editor| editor.split_left(tab, window, new_buffer, true))
                 } else {
-                    access.with_ex_editor(|editor| {
-                        editor.split_above(tab, window, new_buffer, true)
-                    })
+                    access
+                        .with_ex_editor(|editor| editor.split_above(tab, window, new_buffer, true))
                 }
                 .map_err(LoadSwitchError::Editor)?;
                 created_window.set(Some(created));
@@ -10208,9 +10238,7 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             },
             || {
                 if let Some(created) = created_window.take() {
-                    let _ = access.with_ex_editor(|editor| {
-                        editor.close_window(tab, created, true)
-                    });
+                    let _ = access.with_ex_editor(|editor| editor.close_window(tab, created, true));
                 }
             },
         ) {
@@ -10404,9 +10432,9 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
         }
     }
 
-    match access.with_ex_editor(|editor| {
-        editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after)
-    }) {
+    match access
+        .with_ex_editor(|editor| editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after))
+    {
         Ok(_) => Flow::Normal,
         Err(error) => {
             if origin.is_created() {
@@ -12097,17 +12125,14 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
-        if let Err(error) =
-            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-        {
+        if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
         return Ok(entered());
     }
 
-    let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
-        .then(|| path_from_ox_str(&name))
+    let Some(path) = (!name.as_bytes().is_empty() && !nofileread).then(|| path_from_ox_str(&name))
     else {
         access
             .with_ex_editor(|editor| -> Result<(), EditorError> {
@@ -12122,9 +12147,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(error);
         }
-        if let Err(error) =
-            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-        {
+        if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
@@ -12159,21 +12182,12 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Err(error);
     }
 
-    if let Err(error) =
-        announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-    {
+    if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
         rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(error);
     }
     if !new_file {
-        let flow = fire_buffer_lifecycle(
-            runtime,
-            access,
-            scope,
-            lua,
-            &[Event::BufReadPre],
-            buffer,
-        );
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
         if !matches!(flow, Flow::Normal) {
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(LoadSwitchError::Flow(flow));
@@ -12181,14 +12195,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
     }
 
     if new_file {
-        let flow = fire_buffer_lifecycle(
-            runtime,
-            access,
-            scope,
-            lua,
-            &[Event::BufNewFile],
-            buffer,
-        );
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufNewFile], buffer);
         if !matches!(flow, Flow::Normal) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(LoadSwitchError::Flow(flow));
@@ -12224,14 +12231,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Err(LoadSwitchError::Editor(error));
     }
 
-    let flow = fire_buffer_lifecycle(
-        runtime,
-        access,
-        scope,
-        lua,
-        &[Event::BufReadPost],
-        buffer,
-    );
+    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPost], buffer);
     if !matches!(flow, Flow::Normal) {
         rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(LoadSwitchError::Flow(flow));
@@ -12311,9 +12311,7 @@ fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
                         .window(*window)
                         .is_ok_and(|state| state.buffer == buffer)
                 }) else {
-                    return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(
-                        buffer,
-                    )));
+                    return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(buffer)));
                 };
                 let tab = editor
                     .window_tabpage(window)
@@ -12357,7 +12355,6 @@ fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
     }
 }
 
-
 /// Loads a file-backed target with file-command error semantics.
 fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -12387,12 +12384,9 @@ fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
             "E484",
             format!("Can't open file {}: {error}", path.display()),
         )),
-        Err(LoadSwitchError::Editor(error)) => {
-            Err(error_flow(runtime, "E948", error.to_string()))
-        }
+        Err(LoadSwitchError::Editor(error)) => Err(error_flow(runtime, "E948", error.to_string())),
     }
 }
-
 
 /// Fires the leave half of a buffer switch, performs any unloaded-buffer
 /// reload with its read lifecycle, then fires the enter half.
@@ -12469,8 +12463,8 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
         return Flow::Normal;
     }
     if matches!(outcome, LoadSwitchOutcome::Resident)
-        && let Err(error) =
-            access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
+        && let Err(error) = access
+            .with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E86", error.to_string());
     }
@@ -12584,8 +12578,8 @@ fn command_argument_absolute<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     target: i64,
 ) -> Flow {
-    let count = i64::try_from(access.with_ex_editor(|editor| editor.arglist().len()))
-        .unwrap_or(i64::MAX);
+    let count =
+        i64::try_from(access.with_ex_editor(|editor| editor.arglist().len())).unwrap_or(i64::MAX);
     let entry = if target == i64::MAX {
         count.saturating_sub(1)
     } else {
@@ -12609,8 +12603,7 @@ fn command_argument<F: FileIO, E: ExEditorAccess>(
         .or_else(|| command.args.trim().parse::<i64>().ok())
         .unwrap_or_else(|| {
             access.with_ex_editor(|editor| {
-                i64::try_from(editor.arglist().index())
-                    .map_or(1, |index| index.saturating_add(1))
+                i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
             })
         });
     do_argfile(
@@ -12622,7 +12615,6 @@ fn command_argument<F: FileIO, E: ExEditorAccess>(
         count.saturating_sub(1),
     )
 }
-
 
 fn command_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -12957,7 +12949,6 @@ fn command_previous<F: FileIO, E: ExEditorAccess>(
     do_argfile(runtime, access, scope, lua, command.bang, target)
 }
 
-
 /// Edits entry `target` of the argument list (`do_argfile`, arglist.c
 /// 600): out-of-range targets fail with E163/E164/E165, and the index
 /// only advances when the edit succeeded.
@@ -13034,9 +13025,7 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
 
     // An argument with no buffer yet opens a new file, which is always a
     // different buffer: same guard.
-    if let Some(flow) =
-        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
-    {
+    if let Some(flow) = access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force)) {
         return flow;
     }
 
@@ -16933,8 +16922,7 @@ fn scope_map(scope: &Scope, kind: ScopeKind) -> Option<&ScopeMap> {
 
 fn mirror_name(key: &OxStr, tag: u8) -> Option<&[u8]> {
     let bytes = key.as_bytes();
-    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag)
-        .then(|| &bytes[2..])
+    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag).then(|| &bytes[2..])
 }
 
 fn mirror_key(tag: u8, key: &[u8]) -> OxStr {
@@ -16965,15 +16953,11 @@ fn refresh_scope_mirror_map(
         .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
         .map(|(key, _)| key.as_bytes())
         .collect();
-    mirror.retain(|(key, _)| {
-        mirror_name(key, tag).is_none_or(|name| current_keys.contains(name))
-    });
+    mirror.retain(|(key, _)| mirror_name(key, tag).is_none_or(|name| current_keys.contains(name)));
     let mut slots: HashMap<Vec<u8>, usize> = mirror
         .iter()
         .enumerate()
-        .filter_map(|(index, (key, _))| {
-            mirror_name(key, tag).map(|name| (name.to_vec(), index))
-        })
+        .filter_map(|(index, (key, _))| mirror_name(key, tag).map(|name| (name.to_vec(), index)))
         .collect();
     for (key, value) in current
         .iter()
@@ -16982,8 +16966,7 @@ fn refresh_scope_mirror_map(
         match slots.get(key.as_bytes()).copied() {
             Some(index) if mirror[index].1 == *value => {}
             Some(index) => {
-                mirror[index].1 =
-                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
+                mirror[index].1 = ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
             }
             None => {
                 let index = mirror.len();
@@ -17002,11 +16985,7 @@ fn refresh_scope_mirror(scope: &Scope, kind: ScopeKind) -> Result<(), ExecError>
     let Some(current) = scope_map(scope, kind) else {
         return Ok(());
     };
-    refresh_scope_mirror_map(
-        current,
-        &mut scope.global_mirror.borrow_mut(),
-        kind,
-    )
+    refresh_scope_mirror_map(current, &mut scope.global_mirror.borrow_mut(), kind)
 }
 
 /// Merge one dirty scope into its live dictionary and refresh its mirror.
@@ -17363,15 +17342,8 @@ pub(crate) fn sync_scope_into_editor(
     if global_dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
         let live = editor.gvars();
         let mut mirror = scope.global_mirror.borrow_mut();
-        pull_scope_map_from_editor(
-            live,
-            &mut scope.global,
-            &mut mirror,
-            ScopeKind::Global,
-        )?;
-        scope
-            .synced
-            .set(ScopeKind::Global, editor.gvars_version());
+        pull_scope_map_from_editor(live, &mut scope.global, &mut mirror, ScopeKind::Global)?;
+        scope.synced.set(ScopeKind::Global, editor.gvars_version());
     }
     if global_dirty {
         scope.synced.clear_dirty(ScopeKind::Global);
@@ -17385,9 +17357,7 @@ pub(crate) fn sync_scope_into_editor(
     let buffer = editor
         .current_buffer()
         .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer));
-    if buffer_dirty
-        && let Some(buffer) = buffer
-    {
+    if buffer_dirty && let Some(buffer) = buffer {
         let state = editor
             .buffer_mut(buffer)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -17405,12 +17375,7 @@ pub(crate) fn sync_scope_into_editor(
                 .map_err(|error| ExecError::Editor(error.to_string()))?
                 .variables();
             let mut mirror = scope.global_mirror.borrow_mut();
-            pull_scope_map_from_editor(
-                live,
-                &mut scope.buffer,
-                &mut mirror,
-                ScopeKind::Buffer,
-            )?;
+            pull_scope_map_from_editor(live, &mut scope.buffer, &mut mirror, ScopeKind::Buffer)?;
             scope.synced.set_buffer_version(buffer_version);
         }
         if buffer_dirty {
@@ -17439,9 +17404,7 @@ pub(crate) fn sync_scope_into_editor(
     }
 
     let window_dirty = scope.synced.is_dirty(ScopeKind::Window);
-    if window_dirty
-        && let Some(window) = editor.current_window()
-    {
+    if window_dirty && let Some(window) = editor.current_window() {
         let live = editor
             .window_variables_mut(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -17457,12 +17420,7 @@ pub(crate) fn sync_scope_into_editor(
                 .window_variables(window)
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
-            pull_scope_map_from_editor(
-                live,
-                &mut scope.window,
-                &mut mirror,
-                ScopeKind::Window,
-            )?;
+            pull_scope_map_from_editor(live, &mut scope.window, &mut mirror, ScopeKind::Window)?;
             scope.synced.set(ScopeKind::Window, window_version);
         }
         if window_dirty {
@@ -17471,9 +17429,7 @@ pub(crate) fn sync_scope_into_editor(
     }
 
     let tab_dirty = scope.synced.is_dirty(ScopeKind::Tab);
-    if tab_dirty
-        && let Some(tab) = editor.current_tabpage()
-    {
+    if tab_dirty && let Some(tab) = editor.current_tabpage() {
         let live = editor
             .tabpage_variables_mut(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;

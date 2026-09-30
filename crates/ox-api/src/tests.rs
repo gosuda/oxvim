@@ -369,7 +369,10 @@ fn editor_with_lines(
 fn editor_with_two_windows() -> (Editor, crate::BufHandle, crate::TabHandle, crate::WinHandle) {
     let (mut editor, buffer, tab, window) = editor_with_lines(&["target"]);
     let other = editor
-        .create_buffer_with(Buffer::from_lines(&[b"other".to_vec()], false).unwrap(), true)
+        .create_buffer_with(
+            Buffer::from_lines(&[b"other".to_vec()], false).unwrap(),
+            true,
+        )
         .unwrap();
     editor.split_vertical(tab, window, other, true).unwrap();
     (editor, buffer, tab, window)
@@ -393,8 +396,6 @@ fn set_buffer_hidden_policy(session: &crate::ApiSession, buffer: crate::BufHandl
     )
     .unwrap();
 }
-
-
 
 #[test]
 fn set_current_window_reports_invalid_id_and_switches_valid_window() {
@@ -550,10 +551,7 @@ fn set_current_buf_fires_the_buffer_lifecycle_in_order() {
 fn set_current_buf_reads_unloaded_non_utf8_file_name() {
     use std::os::unix::ffi::OsStrExt;
 
-    let root = std::env::temp_dir().join(format!(
-        "oxvim-api-byte-path-{}",
-        std::process::id()
-    ));
+    let root = std::env::temp_dir().join(format!("oxvim-api-byte-path-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let file_name = std::ffi::OsStr::from_bytes(b"target-\xff.txt");
@@ -645,7 +643,10 @@ fn set_current_buf_read_hook_sets_target_buffer_local_option() {
         Object::String(OxStr::from("BufReadPre")),
         dict(&[
             ("pattern", Object::String(OxStr::from("*"))),
-            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+            (
+                "command",
+                Object::String(OxStr::from("setlocal shiftwidth=3")),
+            ),
         ]),
     )
     .unwrap();
@@ -1327,8 +1328,6 @@ fn win_close_bufhidden_does_not_release_buffer_with_other_attachment() {
     });
 }
 
-
-
 #[test]
 fn floating_windows_validate_round_trip_and_close() {
     let (editor, buffer, _, _) = editor_with_lines(&["one"]);
@@ -1455,7 +1454,6 @@ fn core_registry_metadata_matches_cross_family_sample() {
         }
     }
 }
-
 
 #[test]
 fn registry_dispatch_converts_objects_and_preserves_api_errors() {
@@ -1772,12 +1770,24 @@ fn nvim_mcursor_validates_arguments_before_extmark_insert() {
 fn nvim_mcursor_dedupes_positions_and_returns_global_count() {
     let (editor, buffer, _, _) = editor_with_lines(&["abc", "z"]);
     let session = session_with(editor);
-    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 2]), Ok(1));
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1, 2]),
+        Ok(1)
+    );
     // Re-adding the tracked position is a no-op: mc_add dedupes.
-    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 2]), Ok(1));
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1, 2]),
+        Ok(1)
+    );
     // An over-long column clamps to the EOL insertion point (a new position).
-    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 99]), Ok(2));
-    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![2, 0]), Ok(3));
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1, 99]),
+        Ok(2)
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![2, 0]),
+        Ok(3)
+    );
 }
 
 #[derive(Clone)]
@@ -2446,7 +2456,10 @@ fn exec_autocmds_keeps_handler_loaded_target_resident() {
 fn exec_autocmds_keeps_already_loaded_hidden_target_resident() {
     let (mut editor, caller, _, _) = editor_with_lines(&["caller"]);
     let target = editor
-        .create_buffer_with(Buffer::from_lines(&[b"already loaded".to_vec()], false).unwrap(), true)
+        .create_buffer_with(
+            Buffer::from_lines(&[b"already loaded".to_vec()], false).unwrap(),
+            true,
+        )
         .unwrap();
     let session = session_with(editor);
     let before_tick = session.with_editor(|editor| editor.buffer(target).unwrap().changedtick());
@@ -2478,7 +2491,10 @@ fn exec_autocmds_keeps_already_loaded_hidden_target_resident() {
     });
     assert_eq!(session.with_editor(Editor::current_buffer), Some(caller));
     assert!(loaded, "an already-loaded target remains resident");
-    assert_eq!(after_tick, before_tick, "context restoration does not reload it");
+    assert_eq!(
+        after_tick, before_tick,
+        "context restoration does not reload it"
+    );
     assert_eq!(
         crate::buffer::nvim_buf_get_lines(&session, target, 0, -1, true).unwrap(),
         vec![OxStr::from("already loaded")]
@@ -6839,9 +6855,11 @@ fn set_text_keeps_classic_columns_while_byte_geometry_tracks_the_splice() {
         .unwrap(),
         vec![Object::Integer(0), Object::Integer(6)]
     );
+    // `u` restores the recorded pre-change cursor like upstream `uh_cursor`
+    // (undo.c:2518-2560) instead of splice-tracking it.
     assert_eq!(
         session.with_editor(|editor| editor.window(second).unwrap().cursor.col),
-        8
+        1
     );
 
     session.with_editor_mut(|editor| editor.buffer_redo(buffer).unwrap());
@@ -6872,9 +6890,11 @@ fn set_text_keeps_classic_columns_while_byte_geometry_tracks_the_splice() {
         .unwrap(),
         vec![Object::Integer(0), Object::Integer(8)]
     );
+    // `CTRL-R` restores `uh_cursor_after`, which this request recorded as
+    // the same position as `cursor_before`.
     assert_eq!(
         session.with_editor(|editor| editor.window(second).unwrap().cursor.col),
-        8
+        1
     );
 }
 
@@ -8592,7 +8612,10 @@ fn open_tabpage_loads_unloaded_buffer_before_read_hooks() {
         Object::String(OxStr::from("BufReadPre")),
         dict(&[
             ("pattern", Object::String(OxStr::from("*"))),
-            ("command", Object::String(OxStr::from("setlocal shiftwidth=3"))),
+            (
+                "command",
+                Object::String(OxStr::from("setlocal shiftwidth=3")),
+            ),
         ]),
     )
     .unwrap();
@@ -8620,19 +8643,9 @@ fn open_tabpage_loads_unloaded_buffer_before_read_hooks() {
         session.with_editor(Editor::current_tabpage),
         Some(original_tab)
     );
+    assert_eq!(session.with_editor(Editor::current_buffer), Some(source));
     assert_eq!(
-        session.with_editor(Editor::current_buffer),
-        Some(source)
-    );
-    assert_eq!(
-        session.with_editor(|editor| {
-            editor
-                .buffer(target)
-                .unwrap()
-                .text()
-                .unwrap()
-                .line(1)
-        }),
+        session.with_editor(|editor| { editor.buffer(target).unwrap().text().unwrap().line(1) }),
         Ok(b"target".to_vec())
     );
     assert_eq!(
@@ -8655,8 +8668,7 @@ fn open_tabpage_loads_unloaded_buffer_before_read_hooks() {
         }),
         OptionValue::Number(8)
     );
-    let window = session
-        .with_editor(|editor| editor.tabpage(tab).unwrap().current_window());
+    let window = session.with_editor(|editor| editor.tabpage(tab).unwrap().current_window());
     assert_eq!(
         session.with_editor(|editor| editor.window(window).unwrap().buffer),
         target
@@ -9063,12 +9075,18 @@ fn nvim_echo_accepts_documented_progress_options_and_rejects_unknown_keys() {
         ("percent", Object::Integer(42)),
     ]);
     let result = crate::global::nvim_echo(&session, chunks.clone(), false, progress).unwrap();
-    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+    assert!(
+        matches!(result, Object::Integer(id) if id > 0),
+        "got {result:?}"
+    );
 
     // `spellfile.lua` uses `kind = 'empty'`.
     let empty = dict(&[("kind", Object::String(OxStr::from("empty")))]);
     let result = crate::global::nvim_echo(&session, chunks.clone(), false, empty).unwrap();
-    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+    assert!(
+        matches!(result, Object::Integer(id) if id > 0),
+        "got {result:?}"
+    );
 
     // A caller-provided string `id` is returned as-is.
     let with_id = dict(&[
@@ -9161,28 +9179,37 @@ fn nvim_echo_rejects_wrong_typed_option_values() {
     // Boolean members fail the strict boolean pop (`api_spec.lua:301`).
     for key in ["err", "verbose", "_truncate"] {
         assert_eq!(
-            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-                (key, Object::String(OxStr::from("x"))),
-            ])),
-            Err(ApiError::validation(format!("Invalid '{key}': not a boolean"))),
+            crate::global::nvim_echo(
+                &session,
+                chunks.clone(),
+                false,
+                dict(&[(key, Object::String(OxStr::from("x"))),])
+            ),
+            Err(ApiError::validation(format!(
+                "Invalid '{key}': not a boolean"
+            ))),
             "{key}",
         );
     }
     // Numbers coerce against zero, `nil` is `false`.
-    assert!(crate::global::nvim_echo(
-        &session,
-        chunks.clone(),
-        false,
-        dict(&[("err", Object::Integer(2))])
-    )
-    .is_ok());
-    assert!(crate::global::nvim_echo(
-        &session,
-        chunks.clone(),
-        false,
-        dict(&[("verbose", Object::Float(0.0))])
-    )
-    .is_ok());
+    assert!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("err", Object::Integer(2))])
+        )
+        .is_ok()
+    );
+    assert!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("verbose", Object::Float(0.0))])
+        )
+        .is_ok()
+    );
 
     // The remaining typed members fail the RPC-side `VALIDATE_T` shape.
     for (key, expected) in [
@@ -9194,9 +9221,12 @@ fn nvim_echo_rejects_wrong_typed_option_values() {
         ("data", "Dict"),
     ] {
         assert_eq!(
-            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-                (key, Object::Array(vec![Object::Integer(1)])),
-            ])),
+            crate::global::nvim_echo(
+                &session,
+                chunks.clone(),
+                false,
+                dict(&[(key, Object::Array(vec![Object::Integer(1)])),])
+            ),
             Err(ApiError::validation(format!(
                 "Invalid '{key}': expected {expected}, got Array"
             ))),
@@ -9214,7 +9244,6 @@ fn nvim_echo_rejects_wrong_typed_option_values() {
             "Invalid 'data': expected Dict, got nil"
         )),
     );
-
 }
 
 #[test]
@@ -9242,50 +9271,66 @@ fn nvim_echo_applies_upstream_progress_validations() {
     for (key, value) in [
         ("status", Object::String(OxStr::from("running"))),
         ("title", Object::String(OxStr::from("TestSuit"))),
-        ("data", Object::Dict(Dict(vec![(OxStr::from("tag"), Object::Integer(1))]))),
+        (
+            "data",
+            Object::Dict(Dict(vec![(OxStr::from("tag"), Object::Integer(1))])),
+        ),
         ("percent", Object::Integer(0)),
         ("source", Object::String(OxStr::from("tests"))),
     ] {
         assert_eq!(
-            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-                (key, value),
-            ])),
+            crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[(key, value),])),
             Err(ApiError::validation(
                 "Conflict: title/source/status/percent/data not allowed with kind='echo'"
             )),
             "{key}",
         );
     }
-    assert!(crate::global::nvim_echo(
-        &session,
-        chunks.clone(),
-        false,
-        dict(&[("data", Object::Array(vec![]))]),
-    )
-    .is_ok());
+    assert!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[("data", Object::Array(vec![]))]),
+        )
+        .is_ok()
+    );
 
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-            ("kind", Object::String(OxStr::from("empty"))),
-            ("title", Object::String(OxStr::from("TestSuit"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("kind", Object::String(OxStr::from("empty"))),
+                ("title", Object::String(OxStr::from("TestSuit"))),
+            ])
+        ),
         Err(ApiError::validation(
             "Conflict: title/source/status/percent/data not allowed with kind='empty'"
         )),
     );
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
-            ("err", Object::Boolean(true)),
-            ("status", Object::String(OxStr::from("running"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            true,
+            dict(&[
+                ("err", Object::Boolean(true)),
+                ("status", Object::String(OxStr::from("running"))),
+            ])
+        ),
         Err(ApiError::validation(
             "Conflict: title/source/status/percent/data not allowed with kind='echoerr'"
         )),
     );
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), true, dict(&[
-            ("title", Object::String(OxStr::from("TestSuit"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            true,
+            dict(&[("title", Object::String(OxStr::from("TestSuit"))),])
+        ),
         Err(ApiError::validation(
             "Conflict: title/source/status/percent/data not allowed with kind='echomsg'"
         )),
@@ -9293,10 +9338,12 @@ fn nvim_echo_applies_upstream_progress_validations() {
     // `status` only takes the documented values, and only on progress
     // messages (`messages_spec.lua:3691`).
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
-            "status",
-            Object::String(OxStr::from("live")),
-        )])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            progress(&[("status", Object::String(OxStr::from("live")),)])
+        ),
         Err(ApiError::validation(
             "Invalid 'status': expected success|failed|running|cancel, got live"
         )),
@@ -9305,53 +9352,79 @@ fn nvim_echo_applies_upstream_progress_validations() {
     // `percent` is range-checked (`messages_spec.lua:3702`, `:3712`).
     for percent in [-1, 101] {
         assert_eq!(
-            crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
-                "percent",
-                Object::Integer(percent),
-            )])),
+            crate::global::nvim_echo(
+                &session,
+                chunks.clone(),
+                false,
+                progress(&[("percent", Object::Integer(percent),)])
+            ),
             Err(ApiError::validation("Invalid 'percent': out of range")),
             "{percent}",
         );
     }
-    assert!(crate::global::nvim_echo(&session, chunks.clone(), false, progress(&[(
-        "percent",
-        Object::Integer(100),
-    )]))
-    .is_ok());
+    assert!(
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            progress(&[("percent", Object::Integer(100),)])
+        )
+        .is_ok()
+    );
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-            ("kind", Object::String(OxStr::from("progress"))),
-            ("source", Object::String(OxStr::from("tests"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("kind", Object::String(OxStr::from("progress"))),
+                ("source", Object::String(OxStr::from("tests"))),
+            ])
+        ),
         Err(ApiError::validation(
             "Invalid 'status': expected success|failed|running|cancel"
         )),
     );
 
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-            ("kind", Object::String(OxStr::from("progress"))),
-            ("status", Object::String(OxStr::from("running"))),
-            ("source", Object::String(OxStr::from(""))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("kind", Object::String(OxStr::from("progress"))),
+                ("status", Object::String(OxStr::from("running"))),
+                ("source", Object::String(OxStr::from(""))),
+            ])
+        ),
         Err(ApiError::validation("Required: 'opts.source'")),
     );
 
     // `source` is required and the reserved name "nvim" is rejected
     // (`messages_spec.lua:3736`, `vim_spec.lua:4190`).
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-            ("kind", Object::String(OxStr::from("progress"))),
-            ("status", Object::String(OxStr::from("running"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("kind", Object::String(OxStr::from("progress"))),
+                ("status", Object::String(OxStr::from("running"))),
+            ])
+        ),
         Err(ApiError::validation("Required: 'opts.source'")),
     );
     assert_eq!(
-        crate::global::nvim_echo(&session, chunks.clone(), false, dict(&[
-            ("kind", Object::String(OxStr::from("progress"))),
-            ("status", Object::String(OxStr::from("success"))),
-            ("source", Object::String(OxStr::from("nvim"))),
-        ])),
+        crate::global::nvim_echo(
+            &session,
+            chunks.clone(),
+            false,
+            dict(&[
+                ("kind", Object::String(OxStr::from("progress"))),
+                ("status", Object::String(OxStr::from("success"))),
+                ("source", Object::String(OxStr::from("nvim"))),
+            ])
+        ),
         Err(ApiError::validation("Invalid 'source': 'nvim'")),
     );
 }
@@ -9364,10 +9437,10 @@ fn nvim_echo_data_accepts_dict_and_empty_array() {
         ("kind", Object::String(OxStr::from("progress"))),
         ("source", Object::String(OxStr::from("tests"))),
         ("status", Object::String(OxStr::from("running"))),
-        ("data", Object::Dict(Dict(vec![(
-            OxStr::from("tag"),
-            Object::Integer(1),
-        )]))),
+        (
+            "data",
+            Object::Dict(Dict(vec![(OxStr::from("tag"), Object::Integer(1))])),
+        ),
     ]);
     assert!(crate::global::nvim_echo(&session, chunks.clone(), false, data).is_ok());
     let empty_array = dict(&[
@@ -9412,7 +9485,10 @@ fn nvim_echo_plain_echo_still_pushes_message() {
     let before = session.with_editor(|editor| editor.messages().len());
     let chunks = vec![Object::Array(vec![Object::String(OxStr::from("hello"))])];
     let result = crate::global::nvim_echo(&session, chunks, true, dict(&[])).unwrap();
-    assert!(matches!(result, Object::Integer(id) if id > 0), "got {result:?}");
+    assert!(
+        matches!(result, Object::Integer(id) if id > 0),
+        "got {result:?}"
+    );
     let after = session.with_editor(|editor| editor.messages().len());
     assert_eq!(after, before + 1);
 }

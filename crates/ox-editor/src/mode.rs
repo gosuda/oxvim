@@ -1183,7 +1183,7 @@ impl ModeMachine {
                 Self::preview_ident_tag(editor, state.count.max(1))?;
                 return Ok(Some(Mode::default()));
             }
-            Self::wincmd(editor, key);
+            Self::wincmd(editor, key, state.count.max(1));
             return Ok(Some(Mode::default()));
         }
 
@@ -3128,8 +3128,8 @@ impl ModeMachine {
         Ok(())
     }
     /// `<c-w>` window commands from Normal mode (`normal.c:nv_window`).
-    /// Handles split, close, and directional navigation.
-    fn wincmd(editor: &mut Editor, key: char) {
+    /// Handles split, close, resize, and directional navigation.
+    fn wincmd(editor: &mut Editor, key: char, count: usize) {
         let Some(tab) = editor.current_tabpage() else {
             return;
         };
@@ -3137,6 +3137,32 @@ impl ModeMachine {
             return;
         };
         match key {
+            '<' | '>' | '+' | '-' | '_' | '|' => {
+                // `ctrl_w` resize chords (window.c `win_resize`/`do_window`):
+                // < > grow/shrink columns, + - rows; _ and | maximize. The
+                // editor clamps an out-of-range request to the extents the
+                // sibling windows allow, like upstream frame_setheight.
+                let Ok(geometry) = editor.window_geometry(current) else {
+                    return;
+                };
+                let (extent, vertical) = match key {
+                    '<' => (geometry.width.saturating_sub(count).max(1), true),
+                    '>' => (geometry.width.saturating_add(count), true),
+                    '+' => (geometry.height.saturating_add(count), false),
+                    '-' => (geometry.height.saturating_sub(count).max(1), false),
+                    '_' => (usize::MAX, false),
+                    '|' => (usize::MAX, true),
+                    _ => return,
+                };
+                let _ = if vertical {
+                    editor.set_window_width(current, extent)
+                } else {
+                    editor.set_window_height(current, extent)
+                };
+            }
+            '=' => {
+                let _ = editor.equalize_tabpage(tab);
+            }
             'v' | 's' => {
                 let Some(buffer) = editor.current_buffer() else {
                     return;
