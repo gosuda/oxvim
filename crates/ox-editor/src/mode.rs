@@ -1447,6 +1447,150 @@ impl ModeMachine {
                 Self::move_command(editor, "l", count, false)?;
                 Ok(Some(Mode::default()))
             }
+            'Y' | 'D' | 'C' => {
+                // `Y`/`D`/`C` are `y$`/`d$`/`c$`: the operator runs over the
+                // cursor-to-end-of-line span (`normal.c` `nv_dollar`). `c$`
+                // on an empty line changes nothing but still enters Insert.
+                let ctx = cursor_context(editor)?;
+                let line = ctx.line(editor, ctx.cursor.lnum)?;
+                if line.is_empty() && key != 'C' {
+                    beep_flush(editor);
+                    return Ok(Some(Mode::default()));
+                }
+                let operator = match key {
+                    'Y' => Operator::Yank,
+                    'D' => Operator::Delete,
+                    _ => Operator::Change,
+                };
+                if line.is_empty() {
+                    return Ok(Some(Mode::Insert(InsertState)));
+                }
+                let result = ops::apply(
+                    editor,
+                    OperatorRequest {
+                        buffer: ctx.buffer,
+                        window: ctx.window,
+                        operator,
+                        range: EditRange {
+                            start: ctx.cursor,
+                            end: Position {
+                                lnum: ctx.cursor.lnum,
+                                col: line.len() - 1,
+                            },
+                            kind: MotionKind::CharacterWise,
+                            inclusive: true,
+                        },
+                        register: state.register,
+                        timestamp: self.timestamp,
+                        eval,
+                    },
+                )?;
+                Ok(Some(if result.enter_insert {
+                    Mode::Insert(InsertState)
+                } else {
+                    Mode::default()
+                }))
+            }
+            'X' => {
+                // `X` is `dh`: delete `count` characters before the cursor.
+                let ctx = cursor_context(editor)?;
+                if ctx.cursor.col == 0 {
+                    beep_flush(editor);
+                    return Ok(Some(Mode::default()));
+                }
+                let start = Position {
+                    lnum: ctx.cursor.lnum,
+                    col: ctx.cursor.col.saturating_sub(count),
+                };
+                ops::apply(
+                    editor,
+                    OperatorRequest {
+                        buffer: ctx.buffer,
+                        window: ctx.window,
+                        operator: Operator::Delete,
+                        range: EditRange {
+                            start,
+                            end: Position {
+                                lnum: ctx.cursor.lnum,
+                                col: ctx.cursor.col - 1,
+                            },
+                            kind: MotionKind::CharacterWise,
+                            inclusive: true,
+                        },
+                        register: state.register,
+                        timestamp: self.timestamp,
+                        eval,
+                    },
+                )?;
+                Ok(Some(Mode::default()))
+            }
+            's' => {
+                // `s` is `cl`: change `count` characters under the cursor.
+                let ctx = cursor_context(editor)?;
+                let line = ctx.line(editor, ctx.cursor.lnum)?;
+                if line.is_empty() || ctx.cursor.col >= line.len() {
+                    beep_flush(editor);
+                    return Ok(Some(Mode::default()));
+                }
+                let result = ops::apply(
+                    editor,
+                    OperatorRequest {
+                        buffer: ctx.buffer,
+                        window: ctx.window,
+                        operator: Operator::Change,
+                        range: EditRange {
+                            start: ctx.cursor,
+                            end: Position {
+                                lnum: ctx.cursor.lnum,
+                                col: ctx
+                                    .cursor
+                                    .col
+                                    .saturating_add(count - 1)
+                                    .min(line.len() - 1),
+                            },
+                            kind: MotionKind::CharacterWise,
+                            inclusive: true,
+                        },
+                        register: state.register,
+                        timestamp: self.timestamp,
+                        eval,
+                    },
+                )?;
+                Ok(Some(if result.enter_insert {
+                    Mode::Insert(InsertState)
+                } else {
+                    Mode::default()
+                }))
+            }
+            'S' => {
+                // `S` is `cc`: a linewise change over `count` lines.
+                let ctx = cursor_context(editor)?;
+                let result = ops::apply(
+                    editor,
+                    OperatorRequest {
+                        buffer: ctx.buffer,
+                        window: ctx.window,
+                        operator: Operator::Change,
+                        range: EditRange {
+                            start: ctx.cursor,
+                            end: Position {
+                                lnum: ctx.cursor.lnum.saturating_add(count - 1),
+                                col: 0,
+                            },
+                            kind: MotionKind::LineWise,
+                            inclusive: true,
+                        },
+                        register: state.register,
+                        timestamp: self.timestamp,
+                        eval,
+                    },
+                )?;
+                Ok(Some(if result.enter_insert {
+                    Mode::Insert(InsertState)
+                } else {
+                    Mode::default()
+                }))
+            }
             '\u{1}' | '\u{18}' => {
                 let delta = i64::try_from(count.min(999_999_999)).unwrap_or(999_999_999);
                 self.adjust_number(editor, if key == '\u{1}' { delta } else { -delta })?;

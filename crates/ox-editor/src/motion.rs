@@ -250,7 +250,7 @@ fn resolve_command(
 ) -> Option<Motion> {
     match command {
         "h" | "l" | "0" | "^" | "|" | "$" | "g_" => charwise_motion(lines, start, command, count),
-        "j" | "k" => Some(vertical_motion(start, command, count)),
+        "j" | "k" => vertical_motion(lines, start, command, count),
         "w" | "W" | "e" | "E" | "b" | "B" | "ge" | "gE" => {
             word_motion(lines, start, command, count)
         }
@@ -323,14 +323,25 @@ fn charwise_motion(
     })
 }
 
-/// Vertical motions (`j`, `k`) that keep the curswant unchanged.
-fn vertical_motion(start: Position, command: &str, count: usize) -> Motion {
+/// Vertical motions (`j`, `k`) that keep the curswant unchanged. The
+/// motion fails when the full count cannot be met — `cursor_up`/
+/// `cursor_down` return false and `nv_updown` clears the operator with a
+/// beep rather than moving a partial count.
+fn vertical_motion(
+    lines: &[Vec<u8>],
+    start: Position,
+    command: &str,
+    count: usize,
+) -> Option<Motion> {
     let lnum = if command == "j" {
-        start.lnum.saturating_add(count)
+        start
+            .lnum
+            .checked_add(count)
+            .filter(|lnum| *lnum <= lines.len())?
     } else {
-        start.lnum.saturating_sub(count)
+        start.lnum.checked_sub(count).filter(|lnum| *lnum >= 1)?
     };
-    Motion {
+    Some(Motion {
         target: Position {
             lnum,
             col: start.col,
@@ -339,7 +350,7 @@ fn vertical_motion(start: Position, command: &str, count: usize) -> Motion {
         inclusive: false,
         is_jump: false,
         keep_curswant: true,
-    }
+    })
 }
 
 /// Word motions (`w`, `W`, `e`, `E`, `b`, `B`, `ge`, `gE`); the `e`-shaped
