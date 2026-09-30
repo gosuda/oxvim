@@ -709,16 +709,10 @@ impl Layout {
         if extent == current {
             return Ok(());
         }
-        if resize_window_extent(&mut self.root, resolved, extent, axis)? {
-            Ok(())
-        } else {
-            // Upstream `frame_setwidth`/`frame_setheight` return early when
-            // the frame cannot move along the axis — a root leaf or a
-            // layout that no ancestor distributes that way (window.c:
-            // `fr_parent == NULL` guard) — so the request is a no-op
-            // rather than an error.
-            Ok(())
-        }
+        // An axis with no distributing ancestor is a no-op, matching
+        // upstream's `fr_parent == NULL` guard in frame_setwidth/height.
+        resize_window_extent(&mut self.root, resolved, extent, axis)?;
+        Ok(())
     }
 
     fn split(

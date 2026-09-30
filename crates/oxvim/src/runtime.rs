@@ -802,20 +802,10 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     primary
         .scripts_mut()
         .set_runtime_roots_from_rtp(&default_rtp);
-    let mut nested = ExExecutor::new();
-    nested
-        .scripts_mut()
-        .set_runtime_roots_from_rtp(&default_rtp);
-    let channel_ids = session.with_editor(ox_editor::Editor::channel_ids);
+    let channel_ids = session.with_editor(Editor::channel_ids);
     primary.set_channel_ids(channel_ids.clone());
-    nested.set_channel_ids(channel_ids);
-    // The nested executor shares durable definitions with the primary so
-    // reentrant dispatch observes the same user commands, functions, quit
-    // bus, and session state — the same wiring `build_embedded_core` uses.
-    nested.share_user_commands_from(&primary);
-    nested.share_user_functions_from(&primary);
-    nested.share_quit_bus_from(&primary);
-    nested.share_session_from(&primary);
+    let mut nested = ExExecutor::new();
+    crate::server::seed_executor_from(&mut nested, &primary, &channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(crate::server::EditorBuiltins {

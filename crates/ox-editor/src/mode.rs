@@ -3138,27 +3138,7 @@ impl ModeMachine {
         };
         match key {
             '<' | '>' | '+' | '-' | '_' | '|' => {
-                // `ctrl_w` resize chords (window.c `win_resize`/`do_window`):
-                // < > grow/shrink columns, + - rows; _ and | maximize. The
-                // editor clamps an out-of-range request to the extents the
-                // sibling windows allow, like upstream frame_setheight.
-                let Ok(geometry) = editor.window_geometry(current) else {
-                    return;
-                };
-                let (extent, vertical) = match key {
-                    '<' => (geometry.width.saturating_sub(count).max(1), true),
-                    '>' => (geometry.width.saturating_add(count), true),
-                    '+' => (geometry.height.saturating_add(count), false),
-                    '-' => (geometry.height.saturating_sub(count).max(1), false),
-                    '_' => (usize::MAX, false),
-                    '|' => (usize::MAX, true),
-                    _ => return,
-                };
-                let _ = if vertical {
-                    editor.set_window_width(current, extent)
-                } else {
-                    editor.set_window_height(current, extent)
-                };
+                let _ = crate::excmd_exec::resize_window_by_key(editor, current, key, count);
             }
             '=' => {
                 let _ = editor.equalize_tabpage(tab);

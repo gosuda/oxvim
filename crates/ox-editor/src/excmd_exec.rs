@@ -3771,23 +3771,7 @@ fn command_wincmd<F: FileIO>(
                 Err(error) => error_flow(runtime, "E957", error.to_string()),
             };
         }
-        let Ok(geometry) = editor.window_geometry(current) else {
-            return Flow::Normal;
-        };
-        let (extent, vertical) = match key {
-            '<' => (geometry.width.saturating_sub(count).max(1), true),
-            '>' => (geometry.width.saturating_add(count), true),
-            '+' => (geometry.height.saturating_add(count), false),
-            '-' => (geometry.height.saturating_sub(count).max(1), false),
-            '_' => (usize::MAX, false),
-            '|' => (usize::MAX, true),
-            _ => return error_flow(runtime, "E474", format!("Invalid argument: {key}")),
-        };
-        return match if vertical {
-            editor.set_window_width(current, extent)
-        } else {
-            editor.set_window_height(current, extent)
-        } {
+        return match resize_window_by_key(editor, current, key, count) {
             Ok(()) => Flow::Normal,
             Err(error) => error_flow(runtime, "E957", error.to_string()),
         };
@@ -3821,6 +3805,29 @@ fn command_wincmd<F: FileIO>(
     match next.map(|window| editor.set_current_window(window)) {
         None | Some(Ok(())) => Flow::Normal,
         Some(Err(error)) => error_flow(runtime, "E957", error.to_string()),
+    }
+}
+
+/// Applies the resize keys shared by Normal-mode CTRL-W and `:wincmd`.
+/// Missing geometry and other keys are no-ops; callers handle resize errors.
+pub(crate) fn resize_window_by_key(
+    editor: &mut Editor,
+    window: WinHandle,
+    key: char,
+    count: usize,
+) -> Result<(), EditorError> {
+    let Ok(geometry) = editor.window_geometry(window) else {
+        return Ok(());
+    };
+    // The layout clamps requests to the extents allowed by sibling windows.
+    match key {
+        '<' => editor.set_window_width(window, geometry.width.saturating_sub(count).max(1)),
+        '>' => editor.set_window_width(window, geometry.width.saturating_add(count)),
+        '+' => editor.set_window_height(window, geometry.height.saturating_add(count)),
+        '-' => editor.set_window_height(window, geometry.height.saturating_sub(count).max(1)),
+        '_' => editor.set_window_height(window, usize::MAX),
+        '|' => editor.set_window_width(window, usize::MAX),
+        _ => Ok(()),
     }
 }
 

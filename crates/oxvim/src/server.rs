@@ -425,34 +425,14 @@ pub(crate) fn build_embedded_core(
     let lua_work = Rc::new(RefCell::new(VecDeque::new()));
     let ex = Rc::new(RefCell::new(ExExecutor::new()));
     let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
-    // One quit bus for the session pair: forked executors inherit it
-    // from their source, so `absorb_pending_quit` sees every quit.
-    nested_ex.borrow_mut().share_quit_bus_from(&ex.borrow());
-    // Runtime searches follow &runtimepath (the seeded default includes
-    // the runtime tree, matching the previous single-root setup).
+    // Runtime searches follow &runtimepath; reentrant executors inherit
+    // these roots and the session's durable definitions, quit bus and ledger.
     ex.borrow_mut()
-        .scripts_mut()
-        .set_runtime_roots_from_rtp(&default_rtp);
-    nested_ex
-        .borrow_mut()
         .scripts_mut()
         .set_runtime_roots_from_rtp(&default_rtp);
     let channel_ids = session.with_editor(Editor::channel_ids);
     ex.borrow_mut().set_channel_ids(channel_ids.clone());
-    nested_ex.borrow_mut().set_channel_ids(channel_ids.clone());
-    // The nested executor shares durable definitions with the primary so
-    // reentrant API paths observe the same user commands and functions.
-    nested_ex
-        .borrow_mut()
-        .share_user_commands_from(&ex.borrow());
-    nested_ex
-        .borrow_mut()
-        .share_user_functions_from(&ex.borrow());
-    // One swap ledger, one quit bus, one exit flag for the session:
-    // reentrant executors preserve into the same ledger and fire the
-    // exit events exactly once.
-    nested_ex.borrow_mut().share_quit_bus_from(&ex.borrow());
-    nested_ex.borrow_mut().share_session_from(&ex.borrow());
+    seed_executor_from(&mut nested_ex.borrow_mut(), &ex.borrow(), &channel_ids);
     // This executor is never checked out by a frame. Autocmd actions can
     // therefore fork from it while an outer `:lua` holds `ex` and its
     // `vim.cmd` dispatch holds `nested_ex`; using either pool member as the
@@ -4604,7 +4584,11 @@ type ExExecutorPair = (Rc<RefCell<ExExecutor>>, Rc<RefCell<ExExecutor>>);
 /// definitions, the quit bus, and the swap ledger are shared live, runtime
 /// search roots are copied. Every fork of a session executor must seed
 /// exactly this way or it silently diverges from the session.
-fn seed_executor_from(executor: &mut ExExecutor, source: &ExExecutor, channel_ids: &ChannelIds) {
+pub(crate) fn seed_executor_from(
+    executor: &mut ExExecutor,
+    source: &ExExecutor,
+    channel_ids: &ChannelIds,
+) {
     executor.share_user_commands_from(source);
     executor.share_user_functions_from(source);
     executor.share_runtime_roots_from(source);
