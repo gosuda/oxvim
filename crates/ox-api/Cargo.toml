@@ -11,6 +11,7 @@ ox-editor = { path = "../ox-editor" }
 ox-eval = { path = "../ox-eval" }
 ox-excmd = { path = "../ox-excmd" }
 ox-rpc = { path = "../ox-rpc" }
+ox-sys = { path = "../ox-sys" }
 ox-text = { path = "../ox-text" }
 ox-types = { path = "../ox-types" }
 ox-ui = { path = "../ox-ui" }

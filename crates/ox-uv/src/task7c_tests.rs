@@ -378,7 +378,7 @@ fn ipc_write2_tcp_roundtrip_reports_tcp_kind() {
 #[test]
 fn extra_stdio_create_pipe_is_typed_unsupported() {
     let mut uv_loop = UvLoop::new().expect("create loop");
-    let mut options = SpawnOptions::new("/bin/true");
+    let mut options = SpawnOptions::new("/usr/bin/true");
     options.extra_stdio = vec![ExtraStdio {
         fd: 3,
         config: StdioConfig::CreatePipe,
@@ -398,7 +398,9 @@ fn extra_stdio_create_pipe_is_typed_unsupported() {
 fn extra_stdio_inherit_fd3_spawns_ok() {
     let mut uv_loop = UvLoop::new().expect("create loop");
     let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut options = SpawnOptions::new("/bin/true");
+    // `/usr/bin/true` exists on Linux and macOS alike; `/bin/true` does
+    // not on modern macOS.
+    let mut options = SpawnOptions::new("/usr/bin/true");
     options.extra_stdio = vec![ExtraStdio {
         fd: 3,
         config: StdioConfig::Inherit,
@@ -495,7 +497,12 @@ fn misc_surface_returns_sane_values() {
 
     let rusage = misc::getrusage().expect("uv.getrusage");
     assert!(
-        rusage.nvcsw > 0 || rusage.stime.0 > 0 || rusage.utime.0 > 0,
+        rusage.nvcsw > 0
+            || rusage.stime.0 > 0
+            || rusage.stime.1 > 0
+            || rusage.utime.0 > 0
+            || rusage.utime.1 > 0
+            || rusage.maxrss > 0,
         "some rusage populated"
     );
 

@@ -3072,9 +3072,12 @@ fn resolve_uses_real_file_types() {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(root.join("directory"), root.join("link")).unwrap();
+        // `resolve()` answers the real path — `/var` is a `/private` symlink
+        // on macOS — so the expectation is canonicalized.
+        let directory = root.join("directory").canonicalize().unwrap();
         assert_eq!(
             call("resolve", vec![text(&root.join("link/").to_string_lossy())]).unwrap(),
-            text(&format!("{}/", root.join("directory").to_string_lossy()))
+            text(&format!("{}/", directory.to_string_lossy()))
         );
     }
     std::fs::remove_dir_all(root).unwrap();

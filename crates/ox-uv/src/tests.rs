@@ -472,7 +472,13 @@ fn misc_time_and_directory_contracts_are_sane() {
     let original = misc::cwd().expect("cwd");
     let temporary = misc::os_tmpdir();
     misc::chdir(&temporary).expect("chdir temporary");
-    assert_eq!(misc::cwd().expect("temporary cwd"), temporary);
+    // `getcwd` answers the resolved path — `os_tmpdir` keeps the TMPDIR
+    // value verbatim (upstream `uv_os_tmpdir` does), and on macOS `/var` is
+    // a `/private` symlink, so the comparison is canonical.
+    assert_eq!(
+        misc::cwd().expect("temporary cwd"),
+        temporary.canonicalize().expect("canonical temporary")
+    );
     misc::chdir(&original).expect("restore cwd");
     assert_eq!(misc::cwd().expect("restored cwd"), original);
 

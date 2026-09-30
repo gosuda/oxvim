@@ -26,5 +26,8 @@ tree-sitter-language = "0.1.5"
 [build-dependencies]
 cc = "1.4.4"
 
+[dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

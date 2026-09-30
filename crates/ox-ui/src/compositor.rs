@@ -1,7 +1,7 @@
 //! Server-side grid layering modeled after Neovim's UI compositor.
 
 use ox_editor::{
-    BufferStateError, Editor, EditorError, Extmark, Geometry, LayoutError,
+    BufferStateError, Editor, EditorError, Extmark, Geometry, LayoutError, OptionValue,
     extmark::ExtmarkHighlightMode,
 };
 use ox_text::BufferError;
@@ -414,9 +414,57 @@ impl Compositor {
                 sign_slots = sign_slots.max(live);
             }
             let sign_slots = sign_slots.min(3);
+            // 'number'/'relativenumber' reserve a gutter after the sign
+            // column sized like upstream's `numberwidth`: the option is the
+            // floor, a longer line count widens it to digits + 1
+            // (screen.c:win_col_off). With 'relativenumber' alone upstream
+            // sizes the gutter from the window's row count instead — only
+            // `w_height` rows ever carry relative numbers.
+            let number_on = matches!(
+                editor.options().get_window(window, "number"),
+                Ok(OptionValue::Boolean(true))
+            );
+            let relative_on = matches!(
+                editor.options().get_window(window, "relativenumber"),
+                Ok(OptionValue::Boolean(true))
+            );
+            // 'signcolumn' bounds (optionstr.c set-time parsing): the option
+            // reserves [min, max] dedicated columns and the live sign depth
+            // clamps into that range (drawscreen.c `compute_signcolumn`:
+            // `w_scwidth = MAX(w_minscwidth, MIN(w_maxscwidth, max_signs))`).
+            // "number" draws signs inside the number column — no dedicated
+            // cells; without numbers it degrades to "auto".
+            let signcolumn = match editor.options().get_window(window, "signcolumn") {
+                Ok(OptionValue::String(value)) => value.clone(),
+                _ => String::from("auto"),
+            };
+            let statuscolumn_on = matches!(
+                editor.options().get_window(window, "statuscolumn"),
+                Ok(OptionValue::String(value)) if !value.is_empty()
+            );
+            let numbers = number_on || relative_on || statuscolumn_on;
+            let (min_sc, max_sc) = signcolumn_bounds(&signcolumn, numbers);
+            let sign_slots = min_sc.max(max_sc.min(sign_slots));
             let sign_width = sign_slots.saturating_mul(2);
+            let number_width = if number_on || relative_on {
+                let minimum = match editor.options().get_window(window, "numberwidth") {
+                    Ok(OptionValue::Number(width)) => {
+                        usize::try_from((*width).clamp(1, 20)).unwrap_or(4)
+                    }
+                    _ => 4,
+                };
+                let extent = if number_on { line_count } else { grid_height };
+                minimum.max(digits(extent).saturating_add(1))
+            } else {
+                0
+            };
+            // Upstream never clamps the gutter (`win_col_off` = sign +
+            // number fields): a window narrower than the gutter shows only
+            // the clipped gutter cells, and buffer text does not draw at
+            // all. Draw calls guard on their start column instead.
+            let gutter = sign_width.saturating_add(number_width);
             let text_height = grid_height;
-            let text_width = geometry.width.saturating_sub(sign_width).max(1);
+            let text_width = geometry.width.saturating_sub(gutter).max(1);
             // Bin sign marks by buffer row once per redraw so each drawn
             // segment looks up its line instead of rescanning every mark.
             let mut sign_marks_by_row: std::collections::HashMap<usize, Vec<usize>> =
@@ -435,6 +483,29 @@ impl Compositor {
                     }
                 }
             }
+            // Upstream picks LineNr for plain 'number', LineNrAbove/Below
+            // around the cursor under 'relativenumber', and CursorLineNr on
+            // the cursor line when 'cursorlineopt' includes "number"
+            // (screen.c:win_draw_line / number row highlighting).
+            let cursor_hl = number_width != 0
+                && matches!(
+                    editor.options().get_window(window, "cursorlineopt"),
+                    Ok(OptionValue::String(opt)) if opt.split(',').any(|item| matches!(item, "number" | "both"))
+                )
+                && matches!(
+                    editor.options().get_window(window, "cursorline"),
+                    Ok(OptionValue::Boolean(true))
+                );
+            let line_nr_ids = if number_width != 0 {
+                (
+                    highlight_or(highlights, "LineNr", 0x00_80_80)?,
+                    highlight_or(highlights, "LineNrAbove", 0x00_80_80)?,
+                    highlight_or(highlights, "LineNrBelow", 0x00_80_80)?,
+                    highlight_or(highlights, "CursorLineNr", 0x80_80_00)?,
+                )
+            } else {
+                (0, 0, 0, 0)
+            };
             let mut screen_row = 0;
             let mut line_number = state.topline;
             let mut watched_extmarks = Vec::new();
@@ -450,8 +521,8 @@ impl Compositor {
                     // (`{1:…}`) spanning the entire fill line, not just the
                     // `~` glyph. Fill the remaining columns with the same
                     // highlight so the row compares equal to the upstream grid.
-                    if text_width > 1 {
-                        grid.set_hl_span(screen_row, 1, text_width, non_text_id)?;
+                    if geometry.width > 1 {
+                        grid.set_hl_span(screen_row, 1, geometry.width, non_text_id)?;
                     }
                     screen_row += 1;
                     line_number += 1;
@@ -476,6 +547,46 @@ impl Compositor {
                     .skip(skip)
                     .take(text_height - screen_row)
                 {
+                    if number_width != 0 {
+                        // Wrapped continuation rows keep an empty number
+                        // gutter; only the first segment of a buffer line
+                        // carries digits, right-aligned with a trailing
+                        // space (screen.c:format_number).
+                        let (line_nr_id, digits_text) = if *segment_cell_start == 0 {
+                            let cursor_row = line_number == state.cursor.lnum;
+                            let id = if cursor_row && cursor_hl {
+                                line_nr_ids.3
+                            } else if relative_on && !cursor_row {
+                                if line_number < state.cursor.lnum {
+                                    line_nr_ids.1
+                                } else {
+                                    line_nr_ids.2
+                                }
+                            } else {
+                                line_nr_ids.0
+                            };
+                            let shown = if relative_on && !cursor_row {
+                                line_number.abs_diff(state.cursor.lnum)
+                            } else if relative_on && !number_on {
+                                0
+                            } else {
+                                line_number
+                            };
+                            (
+                                id,
+                                format!(
+                                    "{:>width$} ",
+                                    shown,
+                                    width = number_width.saturating_sub(1)
+                                ),
+                            )
+                        } else {
+                            (line_nr_ids.0, " ".repeat(number_width))
+                        };
+                        if sign_width < geometry.width {
+                            grid.write_text(screen_row, sign_width, &digits_text, line_nr_id)?;
+                        }
+                    }
                     if sign_width != 0 {
                         grid.set_hl_span(screen_row, 0, sign_width, sign_id)?;
                         let binned = sign_marks_by_row
@@ -483,7 +594,10 @@ impl Compositor {
                             .into_iter()
                             .flatten()
                             .take(sign_slots);
-                        for (slot, mark_index) in binned.enumerate() {
+                        for (slot, mark_index) in binned
+                            .enumerate()
+                            .take_while(|(slot, _)| *slot * 2 < geometry.width)
+                        {
                             let attributes = &marks[*mark_index].placement.attributes;
                             let mut text = attributes
                                 .sign_text
@@ -504,12 +618,14 @@ impl Compositor {
                             grid.write_text(screen_row, slot * 2, &text, hl_id)?;
                         }
                     }
-                    grid.write_text(screen_row, sign_width, segment, 0)?;
+                    if gutter < geometry.width {
+                        grid.write_text(screen_row, gutter, segment, 0)?;
+                    }
                     apply_extmark_highlights(
                         &mut grid,
                         screen_row,
                         line_number.saturating_sub(1),
-                        sign_width,
+                        gutter,
                         *segment_cell_start,
                         &line_text,
                         &marks,
@@ -546,7 +662,9 @@ impl Compositor {
                             namespace: mark.namespace.get(),
                             mark: mark.id.get(),
                             row,
-                            col: sign_width.saturating_add(draw_col % text_width),
+                            col: gutter
+                                .saturating_add(draw_col % text_width)
+                                .min(geometry.width.saturating_sub(1)),
                             buffer_row: mark.position().row,
                         });
                     }
@@ -595,7 +713,11 @@ impl Compositor {
                 let cursor_col = display_column(&cursor_line, state.cursor.col);
                 // `skiprows` only applies to the `topline` line's own height
                 // contribution; a cursor inside that line sits `skiprows`
-                // rows higher than its raw wrapped position.
+                // rows higher than its raw wrapped position. And
+                // `grid_cursor_goto` must stay inside its grid: wrapped
+                // segments can push `before_cursor` past the text area when
+                // the window narrows, so the cursor clamps to the bottom
+                // row — the same spot upstream leaves it after scrolling.
                 (
                     before_cursor
                         .saturating_add(cursor_col / text_width)
@@ -603,8 +725,11 @@ impl Compositor {
                             state.skiprows
                         } else {
                             0
-                        }),
-                    sign_width.saturating_add(cursor_col % text_width),
+                        })
+                        .min(text_height.saturating_sub(1)),
+                    gutter
+                        .saturating_add(cursor_col % text_width)
+                        .min(geometry.width.saturating_sub(1)),
                 )
             });
             self.layers.push(layer);
@@ -1056,4 +1181,74 @@ fn display_column(line: &str, byte: usize) -> usize {
         boundary -= 1;
     }
     UnicodeWidthStr::width(&line[..boundary])
+}
+
+/// Decimal digit count of a line count, for the 'number' gutter's upstream
+/// widening rule (`numberwidth` is the floor, a longer buffer adds one cell
+/// past the digits).
+fn digits(count: usize) -> usize {
+    let mut count = count.max(1);
+    let mut width = 0;
+    while count > 0 {
+        count /= 10;
+        width += 1;
+    }
+    width
+}
+
+/// 'signcolumn' bounds (optionstr.c set-time parsing): (minimum, maximum)
+/// dedicated columns. "number" draws signs inside the number column and
+/// contributes no dedicated columns; without numbers it degrades to
+/// "auto". Mirrors `signcolumn_bounds` in ox-api/src/window.rs.
+fn signcolumn_bounds(value: &str, numbers: bool) -> (usize, usize) {
+    let first_digit = |rest: &str| -> usize {
+        rest.chars()
+            .find_map(|character| character.to_digit(10))
+            .map_or(1, |digit| usize::try_from(digit).unwrap_or(1))
+    };
+    if let Some(rest) = value.strip_prefix("yes:") {
+        let width = first_digit(rest);
+        return (width, width);
+    }
+    if value == "yes" {
+        return (1, 1);
+    }
+    if value == "no" {
+        return (0, 0);
+    }
+    if value.starts_with("number") && numbers {
+        return (0, 0);
+    }
+    if let Some(rest) = value.strip_prefix("auto:") {
+        let rest = rest.trim_matches(|character| character == '[' || character == ']');
+        return match rest.split_once('-') {
+            Some((low, high)) => (first_digit(low), first_digit(high)),
+            None => (0, first_digit(rest)),
+        };
+    }
+    (0, 1)
+}
+
+/// Resolves a highlight group, defining a dim fallback when the colorscheme
+/// has not — the same pattern the sign column uses for `SignColumn`.
+fn highlight_or(
+    highlights: &mut HlState,
+    name: &str,
+    fallback_rgb: u32,
+) -> Result<u64, CompositorError> {
+    if let Some(id) = highlights.group_id(&OxStr::from(name)) {
+        return Ok(id);
+    }
+    highlights
+        .define_group(
+            name,
+            Highlight {
+                rgb: HlAttrs {
+                    foreground: Some(fallback_rgb),
+                    ..HlAttrs::default()
+                },
+                ..Highlight::default()
+            },
+        )
+        .map_err(CompositorError::from)
 }

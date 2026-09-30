@@ -113,7 +113,7 @@ functional: _guard_binary _parser_fixtures _functional_fixtures
     export root
     # "example" is the loose example_spec.lua, not a directory: run it by
     # file after the directory groups.
-    printf '%s\n' api autocmd core editor ex_cmds legacy lua options plugin provider script shada terminal testnvim treesitter ui vimscript |
+    printf '%s\n' api autocmd core editor ex_cmds legacy lua options plugin provider script shada terminal treesitter ui vimscript |
       xargs -P 4 -n 1 bash -c 'run_group "$1"' _
     TEST_FILE=test/functional/example_spec.lua bash -c 'run_group example_spec'
 

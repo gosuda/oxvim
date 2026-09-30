@@ -1,7 +1,5 @@
 //! Editor-global Neovim API functions.
 
-use std::collections::HashSet;
-use std::rc::Rc;
 use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
@@ -11,6 +9,8 @@ use ox_editor::{
 };
 use ox_excmd::ExCommand;
 use ox_types::{Special, Typval};
+use std::collections::HashSet;
+use std::rc::Rc;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::option_merge::SetOp;
@@ -603,31 +603,26 @@ pub fn nvim_set_current_buf(session: &ApiSession, buf: BufHandle) -> Result<(), 
         session,
         buf,
         |session| {
-            session
-                .with_editor_mut(|editor| {
-                    editor
-                        .set_current_buffer(buf, BufferRelease::KeepLoaded)
-                        .map_err(exception)
-                })
+            session.with_editor_mut(|editor| {
+                editor
+                    .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                    .map_err(exception)
+            })
         },
         move |session, succeeded| {
-            if !succeeded
-                && let Some(old) = old
-            {
+            if !succeeded && let Some(old) = old {
                 let _ = session.with_editor_mut(|editor| {
-                    editor
-                        .set_current_buffer(old, BufferRelease::KeepLoaded)
+                    editor.set_current_buffer(old, BufferRelease::KeepLoaded)
                 });
             }
         },
     )?;
     if !switched {
-        session
-            .with_editor_mut(|editor| {
-                editor
-                    .set_current_buffer(buf, BufferRelease::KeepLoaded)
-                    .map_err(exception)
-            })?;
+        session.with_editor_mut(|editor| {
+            editor
+                .set_current_buffer(buf, BufferRelease::KeepLoaded)
+                .map_err(exception)
+        })?;
     }
     fire_focus_events(session, &transition.enters, Some(buf))
 }
@@ -1386,17 +1381,15 @@ pub fn nvim_strwidth(session: &ApiSession, text: OxStr) -> Result<i64, ApiError>
 
 #[api(since = 1, deprecated_since = 13)]
 #[expect(
+    clippy::needless_pass_by_value,
     clippy::unnecessary_wraps,
-    reason = "`#[api]` handlers must return `Result` for the generated dispatcher"
+    reason = "deprecated RPC entry keeps upstream's `String str` argument and the `Result` shape `#[api]` handlers must return"
 )]
 pub fn nvim_err_writeln(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
     session.with_editor_mut(|editor| {
-        editor.push_message(Message {
-            kind: MessageKind::Error,
-            content: Object::String(str),
-            history: true,
-            leading_newline: true,
-        });
+        // api/deprecated.c:984 (`nvim_err_writeln`) →
+        // `write_msg(str, true, true)`.
+        editor.write_msg(str.as_bytes(), true, true);
     });
     Ok(())
 }
@@ -1439,8 +1432,8 @@ pub fn nvim_echo(
         }
     }
     let id = message_id(session, &opts);
-    let progress_data = is_progress_message(&opts)
-        .then(|| progress_event_data(&opts, &id, &chunks));
+    let progress_data =
+        is_progress_message(&opts).then(|| progress_event_data(&opts, &id, &chunks));
     let kind = if dict_strict_bool(&opts, "err") {
         MessageKind::Error
     } else {
@@ -1459,8 +1452,8 @@ pub fn nvim_echo(
             data: Some(&data),
             ..AutocmdContext::default()
         };
-        let plan = session
-            .with_editor_mut(|editor| editor.autocmds_mut().plan(Event::Progress, ctx));
+        let plan =
+            session.with_editor_mut(|editor| editor.autocmds_mut().plan(Event::Progress, ctx));
         crate::autocmd::execute_firing_plan(session, plan)?;
     }
     Ok(id)
@@ -2615,7 +2608,6 @@ pub fn dict_strict_bool(dict: &Dict, key: &str) -> bool {
         _ => false,
     }
 }
-
 
 fn dict_handle<T, E>(
     dict: &Dict,
@@ -3968,11 +3960,7 @@ impl StlBuilder {
     clippy::needless_pass_by_value,
     reason = "the generated dispatcher binds and moves owned RPC arguments"
 )]
-pub fn nvim_mcursor(
-    session: &ApiSession,
-    buf: BufHandle,
-    pos: Vec<i64>,
-) -> Result<i64, ApiError> {
+pub fn nvim_mcursor(session: &ApiSession, buf: BufHandle, pos: Vec<i64>) -> Result<i64, ApiError> {
     let buffer = crate::buffer::resolve_buffer(session, buf)?;
     if pos.len() != 2 {
         return Err(ApiError::validation(
@@ -4002,18 +3990,20 @@ pub fn nvim_mcursor(
     // `mc_ns` (mcursor.c:137): one lazily allocated global namespace shared
     // by every buffer, surfaced in `nvim_get_namespaces` by its upstream
     // name.
-    let namespace = crate::extmark::nvim_create_namespace(session, OxStr::from("nvim.multicursor"))?;
+    let namespace =
+        crate::extmark::nvim_create_namespace(session, OxStr::from("nvim.multicursor"))?;
     let namespace = ox_editor::NamespaceId::new(
         u32::try_from(namespace)
             .map_err(|_| ApiError::exception("mcursor namespace id out of range"))?,
     )
     .map_err(|error| ApiError::exception(error.to_string()))?;
     let count = session.with_editor_mut(|editor| {
-        editor.add_mcursor(buffer, position, namespace).map_err(exception)?;
+        editor
+            .add_mcursor(buffer, position, namespace)
+            .map_err(exception)?;
         Ok::<_, ApiError>(editor.mcursor_count(namespace))
     })?;
-    i64::try_from(count)
-        .map_err(|_| ApiError::exception("mcursor count exceeds API integer range"))
+    i64::try_from(count).map_err(|_| ApiError::exception("mcursor count exceeds API integer range"))
 }
 
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {

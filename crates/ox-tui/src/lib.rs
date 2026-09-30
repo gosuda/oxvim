@@ -1553,7 +1553,12 @@ fn encode_key(key: KeyEvent) -> Option<String> {
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
-            return Some(character.to_string());
+            // Kitty-protocol terminals report the unshifted keycode plus
+            // SHIFT (`,` + Shift for `<`), while raw-byte terminals report
+            // the shifted glyph itself (`<` + Shift). Translate the
+            // base-keycode form so `,` + Shift never arrives as a literal
+            // comma — the same glyph a legacy terminal would have sent.
+            return Some(shifted_char(character, key.modifiers).to_string());
         }
         KeyCode::Char(character) => character.to_string(),
         KeyCode::Enter => "CR".into(),
@@ -1594,6 +1599,40 @@ fn encode_key(key: KeyEvent) -> Option<String> {
         prefix.push_str("S-");
     }
     Some(format!("<{prefix}{key_name}>"))
+}
+
+/// The glyph a US-layout terminal emits for Shift plus `character`
+/// (crossterm's kitty path reports the base keycode; its raw path reports
+/// the already-shifted glyph, which this table leaves alone).
+fn shifted_char(character: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return character;
+    }
+    match character {
+        'a'..='z' => character.to_ascii_uppercase(),
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        '\\' => '|',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '`' => '~',
+        _ => character,
+    }
 }
 
 /// Translate a decoded mouse event into the `nvim_input_mouse` `(button,
@@ -2574,5 +2613,27 @@ mod tests {
         );
         assert!(matches!(foreground, TerminalColor::Ansi16(_)));
         assert!(matches!(background, TerminalColor::Ansi16(_)));
+    }
+
+    /// Kitty-protocol terminals report the base keycode plus SHIFT (`,`,
+    /// `.`, `=`), while legacy terminals report the shifted glyph itself —
+    /// both must encode as the glyph the chord names.
+    #[test]
+    fn encode_key_translates_base_keycode_plus_shift_to_the_shifted_glyph() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let shifted =
+            |character| encode_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::SHIFT));
+        assert_eq!(shifted(','), Some("<".to_owned()));
+        assert_eq!(shifted('.'), Some(">".to_owned()));
+        assert_eq!(shifted('='), Some("+".to_owned()));
+        assert_eq!(shifted('a'), Some("A".to_owned()));
+        assert_eq!(shifted('1'), Some("!".to_owned()));
+
+        assert_eq!(shifted('<'), Some("<".to_owned()));
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)),
+            Some(",".to_owned())
+        );
     }
 }
