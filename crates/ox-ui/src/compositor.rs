@@ -9,6 +9,8 @@ use ox_types::{OxStr, WinHandle};
 use thiserror::Error;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use std::collections::BTreeSet;
+
 use crate::grid::{Grid, GridError};
 use crate::hl::{Highlight, HlAttrs, HlError, HlEvent, HlState};
 use ox_editor::terminal_screen::{CellFlags, TermColor};
@@ -164,6 +166,11 @@ pub struct Compositor {
     /// Whether the previous refresh painted a tabline row; drives the
     /// one-frame blank that clears stale cells on a 1-to-0 transition.
     tabline_was_shown: bool,
+    /// Window grid ids live on any tabpage, refreshed by
+    /// `refresh_from_editor`: a vanished layer whose grid stays live was
+    /// hidden (tab switch, float hidden); one that left the set entirely
+    /// was destroyed (`window.c` `win_close` vs `win_hide`).
+    live_window_grids: BTreeSet<i64>,
 }
 
 impl Compositor {
@@ -176,6 +183,7 @@ impl Compositor {
             layers: Vec::new(),
             tabline_row: Vec::new(),
             tabline_was_shown: false,
+            live_window_grids: BTreeSet::new(),
         }
     }
 
@@ -203,12 +211,19 @@ impl Compositor {
     pub fn clear(&mut self) {
         self.layers.clear();
         self.tabline_row.clear();
+        self.live_window_grids.clear();
     }
 
     /// Returns layers in insertion order.
     #[must_use]
     pub fn layers(&self) -> &[Layer] {
         &self.layers
+    }
+
+    /// Window grid ids live on any tabpage as of the last refresh.
+    #[must_use]
+    pub fn live_window_grids(&self) -> &BTreeSet<i64> {
+        &self.live_window_grids
     }
 
     /// Rebuilds the layer stack from the active editor tabpage in place,
@@ -301,6 +316,12 @@ impl Compositor {
         let tabline_top = tabline.height;
         self.tabline_was_shown = !self.tabline_row.is_empty();
         self.tabline_row = resolve_tabline_row(&tabline.cells, highlights)?;
+        self.live_window_grids = editor
+            .tabpages()
+            .into_iter()
+            .flat_map(|handle| editor.tabpage_windows(handle).unwrap_or_default())
+            .map(window_grid_id)
+            .collect();
         let mut retired: Vec<Layer> = std::mem::take(&mut self.layers);
         self.width = width;
         self.height = height;

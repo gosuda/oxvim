@@ -37,6 +37,8 @@ const SYNC_BEGIN: &[u8] = b"\x1b[?2026h";
 const SYNC_END: &[u8] = b"\x1b[?2026l";
 const CURSOR_SETUP: &[u8] = b"\x1b[?25l";
 const CURSOR_RESTORE: &[u8] = b"\x1b[0 q\x1b[?25h\x1b[0m";
+const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
 const PALETTE_RESTORE: &[u8] = b"\x1b]104\x1b\\";
 const TMUX_PALETTE_RESTORE: &[u8] = b"\x1bPtmux;\x1b\x1b]104\x1b\x1b\\\x1b\\";
 
@@ -985,6 +987,7 @@ impl SessionState {
     const KITTY_KEYBOARD: u8 = 1 << 2;
     const SYNCHRONIZED_OUTPUT: u8 = 1 << 3;
     const PALETTE_RESTORE_PENDING: u8 = 1 << 4;
+    const ALT_SCREEN: u8 = 1 << 5;
 
     const fn has(self, flag: u8) -> bool {
         self.0 & flag != 0
@@ -1020,6 +1023,11 @@ impl<W: Write> TerminalSession<W> {
             state: SessionState(SessionState::RAW_MODE | SessionState::PALETTE_RESTORE_PENDING),
             capabilities,
         };
+        if let Err(error) = session.writer.write_all(ALT_SCREEN_ENTER) {
+            let _ = session.restore();
+            return Err(TerminalError::io("alt-screen enter", error));
+        }
+        session.state.set(SessionState::ALT_SCREEN, true);
         session.state.set(SessionState::CURSOR_CONFIGURED, true);
         if let Err(error) = session.writer.write_all(CURSOR_SETUP) {
             let _ = session.restore();
@@ -1182,6 +1190,15 @@ impl<W: Write> TerminalSession<W> {
                 Ok(()) => self.state.set(SessionState::PALETTE_RESTORE_PENDING, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("palette restore", error));
+                }
+                Err(_) => {}
+            }
+        }
+        if self.state.has(SessionState::ALT_SCREEN) {
+            match self.writer.write_all(ALT_SCREEN_LEAVE) {
+                Ok(()) => self.state.set(SessionState::ALT_SCREEN, false),
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(TerminalError::io("alt-screen restore", error));
                 }
                 Err(_) => {}
             }
@@ -1644,6 +1661,27 @@ mod tests {
         let cursor = bytes.find("\x1b[0 q").ok_or("missing cursor reset")?;
         let palette = bytes.find("\x1b]104").ok_or("missing palette restore")?;
         assert!(sync < kitty && kitty < cursor && cursor < palette);
+        Ok(())
+    }
+
+    #[test]
+    fn alt_screen_brackets_the_session_frame() -> TestResult {
+        let mut session = TerminalSession {
+            writer: Vec::new(),
+            state: SessionState(
+                SessionState::ALT_SCREEN
+                    | SessionState::CURSOR_CONFIGURED
+                    | SessionState::PALETTE_RESTORE_PENDING,
+            ),
+            capabilities: capabilities(),
+        };
+        session.restore()?;
+        let bytes = String::from_utf8(session.writer.clone())?;
+        let leave = bytes.find("\x1b[?1049l").ok_or("missing alt-screen leave")?;
+        let cursor = bytes.find("\x1b[0 q").ok_or("missing cursor reset")?;
+        // The alt screen is left after every other screen-state restore so the
+        // primary screen shows none of the teardown writes.
+        assert!(cursor < leave);
         Ok(())
     }
 

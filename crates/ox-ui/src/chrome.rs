@@ -277,13 +277,21 @@ impl ChromeState {
                     entries
                         .iter()
                         .map(|(kind, content)| {
-                            Object::Array(vec![Object::String(kind.clone()), chunks(content)])
+                            Object::Array(vec![
+                                Object::String(kind.clone()),
+                                chunks(content),
+                                // `entry->append` (message.c `ex_messages`): only
+                                // ever true for `:echon` temp entries, which this
+                                // history does not retain.
+                                Object::Boolean(false),
+                            ])
                         })
                         .collect(),
                 ),
                 Object::Boolean(false),
             ],
         ));
+        self.history_shown = true;
         self.message = Some(text);
     }
 
@@ -505,24 +513,21 @@ impl ChromeState {
     }
 
     /// Drains ordered pending state transitions.
-    ///
-    /// A shown history pager closes on the next UI interaction (message.c
-    /// `wait_return` consumes the key and emits `msg_history_hide`), so the
-    /// drain after `msg_history_show` opens with the hide event even when it
-    /// carries nothing else.
     pub fn take_events(&mut self) -> Vec<UiEvent> {
-        let mut events = std::mem::take(&mut self.pending);
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Closes an open history pager, queueing `msg_history_hide`.
+    ///
+    /// `wait_return` (message.c) hides the pager on the key that resumes
+    /// input, so this belongs on the input path: an unrelated redraw must
+    /// not close it.
+    pub fn hide_history_pager(&mut self) {
         if self.history_shown {
             self.history_shown = false;
-            events.insert(0, UiEvent::new("msg_history_hide", vec![]));
+            self.pending
+                .push(UiEvent::new("msg_history_hide", vec![]));
         }
-        if events
-            .iter()
-            .any(|event| event.name.as_bytes() == b"msg_history_show")
-        {
-            self.history_shown = true;
-        }
-        events
     }
 
     /// Builds the current state events needed to initialize a newly attached UI.

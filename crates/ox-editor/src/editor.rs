@@ -31,8 +31,6 @@ use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
 
-/// Extmark namespace backing placed multicursors (`mc_ns`, src/nvim/mcursor.c).
-const MCURSOR_NAMESPACE: &str = "mcursor";
 
 /// Cloneable allocator for the process-wide dynamic channel key space.
 #[derive(Clone, Debug)]
@@ -152,6 +150,12 @@ pub struct MessageIdentity {
     pub kind: OxStr,
     /// Id returned by the producing call; `Object::Nil` when none.
     pub id: Object,
+    /// Set only on `:messages` output: the publisher swaps the wire event
+    /// to `msg_history_show`. A dedicated marker rather than a kind string,
+    /// so a `nvim_echo` caller passing `opts.kind = "history_show"` still
+    /// emits an ordinary `msg_show` (message.c `nvim_echo` puts the kind
+    /// through uninterpreted).
+    pub history_show: bool,
 }
 
 impl MessageIdentity {
@@ -162,6 +166,18 @@ impl MessageIdentity {
         Self {
             kind: OxStr::from(if kind == MessageKind::Error { "emsg" } else { "echo" }),
             id: Object::Nil,
+            history_show: false,
+        }
+    }
+
+    /// Sentinel identity for `:messages` output (message.c `ex_messages`
+    /// `ui_call_msg_history_show`).
+    #[must_use]
+    fn history_show() -> Self {
+        Self {
+            kind: OxStr::from("history_show"),
+            id: Object::Nil,
+            history_show: true,
         }
     }
 }
@@ -980,7 +996,9 @@ impl Editor {
     /// Places a multicursor at `position` in `buffer` (`mc_add`,
     /// src/nvim/mcursor.c): the cursor rides the extmark store so it tracks
     /// later edits and dies with the buffer, and an existing cursor at the
-    /// position is left alone rather than duplicated.
+    /// position is left alone rather than duplicated. The namespace is the
+    /// session-global `nvim.multicursor` id (`mc_ns`): one id shared by
+    /// every buffer, so a buffer store only `ensure`s it locally.
     ///
     /// # Errors
     ///
@@ -993,9 +1011,10 @@ impl Editor {
         &mut self,
         buffer: BufHandle,
         position: Position,
+        namespace: NamespaceId,
     ) -> Result<bool, EditorError> {
         let state = self.buffer_mut(buffer)?;
-        let namespace = state.extmarks.create_namespace(MCURSOR_NAMESPACE)?;
+        state.extmarks.ensure_namespace(namespace)?;
         let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
         if !state.extmarks.query(namespace, point, point, Some(1))?.is_empty() {
             return Ok(false);
@@ -1007,24 +1026,23 @@ impl Editor {
     }
 
     /// Counts multicursors across every live buffer (`mc_count`,
-    /// src/nvim/mcursor.c).
+    /// src/nvim/mcursor.c) under the session-global `nvim.multicursor`
+    /// namespace id.
     #[must_use]
-    pub fn mcursor_count(&self) -> usize {
+    pub fn mcursor_count(&self, namespace: NamespaceId) -> usize {
         self.buffers()
             .iter()
             .filter_map(|handle| self.buffer(*handle).ok())
             .filter_map(|state| {
-                state.extmarks.namespace(MCURSOR_NAMESPACE).and_then(|namespace| {
-                    state
-                        .extmarks
-                        .query(
-                            namespace,
-                            ExtmarkPosition::new(0, 0),
-                            ExtmarkPosition::new(usize::MAX, usize::MAX),
-                            None,
-                        )
-                        .ok()
-                })
+                state
+                    .extmarks
+                    .query(
+                        namespace,
+                        ExtmarkPosition::new(0, 0),
+                        ExtmarkPosition::new(usize::MAX, usize::MAX),
+                        None,
+                    )
+                    .ok()
             })
             .map(|marks| marks.len())
             .sum()
@@ -2438,7 +2456,16 @@ impl Editor {
     /// state must be attached by [`Editor::push_message`] before any callback
     /// can reenter the editor.
     pub fn arm_echo_identity(&mut self, kind: OxStr, id: Object) {
-        self.pending_echo_identity = Some(MessageIdentity { kind, id });
+        self.pending_echo_identity = Some(MessageIdentity {
+            kind,
+            id,
+            history_show: false,
+        });
+    }
+
+    /// Arms the `:messages` sentinel on the next pushed message.
+    pub fn arm_history_show(&mut self) {
+        self.pending_echo_identity = Some(MessageIdentity::history_show());
     }
 
     /// Drops an armed identity when validation or verbose gating prevents a
@@ -2459,7 +2486,11 @@ impl Editor {
     /// matching earlier entry.
     pub fn stamp_echo_identity(&mut self, appended_at: usize, kind: OxStr, id: Object) {
         if let Some(identity) = self.message_identities.get_mut(appended_at) {
-            *identity = MessageIdentity { kind, id };
+            *identity = MessageIdentity {
+                kind,
+                id,
+                history_show: false,
+            };
         }
     }
 
@@ -4660,6 +4691,7 @@ mod tests {
             MessageIdentity {
                 kind: OxStr::from("progress"),
                 id: Object::Integer(9),
+                history_show: false,
             }
         );
     }

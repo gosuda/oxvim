@@ -2309,6 +2309,9 @@ fn drive_input_parts(
     exiting: &mut bool,
     exit_code: &mut i64,
 ) -> Result<(), ApiError> {
+    // `wait_return` (message.c) closes a shown history pager on the key that
+    // resumes input; a redraw without input must leave it open.
+    session.with_render_state(|_, _, chrome| chrome.hide_history_pager());
     loop {
         mode.borrow_mut().set_no_more_input(false);
         let result = ex.borrow_mut().run_typeahead(session.as_ref(), mode);
@@ -2547,9 +2550,11 @@ fn show_message_in_chrome(
         Object::String(text) => text.clone(),
         value => OxStr::from(format!("{value:?}").as_bytes()),
     };
-    if identity.kind.as_bytes() == b"history_show" {
-        // `:messages`: the sentinel kind swaps the wire event to
-        // `msg_history_show`, built from every history-retained entry.
+    if identity.history_show {
+        // `:messages`: the sentinel identity swaps the wire event to
+        // `msg_history_show`, built from every history-retained entry. A
+        // caller-supplied `opts.kind = "history_show"` reaches the plain
+        // `msg_show` path below instead.
         let entries = session.with_editor(|editor| {
             editor
                 .messages()

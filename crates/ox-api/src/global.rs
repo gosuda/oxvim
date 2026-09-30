@@ -3980,9 +3980,18 @@ pub fn nvim_mcursor(
             .min(text.line(row).map_err(exception)?.len());
         Ok::<_, ApiError>(ox_text::Position { lnum: row, col })
     })?;
+    // `mc_ns` (mcursor.c:137): one lazily allocated global namespace shared
+    // by every buffer, surfaced in `nvim_get_namespaces` by its upstream
+    // name.
+    let namespace = crate::extmark::nvim_create_namespace(session, OxStr::from("nvim.multicursor"))?;
+    let namespace = ox_editor::NamespaceId::new(
+        u32::try_from(namespace)
+            .map_err(|_| ApiError::exception("mcursor namespace id out of range"))?,
+    )
+    .map_err(|error| ApiError::exception(error.to_string()))?;
     let count = session.with_editor_mut(|editor| {
-        editor.add_mcursor(buffer, position).map_err(exception)?;
-        Ok::<_, ApiError>(editor.mcursor_count())
+        editor.add_mcursor(buffer, position, namespace).map_err(exception)?;
+        Ok::<_, ApiError>(editor.mcursor_count(namespace))
     })?;
     i64::try_from(count)
         .map_err(|_| ApiError::exception("mcursor count exceeds API integer range"))

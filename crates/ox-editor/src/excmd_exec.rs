@@ -4957,11 +4957,14 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     Flow::Normal
 }
 
-/// `:echo` family output keeps its command name as the wire kind
-/// (`echo`/`echon`/`echomsg`/`echoerr`); `:echomsg` and `:echoerr` enter
-/// message history (message.c `do_one_msg` callers mark `MSG_HIST`).
+/// `:echo` family output keeps a wire kind per upstream: `:echon` shares
+/// `:echo`'s kind (eval.c:6226 `msg_ext_set_kind("echo")` covers both
+/// cmdidx values), `:echomsg` keeps its own name (eval.c:6327), and
+/// `:echoerr` emits `echoerr` through `emsg_multiline` (eval.c:6330).
+/// `:echomsg` and `:echoerr` enter message history.
 fn push_echo_command_message(editor: &mut Editor, name: &str, text: String) {
-    editor.arm_echo_identity(OxStr::from(name.as_bytes()), Object::Nil);
+    let kind = if name == "echon" { "echo" } else { name };
+    editor.arm_echo_identity(OxStr::from(kind.as_bytes()), Object::Nil);
     push_text_message(
         editor,
         text,
@@ -4988,10 +4991,10 @@ fn command_messages(editor: &mut Editor) -> Flow {
     };
     // ex_docmd.c `ex_messages`: an ext_messages UI gets a dedicated
     // `msg_history_show` listing every retained entry; everyone else gets
-    // the joined text as an ordinary message. The sentinel kind tells the
-    // publisher to swap the wire event while keeping this text as the
+    // the joined text as an ordinary message. The sentinel identity tells
+    // the publisher to swap the wire event while keeping this text as the
     // grid-message fallback.
-    editor.arm_echo_identity(OxStr::from("history_show"), Object::Nil);
+    editor.arm_history_show();
     push_info_text_message(editor, output);
     Flow::Normal
 }
