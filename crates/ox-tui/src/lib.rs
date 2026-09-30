@@ -496,36 +496,38 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
             }
             Ok(None) => {
                 let now = TimeMs(duration_millis(started.elapsed()));
-                let expired = state.advance_time(now);
-                let fading =
-                    state.motion == MotionPolicy::Full && state.notification_opacity() < 1.0;
-                if (expired || fading)
-                    && let Ok(grid) = state.screen.composed_grid()
-                {
+                let due = state.advance_time(now)
+                    || (state.motion == MotionPolicy::Full && state.notification_opacity() < 1.0);
+                if due && let Ok(grid) = state.screen.composed_grid() {
                     render_current_frame(&mut session, &mut damage, &grid, &state, capabilities)?;
                 }
             }
             Err(error) => {
-                if finish_run(&mut session, &mut shared, mouse_capture_emitted, &error)? {
+                if finish_run(
+                    &mut session,
+                    &mut shared,
+                    mouse_capture_emitted,
+                    &mut client,
+                    &error,
+                )? {
                     return Ok(());
                 }
                 return Err(TuiError::Client(error));
             }
         }
 
-        // Keys forwarded as the editor quits (`:wq`'s stream close racing the
-        // `nvim_input` reply) surface here instead of through `recv_redraw`:
-        // a clean child exit is the normal quit path, not a failure.
+        // `:wq`'s stream close can race the `nvim_input` reply: a clean
+        // child exit surfacing here is the normal quit path, not a failure.
         if let Err(error) = forward_terminal_events(&mut client, &mut state) {
-            let TuiError::Client(client_error) = &error else {
-                return Err(error);
-            };
-            if finish_run(
-                &mut session,
-                &mut shared,
-                mouse_capture_emitted,
-                client_error,
-            )? {
+            if let TuiError::Client(client_error) = &error
+                && finish_run(
+                    &mut session,
+                    &mut shared,
+                    mouse_capture_emitted,
+                    &mut client,
+                    client_error,
+                )?
+            {
                 return Ok(());
             }
             return Err(error);
@@ -534,18 +536,22 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
 }
 
 /// Shared post-failure path for [`run`]: drop mouse capture, restore the
-/// terminal, then report whether the error was a clean editor quit.
+/// terminal, then report whether the error was a clean editor quit. A
+/// [`ClientError::Write`] needs the exit confirmed — the request's broken
+/// pipe can beat the reader's EOF notification.
 fn finish_run(
     session: &mut TerminalSession<SharedWriter>,
     shared: &mut SharedWriter,
     mouse_capture_emitted: bool,
+    client: &mut Client,
     error: &ClientError,
 ) -> Result<bool, TuiError> {
     if mouse_capture_emitted {
         let _ = apply_mouse_capture(shared, false);
     }
     session.restore()?;
-    if clean_eof(error) {
+    if clean_eof(error) || (matches!(error, ClientError::Write { .. }) && client.successful_exit())
+    {
         return Ok(true);
     }
     process_failure(error).write_diagnostic(&mut io::stderr())?;
