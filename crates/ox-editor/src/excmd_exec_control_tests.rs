@@ -596,11 +596,15 @@ fn missing_endif_produces_e171_error() {
 }
 
 #[test]
-fn missing_endtry_produces_e600_error() {
-    // ex_docmd.c: `:try` without a matching `:endtry` raises E600.
+fn missing_endtry_reports_the_bodys_failure_then_e600() {
+    // ex_docmd.c:763-769: the missing-`:endtry` check runs when the input
+    // ends — a failure inside the `:try` body surfaces instead of E600.
     let mut executor = ExExecutor::new();
     let editor = TestEditorAccess::new(Editor::new());
     let result = executor.execute_script(&editor, "test.vim", "try\nthrow \"x\"");
+    let exception = vim_error(result.map(|_| ()));
+    assert_eq!(exception.kind, VimExceptionKind::Throw);
+    let result = executor.execute_script(&editor, "test.vim", "try\nlet g:x = 1");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Error("E600".to_owned()));
     assert_eq!(exception.message(), "Vim:E600: Missing :endtry");

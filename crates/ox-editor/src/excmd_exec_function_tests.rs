@@ -3499,10 +3499,11 @@ fn getchar_returns_full_multibyte_modified_character() {
 }
 
 /// Sourcing is not `:try`: upstream leaves `trylevel` alone in `do_source`,
-/// so an error inside a sourced script displays and continues both the
-/// script and the caller instead of unwinding to the top.
+/// so an error inside a sourced script displays and `did_emsg` aborts the
+/// rest of the file — verified against the reference binary, where the
+/// line after an uncaught `call` error never executes.
 #[test]
-fn sourced_script_error_continues_script_and_caller() {
+fn sourced_script_error_displays_and_aborts() {
     let io = MemoryFileIO::new();
     io.insert(
         "/inner.vim",
@@ -3510,7 +3511,11 @@ fn sourced_script_error_continues_script_and_caller() {
     );
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(io);
-    exec.source_file(&editor, "/inner.vim".as_ref()).unwrap();
-    assert_eq!(global_number(exec.scope(), "inner_after"), Some(1));
+    let error = exec.source_file(&editor, "/inner.vim".as_ref()).unwrap_err();
+    assert!(
+        error.to_string().contains("NoSuchFunc123"),
+        "got {error}"
+    );
+    assert_eq!(global_number(exec.scope(), "inner_after"), None);
     assert!(exec.did_emsg());
 }
