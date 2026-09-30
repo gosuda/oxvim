@@ -433,6 +433,20 @@ pub fn mode_index(name: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// The `guifont` default broadcast at attach: the platform-selected
+/// `DFLT_GFN` literal the option metadata resolves for this target OS —
+/// SF Mono on macOS, Source Code Pro on Linux — never the Linux list on
+/// every platform.
+fn platform_guifont() -> &'static str {
+    ox_editor::option_metadata("guifont")
+        .and_then(|metadata| metadata.default.value)
+        .and_then(|value| match value {
+            ox_editor::OptionDefaultValue::String(text) => Some(text),
+            _ => None,
+        })
+        .unwrap_or("DejaVu Sans Mono,Courier New,monospace")
+}
+
 fn emit_startup_metadata(
     channel: &mut crate::channel::UiChannel,
     options: UiOptions,
@@ -441,12 +455,7 @@ fn emit_startup_metadata(
         ("ambiwidth", Object::String(OxStr::from("single"))),
         ("arabicshape", Object::Boolean(true)),
         ("emoji", Object::Boolean(true)),
-        (
-            "guifont",
-            Object::String(OxStr::from(
-                "Source Code Pro,DejaVu Sans Mono,Courier New,monospace",
-            )),
-        ),
+        ("guifont", Object::String(OxStr::from(platform_guifont()))),
         ("guifontwide", Object::String(OxStr::from(""))),
         ("linespace", Object::Integer(0)),
         ("mousefocus", Object::Boolean(false)),

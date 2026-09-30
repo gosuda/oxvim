@@ -1411,6 +1411,39 @@ pub(crate) fn cell_width(character: char, vcol: usize, tabstop: usize) -> usize 
     }
 }
 
+/// Display cells a whole line occupies (`plines.c:linetabsize_col` summed
+/// over the line — upstream `linetabsize`).
+pub(crate) fn display_len(line: &[u8], tabstop: usize) -> usize {
+    let mut vcol = 0usize;
+    let mut index = 0usize;
+    while index < line.len() {
+        let (character, _) = decode_char(&line[index..]);
+        vcol = vcol.saturating_add(cell_width(character, vcol, tabstop));
+        index += cluster_len(line, index);
+    }
+    vcol
+}
+
+/// `textobject.c:coladvance`: byte offset of the character covering display
+/// cell `target` — the first character whose cell span contains it, or the
+/// head byte of the last cluster when the target lies past the line's cells.
+pub(crate) fn vcol_to_byte(line: &[u8], target: usize, tabstop: usize) -> usize {
+    let mut vcol = 0usize;
+    let mut index = 0usize;
+    let mut head = 0usize;
+    while index < line.len() {
+        let (character, _) = decode_char(&line[index..]);
+        let length = cluster_len(line, index);
+        if vcol.saturating_add(cell_width(character, vcol, tabstop)) > target {
+            return index;
+        }
+        vcol = vcol.saturating_add(cell_width(character, vcol, tabstop));
+        head = index;
+        index += length;
+    }
+    head
+}
+
 /// Adds the `'showbreak'` cells that precede every continuation row a long
 /// line wraps onto.
 fn wrap_showbreak(editor: &Editor, window: WinHandle, start: usize, end: usize) -> (usize, usize) {

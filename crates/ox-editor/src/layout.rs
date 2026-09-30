@@ -624,10 +624,11 @@ impl Layout {
     ///
     /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
     /// leaf, [`LayoutError::InvalidDimensions`] when `width` is zero,
-    /// [`LayoutError::InvalidWindowExtent`] when `width` is below the window's
-    /// minimum extent or exceeds the space its siblings need, or
-    /// [`LayoutError::GeometryOverflow`] when redistribution arithmetic
-    /// overflows.
+    /// [`LayoutError::InvalidWindowExtent`] when even the windows' minimum
+    /// extents do not fit the space, or [`LayoutError::GeometryOverflow`]
+    /// when redistribution arithmetic overflows. An out-of-range `width`
+    /// clamps to the extent the neighbors allow, like upstream
+    /// `frame_setwidth`.
     pub fn set_window_width(&mut self, window: WinHandle, width: usize) -> Result<(), LayoutError> {
         self.set_window_extent(window, width, SplitAxis::Vertical)
     }
@@ -638,10 +639,11 @@ impl Layout {
     ///
     /// Returns [`LayoutError::UnknownWindow`] when the resolved window has no
     /// leaf, [`LayoutError::InvalidDimensions`] when `height` is zero,
-    /// [`LayoutError::InvalidWindowExtent`] when `height` is below the window's
-    /// minimum extent or exceeds the space its siblings need, or
-    /// [`LayoutError::GeometryOverflow`] when redistribution arithmetic
-    /// overflows.
+    /// [`LayoutError::InvalidWindowExtent`] when even the windows' minimum
+    /// extents do not fit the space, or [`LayoutError::GeometryOverflow`]
+    /// when redistribution arithmetic overflows. An out-of-range `height`
+    /// clamps to the extent the neighbors allow, like upstream
+    /// `frame_setheight`.
     pub fn set_window_height(
         &mut self,
         window: WinHandle,
@@ -712,14 +714,10 @@ impl Layout {
         if extent == current {
             return Ok(());
         }
-        if resize_window_extent(&mut self.root, resolved, extent, axis)? {
-            Ok(())
-        } else {
-            Err(LayoutError::InvalidWindowExtent {
-                requested: extent,
-                available: current,
-            })
-        }
+        // An axis with no distributing ancestor is a no-op, matching
+        // upstream's `fr_parent == NULL` guard in frame_setwidth/height.
+        resize_window_extent(&mut self.root, resolved, extent, axis)?;
+        Ok(())
     }
 
     fn split(
@@ -1899,16 +1897,20 @@ fn resize_window_extent(
         .map(|(_, child)| minimum_extent(child, axis))
         .try_fold(0usize, usize::checked_add)
         .ok_or(LayoutError::GeometryOverflow)?;
-    let required = requested
+    let total_minimum = target_minimum
         .checked_add(sibling_minimum)
         .ok_or(LayoutError::GeometryOverflow)?;
-    if requested < target_minimum || required > available {
+    if total_minimum > available {
         return Err(LayoutError::InvalidWindowExtent {
             requested,
             available,
         });
     }
-    let remaining = available - required;
+    // Upstream `win_setheight_win`/`frame_setwidth` clamp an out-of-range
+    // request to the smallest/largest extent the neighbors allow rather
+    // than erroring (window.c:6246-6319).
+    let requested = requested.clamp(target_minimum, available - sibling_minimum);
+    let remaining = available - requested - sibling_minimum;
     let sibling_base = remaining.checked_div(sibling_count).unwrap_or_default();
     let sibling_remainder = remaining.checked_rem(sibling_count).unwrap_or_default();
     let distributed_extent = |index: usize, frame: &Frame| {

@@ -765,8 +765,10 @@ pub fn statfs(path: impl AsRef<Path>) -> FsResult<StatFs> {
         let value = rustix::fs::statfs(path.as_ref())
             .map_err(|e| FsError::from_io(&io::Error::from_raw_os_error(e.raw_os_error())))?;
         Ok(StatFs {
-            kind: value.f_type.cast_unsigned(),
-            block_size: value.f_bsize.cast_unsigned(),
+            // `f_type`/`f_bsize` are `c_long` on Linux and `u32` on macOS;
+            // `as u64` covers both signednesses without a cfg split.
+            kind: value.f_type as u64,
+            block_size: value.f_bsize as u64,
             blocks: value.f_blocks,
             blocks_free: value.f_bfree,
             blocks_available: value.f_bavail,

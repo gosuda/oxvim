@@ -550,6 +550,7 @@ dependencies = [
  "ox-eval",
  "ox-excmd",
  "ox-rpc",
+ "ox-sys",
  "ox-text",
  "ox-types",
  "ox-ui",
@@ -631,6 +632,7 @@ name = "ox-lua"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libc",
  "libloading",
  "mlua",
  "ox-api",
@@ -679,6 +681,7 @@ dependencies = [
 name = "ox-text"
 version = "0.1.0"
 dependencies = [
+ "ox-sys",
  "rmpv",
  "ropey",
  "sha2",

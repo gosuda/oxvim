@@ -426,34 +426,28 @@ pub fn nvim_call_atomic(session: &ApiSession, calls: Vec<Object>) -> Result<Vec<
 
 #[api(since = 1, deprecated_since = 13)]
 #[expect(
+    clippy::needless_pass_by_value,
     clippy::unnecessary_wraps,
-    reason = "deprecated RPC entry keeps its `Result` return shape"
+    reason = "deprecated RPC entry keeps upstream's `String str` argument and its `Result` return shape"
 )]
 pub fn nvim_out_write(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
     session.with_editor_mut(|editor| {
-        editor.push_message(Message {
-            kind: MessageKind::Echo,
-            content: Object::String(str),
-            history: false,
-            leading_newline: true,
-        });
+        // api/deprecated.c:965-969 → `write_msg(str, false, false)`.
+        editor.write_msg(str.as_bytes(), false, false);
     });
     Ok(())
 }
 
 #[api(since = 1, deprecated_since = 13)]
 #[expect(
+    clippy::needless_pass_by_value,
     clippy::unnecessary_wraps,
-    reason = "deprecated RPC entry keeps its `Result` return shape"
+    reason = "deprecated RPC entry keeps upstream's `String str` argument and its `Result` return shape"
 )]
 pub fn nvim_err_write(session: &ApiSession, str: OxStr) -> Result<(), ApiError> {
     session.with_editor_mut(|editor| {
-        editor.push_message(Message {
-            kind: MessageKind::Error,
-            content: Object::String(str),
-            history: false,
-            leading_newline: true,
-        });
+        // api/deprecated.c:971-975 → `write_msg(str, true, false)`.
+        editor.write_msg(str.as_bytes(), true, false);
     });
     Ok(())
 }

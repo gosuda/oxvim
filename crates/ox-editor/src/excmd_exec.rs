@@ -38,10 +38,10 @@ use crate::autocmd::{
 use crate::buffer::BufferTextEditRequest;
 use crate::builtins::position::cell_width;
 use crate::decoration::{CallbackPhase, RedrawEntry};
+use crate::editor::is_nofileread;
 use crate::extmark::{
     ExtmarkAttributes, ExtmarkId, ExtmarkPlacement, ExtmarkPosition, NamespaceId, SignGroup,
 };
-use crate::editor::is_nofileread;
 use crate::fold::{FoldMethod, Position as FoldPosition};
 use crate::fs_builtins::split_path_list;
 use crate::lvalue::{
@@ -247,7 +247,8 @@ pub trait LuaExec {
     /// Hosts wrap the expression exactly like upstream `nlua_call_luaeval`
     /// (`local _A=select(1,...) return (<expr>)`) and convert the argument
     /// and result with typval semantics.
-    fn eval_expression(&self,
+    fn eval_expression(
+        &self,
         _expression: &str,
         _arg: Option<&Typval>,
     ) -> Result<Typval, LuaExecError> {
@@ -261,7 +262,8 @@ pub trait LuaExec {
     /// # Errors
     ///
     /// Returns the host's runtime or value-conversion failure.
-    fn invoke_callback(&self,
+    fn invoke_callback(
+        &self,
         _reference: usize,
         _args: Vec<Object>,
     ) -> Result<Object, LuaExecError> {
@@ -3293,9 +3295,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         ),
         "args" => command_args(runtime, access, scope, lua, command),
         "next" => command_next(runtime, access, scope, lua, command),
-        "first" | "rewind" => {
-            command_argument_absolute(runtime, access, scope, lua, command, 0)
-        }
+        "first" | "rewind" => command_argument_absolute(runtime, access, scope, lua, command, 0),
         "last" => command_argument_absolute(runtime, access, scope, lua, command, i64::MAX),
         "argument" => command_argument(runtime, access, scope, lua, command),
         "previous" | "Next" => command_previous(runtime, access, scope, lua, command),
@@ -3621,8 +3621,7 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
         self.access
             .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
             .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
-        let result = lua
-            .execute_chunk("return vim.api[select(1, ...)](select(2, ...))", call);
+        let result = lua.execute_chunk("return vim.api[select(1, ...)](select(2, ...))", call);
         let sync = self
             .access
             .with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
@@ -3642,20 +3641,22 @@ fn command_resize<F: FileIO>(
     editor: &mut Editor,
     command: &ExCommand,
 ) -> Flow {
-    // `ex_resize` (ex_docmd.c:5911-5936): an address selects the window,
-    // `+N`/`-N` are relative to the current height, and a bare `:resize`
-    // means Rows - 1 ("as high as possible").
+    // `ex_resize` (ex_docmd.c:5947-5973): an address selects the window,
+    // `:vertical` resizes width instead of height, `+N`/`-N` are relative
+    // to the current extent, and a bare `:resize`/`:vert resize` means
+    // Rows - 1 / Columns ("as high/wide as possible").
     let args = command.args.trim();
-    let signed = args
-        .parse::<isize>()
-        .ok()
-        .unwrap_or_else(|| match args.as_bytes().first() {
-            Some(b'+') => 1,
-            Some(b'-') => -1,
-            _ => 0,
-        });
+    let vertical = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::Vertical);
+    // Upstream uses `atol`: unparseable arguments (including a bare "+"
+    // or "-") contribute 0, and the sign still marks the resize relative.
+    let signed = args.parse::<isize>().ok().unwrap_or(0);
+    let relative = matches!(args.as_bytes().first(), Some(b'+' | b'-'));
     let window = if command.range.is_some() {
-        // `:Nresize` selects the Nth window (ex_docmd.c:5915-5918).
+        // `:Nresize` selects the Nth window; a number past the last
+        // window clamps to it (ex_docmd.c:5950-5952).
         let target = match resolve_range_raw(editor, command) {
             Ok((_, end)) => end.max(1),
             Err(message) => return error_flow(runtime, "E16", message),
@@ -3664,7 +3665,7 @@ fn command_resize<F: FileIO>(
             .current_tabpage()
             .and_then(|tab| editor.tabpage_windows(tab).ok())
             .unwrap_or_default();
-        window_by_number(&windows, target)
+        window_by_number(&windows, target).or_else(|| windows.last().copied())
     } else {
         editor.current_window()
     };
@@ -3675,21 +3676,33 @@ fn command_resize<F: FileIO>(
             "Cannot rotate when another window is split",
         );
     };
-    // The relative base is the window's layout height (upstream
-    // `wp->w_height`), not its text height minus the status line.
-    let current_height = editor
+    // The relative base is the window's layout extent (upstream
+    // `wp->w_height`/`wp->w_width`), not its text extent minus the
+    // status line.
+    let tabpage = editor
         .current_tabpage()
-        .and_then(|tab| editor.tabpage(tab).ok())
+        .and_then(|tab| editor.tabpage(tab).ok());
+    let current_extent = tabpage
         .and_then(|tabpage| tabpage.layout().window_geometry(window).ok())
-        .map_or(1, |geometry| geometry.height);
-    let height = if args.starts_with(['+', '-']) {
-        signed + current_height.cast_signed()
+        .map_or(1, |geometry| {
+            if vertical {
+                geometry.width
+            } else {
+                geometry.height
+            }
+        });
+    let extent = if relative {
+        signed + current_extent.cast_signed()
     } else if args.is_empty() {
-        editor
-            .current_tabpage()
-            .and_then(|tab| editor.tabpage(tab).ok())
-            .map_or(24, |tabpage| tabpage.layout().size().height)
-            .saturating_sub(1)
+        tabpage
+            .map_or(if vertical { 80 } else { 24 }, |tabpage| {
+                let size = tabpage.layout().size();
+                if vertical {
+                    size.width
+                } else {
+                    size.height.saturating_sub(1)
+                }
+            })
             .max(1)
             .cast_signed()
     } else {
@@ -3697,7 +3710,12 @@ fn command_resize<F: FileIO>(
     }
     .max(1)
     .cast_unsigned();
-    match editor.set_window_height(window, height) {
+    let result = if vertical {
+        editor.set_window_width(window, extent)
+    } else {
+        editor.set_window_height(window, extent)
+    };
+    match result {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, "E36", error.to_string()),
     }
@@ -3742,6 +3760,30 @@ fn command_wincmd<F: FileIO>(
     let Some(current) = editor.current_window() else {
         return Flow::Normal;
     };
+    if matches!(key, '<' | '>' | '+' | '-' | '_' | '|' | '=') {
+        // `do_window` (window.c:5193-5380): < > grow/shrink columns, + -
+        // rows, _ and | maximize, = equalizes — the same chords the
+        // Normal-mode `CTRL-W` prefix takes through `nv_window`. The count
+        // may be a post-command count (`wincmd 10<`) or a pre-command
+        // range (`:10wincmd <`) — `ex_wincmd` hands `eap->line2` to
+        // `do_window` for both (ex_docmd.c:6583).
+        let count = command
+            .count
+            .and_then(|value| usize::try_from(value).ok())
+            .or_else(|| wincmd_range_count(command))
+            .unwrap_or(1)
+            .max(1);
+        if key == '=' {
+            return match editor.equalize_tabpage(tab) {
+                Ok(()) => Flow::Normal,
+                Err(error) => error_flow(runtime, "E957", error.to_string()),
+            };
+        }
+        return match resize_window_by_key(editor, current, key, count) {
+            Ok(()) => Flow::Normal,
+            Err(error) => error_flow(runtime, "E957", error.to_string()),
+        };
+    }
     let next = match key {
         'w' => windows
             .iter()
@@ -3771,6 +3813,29 @@ fn command_wincmd<F: FileIO>(
     match next.map(|window| editor.set_current_window(window)) {
         None | Some(Ok(())) => Flow::Normal,
         Some(Err(error)) => error_flow(runtime, "E957", error.to_string()),
+    }
+}
+
+/// Applies the resize keys shared by Normal-mode CTRL-W and `:wincmd`.
+/// Missing geometry and other keys are no-ops; callers handle resize errors.
+pub(crate) fn resize_window_by_key(
+    editor: &mut Editor,
+    window: WinHandle,
+    key: char,
+    count: usize,
+) -> Result<(), EditorError> {
+    let Ok(geometry) = editor.window_geometry(window) else {
+        return Ok(());
+    };
+    // The layout clamps requests to the extents allowed by sibling windows.
+    match key {
+        '<' => editor.set_window_width(window, geometry.width.saturating_sub(count).max(1)),
+        '>' => editor.set_window_width(window, geometry.width.saturating_add(count)),
+        '+' => editor.set_window_height(window, geometry.height.saturating_add(count)),
+        '-' => editor.set_window_height(window, geometry.height.saturating_sub(count).max(1)),
+        '_' => editor.set_window_height(window, usize::MAX),
+        '|' => editor.set_window_width(window, usize::MAX),
+        _ => Ok(()),
     }
 }
 
@@ -5010,7 +5075,8 @@ fn command_version(editor: &mut Editor) -> Flow {
                 let Object::Dict(dict) = dict else {
                     return None;
                 };
-                dict.0.iter()
+                dict.0
+                    .iter()
                     .find(|(key, _)| key.as_bytes() == name.as_bytes())
                     .map(|(_, value)| value)
             }
@@ -5092,11 +5158,10 @@ fn command_help<F: FileIO, E: ExEditorAccess>(
             };
             (path, matched.cmd.clone())
         };
-        let (handle, origin) =
-            match buffer_from_file(runtime, access, &path) {
-                Ok((handle, origin)) => (handle, origin),
-                Err(flow) => return flow,
-            };
+        let (handle, origin) = match buffer_from_file(runtime, access, &path) {
+            Ok((handle, origin)) => (handle, origin),
+            Err(flow) => return flow,
+        };
         let existing_tabs = access.with_ex_editor(|editor| editor.tabpages());
         let existing_windows = access.with_ex_editor(|editor| editor.windows());
         let old_tab = access.with_ex_editor(|editor| editor.current_tabpage());
@@ -6747,7 +6812,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     if !matches!(flow, Flow::Normal) {
         return flow;
     }
-    let text = match runtime.scripts.io().read_to_string(path) {
+    let text = match read_file_text(runtime, access, buffer, path) {
         Ok(text) => text,
         Err(error) => {
             return error_flow(
@@ -6757,7 +6822,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
             );
         }
     };
-    let text = match Buffer::from_bytes(text.as_bytes()) {
+    let text = match Buffer::from_bytes(&text) {
         Ok(text) => text,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
@@ -6914,8 +6979,8 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
     } else if matches!(outcome, LoadSwitchOutcome::Resident)
-        && let Err(error) =
-            access.with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+        && let Err(error) = access
+            .with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E948", error.to_string());
     }
@@ -7905,9 +7970,7 @@ fn swap_meta(editor: &Editor, buffer: BufHandle, candidate: &SwapBuffer, name: &
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_default();
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|name| name.trim().to_owned())
-        .unwrap_or_default();
+    let host = swap_host_name();
     let same_dir = name.parent() == Path::new(&candidate.file_name).parent();
     let file_encoding = match editor.options().get_buffer(buffer, "fileencoding") {
         Ok(OptionValue::String(value)) => value.clone(),
@@ -7932,6 +7995,20 @@ fn swap_meta(editor: &Editor, buffer: BufHandle, candidate: &SwapBuffer, name: &
         file_encoding,
         fileformat,
     }
+}
+
+/// The `b0_uname`/`b0_fname` host field (memline.c:341-344): `gethostname(2)`
+/// via libuv upstream, informational for recovery so an empty string is fine.
+#[cfg(unix)]
+fn swap_host_name() -> String {
+    ox_sys::unix::hostname().unwrap_or_default()
+}
+
+/// The `b0_uname`/`b0_fname` host field fallback where `gethostname` is
+/// unavailable.
+#[cfg(not(unix))]
+fn swap_host_name() -> String {
+    String::new()
 }
 
 /// `b0_ino` (memline.c:688): the original file's inode where the platform
@@ -7988,8 +8065,7 @@ fn preserve_one_swapfile<F: FileIO>(
         .write_to(
             &name,
             ox_text::swapfile::SwapOwnership::for_session(session_owns_swapfile),
-        )
-    {
+        ) {
         Ok(()) => {
             runtime.swap_written.borrow_mut().insert(name);
             if report {
@@ -8428,9 +8504,7 @@ fn command_pop<F: FileIO, E: ExEditorAccess>(
         lnum: item.from_lnum.max(1),
         col: item.from_col.saturating_sub(1),
     };
-    if let Err(error) =
-        access.with_ex_editor(|editor| editor.set_window_cursor(window, target))
-    {
+    if let Err(error) = access.with_ex_editor(|editor| editor.set_window_cursor(window, target)) {
         restore_curidx(access);
         return error_flow(runtime, "E16", error.to_string());
     }
@@ -9344,6 +9418,237 @@ fn current_buffer_name(editor: &Editor) -> String {
         .unwrap_or_default()
 }
 
+/// One file's detected end-of-line style plus the text as the buffer holds
+/// it (`fileio.c` `readfile`'s format decision and line normalization).
+pub struct FileRead {
+    /// File bytes with line separators normalized to `\n`: DOS drops each CR
+    /// before NL, MAC maps CR→NL and NL→CR, UNIX is verbatim.
+    pub text: Vec<u8>,
+    /// The 'fileformat' to set buffer-local.
+    pub fileformat: &'static str,
+    /// 'endofline' — false when the file's last line is unterminated.
+    pub eol: bool,
+}
+
+/// `readfile`'s EOL guess (fileio.c:1440-1520): 'binary' forces UNIX and
+/// skips detection entirely; an empty 'fileformats' keeps the buffer's own
+/// 'fileformat'. Otherwise the first NL decides dos-vs-unix (a CR-preceded
+/// NL is DOS when 'dos' is tried, a bare one UNIX when 'unix' is tried), a
+/// UNIX verdict on a file containing earlier CRs is re-scored against MAC by
+/// raw CR-vs-NL counts, no NL at all is MAC when CRs exist and 'mac' is
+/// tried, and an empty/no-marker file takes the first 'fileformats' entry.
+/// A DOS read that meets a bare NL rewinds and starts over as UNIX when
+/// 'unix' is also tried.
+#[allow(clippy::too_many_lines)] // one decision tree, upstream-ordered
+fn read_file_format(bytes: &[u8], formats: &str, fallback: &str, binary: bool) -> FileRead {
+    let fallback = match fallback {
+        "dos" => "dos",
+        "mac" => "mac",
+        _ => "unix",
+    };
+    if binary {
+        return FileRead {
+            text: bytes.to_vec(),
+            fileformat: fallback,
+            eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+        };
+    }
+    if formats.is_empty() {
+        return FileRead {
+            text: bytes.to_vec(),
+            fileformat: fallback,
+            eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+        };
+    }
+    let try_mac = formats.contains('m');
+    let try_dos = formats.contains('d');
+    let try_unix = formats.contains('x') || formats.contains('u');
+    let default = || match formats.chars().next() {
+        Some('m') => "mac",
+        Some('d') => "dos",
+        _ => "unix",
+    };
+    let mut format: Option<&'static str> = None;
+    if try_dos || try_unix {
+        let mut cr_before_nl = 0usize;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                format = Some(
+                    if !try_unix || (try_dos && index > 0 && bytes[index - 1] == b'\r') {
+                        "dos"
+                    } else {
+                        "unix"
+                    },
+                );
+                break;
+            } else if *byte == b'\r' {
+                cr_before_nl += 1;
+            }
+        }
+        if format == Some("unix") && try_mac && cr_before_nl > 0 {
+            let (mut nls, mut crs) = (1usize, 1usize);
+            for byte in bytes {
+                match byte {
+                    b'\n' => nls += 1,
+                    b'\r' => crs += 1,
+                    _ => {}
+                }
+            }
+            if crs > nls {
+                format = Some("mac");
+            }
+        }
+    }
+    let fileformat = format.unwrap_or_else(|| {
+        if try_mac && bytes.contains(&b'\r') {
+            "mac"
+        } else {
+            default()
+        }
+    });
+    // A bare NL inside a DOS read sends upstream back to the top as UNIX
+    // when 'unix' is in 'fileformats' (`goto retry` on `ff_error`).
+    let fileformat = if fileformat == "dos"
+        && try_unix
+        && bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+    {
+        "unix"
+    } else {
+        fileformat
+    };
+    let text = match fileformat {
+        "dos" => {
+            let mut out = Vec::with_capacity(bytes.len());
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    continue;
+                }
+                out.push(*byte);
+            }
+            out
+        }
+        "mac" => bytes
+            .iter()
+            .map(|byte| match byte {
+                b'\r' => b'\n',
+                b'\n' => b'\r',
+                _ => *byte,
+            })
+            .collect(),
+        _ => bytes.to_vec(),
+    };
+    FileRead {
+        eol: text.is_empty() || text.ends_with(b"\n"),
+        text,
+        fileformat,
+    }
+}
+
+/// Serializes buffer text for `:w` (`bufwrite.c`): 'dos' joins with CRLF,
+/// 'mac' with CR, 'unix' with LF; the trailing EOL is written whenever
+/// 'endofline' is set or 'fixeol' fixes it, but never under 'binary'
+/// without 'endofline'.
+fn buffer_file_bytes(
+    editor: &Editor,
+    buffer: BufHandle,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let bool_option = |name: &str, default: bool| {
+        match editor.options().get_buffer(buffer, name) {
+            Ok(OptionValue::Boolean(value)) => *value,
+            _ => default,
+        }
+    };
+    let fileformat = match editor.options().get_buffer(buffer, "fileformat") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => "unix".to_owned(),
+    };
+    let binary = bool_option("binary", false);
+    let eol = bool_option("endofline", true);
+    let fixeol = bool_option("fixeol", true);
+    // `to_bytes` marks a terminated last line with one trailing `\n`; strip
+    // it so the separator join doesn't double it with the EOL write below.
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    if fileformat == "mac" {
+        for byte in body {
+            out.push(match byte {
+                b'\n' => b'\r',
+                _ => *byte,
+            });
+        }
+        if eol || (fixeol && !binary) {
+            out.push(b'\r');
+        }
+    } else {
+        let separator = if fileformat == "dos" { b"\r\n".as_slice() } else { b"\n".as_slice() };
+        let mut parts = body.split(|byte| *byte == b'\n').peekable();
+        while let Some(part) = parts.next() {
+            out.extend_from_slice(part);
+            if parts.peek().is_some() {
+                out.extend_from_slice(separator);
+            }
+        }
+        if eol || (fixeol && !binary) {
+            out.extend_from_slice(separator);
+        }
+    }
+    out
+}
+
+/// Runs `readfile`'s format detection for `bytes`, consulting 'fileformats'
+/// and, when `buffer` is given, that buffer's 'fileformat' fallback and
+/// 'binary'. With a handle the detected values land buffer-local.
+pub fn detect_file_format(
+    editor: &mut Editor,
+    buffer: Option<BufHandle>,
+    bytes: &[u8],
+) -> FileRead {
+    let value = |name: &str| match buffer {
+        Some(_) => option_value(editor, name, SetLayer::Effective).cloned(),
+        None => editor.options().get_global(name).ok().cloned(),
+    };
+    let formats = match value("fileformats") {
+        Some(OptionValue::String(value)) => value,
+        _ => "unix,dos".to_owned(),
+    };
+    let fallback = match value("fileformat") {
+        Some(OptionValue::String(value)) => value,
+        _ => "unix".to_owned(),
+    };
+    let binary = matches!(value("binary"), Some(OptionValue::Boolean(true)));
+    let read = read_file_format(bytes, &formats, &fallback, binary);
+    if let Some(buffer) = buffer {
+        let _ = editor.options_mut().set_buffer(
+            buffer,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(buffer, "endofline", OptionValue::Boolean(read.eol));
+    }
+    read
+}
+
+/// Loads `path` for `buffer` the way `readfile` does: run the 'fileformats'
+/// EOL detection, normalize line separators to `\n`, then record the result
+/// as the buffer-local 'fileformat' and 'endofline'.
+fn read_file_text<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    buffer: BufHandle,
+    path: &Path,
+) -> std::io::Result<Vec<u8>> {
+    let bytes = runtime.scripts.io().read_bytes(path)?;
+    Ok(access.with_ex_editor(|editor| {
+        detect_file_format(editor, Some(buffer), &bytes).text
+    }))
+}
+
 /// Splits read bytes into buffer lines. A trailing newline terminates the last
 /// line rather than starting an empty one; text without it still contributes a
 /// final line, as `readfile`'s "noeol" handling does.
@@ -9568,9 +9873,8 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         // Keep the exact name bytes: a lossy round-trip here would redirect
         // the write, the existence gate, and the overwrite bookkeeping to a
         // replacement-character filename for non-UTF-8 buffer names.
-        let existing = access.with_ex_editor(|editor| {
-            editor.buffer(buffer).map(|state| state.name().clone())
-        });
+        let existing =
+            access.with_ex_editor(|editor| editor.buffer(buffer).map(|state| state.name().clone()));
         let target = match existing {
             Ok(name) => name,
             Err(error) => return error_flow(runtime, "E32", error.to_string()),
@@ -9604,18 +9908,15 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     if !perform_write {
         return command_write_did_cmd(runtime, access, buffer, &path);
     }
-    let mut bytes = match access.with_ex_editor(|editor| {
+    let bytes = match access.with_ex_editor(|editor| {
         editor
             .buffer(buffer)
             .and_then(|state| state.text().map_err(Into::into))
-            .map(ox_text::Buffer::to_bytes)
+            .map(|text| buffer_file_bytes(editor, buffer, &text.to_bytes()))
     }) {
         Ok(bytes) => bytes,
         Err(error) => return error_flow(runtime, "E749", error.to_string()),
     };
-    if bytes.last().is_some_and(|byte| *byte != b'\n') {
-        bytes.push(b'\n');
-    }
     let contents = String::from_utf8_lossy(&bytes);
     let restore_perm = force_writable(
         runtime,
@@ -9726,9 +10027,7 @@ fn write_overwrites_buffer(name: &OxStr, target: &Path) -> bool {
         for component in absolute.components() {
             match component {
                 Component::CurDir => {}
-                Component::ParentDir
-                    if matches!(components.last(), Some(Component::Normal(_))) =>
-                {
+                Component::ParentDir if matches!(components.last(), Some(Component::Normal(_))) => {
                     components.pop();
                 }
                 Component::ParentDir if !anchored => components.push(component),
@@ -10175,6 +10474,13 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     vertical: bool,
 ) -> Flow {
+    // `P_VERT` on `:split`/`:new` splits vertically too (`ex_splitview`,
+    // ex_docmd.c:7890-7896: `cmdmod.split & WSP_VERT`).
+    let vertical = vertical
+        || command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Vertical);
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E749", "Empty buffer");
     };
@@ -10216,13 +10522,10 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             LoadSwitchFocus::Revalidate,
             |_runtime| {
                 let created = if vertical {
-                    access.with_ex_editor(|editor| {
-                        editor.split_left(tab, window, new_buffer, true)
-                    })
+                    access.with_ex_editor(|editor| editor.split_left(tab, window, new_buffer, true))
                 } else {
-                    access.with_ex_editor(|editor| {
-                        editor.split_above(tab, window, new_buffer, true)
-                    })
+                    access
+                        .with_ex_editor(|editor| editor.split_above(tab, window, new_buffer, true))
                 }
                 .map_err(LoadSwitchError::Editor)?;
                 created_window.set(Some(created));
@@ -10237,9 +10540,7 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             },
             || {
                 if let Some(created) = created_window.take() {
-                    let _ = access.with_ex_editor(|editor| {
-                        editor.close_window(tab, created, true)
-                    });
+                    let _ = access.with_ex_editor(|editor| editor.close_window(tab, created, true));
                 }
             },
         ) {
@@ -10433,9 +10734,9 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
         }
     }
 
-    match access.with_ex_editor(|editor| {
-        editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after)
-    }) {
+    match access
+        .with_ex_editor(|editor| editor.create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after))
+    {
         Ok(_) => Flow::Normal,
         Err(error) => {
             if origin.is_created() {
@@ -12143,17 +12444,14 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
-        if let Err(error) =
-            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-        {
+        if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
         return Ok(entered());
     }
 
-    let Some(path) = (!name.as_bytes().is_empty() && !nofileread)
-        .then(|| path_from_ox_str(&name))
+    let Some(path) = (!name.as_bytes().is_empty() && !nofileread).then(|| path_from_ox_str(&name))
     else {
         access
             .with_ex_editor(|editor| -> Result<(), EditorError> {
@@ -12168,9 +12466,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(error);
         }
-        if let Err(error) =
-            announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-        {
+        if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
@@ -12205,21 +12501,12 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Err(error);
     }
 
-    if let Err(error) =
-        announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
-    {
+    if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin) {
         rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(error);
     }
     if !new_file {
-        let flow = fire_buffer_lifecycle(
-            runtime,
-            access,
-            scope,
-            lua,
-            &[Event::BufReadPre],
-            buffer,
-        );
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
         if !matches!(flow, Flow::Normal) {
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(LoadSwitchError::Flow(flow));
@@ -12227,14 +12514,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
     }
 
     if new_file {
-        let flow = fire_buffer_lifecycle(
-            runtime,
-            access,
-            scope,
-            lua,
-            &[Event::BufNewFile],
-            buffer,
-        );
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufNewFile], buffer);
         if !matches!(flow, Flow::Normal) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(LoadSwitchError::Flow(flow));
@@ -12242,7 +12522,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Ok(entered());
     }
 
-    let content = match runtime.scripts.io().read_to_string(&path) {
+    let content = match read_file_text(runtime, access, buffer, &path) {
         Ok(content) => content,
         Err(error) => {
             rollback_buffer_switch(access, buffer, &mut restore, true);
@@ -12252,7 +12532,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             });
         }
     };
-    let text = match Buffer::from_bytes(content.as_bytes()) {
+    let text = match Buffer::from_bytes(&content) {
         Ok(text) => text,
         Err(error) => {
             rollback_buffer_switch(access, buffer, &mut restore, true);
@@ -12375,9 +12655,7 @@ fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
                         .window(*window)
                         .is_ok_and(|state| state.buffer == buffer)
                 }) else {
-                    return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(
-                        buffer,
-                    )));
+                    return Err(LoadSwitchError::Editor(EditorError::UnknownBuffer(buffer)));
                 };
                 let tab = editor
                     .window_tabpage(window)
@@ -12421,7 +12699,6 @@ fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
     }
 }
 
-
 /// Loads a file-backed target with file-command error semantics.
 fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -12451,12 +12728,9 @@ fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
             "E484",
             format!("Can't open file {}: {error}", path.display()),
         )),
-        Err(LoadSwitchError::Editor(error)) => {
-            Err(error_flow(runtime, "E948", error.to_string()))
-        }
+        Err(LoadSwitchError::Editor(error)) => Err(error_flow(runtime, "E948", error.to_string())),
     }
 }
-
 
 /// Fires the leave half of a buffer switch, performs any unloaded-buffer
 /// reload with its read lifecycle, then fires the enter half.
@@ -12533,8 +12807,8 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
         return Flow::Normal;
     }
     if matches!(outcome, LoadSwitchOutcome::Resident)
-        && let Err(error) =
-            access.with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
+        && let Err(error) = access
+            .with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E86", error.to_string());
     }
@@ -12648,8 +12922,8 @@ fn command_argument_absolute<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     target: i64,
 ) -> Flow {
-    let count = i64::try_from(access.with_ex_editor(|editor| editor.arglist().len()))
-        .unwrap_or(i64::MAX);
+    let count =
+        i64::try_from(access.with_ex_editor(|editor| editor.arglist().len())).unwrap_or(i64::MAX);
     let entry = if target == i64::MAX {
         count.saturating_sub(1)
     } else {
@@ -12673,8 +12947,7 @@ fn command_argument<F: FileIO, E: ExEditorAccess>(
         .or_else(|| command.args.trim().parse::<i64>().ok())
         .unwrap_or_else(|| {
             access.with_ex_editor(|editor| {
-                i64::try_from(editor.arglist().index())
-                    .map_or(1, |index| index.saturating_add(1))
+                i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
             })
         });
     do_argfile(
@@ -12686,7 +12959,6 @@ fn command_argument<F: FileIO, E: ExEditorAccess>(
         count.saturating_sub(1),
     )
 }
-
 
 fn command_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -13021,7 +13293,6 @@ fn command_previous<F: FileIO, E: ExEditorAccess>(
     do_argfile(runtime, access, scope, lua, command.bang, target)
 }
 
-
 /// Edits entry `target` of the argument list (`do_argfile`, arglist.c
 /// 600): out-of-range targets fail with E163/E164/E165, and the index
 /// only advances when the edit succeeded.
@@ -13098,9 +13369,7 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
 
     // An argument with no buffer yet opens a new file, which is always a
     // different buffer: same guard.
-    if let Some(flow) =
-        access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force))
-    {
+    if let Some(flow) = access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, force)) {
         return flow;
     }
 
@@ -13138,19 +13407,28 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
     // There is no current window to give the loader a display context. Keep
     // the bootstrap path that creates the first tabpage around already-read
     // text; normal argument navigation always takes the branch above.
-    let text = match runtime.scripts.io().read_to_string(Path::new(name)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let bytes = match runtime.scripts.io().read_bytes(Path::new(name)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return error_flow(runtime, "E484", format!("Can't open file {name}: {error}"));
         }
     };
-    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
+    let read = access.with_ex_editor(|editor| detect_file_format(editor, None, &bytes));
+    let buffer_text = match Buffer::from_bytes(&read.text) {
         Ok(buffer) => buffer,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
     let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
         let handle = editor.create_buffer_with(buffer_text, true)?;
+        let _ = editor.options_mut().set_buffer(
+            handle,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         let state = editor.buffer_mut(handle)?;
         state.set_name(OxStr::from(name));
         state.mark_saved();
@@ -16997,8 +17275,7 @@ fn scope_map(scope: &Scope, kind: ScopeKind) -> Option<&ScopeMap> {
 
 fn mirror_name(key: &OxStr, tag: u8) -> Option<&[u8]> {
     let bytes = key.as_bytes();
-    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag)
-        .then(|| &bytes[2..])
+    (bytes.len() >= 2 && bytes[0] == SCOPE_MIRROR_PREFIX && bytes[1] == tag).then(|| &bytes[2..])
 }
 
 fn mirror_key(tag: u8, key: &[u8]) -> OxStr {
@@ -17029,15 +17306,11 @@ fn refresh_scope_mirror_map(
         .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
         .map(|(key, _)| key.as_bytes())
         .collect();
-    mirror.retain(|(key, _)| {
-        mirror_name(key, tag).is_none_or(|name| current_keys.contains(name))
-    });
+    mirror.retain(|(key, _)| mirror_name(key, tag).is_none_or(|name| current_keys.contains(name)));
     let mut slots: HashMap<Vec<u8>, usize> = mirror
         .iter()
         .enumerate()
-        .filter_map(|(index, (key, _))| {
-            mirror_name(key, tag).map(|name| (name.to_vec(), index))
-        })
+        .filter_map(|(index, (key, _))| mirror_name(key, tag).map(|name| (name.to_vec(), index)))
         .collect();
     for (key, value) in current
         .iter()
@@ -17046,8 +17319,7 @@ fn refresh_scope_mirror_map(
         match slots.get(key.as_bytes()).copied() {
             Some(index) if mirror[index].1 == *value => {}
             Some(index) => {
-                mirror[index].1 =
-                    ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
+                mirror[index].1 = ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
             }
             None => {
                 let index = mirror.len();
@@ -17066,11 +17338,7 @@ fn refresh_scope_mirror(scope: &Scope, kind: ScopeKind) -> Result<(), ExecError>
     let Some(current) = scope_map(scope, kind) else {
         return Ok(());
     };
-    refresh_scope_mirror_map(
-        current,
-        &mut scope.global_mirror.borrow_mut(),
-        kind,
-    )
+    refresh_scope_mirror_map(current, &mut scope.global_mirror.borrow_mut(), kind)
 }
 
 /// Merge one dirty scope into its live dictionary and refresh its mirror.
@@ -17427,15 +17695,8 @@ pub(crate) fn sync_scope_into_editor(
     if global_dirty || scope.synced.get(ScopeKind::Global) != editor.gvars_version() {
         let live = editor.gvars();
         let mut mirror = scope.global_mirror.borrow_mut();
-        pull_scope_map_from_editor(
-            live,
-            &mut scope.global,
-            &mut mirror,
-            ScopeKind::Global,
-        )?;
-        scope
-            .synced
-            .set(ScopeKind::Global, editor.gvars_version());
+        pull_scope_map_from_editor(live, &mut scope.global, &mut mirror, ScopeKind::Global)?;
+        scope.synced.set(ScopeKind::Global, editor.gvars_version());
     }
     if global_dirty {
         scope.synced.clear_dirty(ScopeKind::Global);
@@ -17449,9 +17710,7 @@ pub(crate) fn sync_scope_into_editor(
     let buffer = editor
         .current_buffer()
         .filter(|buffer| scope.synced.buffer_identity() == Some(*buffer));
-    if buffer_dirty
-        && let Some(buffer) = buffer
-    {
+    if buffer_dirty && let Some(buffer) = buffer {
         let state = editor
             .buffer_mut(buffer)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -17469,12 +17728,7 @@ pub(crate) fn sync_scope_into_editor(
                 .map_err(|error| ExecError::Editor(error.to_string()))?
                 .variables();
             let mut mirror = scope.global_mirror.borrow_mut();
-            pull_scope_map_from_editor(
-                live,
-                &mut scope.buffer,
-                &mut mirror,
-                ScopeKind::Buffer,
-            )?;
+            pull_scope_map_from_editor(live, &mut scope.buffer, &mut mirror, ScopeKind::Buffer)?;
             scope.synced.set_buffer_version(buffer_version);
         }
         if buffer_dirty {
@@ -17503,9 +17757,7 @@ pub(crate) fn sync_scope_into_editor(
     }
 
     let window_dirty = scope.synced.is_dirty(ScopeKind::Window);
-    if window_dirty
-        && let Some(window) = editor.current_window()
-    {
+    if window_dirty && let Some(window) = editor.current_window() {
         let live = editor
             .window_variables_mut(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -17521,12 +17773,7 @@ pub(crate) fn sync_scope_into_editor(
                 .window_variables(window)
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
-            pull_scope_map_from_editor(
-                live,
-                &mut scope.window,
-                &mut mirror,
-                ScopeKind::Window,
-            )?;
+            pull_scope_map_from_editor(live, &mut scope.window, &mut mirror, ScopeKind::Window)?;
             scope.synced.set(ScopeKind::Window, window_version);
         }
         if window_dirty {
@@ -17535,9 +17782,7 @@ pub(crate) fn sync_scope_into_editor(
     }
 
     let tab_dirty = scope.synced.is_dirty(ScopeKind::Tab);
-    if tab_dirty
-        && let Some(tab) = editor.current_tabpage()
-    {
+    if tab_dirty && let Some(tab) = editor.current_tabpage() {
         let live = editor
             .tabpage_variables_mut(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;

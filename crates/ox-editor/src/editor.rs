@@ -31,7 +31,6 @@ use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
 
-
 /// Cloneable allocator for the process-wide dynamic channel key space.
 #[derive(Clone, Debug)]
 pub struct ChannelIds(Rc<Cell<u64>>);
@@ -474,6 +473,12 @@ pub struct Editor {
     /// Identity armed by the server before an `nvim_echo` handler pushes its
     /// message. The push consumes this marker before Progress callbacks run.
     pending_echo_identity: Option<MessageIdentity>,
+    /// `write_msg` line buffers (api/deprecated.c:922-923): the deprecated
+    /// `nvim_out_write`/`nvim_err_write` calls accumulate text until a
+    /// newline completes a line; content still buffered when the editor
+    /// exits is dropped, like upstream's `out_line_buf`/`err_line_buf`.
+    out_line_buf: Vec<u8>,
+    err_line_buf: Vec<u8>,
     /// In-place echo replacements waiting for the server's render pass.
     echo_replacements: Vec<(Message, MessageIdentity)>,
     /// Raw `nvim_ui_send` payloads staged for the server's redraw pass.
@@ -616,6 +621,8 @@ impl Editor {
             message_destinations: Vec::new(),
             message_identities: Vec::new(),
             pending_echo_identity: None,
+            out_line_buf: Vec::new(),
+            err_line_buf: Vec::new(),
             echo_replacements: Vec::new(),
             ui_sends: Vec::new(),
             message_routing: MessageRouting::default(),
@@ -1024,7 +1031,11 @@ impl Editor {
         let state = self.buffer_mut(buffer)?;
         state.extmarks.ensure_namespace(namespace)?;
         let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
-        if !state.extmarks.query(namespace, point, point, Some(1))?.is_empty() {
+        if !state
+            .extmarks
+            .query(namespace, point, point, Some(1))?
+            .is_empty()
+        {
             return Ok(false);
         }
         state
@@ -2432,6 +2443,43 @@ impl Editor {
         }
     }
 
+    /// `write_msg` (api/deprecated.c:919-951): the buffered emit behind
+    /// `nvim_out_write`, `nvim_err_write` and `nvim_err_writeln`. Text
+    /// accumulates in the out or error line buffer; each newline completes
+    /// a line and emits it as one message, `NUL` turns into a newline, and
+    /// `writeln` terminates whatever remains buffered.
+    pub fn write_msg(&mut self, text: &[u8], to_err: bool, writeln: bool) {
+        let line_buf = if to_err {
+            &mut self.err_line_buf
+        } else {
+            &mut self.out_line_buf
+        };
+        let mut lines = Vec::new();
+        for &byte in text {
+            if byte == b'\n' {
+                lines.push(std::mem::take(line_buf));
+            } else {
+                line_buf.push(if byte == 0 { b'\n' } else { byte });
+            }
+        }
+        if writeln {
+            lines.push(std::mem::take(line_buf));
+        }
+        let kind = if to_err {
+            MessageKind::Error
+        } else {
+            MessageKind::Echo
+        };
+        for line in lines {
+            self.push_message(Message {
+                kind,
+                content: Object::String(OxStr::from(line.as_slice())),
+                history: true,
+                leading_newline: true,
+            });
+        }
+    }
+
     /// Stores a message without claiming that a UI has rendered it, together
     /// with the sink decision that applies to it.
     pub fn push_message(&mut self, message: Message) {
@@ -2662,10 +2710,15 @@ impl Editor {
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.resize(geometry)?;
-        // A shrunken frame can leave a window's cursor below its new text
-        // area; scroll each tiled window's topline back into view the way
-        // `win_new_height`/`validate_cursor` do after a screen resize
-        // (window.c), instead of emitting a cursor past the window grid.
+        Self::revalidate_window_toplines(tabpage)?;
+        Ok(())
+    }
+
+    /// Scrolls each tiled window's topline back into view after its frame
+    /// changed, the way `win_new_height`/`validate_cursor` do after a
+    /// resize (window.c) — a shrunken frame can otherwise leave the cursor
+    /// below the new text area and emit it past the window grid.
+    fn revalidate_window_toplines(tabpage: &mut TabpageState) -> Result<(), EditorError> {
         for window in tabpage.layout().windows() {
             let height = tabpage.tiled_window_text_height(window)?;
             let state = tabpage.window_mut(window)?;
@@ -2689,10 +2742,12 @@ impl Editor {
         } else {
             tab
         };
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&resolved)
-            .ok_or(EditorError::UnknownTabpage(resolved))?
-            .equalize()?;
+            .ok_or(EditorError::UnknownTabpage(resolved))?;
+        tabpage.equalize()?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
 
@@ -2977,10 +3032,12 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&tab)
-            .ok_or(EditorError::UnknownTabpage(tab))?
-            .set_window_width(resolved, width)?;
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        tabpage.set_window_width(resolved, width)?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
 
@@ -3004,10 +3061,12 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&tab)
-            .ok_or(EditorError::UnknownTabpage(tab))?
-            .set_window_height(resolved, height)?;
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        tabpage.set_window_height(resolved, height)?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
     /// Returns the renderable text-row count for a window.
@@ -3847,6 +3906,28 @@ impl Editor {
         }
         if let Some(last) = replayed.last() {
             self.changelists.push(buffer, last.cursor);
+            // Upstream `u_undo_end` restores `curwin->w_cursor` from the undo
+            // header — `uh_cursor` on undo, `uh_cursor_after` on redo
+            // (undo.c:2518-2560), bounds-checked like its `check_cursor`.
+            if let Some(window) = self.current_window()
+                && self
+                    .window(window)
+                    .is_ok_and(|state| state.buffer == buffer)
+            {
+                let clamped = self
+                    .buffer(buffer)
+                    .ok()
+                    .and_then(|state| state.text().ok())
+                    .map_or(last.cursor, |text| {
+                        let lnum = last.cursor.lnum.clamp(1, text.line_count().max(1));
+                        let col = text.line(lnum).map_or(0, |line| line.len());
+                        Position {
+                            lnum,
+                            col: last.cursor.col.min(col),
+                        }
+                    });
+                let _ = self.set_window_cursor(window, clamped);
+            }
         }
     }
 
@@ -4135,6 +4216,7 @@ impl Editor {
             self.previous_window = previous.filter(|current| *current != window);
         }
         self.windows.insert(window, tab);
+        self.options.copy_window_options(target, window);
         self.apply_effective_directory();
         Ok(window)
     }

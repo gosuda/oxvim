@@ -3,6 +3,10 @@
 //! Locale state lives in [`locale`]; environment mutation below.
 
 pub mod locale;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(unix)]
+pub mod unix;
 #[cfg(windows)]
 pub mod windows;
 

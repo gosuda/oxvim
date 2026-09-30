@@ -2915,12 +2915,11 @@ fn keytrans(value: &Typval) -> Result<Typval> {
                     b"<" => "lt".to_owned(),
                     b"|" => "Bar".to_owned(),
                     b"\\" => "Bslash".to_owned(),
-                    [0x08] => "BS".to_owned(),
-                    [b'\t'] => "C-I".to_owned(),
+                    [b'\t'] => "Tab".to_owned(),
+                    [0x0a] => "NL".to_owned(),
                     [b'\r'] => "CR".to_owned(),
                     [0x1b] => "Esc".to_owned(),
-                    [0x7f] => "Del".to_owned(),
-                    [control @ 1..=26] => format!("C-{}", char::from(control + b'@')),
+                    [control @ 1..=31] => format!("C-{}", char::from(control + b'@')),
                     _ => String::from_utf8_lossy(raw).into_owned(),
                 };
                 (name, width)
@@ -4044,12 +4043,19 @@ fn hostname() -> Result<Typval> {
     Ok(Typval::String(OxStr::from(name.as_str())))
 }
 
+/// `f_hostname` → `mch_get_host_name` → `uv_os_gethostname`: the kernel's
+/// `gethostname(2)` answer, not an environment variable.
+#[cfg(unix)]
+fn os_hostname() -> std::result::Result<String, std::env::VarError> {
+    ox_sys::unix::hostname().map_err(|_| std::env::VarError::NotPresent)
+}
+
 #[cfg(windows)]
 fn os_hostname() -> std::result::Result<String, std::env::VarError> {
     ox_sys::windows::hostname().map_err(|_| std::env::VarError::NotPresent)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 fn os_hostname() -> std::result::Result<String, std::env::VarError> {
     Err(std::env::VarError::NotPresent)
 }

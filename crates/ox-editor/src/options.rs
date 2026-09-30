@@ -471,6 +471,34 @@ impl OptionStore {
         }
     }
 
+    /// Copies a window's local overlay into a newly split window, mirroring
+    /// upstream `win_split_ins` calling `copy_winopt` (`window.c`): the new
+    /// window starts with the source window's local values, not the global
+    /// baseline. Options the source never overrode keep resolving to the
+    /// shared baseline, so only the overlay itself is cloned. Upstream skips
+    /// 'scroll' (depends on window height), 'previewwindow' (only one preview
+    /// window), and 'winfixbuf'/'winfixheight'/'winfixwidth' (a split is never
+    /// born fixed — ex_cmds2.c relies on it to escape 'winfixbuf').
+    pub fn copy_window_options(&mut self, source: WinHandle, window: WinHandle) {
+        const NOT_COPIED: [&str; 5] = [
+            "scroll",
+            "previewwindow",
+            "winfixbuf",
+            "winfixheight",
+            "winfixwidth",
+        ];
+        if let Some(overlay) = self.windows.get(&source) {
+            let overlay: HashMap<&'static str, OptionValue> = overlay
+                .iter()
+                .filter(|(name, _)| !NOT_COPIED.contains(name))
+                .map(|(name, value)| (*name, value.clone()))
+                .collect();
+            if !overlay.is_empty() {
+                self.windows.insert(window, overlay);
+            }
+        }
+    }
+
     /// Drops every local value owned by a closed window.
     pub fn remove_window(&mut self, window: WinHandle) {
         self.windows.remove(&window);

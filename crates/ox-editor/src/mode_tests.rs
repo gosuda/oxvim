@@ -2394,8 +2394,8 @@ behavior!(
     "one",
     position(1, 0),
     ">>",
-    "        one",
-    position(1, 8),
+    "\tone",
+    position(1, 0),
     "normal"
 );
 behavior!(
@@ -4710,4 +4710,37 @@ fn ctrl_w_brace_reuses_the_preview_window() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The `C-w <` chord through the real input path: `nvim_input("<C-w>")`
+// then `nvim_input("<")` append two key strings to the typeahead — the
+// `\x17` byte sets the pending prefix and the following `<` byte must
+// reach `wincmd` as the shrink command rather than the `<` operator.
+#[test]
+fn ctrl_w_less_reaches_wincmd_through_the_typeahead() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.split_left(tab, window, buffer, true).unwrap();
+    let focused = editor.current_window().unwrap();
+    let before = editor.window_geometry(focused).unwrap().width;
+
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("\u{17}"), TypeaheadFlags::default());
+    editor
+        .typeahead_mut()
+        .append(&Keys::from("<"), TypeaheadFlags::default());
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+    machine.run_once(&mut editor, &mut eval).unwrap();
+    machine.run_once(&mut editor, &mut eval).unwrap();
+
+    assert_eq!(
+        editor.window_geometry(focused).unwrap().width,
+        before - 1
+    );
 }

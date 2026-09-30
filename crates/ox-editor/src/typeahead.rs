@@ -514,6 +514,14 @@ impl Typeahead {
             } else {
                 Remap::Yes
             },
+            // `feedkeys` stuffs its argument with `nottyped = !has_t`
+            // (`f_feedkeys` → `ins_typebuf`): without `t` the bytes count
+            // into `tb_maplen`, so `flush_buffers(FLUSH_MINIMAL)` —
+            // `beep_flush` after a failed operator or motion — discards the
+            // rest of the string and `gotchars` skips them for `q`
+            // recordings. With `t` they are typed keys: recorded, synced
+            // per key for undo, and never error-flushed.
+            mapped: !mode.contains('t'),
             ..TypeaheadFlags::default()
         };
         if mode.contains('L') {

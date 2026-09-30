@@ -591,9 +591,12 @@ return return_count, tostring_calls, writes, written",
         .eval()
         .unwrap();
 
+    // The binding hands `nvim_out_write` the line-terminated payload, the
+    // same bytes `nlua_print` queues upstream minus the NUL terminator it
+    // appends for `msg_multihl` (executor.c:1131-1176).
     assert_eq!(
         (return_count, tostring_calls, writes, written),
-        (0, 4, 1, " <nil> 7 <nil>".to_owned())
+        (0, 4, 1, " <nil> 7 <nil>\n".to_owned())
     );
 }
 
@@ -740,15 +743,15 @@ fn buffer_lines_callback_rejects_nested_text_change() {
 #[test]
 fn buffer_callback_error_releases_textlock_for_later_mutation() {
     let (host, _, _) = with_c_host();
-    let (
-        first_ok,
-        first_error,
-        nested_ok,
-        nested_error,
-        second_ok,
-        second_error,
-        contents,
-    ): (bool, String, bool, String, bool, String, String) = host
+    let (first_ok, first_error, nested_ok, nested_error, second_ok, second_error, contents): (
+        bool,
+        String,
+        bool,
+        String,
+        bool,
+        String,
+        String,
+    ) = host
         .lua()
         .load(
             r#"
@@ -1336,6 +1339,9 @@ fn with_c_keepcwd_restores_directory() {
     let original = std::env::current_dir().unwrap();
     let third = std::env::temp_dir().join(format!("ox-lua-with-c-third-{}", std::process::id()));
     std::fs::create_dir_all(&third).unwrap();
+    // `vim.fn.getcwd()` reports the resolved path — `/var` is a `/private`
+    // symlink on macOS — so the expectation is canonicalized.
+    let third = third.canonicalize().unwrap();
     let _cleanup = TempDir(third.clone());
 
     let third_str = third.to_string_lossy().into_owned();

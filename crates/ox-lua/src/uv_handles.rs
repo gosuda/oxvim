@@ -2343,6 +2343,12 @@ fn install_udp_tty(
         uv.set(
             "new_tty",
             lua.create_function(move |lua, (fd, readable): (i32, bool)| {
+                // `/dev/fd` exists on macOS as a device directory; on Linux
+                // it is only an optional symlink to `/proc/self/fd`, so the
+                // procfs path is the portable one there.
+                #[cfg(target_os = "macos")]
+                let path = format!("/dev/fd/{fd}");
+                #[cfg(not(target_os = "macos"))]
                 let path = format!("/proc/self/fd/{fd}");
                 let file = OpenOptions::new()
                     .read(readable)
@@ -2795,7 +2801,7 @@ mod fs_event_lifecycle_tests {
                 sealed.join("probe").to_string_lossy().as_ref(),
             )
             .unwrap();
-        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0))
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o0))
             .expect("seal directory");
         if std::fs::metadata(sealed.join("probe")).is_ok() {
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755))

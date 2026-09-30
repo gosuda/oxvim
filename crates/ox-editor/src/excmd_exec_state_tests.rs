@@ -185,9 +185,12 @@ impl CwdFixture {
         let directory =
             std::env::temp_dir().join(format!("ox-editor-{name}-{}-{nonce}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
+        // `getcwd(3)` answers the resolved path — on macOS `/var` and `/tmp`
+        // are `/private` symlinks — so fixtures hold canonical paths, the
+        // only form a working-directory comparison can trust.
         Self {
-            original,
-            directory,
+            original: original.canonicalize().unwrap(),
+            directory: directory.canonicalize().unwrap(),
         }
     }
 
@@ -807,9 +810,63 @@ fn wincmd_two_key_form_gates_the_tail_on_the_window_command() {
     );
 }
 
-// A literal `|` is the window-command key itself: only the second bar
-// separates the next command, so the key is dispatched (and rejected as
-// unimplemented, naming the key) instead of being read as trailing garbage.
+// ex_docmd.c:6583 — digits between the command name and the key are the
+// count (`wincmd 10<` resizes by 10), identical to a pre-command
+// `:10wincmd <` range: both land in `eap->line2` for `do_window`.
+#[test]
+fn wincmd_embedded_count_resizes_by_the_count() {
+    let (editor, _, _) = editor_with_window();
+
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "vsplit").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let width = editor.editor().window_geometry(window).unwrap().width;
+    exec.execute_line(&editor, "wincmd 10<").unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 10
+    );
+    exec.execute_line(&editor, "wincmd 5>").unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 5
+    );
+}
+
+// The count is consumed before the `check_nextcmd` scan, so a `|` tail
+// still splits after a digit-prefixed key (`wincmd 10< | cmd` runs the
+// tail; upstream accepts it the same way).
+#[test]
+fn wincmd_counted_key_splits_the_bar_tail() {
+    let (editor, buffer, _) = editor_with_window();
+
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    editor.editor_mut().buffer_mut(buffer).unwrap().mark_saved();
+    exec.execute_line(&editor, "vsplit").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let width = editor.editor().window_geometry(window).unwrap().width;
+
+    exec.execute_line(&editor, "wincmd 10< | setlocal modified")
+        .unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 10
+    );
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED)
+    );
+}
+
+// A literal `|` is the window-command key itself (maximize width): only the
+// second bar separates the next command, which then runs normally — the
+// oracle maximizes the window and applies `setlocal modified`, no E474.
 #[test]
 fn wincmd_pipe_key_consumes_the_first_bar_only() {
     let (editor, buffer, _) = editor_with_window();
@@ -818,20 +875,10 @@ fn wincmd_pipe_key_consumes_the_first_bar_only() {
     let mut exec = ExExecutor::new();
     editor.editor_mut().buffer_mut(buffer).unwrap().mark_saved();
 
-    let ExecError::Vim(exception) = exec
-        .execute_line(&editor, "wincmd | | setlocal modified")
-        .unwrap_err()
-    else {
-        panic!("expected E474 for the pipe key")
-    };
-    assert_eq!(exception.kind, VimExceptionKind::Error("E474".to_owned()));
+    exec.execute_line(&editor, "wincmd | | setlocal modified")
+        .unwrap();
     assert!(
-        exception.message().contains("Invalid argument: |"),
-        "{}",
-        exception.message()
-    );
-    assert!(
-        !editor
+        editor
             .editor()
             .buffer(buffer)
             .unwrap()
@@ -1456,6 +1503,9 @@ fn cd_changes_the_directory_observed_by_getcwd() {
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
+    // `getcwd` reports the resolved directory: `/var` is a `/private`
+    // symlink on macOS.
+    let target = target.canonicalize().unwrap();
 
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
@@ -1474,6 +1524,8 @@ fn cd_minus_toggles_and_returns_previous_directory() {
     let original = std::env::current_dir().unwrap();
     let target = std::env::temp_dir().join(format!("ox-editor-cd-{}", std::process::id()));
     std::fs::create_dir_all(&target).unwrap();
+    // `getcwd` and the `cd -` slot record the resolved directory.
+    let target = target.canonicalize().unwrap();
 
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();

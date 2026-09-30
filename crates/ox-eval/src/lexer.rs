@@ -799,20 +799,17 @@ impl<'a> Lexer<'a> {
             return Ok(character.encode_utf8(&mut encoded).as_bytes().to_vec());
         }
         if byte == b'<' {
-            let name_start = self.offset;
-            while !matches!(self.peek(0), None | Some(b'>')) {
-                self.offset += 1;
+            let tail = &self.source[self.offset..];
+            match find_special_key(tail, escape_offset)? {
+                Some((bytes, consumed)) => {
+                    self.offset += consumed;
+                    return Ok(bytes);
+                }
+                // Unresolved `\<`: Vim emits the `<` literal and scans the
+                // rest as ordinary string text (`"\<C-\\"` is the string
+                // `<C-\`).
+                None => return Ok(vec![b'<']),
             }
-            if self.peek(0) != Some(b'>') {
-                return Err(EvalError::new(
-                    "E114",
-                    escape_offset,
-                    "unfinished special key escape",
-                ));
-            }
-            let name = &self.source[name_start..self.offset];
-            self.offset += 1;
-            return decode_special_key(name, escape_offset);
         }
         // As in Vim, an unrecognized escape keeps the escaped byte and drops
         // only the backslash.
@@ -922,79 +919,538 @@ fn is_name_continue(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'#')
 }
 
-fn decode_special_key(name: &[u8], offset: usize) -> Result<Vec<u8>, EvalError> {
-    const SPECIAL: u8 = 0x80;
+/// One resolved key from a `\<name>` escape.
+#[derive(Clone, Copy)]
+enum DecodedKey {
+    /// A plain Unicode scalar (or byte), emitted with `utf_char2bytes`.
+    Char(u32),
+    /// An internal two-byte special key emitted as `K_SPECIAL t0 t1`.
+    Special(u8, u8),
+}
+
+/// `simplify_key`'s `modifier_keys_table` (`keycodes.c:51-137`):
+/// `(modifier mask, with-modifier pair, without-modifier pair)`.
+static SIMPLIFY_TABLE: &[(u8, u8, u8, u8, u8)] = &[
+    (0x02, b'&', b'9', b'@', b'1'),
+    (0x02, b'&', b'0', b'@', b'2'),
+    (0x02, b'*', b'1', b'@', b'4'),
+    (0x02, b'*', b'2', b'@', b'5'),
+    (0x02, b'*', b'3', b'@', b'6'),
+    (0x02, b'*', b'4', b'k', b'D'),
+    (0x02, b'*', b'5', b'k', b'L'),
+    (0x02, b'*', b'7', b'@', b'7'),
+    (0x02, b'*', b'9', b'@', b'9'),
+    (0x02, b'*', b'0', b'@', b'0'),
+    (0x02, b'#', b'1', b'%', b'1'),
+    (0x02, b'#', b'2', b'k', b'h'),
+    (0x02, b'#', b'3', b'k', b'I'),
+    (0x02, b'#', b'4', b'k', b'l'),
+    (0x02, b'%', b'a', b'%', b'3'),
+    (0x02, b'%', b'b', b'%', b'4'),
+    (0x02, b'%', b'c', b'%', b'5'),
+    (0x02, b'%', b'd', b'%', b'7'),
+    (0x02, b'%', b'e', b'%', b'8'),
+    (0x02, b'%', b'f', b'%', b'9'),
+    (0x02, b'%', b'g', b'%', b'0'),
+    (0x02, b'%', b'h', b'&', b'3'),
+    (0x02, b'%', b'i', b'k', b'r'),
+    (0x02, b'%', b'j', b'&', b'5'),
+    (0x02, b'!', b'1', b'&', b'6'),
+    (0x02, b'!', b'2', b'&', b'7'),
+    (0x02, b'!', b'3', b'&', b'8'),
+    (0x04, 0xfd, 88, b'@', b'7'),
+    (0x04, 0xfd, 87, b'k', b'h'),
+    (0x04, 0xfd, 85, b'k', b'l'),
+    (0x04, 0xfd, 86, b'k', b'r'),
+    (0x02, 0xfd, 4, b'k', b'u'),
+    (0x02, 0xfd, 5, b'k', b'd'),
+    (0x02, 0xfd, 71, 0xfd, 57),
+    (0x02, 0xfd, 72, 0xfd, 58),
+    (0x02, 0xfd, 73, 0xfd, 59),
+    (0x02, 0xfd, 74, 0xfd, 60),
+    (0x02, 0xfd, 6, b'k', b'1'),
+    (0x02, 0xfd, 7, b'k', b'2'),
+    (0x02, 0xfd, 8, b'k', b'3'),
+    (0x02, 0xfd, 9, b'k', b'4'),
+    (0x02, 0xfd, 10, b'k', b'5'),
+    (0x02, 0xfd, 11, b'k', b'6'),
+    (0x02, 0xfd, 12, b'k', b'7'),
+    (0x02, 0xfd, 13, b'k', b'8'),
+    (0x02, 0xfd, 14, b'k', b'9'),
+    (0x02, 0xfd, 15, b'k', b';'),
+    (0x02, 0xfd, 16, b'F', b'1'),
+    (0x02, 0xfd, 17, b'F', b'2'),
+    (0x02, 0xfd, 18, b'F', b'3'),
+    (0x02, 0xfd, 19, b'F', b'4'),
+    (0x02, 0xfd, 20, b'F', b'5'),
+    (0x02, 0xfd, 21, b'F', b'6'),
+    (0x02, 0xfd, 22, b'F', b'7'),
+    (0x02, 0xfd, 23, b'F', b'8'),
+    (0x02, 0xfd, 24, b'F', b'9'),
+    (0x02, 0xfd, 25, b'F', b'A'),
+    (0x02, 0xfd, 26, b'F', b'B'),
+    (0x02, 0xfd, 27, b'F', b'C'),
+    (0x02, 0xfd, 28, b'F', b'D'),
+    (0x02, 0xfd, 29, b'F', b'E'),
+    (0x02, 0xfd, 30, b'F', b'F'),
+    (0x02, 0xfd, 31, b'F', b'G'),
+    (0x02, 0xfd, 32, b'F', b'H'),
+    (0x02, 0xfd, 33, b'F', b'I'),
+    (0x02, 0xfd, 34, b'F', b'J'),
+    (0x02, 0xfd, 35, b'F', b'K'),
+    (0x02, 0xfd, 36, b'F', b'L'),
+    (0x02, 0xfd, 37, b'F', b'M'),
+    (0x02, 0xfd, 38, b'F', b'N'),
+    (0x02, 0xfd, 39, b'F', b'O'),
+    (0x02, 0xfd, 40, b'F', b'P'),
+    (0x02, 0xfd, 41, b'F', b'Q'),
+    (0x02, 0xfd, 42, b'F', b'R'),
+    (0x02, b'k', b'B', 0xfd, 54),
+];
+
+/// Identifier byte for the `find_special_key` name scan (`ascii_isident`).
+fn is_ident(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// `name_to_mod_mask` (`keycodes.c:171-184`): modifier letters recognized in a
+/// `\<X-key>` prefix. Case-insensitive; 'A' is an 'M' alias.
+fn mod_mask(byte: u8) -> Option<u8> {
+    Some(match byte.to_ascii_uppercase() {
+        b'M' | b'A' => 0x08,
+        b'T' => 0x10,
+        b'C' => 0x04,
+        b'S' => 0x02,
+        b'2' => 0x20,
+        b'3' => 0x40,
+        b'4' => 0x60,
+        b'D' => 0x80,
+        _ => return None,
+    })
+}
+
+/// Byte length of the first UTF-8 scalar (`utfc_ptr2len`); 1 on invalid UTF-8.
+fn utf_len(bytes: &[u8]) -> usize {
+    let Some(&first) = bytes.first() else { return 0 };
+    let len = if first < 0x80 {
+        1
+    } else if first < 0xe0 {
+        2
+    } else if first < 0xf0 {
+        3
+    } else {
+        4
+    };
+    if bytes.len() >= len && bytes[1..len].iter().all(|byte| byte & 0xc0 == 0x80) {
+        len
+    } else {
+        1
+    }
+}
+
+/// `vim_str2nr` with `STR2NR_ALL` and `strict` (`charset.c`): optional sign,
+/// `0x`/`0o`/`0b` radix prefixes (a bare leading `0` stays decimal in Neovim),
+/// at least one digit, and no trailing identifier junk. Returns the value and
+/// the consumed byte count.
+fn vim_str2nr(text: &[u8]) -> Option<(u32, usize)> {
+    let mut rest = text;
+    let mut negative = false;
+    if matches!(rest.first(), Some(&b'-' | &b'+')) {
+        negative = rest[0] == b'-';
+        rest = &rest[1..];
+    }
+    let (digits, radix) = if rest.len() > 2 && rest[..2].eq_ignore_ascii_case(b"0x") {
+        (&rest[2..], 16)
+    } else if rest.len() > 2 && rest[..2].eq_ignore_ascii_case(b"0o") {
+        (&rest[2..], 8)
+    } else if rest.len() > 2 && rest[..2].eq_ignore_ascii_case(b"0b") {
+        (&rest[2..], 2)
+    } else {
+        (rest, 10)
+    };
+    let digit_len = digits
+        .iter()
+        .take_while(|byte| (**byte as char).is_digit(radix))
+        .count();
+    if digit_len == 0 {
+        return None;
+    }
+    // The number ends at the first non-digit; strict mode rejects a trailing
+    // identifier character (`char-66x` is E474).
+    if digits
+        .get(digit_len)
+        .is_some_and(|byte| is_ident(*byte))
+    {
+        return None;
+    }
+    let value = u32::from_str_radix(
+        std::str::from_utf8(&digits[..digit_len]).ok()?,
+        radix,
+    )
+    .ok()?;
+    let signed = if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    };
+    Some((signed, text.len() - digits.len() + digit_len))
+}
+
+/// `handle_x_keys` (`keycodes.c:236-268`): maps the extra xterm keys to the
+/// codes they alias.
+fn handle_x_keys(second: u8, third: u8) -> DecodedKey {
     const EXTRA: u8 = 0xfd;
+    match (second, third) {
+        (EXTRA, 57..=60) => DecodedKey::Special(b'k', third - 8),
+        (EXTRA, 71..=74) => DecodedKey::Special(EXTRA, third - 65),
+        (EXTRA, 65) => DecodedKey::Special(b'k', b'u'),
+        (EXTRA, 66) => DecodedKey::Special(b'k', b'd'),
+        (EXTRA, 67) => DecodedKey::Special(b'k', b'l'),
+        (EXTRA, 68) => DecodedKey::Special(b'k', b'r'),
+        (EXTRA, 63 | 64) => DecodedKey::Special(b'k', b'h'),
+        (EXTRA, 61 | 62) => DecodedKey::Special(b'@', b'7'),
+        _ => DecodedKey::Special(second, third),
+    }
+}
+
+/// `get_special_key_code` (`keycodes.c:664-680`): the named-key table,
+/// case-insensitive. `t_xx` resolves to the raw termcap pair — the second `x`
+/// may be the `>` terminator itself, so `next` supplies the byte right after
+/// `name` (always `>` at this call site).
+#[allow(clippy::too_many_lines)] // one flat table mirrors `keycode_names.generated.h`
+fn named_key_code(name: &[u8], next: u8) -> Option<DecodedKey> {
+    const EXTRA: u8 = 0xfd;
+    if name.len() >= 3 && name[0] == b't' && name[1] == b'_' {
+        return Some(DecodedKey::Special(name[2], name.get(3).copied().unwrap_or(next)));
+    }
+    let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+    if let [b'f', rest @ ..] = lower.as_slice()
+        && !rest.is_empty()
+        && rest.iter().all(u8::is_ascii_digit)
+    {
+        let number: u8 = std::str::from_utf8(rest).ok()?.parse().ok()?;
+        return f_key(number);
+    }
+    let plain = match lower.as_slice() {
+        b"esc" | b"escape" => 0x1b,
+        b"cr" | b"enter" | b"return" => b'\r',
+        b"nl" | b"lf" | b"newline" | b"linefeed" => b'\n',
+        b"tab" => b'\t',
+        b"space" => b' ',
+        b"lt" => b'<',
+        b"bar" => b'|',
+        b"bslash" => b'\\',
+        b"csi" => 0x9b,
+        _ => 0,
+    };
+    if plain != 0 {
+        return Some(DecodedKey::Char(u32::from(plain)));
+    }
+    let special = match lower.as_slice() {
+        b"bs" | b"backspace" => (b'k', b'b'),
+        b"del" | b"delete" => (b'k', b'D'),
+        b"up" => (b'k', b'u'),
+        b"down" => (b'k', b'd'),
+        b"left" => (b'k', b'l'),
+        b"right" => (b'k', b'r'),
+        b"home" => (b'k', b'h'),
+        b"end" => (b'@', b'7'),
+        b"pageup" => (b'k', b'P'),
+        b"pagedown" => (b'k', b'N'),
+        b"ins" | b"insert" => (b'k', b'I'),
+        b"help" => (b'%', b'1'),
+        b"undo" => (b'&', b'8'),
+        b"find" => (b'@', b'0'),
+        b"select" => (b'*', b'6'),
+        b"nul" => (0xff, b'X'),
+        b"k0" => (b'K', b'C'),
+        b"k1" => (b'K', b'D'),
+        b"k2" => (b'K', b'E'),
+        b"k3" => (b'K', b'F'),
+        b"k4" => (b'K', b'G'),
+        b"k5" => (b'K', b'H'),
+        b"k6" => (b'K', b'I'),
+        b"k7" => (b'K', b'J'),
+        b"k8" => (b'K', b'K'),
+        b"k9" => (b'K', b'L'),
+        b"kup" | b"kp8" => (b'K', b'u'),
+        b"kdown" | b"kp2" => (b'K', b'd'),
+        b"kleft" | b"kp4" => (b'K', b'l'),
+        b"kright" | b"kp6" => (b'K', b'r'),
+        b"khome" | b"kp7" => (b'K', b'1'),
+        b"kend" | b"kp1" => (b'K', b'4'),
+        b"korigin" | b"kp5" => (b'K', b'2'),
+        b"kpageup" | b"kp9" => (b'K', b'3'),
+        b"kpagedown" | b"kp3" => (b'K', b'5'),
+        b"kplus" | b"kpplus" => (b'K', b'6'),
+        b"kminus" | b"kpminus" => (b'K', b'7'),
+        b"kdivide" | b"kpdiv" => (b'K', b'8'),
+        b"kmultiply" | b"kpmult" => (b'K', b'9'),
+        b"kenter" | b"kpenter" => (b'K', b'A'),
+        b"kpoint" => (b'K', b'B'),
+        b"kcomma" | b"kpcomma" => (b'K', b'M'),
+        b"kequal" | b"kpequals" => (b'K', b'N'),
+        b"kp0" | b"kins" | b"kinsert" => (EXTRA, 79),
+        b"kdel" | b"kpperiod" => (EXTRA, 80),
+        b"xf1" => (EXTRA, 57),
+        b"xf2" => (EXTRA, 58),
+        b"xf3" => (EXTRA, 59),
+        b"xf4" => (EXTRA, 60),
+        b"xend" => (EXTRA, 61),
+        b"zend" => (EXTRA, 62),
+        b"xhome" => (EXTRA, 63),
+        b"zhome" => (EXTRA, 64),
+        b"xup" => (EXTRA, 65),
+        b"xdown" => (EXTRA, 66),
+        b"xleft" => (EXTRA, 67),
+        b"xright" => (EXTRA, 68),
+        b"leftmousenm" => (EXTRA, 69),
+        b"leftreleasenm" => (EXTRA, 70),
+        b"ignore" => (EXTRA, 53),
+        b"snr" => (EXTRA, 82),
+        b"plug" => (EXTRA, 83),
+        b"drop" => (EXTRA, 95),
+        b"cmd" => (EXTRA, 104),
+        b"leftmouse" => (EXTRA, 44),
+        b"leftdrag" => (EXTRA, 45),
+        b"leftrelease" => (EXTRA, 46),
+        b"middlemouse" => (EXTRA, 47),
+        b"middledrag" => (EXTRA, 48),
+        b"middlerelease" => (EXTRA, 49),
+        b"rightmouse" => (EXTRA, 50),
+        b"rightdrag" => (EXTRA, 51),
+        b"rightrelease" => (EXTRA, 52),
+        b"x1mouse" => (EXTRA, 89),
+        b"x1drag" => (EXTRA, 90),
+        b"x1release" => (EXTRA, 91),
+        b"x2mouse" => (EXTRA, 92),
+        b"x2drag" => (EXTRA, 93),
+        b"x2release" => (EXTRA, 94),
+        b"mousemove" => (EXTRA, 100),
+        // `ScrollWheelLeft`/`Right` carry the pseudo-codes in upstream's
+        // order — K_MOUSERIGHT for left and K_MOUSELEFT for right.
+        b"scrollwheelup" | b"mousedown" => (EXTRA, 75),
+        b"scrollwheeldown" | b"mouseup" => (EXTRA, 76),
+        b"scrollwheelleft" => (EXTRA, 78),
+        b"scrollwheelright" => (EXTRA, 77),
+        b"mouse" => (0xfb, b'X'),
+        _ => return None,
+    };
+    Some(DecodedKey::Special(special.0, special.1))
+}
+
+/// `K_F1`..`K_F63` (`keycodes.h:270-339`): F1-F10 live in the `k` row,
+/// F11-F63 in the `F` row.
+fn f_key(number: u8) -> Option<DecodedKey> {
+    let pair = match number {
+        1..=9 => (b'k', b'0' + number),
+        10 => (b'k', b';'),
+        11..=63 => (
+            b'F',
+            *b"123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr"
+                .get(usize::from(number) - 11)?,
+        ),
+        _ => return None,
+    };
+    Some(DecodedKey::Special(pair.0, pair.1))
+}
+
+/// `find_special_key` + `special_to_buf` (`keycodes.c:470-604`), as called by
+/// `eval_string` with `FSK_KEYCODE | FSK_IN_STRING` plus `FSK_SIMPLIFY` when
+/// the name does not start with `*`.
+///
+/// `tail` is the source immediately after `\<`. On success returns the bytes
+/// the string stores and the number of `tail` bytes the whole escape consumed
+/// (name plus the `>` terminator). `Ok(None)` means the escape did not
+/// resolve: the caller emits a literal `<` and resumes at the next byte,
+/// matching upstream's `mb_copy_char` fallback.
+#[allow(clippy::too_many_lines)] // mirrors `find_special_key` + `special_to_buf` end to end
+fn find_special_key(tail: &[u8], offset: usize) -> Result<Option<(Vec<u8>, usize)>, EvalError> {
+    const SPECIAL: u8 = 0x80;
     const MODIFIER: u8 = 0xfc;
     const MOD_MASK_SHIFT: u8 = 0x02;
     const MOD_MASK_CTRL: u8 = 0x04;
-    const MOD_MASK_ALT: u8 = 0x08;
-    let mut name = name;
-    let simplify = name.first() != Some(&b'*');
-    if !simplify {
-        name = &name[1..];
+
+    let mut src = 0usize;
+    let mut simplify = true;
+    if tail.first() == Some(&b'*') {
+        simplify = false;
+        src = 1;
     }
-    let mut modifiers = 0u8;
-    loop {
-        if name.len() < 2 || name[1] != b'-' {
+
+    // Find end of modifier list (`keycodes.c:494-522`): walk `-` and
+    // identifier bytes, remembering the last `-` and skipping `t_xx` termcap
+    // names and `<char-N>` numbers whose dashes are not modifier separators.
+    let mut last_dash: Option<usize> = None;
+    let mut bp = src;
+    while bp < tail.len() && (tail[bp] == b'-' || is_ident(tail[bp])) {
+        if tail[bp] == b'-' {
+            last_dash = Some(bp);
+            if bp + 1 < tail.len() {
+                let len = utf_len(&tail[bp + 1..]);
+                // `<C-">`/`\<M-">` are not special inside a double-quoted
+                // string: `"` is the delimiter. `\">` escapes it.
+                if tail.len() - bp > len + 1
+                    && tail[bp + 1] != b'"'
+                    && tail.get(bp + 1 + len) == Some(&b'>')
+                {
+                    bp += len;
+                } else if tail.len() - bp > 3
+                    && tail[bp + 1] == b'\\'
+                    && tail[bp + 2] == b'"'
+                    && tail[bp + 3] == b'>'
+                {
+                    bp += 2;
+                }
+            }
+        }
+        if tail.len() - bp > 4 && tail[bp] == b't' && tail[bp + 1] == b'_' {
+            bp += 3;
+        } else if tail.len() - bp > 5 && tail[bp..bp + 5].eq_ignore_ascii_case(b"char-") {
+            let Some((_, len)) = vim_str2nr(&tail[bp + 5..]) else {
+                return Err(EvalError::new("E474", offset, "Invalid argument"));
+            };
+            bp += len + 5;
             break;
         }
-        modifiers |= match name[0].to_ascii_lowercase() {
-            b's' => MOD_MASK_SHIFT,
-            b'c' => MOD_MASK_CTRL,
-            b'm' | b'a' => MOD_MASK_ALT,
-            _ => break,
+        bp += 1;
+    }
+    if tail.get(bp) != Some(&b'>') {
+        return Ok(None);
+    }
+    let consumed = bp + 1;
+    let name = &tail[src..bp];
+    let (pre, after) = match last_dash {
+        Some(dash) => (&name[..dash - src], &name[dash - src + 1..]),
+        None => (&name[..0], name),
+    };
+
+    // Which modifiers are given? (`keycodes.c:531-540`)
+    let mut modifiers = 0u8;
+    for &byte in pre {
+        if byte == b'-' {
+            continue;
+        }
+        let Some(bit) = mod_mask(byte) else {
+            return Ok(None);
         };
-        name = &name[2..];
+        modifiers |= bit;
     }
-    let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
-    if simplify && modifiers == MOD_MASK_CTRL && name.len() == 1 {
-        let key = name[0].to_ascii_uppercase();
-        if key == b'?' {
-            return Ok(vec![0x7f]);
+
+    let resolved = if after.len() > 5
+        && after[..5].eq_ignore_ascii_case(b"char-")
+        && after[5].is_ascii_digit()
+    {
+        // `<Char-123>`, `<Char-033>`, `<Char-0x33>` (`keycodes.c:544-552`).
+        vim_str2nr(&after[5..])
+            .map(|(value, _)| DecodedKey::Char(value))
+    } else {
+        let single = if modifiers != 0 {
+            if after == b"\\\"" {
+                // `<C-\">` inside a double-quoted string (`keycodes.c:557-559`).
+                Some(DecodedKey::Char(u32::from(b'"')))
+            } else {
+                match after {
+                    &[first] => Some(DecodedKey::Char(u32::from(first))),
+                    _ if utf_len(after) == after.len() => std::str::from_utf8(after)
+                        .ok()
+                        .and_then(|text| text.chars().next())
+                        .map(|ch| DecodedKey::Char(u32::from(ch))),
+                    _ => None,
+                }
+            }
+        } else {
+            None
+        };
+        match single {
+            Some(key) => Some(key),
+            None => named_key_code(after, b'>').map(|key| match key {
+                DecodedKey::Char(value) => DecodedKey::Char(value),
+                DecodedKey::Special(second, third) => handle_x_keys(second, third),
+            }),
         }
-        if (b'@'..=b'_').contains(&key) {
-            return Ok(vec![key & 0x1f]);
+    };
+    let Some(mut resolved) = resolved else {
+        return Ok(None);
+    };
+    if matches!(resolved, DecodedKey::Char(0)) {
+        // `key != NUL` (`keycodes.c:575`): a zero keycode is no match.
+        return Ok(None);
+    }
+
+    // `simplify_key` (`keycodes.c:190-213`): fold Shift/Ctrl into a dedicated
+    // shifted keycode when one exists.
+    if modifiers & (MOD_MASK_SHIFT | MOD_MASK_CTRL) != 0 {
+        if let DecodedKey::Char(value) = resolved
+            && value == u32::from(b'\t')
+            && modifiers & MOD_MASK_SHIFT != 0
+        {
+            resolved = DecodedKey::Special(b'k', b'B');
+            modifiers &= !MOD_MASK_SHIFT;
+        } else if let DecodedKey::Special(first, second) = resolved
+            && let Some(entry) = SIMPLIFY_TABLE
+                .iter()
+                .find(|row| modifiers & row.0 != 0 && row.3 == first && row.4 == second)
+        {
+            modifiers &= !entry.0;
+            resolved = DecodedKey::Special(entry.1, entry.2);
         }
     }
+
+    // `extract_modifiers` (`keycodes.c:609-640`): fold Shift+letter into the
+    // uppercase key and simplify Ctrl+key into the control byte.
+    if let DecodedKey::Char(mut value) = resolved {
+        if modifiers & MOD_MASK_SHIFT != 0
+            && value < 0x80
+            && u8::try_from(value).is_ok_and(|byte| byte.is_ascii_alphabetic())
+        {
+            value = u32::from(u8::try_from(value).unwrap_or_default().to_ascii_uppercase());
+            if modifiers & MOD_MASK_CTRL == 0 {
+                modifiers &= !MOD_MASK_SHIFT;
+            }
+        }
+        if modifiers & MOD_MASK_CTRL != 0
+            && value < 0x80
+            && u8::try_from(value).is_ok_and(|byte| byte.is_ascii_alphabetic())
+        {
+            value = u32::from(u8::try_from(value).unwrap_or_default().to_ascii_uppercase());
+        }
+        if simplify
+            && modifiers & MOD_MASK_CTRL != 0
+            && ((0x3f..=0x5f).contains(&value)
+                || (value < 0x80
+                    && u8::try_from(value).is_ok_and(|byte| byte.is_ascii_alphabetic())))
+        {
+            value = match value {
+                0x3f => 0x7f,
+                value => value & 0x1f,
+            };
+            modifiers &= !MOD_MASK_CTRL;
+            resolved = if value == 0 {
+                // `<C-@>` is `<Nul>`.
+                DecodedKey::Special(0xff, b'X')
+            } else {
+                DecodedKey::Char(value)
+            };
+        } else {
+            resolved = DecodedKey::Char(value);
+        }
+    }
+
     let mut output = Vec::new();
     if modifiers != 0 {
         output.extend_from_slice(&[SPECIAL, MODIFIER, modifiers]);
     }
-
-    if let [b'f', digit @ b'1'..=b'9'] = lower.as_slice() {
-        output.extend_from_slice(&[SPECIAL, b'k', *digit]);
-        return Ok(output);
-    }
-    let named = match lower.as_slice() {
-        b"bs" => Some((b'B', 0x08)),
-        b"tab" => Some((b'T', b'\t')),
-        b"nl" => Some((b'N', b'\n')),
-        b"cr" | b"return" | b"enter" => Some((b'R', b'\r')),
-        b"esc" => Some((b'E', 0x1b)),
-        b"space" => Some((b'S', b' ')),
-        b"lt" => Some((b'L', b'<')),
-        b"bslash" => Some((b'\\', b'\\')),
-        b"bar" => Some((b'|', b'|')),
-        b"del" => Some((b'D', 0x7f)),
-        b"home" => Some((b'H', 0)),
-        _ => None,
-    };
-    if let Some((code, literal)) = named {
-        if modifiers == 0 || code == b'H' {
-            output.extend_from_slice(&[SPECIAL, EXTRA, code]);
-        } else {
-            output.push(literal);
+    match resolved {
+        DecodedKey::Char(value) => {
+            let Some(ch) = char::from_u32(value) else {
+                return Ok(None);
+            };
+            output.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
         }
-        return Ok(output);
+        DecodedKey::Special(second, third) => {
+            output.extend_from_slice(&[SPECIAL, second, third]);
+        }
     }
-    if !name.is_empty() {
-        output.extend_from_slice(name);
-        return Ok(output);
-    }
-    Err(EvalError::new(
-        "E114",
-        offset,
-        "unsupported special key escape",
-    ))
+    Ok(Some((output, consumed)))
 }

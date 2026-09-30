@@ -401,6 +401,104 @@ pub fn backspace(
     Ok(after)
 }
 
+/// `i_CTRL-W`: deletes the word before the cursor (`ins_bs` with
+/// `BACKSPACE_WORD`): trailing whitespace first, then the run of same-class
+/// characters. At column zero it joins with the previous line when
+/// 'backspace' contains `eol`, like every other insert delete.
+///
+/// # Errors
+///
+/// Returns an error when the affected line cannot be read, the deletion
+/// fails, or the window cursor cannot be updated.
+pub fn ctrl_w(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    mut cursor: Position,
+    allow_join: bool,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
+    if cursor.col == 0 {
+        return backspace(editor, buffer, window, cursor, allow_join, timestamp);
+    }
+    let class_before = |editor: &Editor, lnum: usize, col: usize| -> Result<u8, EditorError> {
+        let line = line(editor, buffer, lnum)?;
+        Ok(line
+            .get(col.saturating_sub(1))
+            .map_or(0, |byte| crate::motion::classify(*byte, false)))
+    };
+    while cursor.col > 0 && class_before(editor, cursor.lnum, cursor.col)? == 0 {
+        cursor = backspace(editor, buffer, window, cursor, false, timestamp)?;
+    }
+    if cursor.col > 0 {
+        let word_class = class_before(editor, cursor.lnum, cursor.col)?;
+        while cursor.col > 0 && class_before(editor, cursor.lnum, cursor.col)? == word_class {
+            cursor = backspace(editor, buffer, window, cursor, false, timestamp)?;
+        }
+    }
+    Ok(cursor)
+}
+
+/// `i_CTRL-U`: deletes the text entered on the current line back to the
+/// insert-session anchor (`ins_bs` with `BACKSPACE_LINE` stopping at
+/// `Ins.start_orig`). When the cursor is already at column zero, it deletes
+/// the newline instead — the join that undoes a bare `o`/`O`.
+///
+/// # Errors
+///
+/// Returns an error when the affected line cannot be read, the deletion
+/// fails, or the window cursor cannot be updated.
+pub fn ctrl_u(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    mut cursor: Position,
+    anchor: Position,
+    allow_join: bool,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
+    if cursor.col == 0 {
+        return backspace(editor, buffer, window, cursor, allow_join, timestamp);
+    }
+    while cursor.col > 0 && cursor != anchor {
+        cursor = backspace(editor, buffer, window, cursor, false, timestamp)?;
+    }
+    Ok(cursor)
+}
+
+/// `i_CTRL-E`/`i_CTRL-Y`: inserts the character from the line below (`E` =
+/// `below == true`) or above (`Y`) the cursor at the cursor's byte column,
+/// when that column lands on a character there.
+///
+/// # Errors
+///
+/// Returns an error when the sibling line cannot be read, the insert fails,
+/// or the window cursor cannot be updated.
+pub fn sibling_char(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    cursor: Position,
+    below: bool,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
+    let lnum = if below {
+        cursor.lnum + 1
+    } else {
+        cursor.lnum.wrapping_sub(1)
+    };
+    let Ok(sibling) = line(editor, buffer, lnum) else {
+        return Ok(cursor);
+    };
+    let Some(slice) = sibling.get(cursor.col..) else {
+        return Ok(cursor);
+    };
+    let Some(ch) = std::str::from_utf8(slice).ok().and_then(|text| text.chars().next()) else {
+        return Ok(cursor);
+    };
+    insert_char(editor, buffer, window, cursor, ch, timestamp)
+}
+
 /// Leaves insertion on the character before the insertion point, as `stop_insert()` does.
 ///
 /// # Errors

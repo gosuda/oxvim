@@ -602,8 +602,10 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
         editor.local_mark(buffer, 'a').unwrap(),
         Some(position(4, 0))
     );
-    assert_eq!(editor.window(window).unwrap().cursor, position(4, 1));
-    assert_eq!(editor.window(window).unwrap().topline, 4);
+    // `u` restores the pre-change cursor like upstream `uh_cursor`
+    // (undo.c:2518-2560) and the viewport scrolls it back into view.
+    assert_eq!(editor.window(window).unwrap().cursor, position(2, 0));
+    assert_eq!(editor.window(window).unwrap().topline, 2);
     assert_eq!(editor.changelists().len(buffer), 2);
 
     assert_eq!(editor.buffer_redo(buffer).unwrap(), Some(1));
@@ -618,8 +620,10 @@ fn undo_redo_replay_through_ticks_marks_and_winpos() {
         editor.local_mark(buffer, 'a').unwrap(),
         Some(position(5, 0))
     );
-    assert_eq!(editor.window(window).unwrap().cursor, position(5, 1));
-    assert_eq!(editor.window(window).unwrap().topline, 5);
+    // `CTRL-R` restores `uh_cursor_after`; it is already visible in the
+    // viewport, so the topline does not move.
+    assert_eq!(editor.window(window).unwrap().cursor, position(5, 0));
+    assert_eq!(editor.window(window).unwrap().topline, 2);
     assert_eq!(editor.changelists().len(buffer), 3);
 
     assert_eq!(editor.buffer_undo(buffer).unwrap(), Some(1));
@@ -1013,6 +1017,34 @@ fn replace_lines(
             })
             .unwrap();
     }
+}
+
+#[test]
+fn set_window_height_scrolls_topline_to_keep_cursor_visible() {
+    // `win_new_height`/`validate_cursor` (window.c): when a window shrinks
+    // below the cursor's screen row, its topline follows the cursor instead
+    // of leaving the cursor past the new text area.
+    let (mut editor, buffer, window) = editor_with_scrolled_window(
+        &[
+            b"l01", b"l02", b"l03", b"l04", b"l05", b"l06", b"l07", b"l08", b"l09", b"l10",
+        ],
+        position(10, 0),
+        6,
+        20,
+    );
+    let tab = editor.current_tabpage().unwrap();
+    editor.split_above(tab, window, buffer, false).unwrap();
+    editor.set_window_height(window, 2).unwrap();
+    let height = editor.window_text_height(window).unwrap();
+    assert!(
+        height < 5,
+        "expected the shrink to drop the window under the cursor row, got {height}"
+    );
+    // Cursor line 10 sits on the bottom row: topline = 10 - height + 1.
+    assert_eq!(
+        editor.window(window).unwrap().topline,
+        10usize.saturating_sub(height).saturating_add(1)
+    );
 }
 
 #[test]

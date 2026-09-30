@@ -922,6 +922,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn successful_exit_is_true_only_after_a_clean_exit() {
+        let mut live_command = Command::new("sh");
+        live_command.args(["-c", "cat >/dev/null"]);
+        let mut live = Client::spawn(live_command).unwrap();
+        assert!(!live.successful_exit());
+
+        let mut done_command = Command::new("sh");
+        done_command.args(["-c", "exit 0"]);
+        let mut done = Client::spawn(done_command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.successful_exit() {
+            assert!(
+                Instant::now() < deadline,
+                "child should have exited cleanly"
+            );
+        }
+
+        let mut failed_command = Command::new("sh");
+        failed_command.args(["-c", "exit 7"]);
+        let mut failed = Client::spawn(failed_command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while failed.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "child should have exited");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!failed.successful_exit());
+        let _ = live.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shutdown_reports_nonzero_exit_and_captured_stderr() {
         let mut command = Command::new("sh");
         command.args(["-c", "cat >/dev/null; printf child-failed >&2; exit 7"]);

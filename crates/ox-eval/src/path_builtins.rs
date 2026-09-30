@@ -292,7 +292,7 @@ fn temp_dir_names() -> Vec<PathBuf> {
     roots
 }
 
-/// `os_get_username` (`os/users.c`): the `/etc/passwd` name of the real uid,
+/// `os_get_username` (`os/users.c`): the `getpwuid` name of the real uid,
 /// or the uid rendered as a decimal number when it has none. Upstream then
 /// replaces path separators, because a user name may contain them.
 fn tempdir_user() -> String {
@@ -303,27 +303,31 @@ fn tempdir_user() -> String {
     name.replace(['/', '\\'], "_")
 }
 
-/// The real uid from `/proc/self/status`, which is how this crate already
-/// reads process and kernel state (see `hostname()`).
+/// The real uid from `getuid(2)`, which is what `os_get_username` starts
+/// from upstream.
+#[cfg(unix)]
 fn current_uid() -> Option<u32> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
-    let field = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
-    field.split_whitespace().next()?.parse().ok()
+    Some(ox_sys::unix::real_uid())
 }
 
-/// The `getpwuid` name for `uid`, read from `/etc/passwd`.
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+/// The `getpwuid` name for `uid`; on macOS this resolves through
+/// OpenDirectory, so an `/etc/passwd` parse would only see system accounts.
+#[cfg(unix)]
 fn passwd_name(uid: u32) -> Option<String> {
-    let passwd = fs::read_to_string("/etc/passwd").ok()?;
-    for line in passwd.lines() {
-        let mut fields = line.split(':');
-        let name = fields.next()?;
-        let _password = fields.next();
-        if fields.next().and_then(|value| value.parse::<u32>().ok()) == Some(uid)
-            && !name.is_empty()
-        {
-            return Some(name.to_owned());
-        }
-    }
+    ox_sys::unix::passwd_entry(uid)
+        .ok()
+        .flatten()
+        .map(|entry| entry.name)
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(not(unix))]
+fn passwd_name(_uid: u32) -> Option<String> {
     None
 }
 

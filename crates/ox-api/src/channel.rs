@@ -285,6 +285,7 @@ fn runtime_file_strings(session: &ApiSession, name: &str, all: bool) -> Vec<OxSt
 
 /// Reads a field of `/proc/<pid>/stat` split safely past the comm field,
 /// which may itself contain spaces and parentheses.
+#[cfg(target_os = "linux")]
 fn proc_stat_field(pid: i64, field: usize) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // comm is parenthesized and may contain ' ' and ')'; the fields after
@@ -293,6 +294,70 @@ fn proc_stat_field(pid: i64, field: usize) -> Option<String> {
     tail.split_whitespace()
         .nth(field.saturating_sub(3))
         .map(str::to_owned)
+}
+
+/// The `(name, ppid)` pair `nvim_get_proc` reports, or `None` when `pid`
+/// does not name a live process.
+#[cfg(target_os = "linux")]
+fn proc_name_and_ppid(pid: i64) -> Option<(String, i64)> {
+    let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|raw| raw.trim_end().to_owned())?;
+    // Upstream's helper reports {name, pid, ppid}
+    // (runtime/lua/vim/_core/editor.lua:215-219); ppid is stat field 4.
+    let parent = proc_stat_field(pid, 4)
+        .and_then(|field| field.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    Some((name, parent))
+}
+
+/// The `(name, ppid)` pair from `sysctl(KERN_PROC_PID)` — libproc's data
+/// source on Darwin, where `/proc` does not exist.
+#[cfg(target_os = "macos")]
+fn proc_name_and_ppid(pid: i64) -> Option<(String, i64)> {
+    let info = ox_sys::macos::proc_info(i32::try_from(pid).ok()?).ok()??;
+    Some((info.comm, info.ppid))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn proc_name_and_ppid(_pid: i64) -> Option<(String, i64)> {
+    None
+}
+
+/// Every child pid of `parent`, scanned the way upstream's portable route
+/// does (a PPID scan over the process table).
+#[cfg(target_os = "linux")]
+fn proc_children(parent: i64) -> Vec<i64> {
+    let mut children = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in entries.flatten() {
+        let Ok(candidate) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Ok(candidate_pid) = candidate.parse::<i64>() else {
+            continue;
+        };
+        // stat field 4 is PPID (1-based fields after the comm parenthesis).
+        if proc_stat_field(candidate_pid, 4).is_some_and(|ppid| ppid == parent.to_string()) {
+            children.push(candidate_pid);
+        }
+    }
+    children
+}
+
+#[cfg(target_os = "macos")]
+fn proc_children(parent: i64) -> Vec<i64> {
+    i32::try_from(parent)
+        .ok()
+        .and_then(|ppid| ox_sys::macos::child_pids(ppid).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn proc_children(_parent: i64) -> Vec<i64> {
+    Vec::new()
 }
 
 /// Gets info describing process `pid` (upstream `nvim_get_proc`,
@@ -308,17 +373,9 @@ pub fn nvim_get_proc(_session: &ApiSession, pid: i64) -> Result<Object, ApiError
     if !(pid > 0 && pid <= i32::MAX.into()) {
         return Ok(Object::Nil);
     }
-    let Some(name) = std::fs::read_to_string(format!("/proc/{pid}/comm"))
-        .ok()
-        .map(|raw| raw.trim_end().to_owned())
-    else {
+    let Some((name, parent)) = proc_name_and_ppid(pid) else {
         return Ok(Object::Nil);
     };
-    // Upstream's helper reports {name, pid, ppid}
-    // (runtime/lua/vim/_core/editor.lua:215-219); ppid is stat field 4.
-    let parent = proc_stat_field(pid, 4)
-        .and_then(|field| field.trim().parse::<i64>().ok())
-        .unwrap_or(0);
     Ok(Object::Dict(Dict(vec![
         (
             OxStr::from("name"),
@@ -342,25 +399,13 @@ pub fn nvim_get_proc_children(_session: &ApiSession, pid: i64) -> Result<Vec<Obj
     if !(pid > 0 && pid <= i32::MAX.into()) {
         return Ok(Vec::new());
     }
-    // The kernel's /proc children listing needs CONFIG_PROC_CHILDREN; the
-    // portable route upstream falls back to (a `ps` walk) is a PPID scan.
-    let mut children = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Ok(children);
-    };
-    for entry in entries.flatten() {
-        let Ok(candidate) = entry.file_name().into_string() else {
-            continue;
-        };
-        let Ok(candidate_pid) = candidate.parse::<i64>() else {
-            continue;
-        };
-        // stat field 4 is PPID (1-based fields after the comm parenthesis).
-        if proc_stat_field(candidate_pid, 4).is_some_and(|ppid| ppid == pid.to_string()) {
-            children.push(Object::Integer(candidate_pid));
-        }
-    }
-    Ok(children)
+    // Upstream's kernel children listing needs Linux's
+    // CONFIG_PROC_CHILDREN; the portable route it falls back to is a PPID
+    // scan over the process table.
+    Ok(proc_children(pid)
+        .into_iter()
+        .map(Object::Integer)
+        .collect())
 }
 
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {

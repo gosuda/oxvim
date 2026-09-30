@@ -161,7 +161,7 @@ fn immediate_pipe_callback_can_close_process_handles() {
             r"
             local output = vim.uv.new_pipe(false)
             local process
-            process = assert(vim.uv.spawn('/bin/true', { stdio = { nil, output, nil } }, function()
+            process = assert(vim.uv.spawn('/usr/bin/true', { stdio = { nil, output, nil } }, function()
               if not process:is_closing() then process:close() end
             end))
             output:read_start(function(err, chunk)
@@ -375,7 +375,9 @@ fn fs_event_rejects_mistyped_options_and_coerces_numbers() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+// APFS stores filenames as UTF-8 and rejects invalid byte sequences
+// (EILSEQ), so a raw-0xff name cannot exist under macOS at all.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn fs_event_callback_preserves_non_utf8_filename_bytes() {
     use std::ffi::OsString;
@@ -424,7 +426,7 @@ fn fs_event_callback_preserves_non_utf8_filename_bytes() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn fs_event_start_preserves_non_utf8_watch_path_bytes() {
     use std::ffi::OsString;
@@ -878,23 +880,47 @@ fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
     assert!(host.lua().globals().get::<bool>("write_fired").unwrap());
 }
 
-/// Capacity of a fresh child-stdin pipe: one blocking oversized write fills
-/// the pipe, and the `head -c 1` child exits after its single-byte read and
-/// closes the read end, so the write returns the partial count it copied —
-/// the pipe capacity — instead of blocking for a reader that never drains.
+/// Capacity of a fresh child-stdin pipe: a `sleep` child holds the read end
+/// open without ever draining it, so an `O_NONBLOCK` write loop fills the
+/// pipe and `WouldBlock` marks the exact capacity — the same probe on Linux
+/// and macOS.
 #[cfg(unix)]
 fn stdin_pipe_capacity() -> usize {
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("head")
-        .args(["-c", "1"])
+    let mut child = Command::new("sleep")
+        .arg("60")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn pipe capacity probe");
     let mut stdin = child.stdin.take().expect("probe stdin pipe");
-    let accepted = stdin.write(&vec![b'x'; 1 << 20]).expect("probe write");
+    // SAFETY: `fd` is a live pipe descriptor owned by `stdin`.
+    let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+    assert_ne!(flags, -1, "fcntl(F_GETFL)");
+    // SAFETY: `fd` is a live pipe descriptor owned by `stdin`.
+    assert_ne!(
+        unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        -1,
+        "fcntl(F_SETFL)"
+    );
+    let chunk = vec![b'x'; 1 << 16];
+    let mut accepted = 0usize;
+    loop {
+        match stdin.write(&chunk) {
+            Ok(written) if written > 0 => accepted += written,
+            Ok(_) => break,
+            Err(error) => {
+                assert!(
+                    error.kind() == std::io::ErrorKind::WouldBlock,
+                    "probe write: {error}"
+                );
+                break;
+            }
+        }
+    }
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
@@ -1027,7 +1053,9 @@ fn fresh_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("oxvim-uvfs-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    dir
+    // `uv.cwd()` and `uv.fs_realpath` answer resolved paths — `/var` is a
+    // `/private` symlink on macOS — so fixtures must be canonicalized.
+    dir.canonicalize().unwrap()
 }
 
 fn drive(host: &LuaHost, scheduler: &Rc<TestScheduler>, script: &str) {

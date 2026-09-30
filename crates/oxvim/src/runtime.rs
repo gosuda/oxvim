@@ -17,14 +17,11 @@ use ox_editor::{
     Editor, EditorError, ExExecutor, ExecOutcome, Geometry, MessageRouting, OptionError,
     OptionValue,
 };
-use ox_eval::BuiltinHost as EvalBuiltins;
-use ox_eval::{Builtins, Scope};
 use ox_lua::{
-    ApiDispatchContext, BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work, bind_api,
-    bind_variables, bind_with,
+    ApiDispatchContext, LuaHost, RuntimeRoot, Scheduler, Work, bind_api, bind_variables, bind_with,
 };
 use ox_text::Buffer;
-use ox_types::{BufHandle, Object, OxStr, Typval};
+use ox_types::{BufHandle, Object, OxStr};
 
 /// Start the terminal client against a child copy of this executable in embed mode.
 pub fn run_interactive(cli: &Cli) -> Result<ExitCode, AppError> {
@@ -348,20 +345,29 @@ fn seed_default_swap_directory(
 /// exist yet still opens as a named empty buffer, like upstream's buffer
 /// creation during argument-list setup; other read failures are `E484`,
 /// matching `:edit`'s error for an unreadable file.
-fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
-    // `RealFileIO` decodes lossily, so a startup file with invalid UTF-8
-    // opens with replacement characters instead of failing like `:edit`
-    // on an unreadable file.
-    let bytes = match fs::read(file) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(AppError::Ex(format!(
-                "E484: Can't open file {file}: {error}"
-            )));
-        }
-    };
-    let text = String::from_utf8_lossy(&bytes);
+fn read_startup_file(file: &str) -> Result<Vec<u8>, AppError> {
+    match fs::read(file) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(AppError::Ex(format!(
+            "E484: Can't open file {file}: {error}"
+        ))),
+    }
+}
+
+/// `readfile`'s line-ending pass for one startup file: run the
+/// 'fileformats' guess, then `from_bytes` re-derives 'eol' from the
+/// normalized text.
+fn startup_file_read(
+    editor: &mut Editor,
+    buffer: Option<BufHandle>,
+    bytes: &[u8],
+) -> ox_editor::excmd_exec::FileRead {
+    ox_editor::excmd_exec::detect_file_format(editor, buffer, bytes)
+}
+
+fn startup_file_buffer(read: &ox_editor::excmd_exec::FileRead) -> Result<Buffer, AppError> {
+    let text = String::from_utf8_lossy(&read.text);
     Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
 }
 
@@ -463,7 +469,7 @@ fn open_startup_files(
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
-        let text = read_startup_file(file)?;
+        let bytes = read_startup_file(file)?;
         // `file_readonly` (fileio.c:462): a file with no write permission
         // bit loads 'readonly'; a file that does not exist yet stays
         // writable as a new buffer.
@@ -480,6 +486,13 @@ fn open_startup_files(
             let current = editor
                 .current_buffer()
                 .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
+            if flags.binary {
+                let _ = editor
+                    .options_mut()
+                    .set_buffer(current, "binary", OptionValue::Boolean(true));
+            }
+            let read = startup_file_read(editor, Some(current), &bytes);
+            let text = startup_file_buffer(&read)?;
             if let Ok(state) = editor.buffer_mut(current) {
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
@@ -488,9 +501,29 @@ fn open_startup_files(
             handles.push(current);
             continue;
         }
+        let read = if flags.binary {
+            // `-b` sets 'binary' before the read (`open_buffer`), which
+            // forces UNIX and skips detection entirely.
+            ox_editor::excmd_exec::FileRead {
+                eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+                text: bytes.clone(),
+                fileformat: "unix",
+            }
+        } else {
+            startup_file_read(editor, None, &bytes)
+        };
+        let text = startup_file_buffer(&read)?;
         let handle = editor
             .create_buffer_with(text, true)
             .map_err(|error| AppError::Editor(error.to_string()))?;
+        let _ = editor.options_mut().set_buffer(
+            handle,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
@@ -776,6 +809,7 @@ fn split_commands(line: &str) -> Vec<&str> {
 }
 
 /// Run a Lua file with its trailing argv exposed in `_G.arg`.
+#[allow(clippy::too_many_lines)] // One `-l` startup wiring pass, like `nvim -es`'s.
 pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     let source = if script.path == "-" {
         let mut source = Vec::new();
@@ -785,6 +819,19 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         fs::read(&script.path).map_err(AppError::Io)?
     };
     let mut editor = Editor::new();
+    // Upstream `-l` sets `silent_mode` and `p_verbose = 1` together
+    // (main.c `command_line_scan`): the nonzero `'verbose'` keeps
+    // `msg_puts_printf` from dropping output (message.c:3038), and the
+    // stream ends with the batch-mode trailing newline that
+    // `PrintfSink::finish` adds only under silent routing.
+    editor.message_routing = MessageRouting {
+        silent: true,
+        ..MessageRouting::default()
+    };
+    editor
+        .options_mut()
+        .set_global("verbose", OptionValue::Number(1))
+        .map_err(|error| AppError::Editor(error.to_string()))?;
     let buffer = editor
         .create_buffer(true)
         .map_err(|error| AppError::Editor(error.to_string()))?;
@@ -812,9 +859,24 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         Ok::<(), AppError>(())
     })?;
     let registry = ox_api::core().map_err(|error| AppError::Api(error.to_string()))?;
+    // `nvim -l` runs scripts against a live editor, so `vim.fn` must route
+    // through the same editor-backed executor tier the embed path uses — a
+    // stateless builtin table reports E117 for every stateful builtin.
+    let mut primary = ExExecutor::new();
+    primary
+        .scripts_mut()
+        .set_runtime_roots_from_rtp(&default_rtp);
+    let channel_ids = session.with_editor(Editor::channel_ids);
+    primary.set_channel_ids(channel_ids.clone());
+    let mut nested = ExExecutor::new();
+    crate::server::seed_executor_from(&mut nested, &primary, &channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(ScriptBuiltins),
+        Rc::new(crate::server::EditorBuiltins {
+            session: session.clone(),
+            ex: Rc::new(RefCell::new(primary)),
+            nested_ex: Rc::new(RefCell::new(nested)),
+        }),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -838,7 +900,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         host.fast_callbacks(),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
-    let ui_context = ApiDispatchContext::new(session);
+    let ui_context = ApiDispatchContext::new(session.clone());
     let ui_fast = host.fast_callbacks();
     ox_lua::bind_ui_events(host.lua(), &ui_context, &ui_fast)
         .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -857,22 +919,76 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     lua.globals()
         .set("arg", arguments)
         .map_err(|error| AppError::Lua(error.to_string()))?;
-    lua.load(&source)
+    // Stock `os.exit` exits the real process mid-script, bypassing the
+    // post-exec print flush below; drain the editor's output first like
+    // upstream's exit path, then honour the requested status.
+    let flush_session = session.clone();
+    lua.globals()
+        .get::<mlua::Table>("os")
+        .and_then(|os| {
+            let exit =
+                lua.create_function(move |_, status: Option<mlua::Value>| -> mlua::Result<()> {
+                    let code = match status {
+                        Some(mlua::Value::Integer(code)) => i32::try_from(code).unwrap_or(1),
+                        Some(mlua::Value::Number(code)) => code as i32,
+                        Some(mlua::Value::Boolean(false)) => 1,
+                        _ => 0,
+                    };
+                    let _ = flush_lua_prints(&flush_session);
+                    std::process::exit(code);
+                })?;
+            os.set("exit", exit)
+        })
+        .map_err(|error| AppError::Lua(error.to_string()))?;
+    if let Err(error) = lua
+        .load(&source)
         .set_name(format!("@{}", script.path))
         .exec()
-        .map_err(|error| AppError::Lua(error.to_string()))
+    {
+        // `nlua_error` reports the chunk failure through `semsg_multiline`
+        // — an ordinary emsg on the message stream, never a process
+        // wrapper prefix (executor.c:305-312).
+        session.with_editor_mut(|editor| {
+            editor.push_message(ox_editor::Message {
+                kind: ox_editor::MessageKind::Error,
+                content: Object::String(OxStr::from(lua_chunk_error(&error).as_str())),
+                history: true,
+                leading_newline: true,
+            });
+        });
+        flush_lua_prints(&session)?;
+        std::process::exit(1);
+    }
+    // `print()` lands in the editor message stream via `nvim_out_write`
+    // (executor.c:nlua_print); flush it to the process's stdout/stderr like
+    // the batch path so `nvim -l` scripts emit their output — including the
+    // output a script printed before failing, which upstream still emits.
+    flush_lua_prints(&session)?;
+    Ok(())
 }
 
-struct ScriptBuiltins;
-impl BuiltinHost for ScriptBuiltins {
-    fn call(&self, name: &OxStr, args: Vec<Typval>) -> Result<Typval, String> {
-        // Pure-eval vimscript builtins with no editor state: the runtime
-        // prelude probes has('win32') during host init
-        // (runtime/lua/vim/_core/system.lua), and `-l` scripts may call any
-        // stateless builtin.
-        let mut builtins = Builtins::without_regex();
-        let mut scope = Scope::new();
-        EvalBuiltins::call(&mut builtins, name, args, &mut scope).map_err(|error| error.to_string())
+/// Drains the editor's message stream through the process's stdout/stderr,
+/// the way upstream's `os_out` emits `nvim -l` script output.
+fn flush_lua_prints(session: &ApiSession) -> Result<(), AppError> {
+    let mut sink = PrintfSink::default();
+    session.with_editor(|editor| {
+        for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
+            sink.write(*destination, message).map_err(AppError::Io)?;
+        }
+        sink.finish(editor.message_routing).map_err(AppError::Io)?;
+        Ok::<(), AppError>(())
+    })
+}
+
+/// Formats an `-l` script failure like upstream's `nlua_error`: a compile
+/// failure is `E5112: Lua chunk: ...` and a runtime failure `E5113: Lua
+/// chunk: ...` (message.c; executor.c `nlua_call_prepare`/`nlua_pcall`).
+/// mlua embeds the traceback in the error message, matching upstream's.
+fn lua_chunk_error(error: &mlua::Error) -> String {
+    match error {
+        mlua::Error::SyntaxError { message, .. } => format!("E5112: Lua chunk: {message}"),
+        mlua::Error::RuntimeError(message) => format!("E5113: Lua chunk: {message}"),
+        other => format!("E5113: Lua chunk: {other}"),
     }
 }
 

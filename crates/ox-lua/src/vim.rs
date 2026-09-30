@@ -821,7 +821,15 @@ pub fn bind_api(
         // observable string is `Invalid '<key>': not a boolean`
         // (api_spec.lua:301 pins the composite for nvim_exec2's `output`).
         // Presence stays the action signal, so `{valid = 0}` still counts.
-        let boolean_keys = ["cursor", "flush", "tabline", "statusline", "statuscolumn", "winbar", "valid"];
+        let boolean_keys = [
+            "cursor",
+            "flush",
+            "tabline",
+            "statusline",
+            "statuscolumn",
+            "winbar",
+            "valid",
+        ];
         for key in boolean_keys {
             if !opts.contains_key(key).unwrap_or(false) {
                 continue;
@@ -902,6 +910,10 @@ pub fn bind_api(
                 let rendered: LuaString = to_string.call(value)?;
                 bytes.extend_from_slice(&rendered.as_bytes());
             }
+            // Each `nlua_print` call renders one line-terminated message;
+            // the trailing newline is what completes the line in the
+            // `write_msg` buffer behind `nvim_out_write`.
+            bytes.push(b'\n');
             // executor.c:nlua_print queues the emit for fast callbacks
             // (executor.c:1159-1161) instead of raising E5560; single-threaded
             // host, so there is no worker-thread branch (executor.c:1154-1158)
@@ -916,10 +928,8 @@ pub fn bind_api(
                     // deferred print immediately, still under the live
                     // fast-callback guard (E5560). Emit directly to preserve
                     // the bytes — message-system capture does not apply
-                    // inside fast callbacks by definition. Like the queued
-                    // branch and upstream `nlua_print`, the payload carries
-                    // separators between values, never a trailing newline
-                    // (executor.c:1099-1106).
+                    // inside fast callbacks by definition. The payload is the
+                    // same line-terminated text the queued branch emits.
                     let mut stdout = std::io::stdout().lock();
                     return stdout.write_all(&bytes).map_err(mlua::Error::external);
                 }
@@ -1214,16 +1224,15 @@ fn with_c(
                 return Ok(MultiValue::new());
             }
         }
-        let hidden_target = entered.as_ref().is_some_and(|(window, _, residency)| {
-            Some(*window) == caller && residency.is_none()
-        });
+        let hidden_target = entered
+            .as_ref()
+            .is_some_and(|(window, _, residency)| Some(*window) == caller && residency.is_none());
         if hidden_target && let Some(buffer) = buf_handle {
             // Hidden buffer target: take over the caller window without
             // opening its file, matching upstream `ctx_switch`, while
             // preserving the target's entry residency for restoration.
-            let residency = session.with_editor_mut(|editor| {
-                EnteredResidency::enter(editor, buffer)
-            });
+            let residency =
+                session.with_editor_mut(|editor| EnteredResidency::enter(editor, buffer));
             match residency {
                 Ok(residency) => {
                     if let Some((_, _, slot)) = entered.as_mut() {
