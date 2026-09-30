@@ -9821,9 +9821,10 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     };
     if !command.bang
         && access.with_ex_editor(|editor| {
-            editor
-                .buffer(buffer)
-                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::READONLY))
+            editor.buffer(buffer).is_ok_and(|state| {
+                state.flags.contains(crate::BufferFlags::READONLY)
+                    || buffer_bool_option(editor, buffer, "readonly")
+            })
         })
     {
         return error_flow(
@@ -12162,7 +12163,8 @@ fn command_wqall<F: FileIO, E: ExEditorAccess>(
                 (
                     state.name().to_string_lossy().into_owned(),
                     state.flags.contains(crate::BufferFlags::MODIFIED),
-                    state.flags.contains(crate::BufferFlags::READONLY),
+                    state.flags.contains(crate::BufferFlags::READONLY)
+                        || buffer_bool_option(editor, buffer, "readonly"),
                 )
             })
         }) else {
@@ -12474,7 +12476,32 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Err(LoadSwitchError::Editor(error));
     }
 
-    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPost], buffer);
+    // First load of a file without any write permission bit marks the buffer
+    // 'readonly' (fileio.c:538 `b_p_ro`); reloads keep the option as the user
+    // left it. The metadata seam cannot see access(W_OK), so ACL- or
+    // mount-level unwritability is not covered.
+    if origin.is_created() {
+        let readonly = runtime
+            .scripts
+            .io()
+            .metadata(&path, true)
+            .ok()
+            .is_some_and(|meta| meta.mode & 0o222 == 0);
+        let _ = access.with_ex_editor(|editor| {
+            editor
+                .options_mut()
+                .set_buffer(buffer, "readonly", OptionValue::Boolean(readonly))
+        });
+    }
+
+    let flow = fire_buffer_lifecycle(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufReadPost],
+        buffer,
+    );
     if !matches!(flow, Flow::Normal) {
         rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(LoadSwitchError::Flow(flow));

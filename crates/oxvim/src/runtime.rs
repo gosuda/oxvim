@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::rc::Rc;
 
 use crate::AppError;
@@ -24,14 +24,29 @@ use ox_text::Buffer;
 use ox_types::{BufHandle, Object, OxStr};
 
 /// Start the terminal client against a child copy of this executable in embed mode.
-pub fn run_interactive(cli: &Cli) -> Result<(), AppError> {
+pub fn run_interactive(cli: &Cli) -> Result<ExitCode, AppError> {
     let executable = std::env::current_exe().map_err(AppError::Io)?;
     let mut command = Command::new(executable);
     command.arg("--embed");
     for argument in interactive_child_arguments(cli) {
         command.arg(argument);
     }
-    ox_tui::run_command(command).map_err(|error| AppError::Tui(error.to_string()))
+    match ox_tui::run_command(command) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        // The child chose its own exit status (`:cq 3`, `-c cquit`): its
+        // stderr was already relayed verbatim, so take the code.
+        Err(ox_tui::TuiError::Client(
+            ox_tui::client::ClientError::Eof {
+                exit_code: Some(code),
+                ..
+            }
+            | ox_tui::client::ClientError::NonZeroExit {
+                exit_code: Some(code),
+                ..
+            },
+        )) => Ok(crate::process_code(i64::from(code))),
+        Err(error) => Err(AppError::Tui(error.to_string())),
+    }
 }
 /// Seeds `v:argv` (main.c `build_argv_list`): the command line as the
 /// process saw it, `argv[0]` included.
@@ -418,8 +433,9 @@ fn apply_startup_file_overlays(
     editor: &mut Editor,
     handle: BufHandle,
     flags: StartupFlags,
+    readonly_perm: bool,
 ) -> Result<(), AppError> {
-    if flags.readonly {
+    if flags.readonly || readonly_perm {
         editor
             .options_mut()
             .set_buffer(handle, "readonly", OptionValue::Boolean(true))
@@ -454,6 +470,18 @@ fn open_startup_files(
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
         let bytes = read_startup_file(file)?;
+        // `file_readonly` (fileio.c:462): a file with no write permission
+        // bit loads 'readonly'; a file that does not exist yet stays
+        // writable as a new buffer.
+        #[cfg(unix)]
+        let readonly_perm = fs::metadata(file)
+            .map(|meta| {
+                use std::os::unix::fs::PermissionsExt;
+                meta.permissions().mode() & 0o222 == 0
+            })
+            .unwrap_or(false);
+        #[cfg(not(unix))]
+        let readonly_perm = false;
         if index == 0 && first_into_current {
             let current = editor
                 .current_buffer()
@@ -469,7 +497,7 @@ fn open_startup_files(
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
             }
-            apply_startup_file_overlays(editor, current, flags)?;
+            apply_startup_file_overlays(editor, current, flags, readonly_perm)?;
             handles.push(current);
             continue;
         }
@@ -500,7 +528,7 @@ fn open_startup_files(
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
         }
-        apply_startup_file_overlays(editor, handle, flags)?;
+        apply_startup_file_overlays(editor, handle, flags, readonly_perm)?;
         handles.push(handle);
     }
     Ok(handles)

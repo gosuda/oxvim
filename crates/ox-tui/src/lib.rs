@@ -419,6 +419,10 @@ pub enum TuiError {
 ///
 /// Returns an error when attachment, terminal setup or restoration, RPC or input
 /// handling, redraw decoding, frame construction, or terminal output fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the interactive loop is one indivisible terminal protocol transaction"
+)]
 pub fn run(mut client: Client) -> Result<(), TuiError> {
     // This full-screen client owns its palette; NO_COLOR must not strip its SGR output.
     crossterm::style::force_color_output(true);
@@ -449,13 +453,21 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     event::poll(INPUT_POLL).map_err(TuiError::Input)?;
     let size = crossterm::terminal::size().map_err(TuiError::Input)?;
     if size != (width, height) {
-        client.try_resize(size.0, size.1)?;
+        // Same clean-exit race as attach: a startup-quit child may be gone
+        // before this resize request.
+        if let Err(error) = client.try_resize(size.0, size.1) {
+            if finish_run(&mut session, &mut shared, false, &mut client, &error)? {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
     }
     let mut damage = DamageWriter::new(shared.clone(), capabilities.features.undercurl());
     // Registered before the palette is programmed: a terminating signal that
     // arrives between programming and the first loop turn must still reach the
     // restore path instead of killing the process with OSC 4 still in effect.
     let signals = ShutdownSignals::install()?;
+    client.watch_shutdown(signals.watch());
     let mut state = TuiState::new(
         env::var("COLORFGBG").ok().as_deref(),
         MotionPolicy::from_environment(),
@@ -502,6 +514,11 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                     render_current_frame(&mut session, &mut damage, &grid, &state, capabilities)?;
                 }
             }
+            Err(ClientError::Interrupted) => {
+                // A wait interrupted by a terminating signal surfaces at the
+                // `signals.pending()` check on the next loop turn.
+                continue;
+            }
             Err(error) => {
                 if finish_run(
                     &mut session,
@@ -519,6 +536,9 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
         // `:wq`'s stream close can race the `nvim_input` reply: a clean
         // child exit surfacing here is the normal quit path, not a failure.
         if let Err(error) = forward_terminal_events(&mut client, &mut state) {
+            if matches!(&error, TuiError::Client(ClientError::Interrupted)) {
+                continue;
+            }
             if let TuiError::Client(client_error) = &error
                 && finish_run(
                     &mut session,
@@ -554,7 +574,28 @@ fn finish_run(
     {
         return Ok(true);
     }
-    process_failure(error).write_diagnostic(&mut io::stderr())?;
+    // A child that exited with a status chose its own exit code (`:cq 3`):
+    // the caller maps it onto the process status, so its stderr is relayed
+    // verbatim rather than wrapped in the transport diagnostic.
+    match error {
+        ClientError::Eof {
+            exit_code: Some(_),
+            stderr,
+        }
+        | ClientError::NonZeroExit {
+            exit_code: Some(_),
+            stderr,
+        } => {
+            let mut out = io::stderr();
+            out.write_all(stderr).map_err(TuiError::Input)?;
+            if !stderr.is_empty() && !stderr.ends_with(b"\n") {
+                out.write_all(b"\n").map_err(TuiError::Input)?;
+            }
+        }
+        _ => {
+            process_failure(error).write_diagnostic(&mut io::stderr())?;
+        }
+    }
     Ok(false)
 }
 

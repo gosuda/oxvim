@@ -503,6 +503,7 @@ pub const RESTORE_SIGNALS: [c_int; 2] = [signal_hook::consts::SIGINT, signal_hoo
 /// Flags for the terminating signals that must restore the terminal first.
 pub struct ShutdownSignals {
     flags: Vec<(c_int, Arc<AtomicBool>)>,
+    requested: Arc<AtomicBool>,
 }
 
 impl ShutdownSignals {
@@ -522,14 +523,27 @@ impl ShutdownSignals {
     /// Returns an error if registering any signal handler flag fails;
     /// registrations completed before the failure stay installed.
     pub fn install_for(signals: &[c_int]) -> Result<Self, TerminalError> {
+        let requested = Arc::new(AtomicBool::new(false));
         let mut flags = Vec::with_capacity(signals.len());
         for signal in signals {
             let flag = Arc::new(AtomicBool::new(false));
             signal_hook::flag::register(*signal, Arc::clone(&flag))
                 .map_err(|error| TerminalError::io("shutdown signal registration", error))?;
+            // `pending` consumes the per-signal flag, so a wait loop that
+            // only watches for termination needs its own registration.
+            signal_hook::flag::register(*signal, Arc::clone(&requested))
+                .map_err(|error| TerminalError::io("shutdown signal registration", error))?;
             flags.push((*signal, flag));
         }
-        Ok(Self { flags })
+        Ok(Self { flags, requested })
+    }
+
+    /// A shared flag set by any registered signal, for interruptible waits.
+    ///
+    /// Unlike [`Self::pending`] it is never consumed: a synchronous RPC wait
+    /// can poll it while the loop's `pending` check is unreachable.
+    pub fn watch(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.requested)
     }
 
     /// The first delivered signal, in [`RESTORE_SIGNALS`] order, or `None`.

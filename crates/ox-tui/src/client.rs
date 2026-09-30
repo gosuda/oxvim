@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -104,6 +105,12 @@ pub enum ClientError {
     /// A transport worker panicked while the client was shutting down.
     #[error("the {0} worker panicked")]
     WorkerPanicked(&'static str),
+    /// A terminating signal interrupted an unbounded wait.
+    ///
+    /// Raised only while a shutdown flag from [`crate::ShutdownSignals`] is
+    /// watched; the run loop maps it back to its own signal check.
+    #[error("a terminating signal interrupted the wait")]
+    Interrupted,
 }
 
 /// A synchronous client connected to an embedded editor over stdio.
@@ -116,6 +123,7 @@ pub struct Client {
     stderr: Arc<Mutex<Vec<u8>>>,
     msgids: MsgidCounter,
     redraws: VecDeque<Vec<RedrawEvent>>,
+    shutdown: Option<Arc<AtomicBool>>,
 }
 
 impl Client {
@@ -183,6 +191,7 @@ impl Client {
             stderr,
             msgids: MsgidCounter::new(),
             redraws: VecDeque::new(),
+            shutdown: None,
         })
     }
 
@@ -466,13 +475,36 @@ impl Client {
     }
 
     fn next_message(&mut self) -> Result<Message, ClientError> {
-        match self.incoming.recv() {
-            Ok(ReaderEvent::Message(message)) => Ok(message),
-            Ok(ReaderEvent::Decode(error)) => Err(ClientError::Decode(error)),
-            Ok(ReaderEvent::Read(source)) => Err(ClientError::Read { source }),
-            Ok(ReaderEvent::Eof) => Err(self.eof_error()),
-            Err(_) => Err(ClientError::ReaderStopped),
+        loop {
+            match self.incoming.recv_timeout(Duration::from_millis(50)) {
+                Ok(ReaderEvent::Message(message)) => return Ok(message),
+                Ok(ReaderEvent::Decode(error)) => return Err(ClientError::Decode(error)),
+                Ok(ReaderEvent::Read(source)) => return Err(ClientError::Read { source }),
+                Ok(ReaderEvent::Eof) => return Err(self.eof_error()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self
+                        .shutdown
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+                    {
+                        return Err(ClientError::Interrupted);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(ClientError::ReaderStopped);
+                }
+            }
         }
+    }
+
+    /// Watch a shared signal flag that turns unbounded waits into
+    /// [`ClientError::Interrupted`] once any terminating signal lands.
+    ///
+    /// A synchronous request can outlast the editor's own processing —
+    /// `:!<CR>` only replies after the shell command finishes — so the run
+    /// loop's signal check alone cannot wake a parked wait.
+    pub fn watch_shutdown(&mut self, shutdown: Arc<AtomicBool>) {
+        self.shutdown = Some(shutdown);
     }
 
     /// Wait briefly for the child to exit and report whether it was clean.

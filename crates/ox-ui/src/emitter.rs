@@ -120,11 +120,23 @@ impl Emitter {
             return Ok(RedrawOutput::default_empty(chrome.take_events()));
         }
         let chrome_events = chrome.take_events();
-        let mut initial_chrome_events = chrome.snapshot_events();
-        for event in &chrome_events {
-            if !initial_chrome_events.contains(event) {
-                initial_chrome_events.push(event.clone());
-            }
+        // A first-redraw channel gets the state snapshot merged with this
+        // pass's transitions; dedup is against the snapshot alone, not the
+        // growing merged list (that scan is quadratic on large batches, and
+        // established channels already see pending events verbatim).
+        let needs_initial = channels
+            .iter()
+            .any(|(id, _)| !self.initialized.contains(id));
+        let mut initial_chrome_events = Vec::new();
+        if needs_initial {
+            let snapshot = chrome.snapshot_events();
+            initial_chrome_events.extend_from_slice(&snapshot);
+            initial_chrome_events.extend(
+                chrome_events
+                    .iter()
+                    .filter(|event| !snapshot.contains(event))
+                    .cloned(),
+            );
         }
         let mut frames = BTreeMap::new();
         for (&channel_id, channel) in channels.iter_mut() {
