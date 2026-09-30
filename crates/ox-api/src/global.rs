@@ -2551,8 +2551,10 @@ fn modifier_termcode(notation: &[u8]) -> Option<Vec<u8>> {
     let encoded = Keys::parse_notation(&format!("<{text}>"), "\\", "\\");
     let bytes = encoded.as_bytes();
     // A notation the parser also could not resolve comes back as literal
-    // text; only a real decode is accepted here.
-    (bytes.first() == Some(&K_SPECIAL)).then(|| bytes.to_vec())
+    // text; only a real decode is accepted here — including plain bytes like
+    // `<S-A>` -> 'A', which carry no `K_SPECIAL` lead.
+    (!bytes.is_empty() && !bytes.starts_with(format!("<{text}>").as_bytes()))
+        .then(|| bytes.to_vec())
 }
 
 fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {

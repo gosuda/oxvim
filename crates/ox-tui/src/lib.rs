@@ -631,7 +631,14 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
             }
             Event::Paste(data) => {
                 state.chrome.keypress();
-                client.paste(OxStr::from(data.as_str()))?;
+                match client.paste(OxStr::from(data.as_str())) {
+                    // A refused paste (`'nomodifiable'`, a cancelled
+                    // `vim.paste`, ...) is a remote rejection the server
+                    // already reports in the message area, not a transport
+                    // failure the session should die on.
+                    Ok(_) | Err(ClientError::Remote(_)) => {}
+                    Err(error) => return Err(TuiError::Client(error)),
+                }
             }
             Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
             Event::Mouse(mouse) => {
@@ -868,11 +875,15 @@ fn paint_message_surfaces(
     }
     if let (Some(rect), Some(history)) = (layout.history, &state.chrome.history_float) {
         let mut text = Vec::new();
-        for entry in &history.entries {
+        for (index, entry) in history.entries.iter().enumerate() {
+            // An `append` entry continues the previous message's line
+            // (`msg_ext_append` in ui.txt), not a fresh row.
+            if index > 0 && !entry.append {
+                text.push(b'\n');
+            }
             for chunk in &entry.content {
                 text.extend_from_slice(chunk.text.as_bytes());
             }
-            text.push(b'\n');
         }
         canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
     }

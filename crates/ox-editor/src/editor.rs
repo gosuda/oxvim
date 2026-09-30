@@ -803,6 +803,7 @@ impl Editor {
                         col: cursor_col,
                     };
                     state.topline = topline;
+                    state.skiprows = 0;
                 }
             }
         }
@@ -1659,7 +1660,7 @@ impl Editor {
             .get(&window)
             .copied()
             .ok_or(EditorError::UnknownWindow(window))?;
-        let topline = {
+        let (topline, skiprows) = {
             let state = self.window(window)?;
             let tabpage = self
                 .tabpages
@@ -1667,6 +1668,7 @@ impl Editor {
                 .ok_or(EditorError::UnknownTabpage(tab))?;
             let height = viewport_height(tabpage, window);
             let mut topline = cursor_visible_topline(state.topline, position.lnum, height);
+            let mut skiprows = 0;
             let geometry = self.window_geometry(window)?;
             let wrap = match self.options().get_window(window, "wrap") {
                 Ok(OptionValue::Boolean(value)) => *value,
@@ -1676,11 +1678,11 @@ impl Editor {
                 // `update_topline` works in screen rows: wrapped lines above
                 // the cursor push it out of the window even when the line
                 // numbers look in range, so scroll by wrapped heights.
-                topline = self
+                (topline, skiprows) = self
                     .wrapped_cursor_topline(state.buffer, topline, position, height, geometry.width)
-                    .unwrap_or(topline);
+                    .unwrap_or((topline, 0));
             }
-            topline
+            (topline, skiprows)
         };
         let tabpage = self
             .tabpages
@@ -1689,13 +1691,15 @@ impl Editor {
         let state = tabpage.window_mut(window)?;
         state.cursor = position;
         state.topline = topline;
+        state.skiprows = skiprows;
         // `check_cursor_moved` / most motions set `w_set_curswant`.
         state.set_curswant = true;
         Ok(())
     }
 
-    /// Topline that keeps `position` on screen with `'wrap'` on, or `None` when
-    /// the window's buffer or cursor line can't be read.
+    /// Topline plus the wrapped rows to skip inside it (upstream `w_skipcol`)
+    /// that keep `position` on screen with `'wrap'` on, or `None` when the
+    /// window's buffer or cursor line can't be read.
     fn wrapped_cursor_topline(
         &self,
         buffer: BufHandle,
@@ -1703,14 +1707,15 @@ impl Editor {
         cursor: Position,
         height: usize,
         width: usize,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize)> {
         let tabstop = match self.options().get_buffer(buffer, "tabstop") {
             Ok(OptionValue::Number(value)) if *value > 0 => usize::try_from(*value).ok()?,
             _ => crate::builtins::position::tabstop(self),
         };
         let text = self.buffer(buffer).ok()?.text().ok()?;
         let cursor_line = text.line(cursor.lnum).ok()?;
-        let mut screen_row = cursor_vcol(&cursor_line, cursor.col, tabstop) / width;
+        let cursor_row = cursor_vcol(&cursor_line, cursor.col, tabstop) / width;
+        let mut screen_row = cursor_row;
         let mut topline = topline;
         for lnum in (topline..cursor.lnum).rev() {
             let line = text.line(lnum).ok()?;
@@ -1721,7 +1726,15 @@ impl Editor {
             }
             screen_row += rows;
         }
-        Some(topline)
+        // When the cursor's own line is taller than the window it can't be
+        // scrolled past itself: skip the wrapped rows above the cursor
+        // instead (`w_skipcol` in upstream `update_topline`).
+        let skiprows = if topline == cursor.lnum && cursor_row >= height {
+            cursor_row.saturating_sub(height.saturating_sub(1))
+        } else {
+            0
+        };
+        Some((topline, skiprows))
     }
 
     /// Changes the first displayed line of a live window.
@@ -1748,7 +1761,9 @@ impl Editor {
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
-        tabpage.window_mut(window)?.topline = topline.max(1);
+        let state = tabpage.window_mut(window)?;
+        state.topline = topline.max(1);
+        state.skiprows = 0;
         Ok(())
     }
 
@@ -2631,6 +2646,7 @@ impl Editor {
             let height = tabpage.tiled_window_text_height(window)?;
             let state = tabpage.window_mut(window)?;
             state.topline = cursor_visible_topline(state.topline, state.cursor.lnum, height);
+            state.skiprows = 0;
         }
         Ok(())
     }
@@ -4099,6 +4115,7 @@ impl Editor {
         let target_state = tabpage.window_mut(target)?;
         target_state.topline =
             cursor_visible_topline(fraction_topline, target_state.cursor.lnum, new_height);
+        target_state.skiprows = 0;
         if enter {
             self.previous_window = previous.filter(|current| *current != window);
         }
@@ -4157,6 +4174,7 @@ impl Editor {
                 new_count,
                 kind: ToplineSpliceKind::Lines,
             });
+            state.skiprows = 0;
         }
     }
 
@@ -4253,6 +4271,7 @@ impl Editor {
                 new_count,
                 kind: ToplineSpliceKind::Text,
             });
+            state.skiprows = 0;
         }
     }
 
