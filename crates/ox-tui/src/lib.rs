@@ -506,21 +506,50 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                 }
             }
             Err(error) => {
-                if mouse_capture_emitted {
-                    let _ = apply_mouse_capture(&mut shared, false);
-                }
-                session.restore()?;
-                if clean_eof(&error) {
+                if finish_run(&mut session, &mut shared, mouse_capture_emitted, &error)? {
                     return Ok(());
                 }
-                let failure = process_failure(&error);
-                failure.write_diagnostic(&mut io::stderr())?;
                 return Err(TuiError::Client(error));
             }
         }
 
-        forward_terminal_events(&mut client, &mut state)?;
+        // Keys forwarded as the editor quits (`:wq`'s stream close racing the
+        // `nvim_input` reply) surface here instead of through `recv_redraw`:
+        // a clean child exit is the normal quit path, not a failure.
+        if let Err(error) = forward_terminal_events(&mut client, &mut state) {
+            let TuiError::Client(client_error) = &error else {
+                return Err(error);
+            };
+            if finish_run(
+                &mut session,
+                &mut shared,
+                mouse_capture_emitted,
+                client_error,
+            )? {
+                return Ok(());
+            }
+            return Err(error);
+        }
     }
+}
+
+/// Shared post-failure path for [`run`]: drop mouse capture, restore the
+/// terminal, then report whether the error was a clean editor quit.
+fn finish_run(
+    session: &mut TerminalSession<SharedWriter>,
+    shared: &mut SharedWriter,
+    mouse_capture_emitted: bool,
+    error: &ClientError,
+) -> Result<bool, TuiError> {
+    if mouse_capture_emitted {
+        let _ = apply_mouse_capture(shared, false);
+    }
+    session.restore()?;
+    if clean_eof(error) {
+        return Ok(true);
+    }
+    process_failure(error).write_diagnostic(&mut io::stderr())?;
+    Ok(false)
 }
 
 fn render_current_frame(
