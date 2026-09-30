@@ -286,12 +286,10 @@ mod tests {
     fn hostname_matches_the_dns_name_not_the_environment() -> std::io::Result<()> {
         let name = super::hostname()?;
         assert!(!name.is_empty());
-        // `GetComputerNameExW(ComputerNameDnsHostname)` agrees with
-        // COMPUTERNAME on an ordinary machine, while ignoring it when the
-        // variable is spoofed or absent.
-        if let Ok(env_name) = std::env::var("COMPUTERNAME") {
-            assert_eq!(name.to_uppercase(), env_name.to_uppercase());
-        }
+        // `hostname()` must not validate against COMPUTERNAME here: the env
+        // var is the NetBIOS name (truncated to 15 chars) and may be
+        // configured or overridden independently of the DNS hostname the API
+        // returns, so no comparison between them can hold everywhere.
         Ok(())
     }
 

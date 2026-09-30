@@ -1318,3 +1318,17 @@ fn preview_pattern_classifies_families() {
         );
     }
 }
+
+// A drive-letter path argument must not split the command at the drive
+// colon: `e C:\path` stays one `edit` whose args keep the whole path.
+// (Regression coverage for a Windows GUI pass where the command echo showed
+// only `\path` — the `e C:` keystrokes were lost to the ConPTY input-record
+// boundary, not to parsing.)
+#[test]
+fn drive_letter_path_arg_parses_as_one_command() {
+    let command = parse_one("e C:\\Users\\Administrator\\oxvim_adv_long.txt");
+    assert_eq!(
+        command.args, "C:\\Users\\Administrator\\oxvim_adv_long.txt",
+        "the drive path must survive as the command's argument"
+    );
+}

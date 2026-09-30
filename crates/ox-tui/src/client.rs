@@ -475,11 +475,20 @@ impl Client {
         }
     }
 
-    /// Whether the child already exited successfully. A send that failed
-    /// because the child quit is not a transport failure — the RPC peer is
-    /// gone only because the editor finished shutting down first.
-    pub fn exited_successfully(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(status)) if status.success())
+    /// Wait briefly for the child to exit and report whether it was clean.
+    ///
+    /// A broken pipe on the request write can outrun the reader's EOF
+    /// notification when the child quits between a keypress and its request;
+    /// confirming the exit keeps that race on the clean path.
+    pub fn successful_exit(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(None) | Err(_) => return false,
+            }
+        }
     }
 
     fn eof_error(&mut self) -> ClientError {
@@ -881,22 +890,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn exited_successfully_is_true_only_after_a_clean_exit() {
+    fn successful_exit_is_true_only_after_a_clean_exit() {
         let mut live_command = Command::new("sh");
         live_command.args(["-c", "cat >/dev/null"]);
         let mut live = Client::spawn(live_command).unwrap();
-        assert!(!live.exited_successfully());
+        assert!(!live.successful_exit());
 
         let mut done_command = Command::new("sh");
         done_command.args(["-c", "exit 0"]);
         let mut done = Client::spawn(done_command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !done.exited_successfully() {
+        while !done.successful_exit() {
             assert!(
                 Instant::now() < deadline,
                 "child should have exited cleanly"
             );
-            thread::sleep(Duration::from_millis(5));
         }
 
         let mut failed_command = Command::new("sh");
@@ -907,7 +915,7 @@ mod tests {
             assert!(Instant::now() < deadline, "child should have exited");
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(!failed.exited_successfully());
+        assert!(!failed.successful_exit());
         let _ = live.shutdown();
     }
 
