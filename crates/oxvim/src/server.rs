@@ -699,6 +699,7 @@ impl AppState {
         let mode = Rc::new(RefCell::new(ModeMachine::default()));
         ex.borrow_mut().set_mode_machine(mode.clone());
         nested_ex.borrow_mut().set_mode_machine(mode.clone());
+        ox_api::set_mode_machine(&session, mode.clone());
         let mut state = Self {
             session,
             lua,

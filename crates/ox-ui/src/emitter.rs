@@ -167,16 +167,28 @@ impl Emitter {
                     if options.ext_messages && layer.kind == LayerKind::Message {
                         continue;
                     }
-                    emit_position(channel, layer, float_compindex.get(&index).copied())?;
+                    // The grid must exist before its position event: a new
+                    // float's `win_float_pos` references the grid id, so
+                    // `grid_resize` has to precede it in the same flush.
                     self.emit_grid(channel_id, channel, &layer.grid)?;
-                    if let Some((row, col)) = layer.cursor {
+                    emit_position(channel, layer, float_compindex.get(&index).copied())?;
+                    // Upstream never puts a cursor outside the emitting grid:
+                    // an off-viewport position (e.g. a wrapped line taller
+                    // than the window) simply produces no cursor move.
+                    if let Some((row, col)) = layer.cursor
+                        && row < layer.grid.height()
+                        && col < layer.grid.width()
+                    {
                         channel.emit(UiEvent::new(
                             "grid_cursor_goto",
                             vec![Object::Integer(layer.grid.id()), integer(row), integer(col)],
                         ))?;
                     }
                 }
-                if let Some((row, col)) = cmdline_cursor {
+                if let Some((row, col)) = cmdline_cursor
+                    && row < default_grid.height()
+                    && col < default_grid.width()
+                {
                     channel.emit(UiEvent::new(
                         "grid_cursor_goto",
                         vec![Object::Integer(1), integer(row), integer(col)],
@@ -205,7 +217,10 @@ impl Emitter {
                     apply_popupmenu_fallback(&mut output, highlights, chrome)?;
                 }
                 self.emit_grid(channel_id, channel, &output)?;
-                if let Some((row, col)) = cmdline_cursor.or(message_cursor).or(composed.cursor) {
+                if let Some((row, col)) = cmdline_cursor.or(message_cursor).or(composed.cursor)
+                    && row < output.height()
+                    && col < output.width()
+                {
                     channel.emit(UiEvent::new(
                         "grid_cursor_goto",
                         vec![Object::Integer(1), integer(row), integer(col)],

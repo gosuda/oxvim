@@ -363,11 +363,18 @@ impl TuiState {
                     "message history entry must be an array".into(),
                 ));
             };
-            require_arity(fields, 2, "msg_history_show entry")?;
+            // Upstream sends `[kind, content, append]` (message.c
+            // `msg_history_show`); tolerate the two-field legacy shape.
+            if fields.len() != 2 && fields.len() != 3 {
+                return Err(TuiError::Protocol(format!(
+                    "msg_history_show entry expected 2 or 3 arguments, got {}",
+                    fields.len()
+                )));
+            }
             history.push(HistoryEntry {
                 kind: object_string(&fields[0], "msg_history_show kind")?.clone(),
                 content: chunks_from_object(&fields[1], "msg_history_show content")?,
-                append: false,
+                append: fields.len() == 3 && as_bool(fields, 2, "msg_history_show")?,
             });
         }
         self.chrome
@@ -621,6 +628,10 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 if let Some(input) = encode_key(key) {
                     client.input(OxStr::from(input.as_str()))?;
                 }
+            }
+            Event::Paste(data) => {
+                state.chrome.keypress();
+                client.paste(OxStr::from(data.as_str()))?;
             }
             Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
             Event::Mouse(mouse) => {

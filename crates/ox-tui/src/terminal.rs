@@ -39,6 +39,8 @@ const CURSOR_SETUP: &[u8] = b"\x1b[?25l";
 const CURSOR_RESTORE: &[u8] = b"\x1b[0 q\x1b[?25h\x1b[0m";
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 const ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l";
+const BRACKETED_PASTE_ENTER: &[u8] = b"\x1b[?2004h";
+const BRACKETED_PASTE_LEAVE: &[u8] = b"\x1b[?2004l";
 const PALETTE_RESTORE: &[u8] = b"\x1b]104\x1b\\";
 const TMUX_PALETTE_RESTORE: &[u8] = b"\x1bPtmux;\x1b\x1b]104\x1b\x1b\\\x1b\\";
 
@@ -988,6 +990,7 @@ impl SessionState {
     const SYNCHRONIZED_OUTPUT: u8 = 1 << 3;
     const PALETTE_RESTORE_PENDING: u8 = 1 << 4;
     const ALT_SCREEN: u8 = 1 << 5;
+    const BRACKETED_PASTE: u8 = 1 << 6;
 
     const fn has(self, flag: u8) -> bool {
         self.0 & flag != 0
@@ -1032,6 +1035,11 @@ impl<W: Write> TerminalSession<W> {
         if let Err(error) = session.writer.write_all(CURSOR_SETUP) {
             let _ = session.restore();
             return Err(TerminalError::io("cursor setup", error));
+        }
+        session.state.set(SessionState::BRACKETED_PASTE, true);
+        if let Err(error) = session.writer.write_all(BRACKETED_PASTE_ENTER) {
+            let _ = session.restore();
+            return Err(TerminalError::io("bracketed-paste enable", error));
         }
         if capabilities.features.kitty_keyboard() {
             session.state.set(SessionState::KITTY_KEYBOARD, true);
@@ -1190,6 +1198,15 @@ impl<W: Write> TerminalSession<W> {
                 Ok(()) => self.state.set(SessionState::PALETTE_RESTORE_PENDING, false),
                 Err(error) if first_error.is_none() => {
                     first_error = Some(TerminalError::io("palette restore", error));
+                }
+                Err(_) => {}
+            }
+        }
+        if self.state.has(SessionState::BRACKETED_PASTE) {
+            match self.writer.write_all(BRACKETED_PASTE_LEAVE) {
+                Ok(()) => self.state.set(SessionState::BRACKETED_PASTE, false),
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(TerminalError::io("bracketed-paste restore", error));
                 }
                 Err(_) => {}
             }
