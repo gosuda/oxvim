@@ -21,7 +21,7 @@ use ox_types::{OxStr, Typval};
 
 use crate::excmd_exec::ExExecutor;
 use crate::script::FileIO;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 use crate::script::RealFileIO;
 use crate::{AutocmdKind, AutocmdOptions, Event};
 
