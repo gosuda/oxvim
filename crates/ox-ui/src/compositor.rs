@@ -699,8 +699,14 @@ impl Compositor {
                 let cursor_line = buffer.line(state.cursor.lnum).unwrap_or_default();
                 let cursor_line = String::from_utf8_lossy(&cursor_line);
                 let cursor_col = display_column(&cursor_line, state.cursor.col);
+                // `grid_cursor_goto` must stay inside its grid: wrapped
+                // segments can push `before_cursor` past the text area when
+                // the window narrows, so the cursor clamps to the bottom
+                // row — the same spot upstream leaves it after scrolling.
                 (
-                    before_cursor.saturating_add(cursor_col / text_width),
+                    before_cursor
+                        .saturating_add(cursor_col / text_width)
+                        .min(text_height.saturating_sub(1)),
                     gutter
                         .saturating_add(cursor_col % text_width)
                         .min(geometry.width.saturating_sub(1)),
