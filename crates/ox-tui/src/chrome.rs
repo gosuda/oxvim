@@ -822,6 +822,29 @@ impl Chrome {
         let force_sticky = update.flags.contains(MessageFlag::Prompt)
             || self.cmdline.is_active()
             || is_sticky_kind(&update.kind);
+
+        // An empty chunk list clears the entry for this kind/id — upstream
+        // shows nothing for an empty `msg_showmode`. Keeping it would
+        // reserve a blank message box for the whole ephemeral lifetime. The
+        // history flag still records: an empty `:echomsg` shows up as an
+        // empty line in `:messages`.
+        if update
+            .content
+            .iter()
+            .all(|chunk| chunk.text.as_bytes().is_empty())
+        {
+            if update.flags.contains(MessageFlag::History) {
+                self.history.push(HistoryEntry {
+                    kind: update.kind,
+                    content: update.content,
+                    append: update.flags.contains(MessageFlag::Append),
+                });
+            }
+            if let Some(index) = self.messages.iter().position(|entry| entry.key == key) {
+                self.messages.remove(index);
+            }
+            return Ok(());
+        }
         let lifetime = lifetime_for(class, generation, force_sticky);
 
         let target = if class == MessageClass::Progress {
@@ -1531,6 +1554,21 @@ mod tests {
         chrome.advance_time(TimeMs(8_008));
         assert_eq!(chrome.messages.len(), 1);
         chrome.advance_time(TimeMs(8_009));
+        assert!(chrome.messages.is_empty());
+    }
+
+    #[test]
+    fn empty_content_clears_the_matching_entry() {
+        let mut chrome = Chrome::default();
+        assert!(
+            chrome
+                .message_show(update("msg_showmode", "-- INSERT --"))
+                .is_ok()
+        );
+        assert_eq!(chrome.messages.len(), 1);
+        // Upstream sends an empty `msg_showmode` when the mode line clears;
+        // the entry must go away instead of leaving a blank message box.
+        assert!(chrome.message_show(update("msg_showmode", "")).is_ok());
         assert!(chrome.messages.is_empty());
     }
 

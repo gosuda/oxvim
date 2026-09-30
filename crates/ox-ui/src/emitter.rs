@@ -224,6 +224,23 @@ impl Emitter {
                 .filter_map(|(id, grid)| (*id == channel_id).then_some(*grid))
                 .collect::<BTreeSet<_>>();
             let layout_changed = current_grids != previous_grids;
+            // window.c:2961/3275 — `ui_call_win_close` marks a destroyed
+            // window's grid, while :976/:1379 `ui_call_win_hide` marks one
+            // merely offscreen (tab switch, float hidden): its window still
+            // lives on another tabpage and a later `win_pos` resurfaces it.
+            if options.ext_multigrid {
+                for grid in previous_grids.difference(&current_grids) {
+                    let destroyed =
+                        *grid % 2 == 0 && !compositor.live_window_grids().contains(grid);
+                    if destroyed {
+                        // A destroyed window never resurfaces and grid ids are
+                        // never reused, so its retained snapshot only leaks.
+                        self.previous.remove(&(channel_id, *grid));
+                    }
+                    let event = if destroyed { "win_close" } else { "win_hide" };
+                    channel.emit(UiEvent::new(event, vec![Object::Integer(*grid)]))?;
+                }
+            }
             for layer in compositor.layers() {
                 let key = (channel_id, layer.grid.id());
                 let previous = self

@@ -176,6 +176,10 @@ impl ModeInfo {
 
 /// Complete server-owned chrome state plus ordered pending transitions.
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag tracks an independent ui-option or pager state negotiated per UI"
+)]
 pub struct ChromeState {
     /// Last visible message.
     pub message: Option<MessageState>,
@@ -201,6 +205,9 @@ pub struct ChromeState {
     pub busy: bool,
     /// Whether mouse reporting is enabled.
     pub mouse: bool,
+    /// A `msg_history_show` left a history pager open; `wait_return`
+    /// (message.c) hides it when the next UI interaction produces events.
+    history_shown: bool,
     pending: Vec<UiEvent>,
 }
 
@@ -219,6 +226,7 @@ impl Default for ChromeState {
             icon: OxStr::from(""),
             busy: false,
             mouse: false,
+            history_shown: false,
             pending: Vec::new(),
         }
     }
@@ -253,6 +261,38 @@ impl ChromeState {
         if self.message.take().is_some() {
             self.pending.push(UiEvent::new("msg_clear", vec![]));
         }
+    }
+
+    /// Shows the message-history pager.
+    ///
+    /// `ex_messages` (`ex_docmd.c`) sends `msg_history_show` with every
+    /// retained entry to `ext_messages` UIs instead of a `msg_show`; the
+    /// joined text stays as the latest message so grid-message fallbacks
+    /// still paint it.
+    pub fn history_show(&mut self, entries: &[(OxStr, Vec<ContentChunk>)], text: MessageState) {
+        self.pending.push(UiEvent::new(
+            "msg_history_show",
+            vec![
+                Object::Array(
+                    entries
+                        .iter()
+                        .map(|(kind, content)| {
+                            Object::Array(vec![
+                                Object::String(kind.clone()),
+                                chunks(content),
+                                // `entry->append` (message.c `ex_messages`): only
+                                // ever true for `:echon` temp entries, which this
+                                // history does not retain.
+                                Object::Boolean(false),
+                            ])
+                        })
+                        .collect(),
+                ),
+                Object::Boolean(false),
+            ],
+        ));
+        self.history_shown = true;
+        self.message = Some(text);
     }
 
     /// Sets the `msg_showmode` content (`-- INSERT --`, `-- VISUAL --`, …),
@@ -475,6 +515,19 @@ impl ChromeState {
     /// Drains ordered pending state transitions.
     pub fn take_events(&mut self) -> Vec<UiEvent> {
         std::mem::take(&mut self.pending)
+    }
+
+    /// Closes an open history pager, queueing `msg_history_hide`.
+    ///
+    /// `wait_return` (message.c) hides the pager on the key that resumes
+    /// input, so this belongs on the input path: an unrelated redraw must
+    /// not close it.
+    pub fn hide_history_pager(&mut self) {
+        if self.history_shown {
+            self.history_shown = false;
+            self.pending
+                .push(UiEvent::new("msg_history_hide", vec![]));
+        }
     }
 
     /// Builds the current state events needed to initialize a newly attached UI.
