@@ -29,7 +29,9 @@ use std::rc::Rc;
 
 use ox_text::Buffer;
 
-use crate::excmd_exec::{run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor, LuaExec};
+use crate::excmd_exec::{
+    LuaExec, run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor,
+};
 use crate::script::{FileIO, FileKind, FileMetadata};
 use crate::{
     AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
@@ -66,7 +68,6 @@ impl MemoryFileIO {
         let path = PathBuf::from(std::ffi::OsStr::from_bytes(path));
         self.files.borrow_mut().insert(path, content.to_owned());
     }
-
 
     fn insert_directory(&self, path: &str) {
         self.directories.borrow_mut().insert(PathBuf::from(path));
@@ -375,7 +376,11 @@ fn write_autocmds_preserve_non_utf8_target_bytes() {
         let ox_types::Typval::String(value) = value else {
             panic!("expected String for {name:?}, got {value:?}");
         };
-        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+        assert_eq!(
+            value.as_bytes(),
+            path,
+            "{name:?} must preserve native bytes"
+        );
     }
     for name in [b"post_afile".as_slice()] {
         let value = executor
@@ -385,7 +390,11 @@ fn write_autocmds_preserve_non_utf8_target_bytes() {
         let ox_types::Typval::String(value) = value else {
             panic!("expected String for {name:?}, got {value:?}");
         };
-        assert_eq!(value.as_bytes(), path, "{name:?} must preserve native bytes");
+        assert_eq!(
+            value.as_bytes(),
+            path,
+            "{name:?} must preserve native bytes"
+        );
     }
     for name in [b"pre_amatch".as_slice(), b"post_amatch".as_slice()] {
         let value = executor
@@ -427,7 +436,11 @@ fn write_autocmds_preserve_non_utf8_target_bytes() {
     let ox_types::Typval::String(value) = value else {
         panic!("expected String for cmd_afile, got {value:?}");
     };
-    assert_eq!(value.as_bytes(), path, "cmd_afile must preserve native bytes");
+    assert_eq!(
+        value.as_bytes(),
+        path,
+        "cmd_afile must preserve native bytes"
+    );
     let value = executor
         .scope()
         .get_scoped(ox_eval::scope::ScopeKind::Global, b"cmd_amatch", 0)
@@ -2063,7 +2076,14 @@ fn edit_without_window_fires_read_lifecycle_for_existing_file() {
     let mut executor = ExExecutor::with_io(MemoryFileIO::new());
     executor.scripts().io().insert("startup.txt", "one\ntwo\n");
     executor.execute_line(&editor, "let g:order = []").unwrap();
-    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
         executor
             .execute_line(
                 &editor,
@@ -2118,7 +2138,14 @@ fn edit_without_window_fires_bufnewfile_for_missing_file() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut executor = ExExecutor::with_io(MemoryFileIO::new());
     executor.execute_line(&editor, "let g:order = []").unwrap();
-    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile", "BufEnter"] {
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+        "BufEnter",
+    ] {
         executor
             .execute_line(
                 &editor,
@@ -2345,7 +2372,9 @@ fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
         .execute_line(&editor, "setlocal shiftwidth=8")
         .unwrap();
     let source = editor.editor().current_buffer().unwrap();
-    executor.execute_line(&editor, "edit read-hook.txt").unwrap();
+    executor
+        .execute_line(&editor, "edit read-hook.txt")
+        .unwrap();
     let target = editor.editor().current_buffer().unwrap();
     editor
         .editor_mut()
@@ -2354,10 +2383,7 @@ fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
     editor.editor_mut().unload_buffer(target).unwrap();
 
     executor
-        .execute_line(
-            &editor,
-            "autocmd BufReadPre * setlocal shiftwidth=3",
-        )
+        .execute_line(&editor, "autocmd BufReadPre * setlocal shiftwidth=3")
         .unwrap();
     executor
         .execute_line(&editor, &format!("buffer {}", i64::from(target)))
@@ -2411,7 +2437,13 @@ fn argnext_reloads_an_unloaded_argument_buffer() {
 
     assert_eq!(editor.editor().current_buffer(), Some(target));
     assert_eq!(
-        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        editor
+            .editor()
+            .buffer(target)
+            .unwrap()
+            .text()
+            .unwrap()
+            .line(1),
         Ok(b"loaded".to_vec())
     );
     assert_eq!(
@@ -2428,7 +2460,10 @@ fn argnext_reloads_an_unloaded_argument_buffer() {
 #[test]
 fn edit_reloads_existing_unloaded_named_buffer() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
-    executor.scripts().io().insert("edit-unloaded.txt", "loaded\n");
+    executor
+        .scripts()
+        .io()
+        .insert("edit-unloaded.txt", "loaded\n");
     let target = editor.editor_mut().create_buffer(true).unwrap();
     editor
         .editor_mut()
@@ -2446,7 +2481,13 @@ fn edit_reloads_existing_unloaded_named_buffer() {
 
     assert_eq!(editor.editor().current_buffer(), Some(target));
     assert_eq!(
-        editor.editor().buffer(target).unwrap().text().unwrap().line(1),
+        editor
+            .editor()
+            .buffer(target)
+            .unwrap()
+            .text()
+            .unwrap()
+            .line(1),
         Ok(b"loaded".to_vec())
     );
     assert_eq!(
@@ -2507,10 +2548,7 @@ fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
 /// switch reports E86, leaves the target unloaded, and keeps the old buffer.
 #[test]
 fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
-    let dir = std::env::temp_dir().join(format!(
-        "oxvim-excmd-unloaded-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("oxvim-excmd-unloaded-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let (editor, mut executor) = {
@@ -3769,10 +3807,7 @@ fn bdelete_skips_bufunload_for_already_unloaded_target() {
         .unwrap();
     executor.execute_line(&editor, "let g:order = []").unwrap();
     executor
-        .execute_line(
-            &editor,
-            &format!("bdelete {}", i64::from(unloaded)),
-        )
+        .execute_line(&editor, &format!("bdelete {}", i64::from(unloaded)))
         .unwrap();
     assert_eq!(order_events(&executor), ["BufDelete"]);
 }
@@ -3807,10 +3842,7 @@ fn bwipeout_skips_bufunload_for_already_unloaded_target() {
         .unwrap();
     executor.execute_line(&editor, "let g:order = []").unwrap();
     executor
-        .execute_line(
-            &editor,
-            &format!("bwipeout {}", i64::from(unloaded)),
-        )
+        .execute_line(&editor, &format!("bwipeout {}", i64::from(unloaded)))
         .unwrap();
     assert_eq!(order_events(&executor), ["BufDelete", "BufWipeout"]);
 }
@@ -3906,9 +3938,11 @@ fn buffer_unload_reports_no_error_when_a_handler_removes_the_target() {
 /// `DOBUF_WIPE` differ in listed-buffer handling.
 #[test]
 fn buffer_removal_updates_plain_listing_per_command() {
-    for (command, should_list_target) in
-        [("bunload 2", true), ("bdelete 2", false), ("bwipeout 2", false)]
-    {
+    for (command, should_list_target) in [
+        ("bunload 2", true),
+        ("bdelete 2", false),
+        ("bwipeout 2", false),
+    ] {
         let (editor, mut executor) = setup();
         let target = editor.editor_mut().create_buffer(true).unwrap();
 
@@ -4333,9 +4367,7 @@ fn read_without_argument_or_name_raises_e32() {
 #[test]
 fn read_filter_inserts_command_output_and_lands_on_last_line() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor
         .execute_line(&editor, "1read !printf 'p\\nq\\n'")
         .unwrap();
@@ -4348,9 +4380,7 @@ fn read_filter_inserts_command_output_and_lands_on_last_line() {
 /// the whole pipeline runs as one command.
 #[test]
 fn read_filter_keeps_the_shell_pipeline() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor
         .execute_line(&editor, "1read !printf 'z\\n' | tr z Z")
@@ -4361,9 +4391,7 @@ fn read_filter_keeps_the_shell_pipeline() {
 /// A failing filter publishes its exit status in `v:shell_error`.
 #[test]
 fn read_filter_publishes_shell_error() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor.execute_line(&editor, "1read !exit 3").unwrap();
     assert_eq!(
@@ -4382,9 +4410,7 @@ fn read_filter_publishes_shell_error() {
 /// range is the whole buffer (`EX_DFLALL`).
 #[test]
 fn write_filter_pipes_lines_into_the_command() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
     let path = std::env::temp_dir().join(format!("oxvim-write-filter-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -4527,9 +4553,7 @@ fn read_file_read_cmd_replaces_the_read() {
 /// `ShellFilterPost` on the way out.
 #[test]
 fn read_filter_fires_the_filter_and_shell_events() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor
         .execute_line(&editor, "autocmd FilterReadPre * let g:pre = line('$')")
@@ -4564,9 +4588,7 @@ fn read_filter_fires_the_filter_and_shell_events() {
 /// `FilterRead*` events.
 #[test]
 fn write_filter_fires_shell_filter_post_only() {
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
     executor
         .execute_line(&editor, "autocmd ShellFilterPost * let g:shell = 1")
@@ -4754,9 +4776,15 @@ fn tabedit_opens_a_file_in_a_new_tabpage() {
 #[test]
 fn split_creation_callbacks_see_the_destination_window() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
-    executor.scripts().io().insert("split-window.txt", "target\n");
     executor
-        .execute_line(&editor, "let g:bufnew_windows = [] | let g:bufadd_windows = []")
+        .scripts()
+        .io()
+        .insert("split-window.txt", "target\n");
+    executor
+        .execute_line(
+            &editor,
+            "let g:bufnew_windows = [] | let g:bufadd_windows = []",
+        )
         .unwrap();
     executor
         .execute_line(
@@ -4798,7 +4826,10 @@ fn split_creation_callbacks_see_the_destination_window() {
 #[test]
 fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
-    executor.scripts().io().insert("edit-switch.txt", "target\n");
+    executor
+        .scripts()
+        .io()
+        .insert("edit-switch.txt", "target\n");
     executor.execute_line(&editor, "let g:order = []").unwrap();
     executor
         .execute_line(
@@ -4810,7 +4841,9 @@ fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
         .execute_line(&editor, "autocmd BufReadPre *.txt enew")
         .unwrap();
 
-    executor.execute_line(&editor, "edit edit-switch.txt").unwrap();
+    executor
+        .execute_line(&editor, "edit edit-switch.txt")
+        .unwrap();
 
     assert_eq!(order_events(&executor), Vec::<String>::new());
     let current = editor.editor().current_buffer().unwrap();
@@ -4830,8 +4863,13 @@ fn edit_does_not_enter_requested_buffer_after_read_callback_switches_away() {
 #[test]
 fn split_does_not_enter_target_after_read_callback_switches_window() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
-    executor.scripts().io().insert("split-switch.txt", "target\n");
-    executor.execute_line(&editor, "let g:target_enters = 0").unwrap();
+    executor
+        .scripts()
+        .io()
+        .insert("split-switch.txt", "target\n");
+    executor
+        .execute_line(&editor, "let g:target_enters = 0")
+        .unwrap();
     executor
         .execute_line(
             &editor,
@@ -4856,7 +4894,10 @@ fn split_does_not_enter_target_after_read_callback_switches_window() {
 #[test]
 fn split_existing_file_fires_creation_before_read_lifecycle() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
-    executor.scripts().io().insert("split-order.txt", "target\n");
+    executor
+        .scripts()
+        .io()
+        .insert("split-order.txt", "target\n");
     executor.execute_line(&editor, "let g:order = []").unwrap();
     for event in [
         "BufNew",
@@ -4874,7 +4915,9 @@ fn split_existing_file_fires_creation_before_read_lifecycle() {
             .unwrap();
     }
 
-    executor.execute_line(&editor, "split split-order.txt").unwrap();
+    executor
+        .execute_line(&editor, "split split-order.txt")
+        .unwrap();
 
     assert_eq!(
         order_events(&executor),
@@ -4917,7 +4960,13 @@ fn tabnew_existing_file_fires_creation_before_read_lifecycle() {
     let (editor, mut executor) = setup_with_content(&[b"source".to_vec()]);
     executor.scripts().io().insert("tab-order.txt", "target\n");
     executor.execute_line(&editor, "let g:order = []").unwrap();
-    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+    ] {
         executor
             .execute_line(
                 &editor,
@@ -4926,7 +4975,9 @@ fn tabnew_existing_file_fires_creation_before_read_lifecycle() {
             .unwrap();
     }
 
-    executor.execute_line(&editor, "tabnew tab-order.txt").unwrap();
+    executor
+        .execute_line(&editor, "tabnew tab-order.txt")
+        .unwrap();
 
     assert_eq!(
         order_events(&executor),
@@ -4940,9 +4991,18 @@ fn help_existing_file_fires_creation_before_read_lifecycle() {
     executor
         .scripts_mut()
         .add_runtime_root(PathBuf::from("runtime"));
-    executor.scripts().io().insert("runtime/doc/help.txt", "help\n");
+    executor
+        .scripts()
+        .io()
+        .insert("runtime/doc/help.txt", "help\n");
     executor.execute_line(&editor, "let g:order = []").unwrap();
-    for event in ["BufNew", "BufAdd", "BufReadPre", "BufReadPost", "BufNewFile"] {
+    for event in [
+        "BufNew",
+        "BufAdd",
+        "BufReadPre",
+        "BufReadPost",
+        "BufNewFile",
+    ] {
         executor
             .execute_line(
                 &editor,
@@ -4984,9 +5044,15 @@ fn help_file_read_hook_sees_target_as_current() {
     executor
         .scripts_mut()
         .add_runtime_root(PathBuf::from("runtime"));
-    executor.scripts().io().insert("runtime/doc/help.txt", "help text\n");
     executor
-        .execute_line(&editor, "autocmd BufReadPre * let g:help_current = bufnr('%')")
+        .scripts()
+        .io()
+        .insert("runtime/doc/help.txt", "help text\n");
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufReadPre * let g:help_current = bufnr('%')",
+        )
         .unwrap();
     executor.execute_line(&editor, "help").unwrap();
     let buffer = editor.editor().current_buffer().unwrap();
@@ -7852,9 +7918,7 @@ fn prompt_replace_geometry_uses_complete_mark_prefix() {
 fn bang_filter_range_replaces_lines() {
     let (editor, mut executor) =
         setup_with_content(&[b"aaa".to_vec(), b"bbb".to_vec(), b"ccc".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "1,2!cat").unwrap();
     assert_eq!(buffer_text(&editor), vec!["aaa", "bbb", "ccc"]);
     let e = editor.editor();
@@ -7871,9 +7935,7 @@ fn bang_filter_range_replaces_lines() {
 #[test]
 fn bang_filter_whole_buffer_identity() {
     let (editor, mut executor) = setup_with_content(&[b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "%!cat").unwrap();
     assert_eq!(buffer_text(&editor), vec!["x", "y", "z"]);
 }
@@ -7885,9 +7947,7 @@ fn bang_filter_whole_buffer_identity() {
 #[test]
 fn bang_filter_empty_output_deletes_range() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "1,2!true").unwrap();
     assert_eq!(buffer_text(&editor), vec!["c"]);
     let e = editor.editor();
@@ -7905,9 +7965,7 @@ fn bang_filter_empty_output_deletes_range() {
 #[test]
 fn bang_bare_command_runs_without_error() {
     let (editor, mut executor) = setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     let result = executor.execute_line(&editor, "!true");
     assert!(result.is_ok(), "bare :!true should succeed: {result:?}");
     assert_eq!(buffer_text(&editor), vec!["line1", "line2"]);
@@ -7926,9 +7984,7 @@ fn bang_bare_command_runs_without_error() {
 #[test]
 fn bang_bare_command_echoes_output() {
     let (editor, mut executor) = setup_with_content(&[b"line1".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "!echo hello").unwrap();
     let messages = echo_messages(&editor);
     assert!(
@@ -7952,9 +8008,7 @@ fn bang_repeat_no_previous_is_e34() {
 fn bang_filter_range_replaces_with_output() {
     let (editor, mut executor) =
         setup_with_content(&[b"foo".to_vec(), b"bar".to_vec(), b"baz".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "1,2!echo hi").unwrap();
     assert_eq!(buffer_text(&editor), vec!["hi", "baz"]);
     let e = editor.editor();
@@ -7972,9 +8026,7 @@ fn bang_filter_range_replaces_with_output() {
 #[test]
 fn bang_repeat_uses_previous_command() {
     let (editor, mut executor) = setup_with_content(&[b"line1".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "!echo first").unwrap();
     executor.execute_line(&editor, "!!").unwrap();
     // Both the original :!echo first and the :!! repeat produce "first".
@@ -7993,9 +8045,7 @@ fn bang_repeat_uses_previous_command() {
 #[test]
 fn bang_filter_repeat_with_bang_in_args() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "1,2!cat").unwrap();
     executor.execute_line(&editor, "3,3!!").unwrap();
     assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
@@ -8006,9 +8056,7 @@ fn bang_filter_repeat_with_bang_in_args() {
 #[test]
 fn bang_sets_shell_error_on_failure() {
     let (editor, mut executor) = setup_with_content(&[b"line1".to_vec()]);
-    let _guard = crate::PROCESS_STATE_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = crate::lock_process_state();
     executor.execute_line(&editor, "!false").unwrap();
     assert_eq!(
         executor
@@ -8548,8 +8596,9 @@ fn stag_aborts_without_split_when_swapchoice_is_quit() {
 // User commands: one registry, buffer-local tables, callbacks, flag handling
 // ---------------------------------------------------------------------------
 
-use crate::LuaExecError;
 use ox_types::{Object, OxStr};
+
+use crate::LuaExecError;
 
 /// Lua host that records `invoke_callback` calls so callback-command opts can
 /// be asserted.
@@ -8558,7 +8607,8 @@ struct CallbackRecorder {
 }
 
 impl crate::LuaExec for CallbackRecorder {
-    fn execute_chunk(&self,
+    fn execute_chunk(
+        &self,
         _code: &str,
         _args: Vec<Object>,
     ) -> Result<Object, crate::LuaExecError> {
@@ -8569,10 +8619,7 @@ impl crate::LuaExec for CallbackRecorder {
         Err(LuaExecError::Runtime("no files".to_owned()))
     }
 
-    fn invoke_callback(&self,
-        reference: usize,
-        args: Vec<Object>,
-    ) -> Result<Object, LuaExecError> {
+    fn invoke_callback(&self, reference: usize, args: Vec<Object>) -> Result<Object, LuaExecError> {
         self.calls
             .borrow_mut()
             .push((reference, args.first().cloned().unwrap_or(Object::Nil)));
@@ -8724,15 +8771,9 @@ fn third_reentrant_callback_completes_on_a_fresh_executor() {
         remaining,
         calls: calls.clone(),
     });
-    primary
-        .borrow_mut()
-        .set_lua_exec(primary_host.clone());
-    secondary
-        .borrow_mut()
-        .set_lua_exec(secondary_host.clone());
-    tertiary
-        .borrow_mut()
-        .set_lua_exec(tertiary_host.clone());
+    primary.borrow_mut().set_lua_exec(primary_host.clone());
+    secondary.borrow_mut().set_lua_exec(secondary_host.clone());
+    tertiary.borrow_mut().set_lua_exec(tertiary_host.clone());
     editor
         .editor_mut()
         .autocmds_mut()

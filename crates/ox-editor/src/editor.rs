@@ -9,19 +9,19 @@ use ox_text::{Buffer, Position, UndoTree};
 use ox_types::{BufHandle, Dict, Object, OxStr, TabHandle, WinHandle};
 use thiserror::Error;
 
-use crate::builtins::position::cursor_vcol;
-use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::arglist::ArgList;
 use crate::autocmd::Autocmds;
 use crate::buffer::{
     BufferState, BufferStateError, BufferSubscriptionRelease, BufferTextEditRequest,
 };
+use crate::builtins::position::cursor_vcol;
 use crate::decoration::Decorations;
+use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
+use crate::fold::{FoldError, Position as FoldPosition};
 use crate::layout::{
     CursorScreenPosition, Geometry, Layout, LayoutError, RelativeTo, TabpageState, WinConfig,
     WindowState,
 };
-use crate::fold::{FoldError, Position as FoldPosition};
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
 use crate::options::{OptionStore, OptionValue};
@@ -157,7 +157,11 @@ impl MessageIdentity {
     #[must_use]
     pub fn of(kind: MessageKind) -> Self {
         Self {
-            kind: OxStr::from(if kind == MessageKind::Error { "emsg" } else { "echo" }),
+            kind: OxStr::from(if kind == MessageKind::Error {
+                "emsg"
+            } else {
+                "echo"
+            }),
             id: Object::Nil,
         }
     }
@@ -600,7 +604,10 @@ impl Editor {
             redraws: Vec::new(),
             previous_window: None,
             previous_directory: None,
-            global_directory: None,
+            // Upstream records `globaldir` from the process cwd at startup.
+            // An unreadable cwd leaves it `None`, and later reapplies then
+            // leave the process cwd unchanged.
+            global_directory: std::env::current_dir().ok(),
 
             next_buffer: 1,
             next_window: LOWEST_WINDOW_ID,
@@ -1305,6 +1312,23 @@ impl Editor {
             // WHY: upstream `update_cwd` ignores `os_chdir` failure — the
             // transition is already committed and the old process cwd stays
             // in effect. No E344 is queued or surfaced.
+            //
+            // WHY(process-state guard): the process cwd is shared by every
+            // test in this binary; a window/tab/buffer switch in an unrelated
+            // editor must not overwrite the directory a cwd-sensitive test
+            // just `lcd`'d into. While a sibling test holds the guard this
+            // restore is skipped — the write is advisory (`update_cwd`
+            // ignores its own failure anyway) and the holder owns the cwd
+            // for its duration. The holding thread itself, and any thread
+            // while the guard is free, still applies it normally.
+            #[cfg(test)]
+            {
+                let free = crate::PROCESS_STATE_GUARD.try_lock().ok();
+                if crate::holds_process_state_guard() || free.is_some() {
+                    std::mem::drop(std::env::set_current_dir(target));
+                }
+            }
+            #[cfg(not(test))]
             std::mem::drop(std::env::set_current_dir(target));
         }
     }
@@ -3094,14 +3118,6 @@ impl Editor {
         self.windows.insert(window, tab);
         self.tabpages.insert(tab, TabpageState::new(layout));
         self.tab_order.insert(index.min(self.tab_order.len()), tab);
-        if self.global_directory.is_none() {
-            // Initialize globaldir from the process cwd only on explicit
-            // success; an unreadable cwd leaves it `None` so later reapplies
-            // fall back to the unchanged process cwd.
-            if let Ok(cwd) = std::env::current_dir() {
-                self.global_directory = Some(cwd);
-            }
-        }
         self.current_tab = Some(tab);
         self.apply_effective_directory();
         Ok(tab)
@@ -3227,9 +3243,8 @@ impl Editor {
         };
         let text = self.buffer(buffer)?.text()?;
         let cursor_line = text.line(cursor.lnum).map_err(BufferStateError::from)?;
-        let virtual_column = cursor_vcol(&cursor_line, cursor.col, tabstop).saturating_add(
-            usize::try_from(coladd.max(0)).unwrap_or(usize::MAX),
-        );
+        let virtual_column = cursor_vcol(&cursor_line, cursor.col, tabstop)
+            .saturating_add(usize::try_from(coladd.max(0)).unwrap_or(usize::MAX));
         if !wrap || geometry.width == 0 {
             return Ok(CursorScreenPosition {
                 row: cursor.lnum.saturating_sub(topline),
@@ -4749,8 +4764,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let config =
-            WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
+        let config = WinConfig::new(RelativeTo::Cursor, Anchor::NorthWest, 0.0, 0.0, 1, 1).unwrap();
         let float = editor.open_float(tab, buffer, config).unwrap();
         let geometry = editor.window_geometry(float).unwrap();
         (geometry.row, geometry.col)

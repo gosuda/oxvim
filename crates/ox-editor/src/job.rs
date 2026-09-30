@@ -2,15 +2,23 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
+#[cfg(not(unix))]
+use std::io::Write as _;
 use std::path::PathBuf;
+#[cfg(not(unix))]
+use std::process::ChildStdin;
+#[cfg(not(unix))]
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ox_types::{DictRef, OxStr, Typval};
 #[cfg(unix)]
-use ox_uv::process::PtyHandle;
-use ox_uv::process::{self, Process, ProcessPipe, PtySize, SpawnOptions, StdioConfig};
-use ox_uv::{NetEvent, UvLoop};
+use ox_uv::NetEvent;
+use ox_uv::UvLoop;
+use ox_uv::process::{self, Process, PtySize, SpawnOptions, StdioConfig};
+#[cfg(unix)]
+use ox_uv::process::{ProcessPipe, PtyHandle};
 
 /// Callback values and their dictionary receiver from `jobstart()` options.
 #[derive(Clone)]
@@ -105,16 +113,27 @@ enum JobInput {
     Pty(PtyHandle),
 }
 
+/// Non-Unix spawn hands the job plain `std::process` pipes; anonymous pipes
+/// cannot join the loop's readiness reactor there, so a pump thread per
+/// direction moves the bytes and `Pipe` is the writer end's ordered queue.
 #[cfg(not(unix))]
 enum JobInput {
-    Pipe(ProcessPipe),
+    Pipe(mpsc::Sender<Vec<u8>>),
 }
+
+/// What keeps a child stdio pipe delivering: on Unix the loop-registered
+/// [`ProcessPipe`] handle must stay alive; elsewhere the pump thread's join
+/// handle does.
+#[cfg(unix)]
+type StdioPump = ProcessPipe;
+#[cfg(not(unix))]
+type StdioPump = std::thread::JoinHandle<()>;
 
 struct Job {
     process: Process,
     input: Option<JobInput>,
-    _stdout_pipe: Option<ProcessPipe>,
-    _stderr_pipe: Option<ProcessPipe>,
+    _stdout_pipe: Option<StdioPump>,
+    _stderr_pipe: Option<StdioPump>,
     callbacks: JobCallbacks,
     stdout: StreamState,
     stderr: StreamState,
@@ -276,8 +295,28 @@ impl JobManager {
             }
             let mut spawned = process::spawn(&mut self.loop_, spawn_options, on_exit)
                 .map_err(|error| error.to_string())?;
-            let input = spawned.pipes.stdin.take().map(JobInput::Pipe);
-            (spawned.process, input, None, None)
+            let input = spawned
+                .pipes
+                .stdin
+                .take()
+                .map(|stdin| pipe_writer(id, stdin).map(JobInput::Pipe))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let stdout_pipe = spawned
+                .pipes
+                .stdout
+                .take()
+                .map(|stream| pipe_reader(id, StreamKind::Stdout, stream, Arc::clone(&self.raw)))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            let stderr_pipe = spawned
+                .pipes
+                .stderr
+                .take()
+                .map(|stream| pipe_reader(id, StreamKind::Stderr, stream, Arc::clone(&self.raw)))
+                .transpose()
+                .map_err(|error| error.to_string())?;
+            (spawned.process, input, stdout_pipe, stderr_pipe)
         };
 
         let pid = process.pid();
@@ -440,9 +479,16 @@ impl JobManager {
             return Ok(false);
         };
         match input {
+            #[cfg(unix)]
             JobInput::Pipe(pipe) => {
                 pipe.write(&mut self.loop_, data)
                     .map_err(|error| error.to_string())?;
+            }
+            #[cfg(not(unix))]
+            JobInput::Pipe(sender) => {
+                sender
+                    .send(data)
+                    .map_err(|_| "job stdin pipe is closed".to_owned())?;
             }
             #[cfg(unix)]
             JobInput::Pty(pty) => {
@@ -474,6 +520,7 @@ impl JobManager {
             return false;
         };
         match input {
+            #[cfg(unix)]
             JobInput::Pipe(pipe) => {
                 let deadline = Instant::now() + Duration::from_secs(30);
                 while pipe.has_pending_writes() && Instant::now() < deadline {
@@ -486,6 +533,12 @@ impl JobManager {
                 // the descriptor open on a stuck peer; the full handle close
                 // cannot, and a descriptor still open is the whole defect.
                 let _ignored = ox_uv::Handle::close(&pipe, &mut self.loop_);
+            }
+            #[cfg(not(unix))]
+            JobInput::Pipe(sender) => {
+                // Dropping the sender ends the writer thread once every
+                // queued write has flushed, which the child reads as EOF.
+                drop(sender);
             }
             // A PTY has no separate write side to shut: closing the master is
             // the child's hangup, which `stop`/teardown already performs.
@@ -769,6 +822,70 @@ fn data_event(
     }
 }
 
+/// Pumps one child pipe onto the raw-event queue from a dedicated thread.
+///
+/// Anonymous pipes on this platform offer no reactor-safe nonblocking mode,
+/// so a blocking reader emits the same `Data`/`Eof` sequence a
+/// [`ProcessPipe`] readiness delivery produces on Unix. The read loop ends
+/// when the child's write end dies with the process or the descriptor
+/// errors, and the [`Job`] retains the join handle so output cannot be
+/// orphaned before teardown reaps the process.
+#[cfg(not(unix))]
+fn pipe_reader(
+    id: u64,
+    stream: StreamKind,
+    mut reader: impl std::io::Read + Send + 'static,
+    queue: Arc<Mutex<VecDeque<RawEvent>>>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let name = match stream {
+        StreamKind::Stdout => "stdout",
+        StreamKind::Stderr => "stderr",
+    };
+    std::thread::Builder::new()
+        .name(format!("ox-job-{id}-{name}"))
+        .spawn(move || {
+            let mut buffer = vec![0_u8; 8 * 1024];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        lock_queue(&queue).push_back(RawEvent::Data(
+                            id,
+                            stream,
+                            buffer[..read].to_vec(),
+                        ));
+                    }
+                    Err(ref error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            lock_queue(&queue).push_back(RawEvent::Eof(id, stream));
+        })
+}
+
+/// Drains an ordered send queue onto child stdin from a dedicated thread.
+///
+/// A blocking `ChildStdin` write can wait on a full pipe buffer; holding it
+/// on this thread keeps [`JobManager::send`] non-blocking. When the sender
+/// drops — [`JobManager::close_input`] or job teardown — `recv` delivers
+/// the queued writes first, then `Err`, so the child receives exactly the
+/// flushed input before stdin closes.
+#[cfg(not(unix))]
+fn pipe_writer(id: u64, mut stdin: ChildStdin) -> std::io::Result<mpsc::Sender<Vec<u8>>> {
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name(format!("ox-job-{id}-stdin"))
+        .spawn(move || {
+            while let Ok(data) = receiver.recv() {
+                if stdin.write_all(&data).is_err() {
+                    break;
+                }
+            }
+        })
+        .map(|_| sender)
+}
+
+#[cfg(unix)]
 fn queue_stream_event(
     queue: &Arc<Mutex<VecDeque<RawEvent>>>,
     id: u64,
@@ -796,7 +913,7 @@ fn lock_queue(
 #[cfg(all(test, unix))]
 #[expect(
     clippy::unwrap_used,
-    reason = "job tests use unwrap to fail immediately on fixture setup errors",
+    reason = "job tests use unwrap to fail immediately on fixture setup errors"
 )]
 mod tests {
     use super::*;

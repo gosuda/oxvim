@@ -128,9 +128,10 @@ impl TuiState {
     pub fn apply_redraw(&mut self, events: &[RedrawEvent], now: TimeMs) -> Result<(), TuiError> {
         self.current_time = now;
         for redraw in events {
-            match self.screen.apply_event(redraw)? {
-                ApplyOutcome::Applied => self.capture_highlight(redraw),
-                ApplyOutcome::Unknown(event) => self.apply_client_event(&event)?,
+            match self.screen.apply_event(redraw) {
+                Err(error) => return Err(error.into()),
+                Ok(ApplyOutcome::Applied) => self.capture_highlight(redraw),
+                Ok(ApplyOutcome::Unknown(event)) => self.apply_client_event(&event)?,
             }
         }
         self.chrome.finish_batch(now);
@@ -610,6 +611,12 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
         match event::read().map_err(TuiError::Input)? {
             Event::Key(key) => {
+                // Windows reports key releases as distinct events; the editor
+                // protocol has presses only, so a release must not re-encode
+                // as another press.
+                if key.kind == event::KeyEventKind::Release {
+                    continue;
+                }
                 state.chrome.keypress();
                 if let Some(input) = encode_key(key) {
                     client.input(OxStr::from(input.as_str()))?;

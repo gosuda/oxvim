@@ -523,8 +523,11 @@ impl UserData for ParserHandle {
                                 };
                                 let mut progress = parse_deadline_callback(started, deadline);
                                 let options = ParseOptions::new().progress_callback(&mut progress);
-                                this.parser
-                                    .parse_with_options(&mut input, old_tree_ref, Some(options))
+                                this.parser.parse_with_options(
+                                    &mut input,
+                                    old_tree_ref,
+                                    Some(options),
+                                )
                             };
                             (bytes, parsed)
                         }
@@ -926,7 +929,6 @@ impl UserData for NodeHandle {
         );
     }
 }
-
 
 impl UserData for QueryHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -1382,90 +1384,94 @@ pub(crate) fn install(lua: &Lua, scheduler: Rc<dyn Scheduler>) -> mlua::Result<(
         })?,
     )?;
 
-/// Walks the raw predicate steps for a compiled tree-sitter query and returns
-/// them in source order. The safe `Query` API splits predicates into separate
-/// `general`/`property`/`text` vectors, so this is the only way to recover the
-/// interleaved order used by upstream `query_inspect`.
-///
-/// # Safety
-///
-/// `query` must be a valid, non-null `TSQuery` pointer returned by
-/// `ts_query_new` (or `Query::new_raw`). It must outlive this function call.
-unsafe fn parse_query_predicates(
-    query: *const tree_sitter::ffi::TSQuery,
-    pattern_count: usize,
-) -> mlua::Result<Vec<Vec<InspectPredicate>>> {
-    let mut predicates = Vec::with_capacity(pattern_count);
-    for pattern_index in 0..pattern_count {
-        predicates.push(unsafe { parse_pattern_predicates(query, pattern_index)? });
-    }
-    Ok(predicates)
-}
-
-/// # Safety
-///
-/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call.
-unsafe fn parse_pattern_predicates(
-    query: *const tree_sitter::ffi::TSQuery,
-    pattern_index: usize,
-) -> mlua::Result<Vec<InspectPredicate>> {
-    let mut length = 0u32;
-    // SAFETY: `query` is a valid TSQuery pointer by the caller's contract.
-    let steps = unsafe { tree_sitter::ffi::ts_query_predicates_for_pattern(
-        query,
-        pattern_index as u32,
-        &mut length,
-    ) };
-    if length == 0 {
-        return Ok(Vec::new());
-    }
-    // SAFETY: `ts_query_predicates_for_pattern` returned `length` valid steps.
-    let steps = unsafe { std::slice::from_raw_parts(steps, length as usize) };
-    let mut pattern_predicates = Vec::new();
-    let mut current = InspectPredicate {
-        operator: String::new(),
-        args: Vec::new(),
-    };
-    let mut has_operator = false;
-    for step in steps {
-        if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeDone {
-            if has_operator {
-                pattern_predicates.push(std::mem::take(&mut current));
-                has_operator = false;
-            }
-        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeString {
-            // SAFETY: `query` is valid and `value_id` is a string from it.
-            let s = unsafe { query_string_value(query, step.value_id)? };
-            if !has_operator {
-                current.operator = s;
-                has_operator = true;
-            } else {
-                current.args.push(InspectArg::String(s));
-            }
-        } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeCapture && has_operator {
-            current.args.push(InspectArg::Capture(step.value_id));
+    /// Walks the raw predicate steps for a compiled tree-sitter query and returns
+    /// them in source order. The safe `Query` API splits predicates into separate
+    /// `general`/`property`/`text` vectors, so this is the only way to recover the
+    /// interleaved order used by upstream `query_inspect`.
+    ///
+    /// # Safety
+    ///
+    /// `query` must be a valid, non-null `TSQuery` pointer returned by
+    /// `ts_query_new` (or `Query::new_raw`). It must outlive this function call.
+    unsafe fn parse_query_predicates(
+        query: *const tree_sitter::ffi::TSQuery,
+        pattern_count: usize,
+    ) -> mlua::Result<Vec<Vec<InspectPredicate>>> {
+        let mut predicates = Vec::with_capacity(pattern_count);
+        for pattern_index in 0..pattern_count {
+            predicates.push(unsafe { parse_pattern_predicates(query, pattern_index)? });
         }
+        Ok(predicates)
     }
-    Ok(pattern_predicates)
-}
 
-/// # Safety
-///
-/// `query` must be a valid, non-null `TSQuery` pointer that outlives this call,
-/// and `id` must be a valid string value id in that query.
-unsafe fn query_string_value(
-    query: *const tree_sitter::ffi::TSQuery,
-    id: u32,
-) -> mlua::Result<String> {
-    let mut length = 0u32;
-    // SAFETY: `query` is valid and `id` is a string value id by the caller.
-    let ptr = unsafe { tree_sitter::ffi::ts_query_string_value_for_id(query, id, &mut length) };
-    // SAFETY: `ts_query_string_value_for_id` returned `length` bytes from the query.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), length as usize) };
-    std::str::from_utf8(bytes)
-        .map(|s| s.to_string())
-        .map_err(|_| runtime_error("query string value is not valid UTF-8"))
-}
+    /// # Safety
+    ///
+    /// `query` must be a valid, non-null `TSQuery` pointer that outlives this call.
+    unsafe fn parse_pattern_predicates(
+        query: *const tree_sitter::ffi::TSQuery,
+        pattern_index: usize,
+    ) -> mlua::Result<Vec<InspectPredicate>> {
+        let mut length = 0u32;
+        // SAFETY: `query` is a valid TSQuery pointer by the caller's contract.
+        let steps = unsafe {
+            tree_sitter::ffi::ts_query_predicates_for_pattern(
+                query,
+                pattern_index as u32,
+                &mut length,
+            )
+        };
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        // SAFETY: `ts_query_predicates_for_pattern` returned `length` valid steps.
+        let steps = unsafe { std::slice::from_raw_parts(steps, length as usize) };
+        let mut pattern_predicates = Vec::new();
+        let mut current = InspectPredicate {
+            operator: String::new(),
+            args: Vec::new(),
+        };
+        let mut has_operator = false;
+        for step in steps {
+            if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeDone {
+                if has_operator {
+                    pattern_predicates.push(std::mem::take(&mut current));
+                    has_operator = false;
+                }
+            } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeString {
+                // SAFETY: `query` is valid and `value_id` is a string from it.
+                let s = unsafe { query_string_value(query, step.value_id)? };
+                if !has_operator {
+                    current.operator = s;
+                    has_operator = true;
+                } else {
+                    current.args.push(InspectArg::String(s));
+                }
+            } else if step.type_ == tree_sitter::ffi::TSQueryPredicateStepTypeCapture
+                && has_operator
+            {
+                current.args.push(InspectArg::Capture(step.value_id));
+            }
+        }
+        Ok(pattern_predicates)
+    }
+
+    /// # Safety
+    ///
+    /// `query` must be a valid, non-null `TSQuery` pointer that outlives this call,
+    /// and `id` must be a valid string value id in that query.
+    unsafe fn query_string_value(
+        query: *const tree_sitter::ffi::TSQuery,
+        id: u32,
+    ) -> mlua::Result<String> {
+        let mut length = 0u32;
+        // SAFETY: `query` is valid and `id` is a string value id by the caller.
+        let ptr = unsafe { tree_sitter::ffi::ts_query_string_value_for_id(query, id, &mut length) };
+        // SAFETY: `ts_query_string_value_for_id` returned `length` bytes from the query.
+        let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), length as usize) };
+        std::str::from_utf8(bytes)
+            .map(|s| s.to_string())
+            .map_err(|_| runtime_error("query string value is not valid UTF-8"))
+    }
 
     let registry = languages.clone();
     vim.set(
@@ -1533,10 +1539,11 @@ unsafe fn query_string_value(
 #[expect(
     clippy::unwrap_used,
     clippy::panic,
-    reason = "parser fixture setup must fail loudly instead of hiding a missing parser",
+    reason = "parser fixture setup must fail loudly instead of hiding a missing parser"
 )]
 mod tests {
     use std::path::{Path, PathBuf};
+
     use mlua::Lua;
 
     use super::*;
@@ -1559,7 +1566,11 @@ mod tests {
                         .map(str::to_owned)
                 })
                 .unwrap_or_else(|| "lua".to_owned());
-            assert!(path.is_file(), "tree-sitter parser does not exist: {}", path.display());
+            assert!(
+                path.is_file(),
+                "tree-sitter parser does not exist: {}",
+                path.display()
+            );
             return (path, language);
         }
 
@@ -1591,6 +1602,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs a built tree-sitter parser: OXVIM_TREE_SITTER_PARSER or .references/neovim"]
     fn buffer_timeout_returns_nil_and_string_timeout_is_ignored() {
         let (path, language) = parser_from_environment();
         // SAFETY: this test exercises the userdata shim, which requires Lua's

@@ -1,14 +1,19 @@
 //! Audited Windows system-information queries used by the safe runtime.
 
+use std::fs::File;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, RtlNtStatusToDosError};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW,
+    GetSystemInfo, GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW,
     PROCESSOR_ARCHITECTURE_ALPHA, PROCESSOR_ARCHITECTURE_ALPHA64, PROCESSOR_ARCHITECTURE_AMD64,
     PROCESSOR_ARCHITECTURE_ARM, PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_IA32_ON_WIN64,
     PROCESSOR_ARCHITECTURE_IA64, PROCESSOR_ARCHITECTURE_INTEL, PROCESSOR_ARCHITECTURE_MIPS,
@@ -163,6 +168,47 @@ pub fn physical_memory() -> io::Result<PhysicalMemory> {
     Ok(PhysicalMemory {
         total: memory.ullTotalPhys,
         available: memory.ullAvailPhys,
+    })
+}
+
+/// Milliseconds since boot, the basis of libuv's `uv.uptime()`.
+#[must_use]
+pub fn uptime_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
+/// NTFS identity values libuv exposes through `stat` (`ino`, `nlink`, `dev`).
+#[derive(Clone, Copy, Debug)]
+pub struct FileIdentity {
+    /// Serial number of the volume containing the file.
+    pub volume_serial: u64,
+    /// Index identifying the file within its volume.
+    pub file_index: u64,
+    /// Number of hard links to the file.
+    pub links: u64,
+}
+
+/// Queries NTFS identity fields for an open file.
+///
+/// # Errors
+///
+/// Returns the OS error when the by-handle query fails (for example on
+/// filesystems without a file index, such as some network shares).
+pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandle(
+            file.as_raw_handle().cast::<std::ffi::c_void>(),
+            &raw mut info,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(FileIdentity {
+        volume_serial: u64::from(info.dwVolumeSerialNumber),
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        links: u64::from(info.nNumberOfLinks),
     })
 }
 

@@ -4032,6 +4032,9 @@ fn hostname() -> Result<Typval> {
     let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
         .or_else(|_| std::env::var("HOSTNAME"))
+        // Upstream falls back to gethostname() (`os_get_hostname`); the
+        // equivalent ambient value on Windows is COMPUTERNAME.
+        .or_else(|_| std::env::var("COMPUTERNAME"))
         .map_err(|error| {
             EvalError::new("E500", 0, format!("Cannot determine hostname: {error}"))
         })?;

@@ -261,6 +261,8 @@ pub fn open(path: impl AsRef<Path>, flags: OpenFlags, mode: u32) -> FsResult<Fil
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let file = options
         .open(path)
         .map_err(|error| FsError::from_io(&error))?;
@@ -422,6 +424,8 @@ pub fn mkdir(path: impl AsRef<Path>, mode: u32) -> FsResult<()> {
     fs::create_dir(&path).map_err(|error| FsError::from_io(&error))?;
     #[cfg(unix)]
     chmod(path, mode)?;
+    #[cfg(not(unix))]
+    let _ = mode;
     Ok(())
 }
 /// Removes an empty directory. See `uv.fs_rmdir()` in `runtime/doc/luvref.txt`.
@@ -450,25 +454,80 @@ pub fn rename(from: impl AsRef<Path>, to: impl AsRef<Path>) -> FsResult<()> {
 /// # Errors
 /// Returns [`FsError`] when metadata for `path` cannot be read, carrying the platform errno name (for example `ENOENT` or `EACCES`).
 pub fn stat(path: impl AsRef<Path>) -> FsResult<Stat> {
-    fs::metadata(path)
-        .map(|m| stat_from_metadata(&m))
-        .map_err(|error| FsError::from_io(&error))
+    stat_path(path.as_ref(), false)
 }
 /// Returns link metadata. See `uv.fs_lstat()` in `runtime/doc/luvref.txt`.
 ///
 /// # Errors
 /// Returns [`FsError`] when link metadata for `path` cannot be read, carrying the platform errno name (for example `ENOENT` or `ELOOP`).
 pub fn lstat(path: impl AsRef<Path>) -> FsResult<Stat> {
-    fs::symlink_metadata(path)
+    stat_path(path.as_ref(), true)
+}
+
+#[cfg(not(windows))]
+fn stat_path(path: &Path, nofollow: bool) -> FsResult<Stat> {
+    let metadata = if nofollow {
+        fs::symlink_metadata(path)
+    } else {
+        fs::metadata(path)
+    };
+    metadata
         .map(|m| stat_from_metadata(&m))
         .map_err(|error| FsError::from_io(&error))
 }
+
+#[cfg(windows)]
+fn stat_path(path: &Path, nofollow: bool) -> FsResult<Stat> {
+    match open_for_stat(path, nofollow) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|e| FsError::from_io(&e))?;
+            let identity = ox_sys::windows::file_identity(&file).ok();
+            Ok(stat_from_metadata(&metadata, identity.as_ref()))
+        }
+        // A reparse point that refuses to open still reports metadata.
+        Err(_) if nofollow => fs::symlink_metadata(path)
+            .map(|m| stat_from_metadata(&m, None))
+            .map_err(|e| FsError::from_io(&e)),
+        Err(error) => Err(FsError::from_io(&error)),
+    }
+}
+
+/// Opens a file or directory for a metadata query; `nofollow` keeps reparse
+/// points unresolved, matching `lstat`. `FILE_FLAG_BACKUP_SEMANTICS` is what
+/// lets the open succeed on directories.
+#[cfg(windows)]
+fn open_for_stat(path: &Path, nofollow: bool) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let flags = if nofollow {
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+    } else {
+        FILE_FLAG_BACKUP_SEMANTICS
+    };
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(path)
+}
+
 /// Returns open-file metadata. See `uv.fs_fstat()` in `runtime/doc/luvref.txt`.
 ///
 /// # Errors
 /// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or when the underlying metadata read fails.
 pub fn fstat(handle: &FileHandle) -> FsResult<Stat> {
-    handle.with_file(|f| f.metadata().map(|m| stat_from_metadata(&m)))
+    #[cfg(windows)]
+    {
+        handle.with_file(|f| {
+            let metadata = f.metadata()?;
+            let identity = ox_sys::windows::file_identity(f).ok();
+            Ok(stat_from_metadata(&metadata, identity.as_ref()))
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        handle.with_file(|f| f.metadata().map(|m| stat_from_metadata(&m)))
+    }
 }
 /// Creates a hard link. See `uv.fs_link()` in `runtime/doc/luvref.txt`.
 ///
@@ -538,7 +597,17 @@ pub fn chmod(path: impl AsRef<Path>, mode: u32) -> FsResult<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
             .map_err(|error| FsError::from_io(&error))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // `_wchmod` collapses the mode to the owner-write bit: the
+        // read-only attribute is the only permission a Windows file has.
+        let mut permissions = fs::metadata(&path)
+            .map_err(|error| FsError::from_io(&error))?
+            .permissions();
+        permissions.set_readonly(mode & 0o200 == 0);
+        fs::set_permissions(&path, permissions).map_err(|error| FsError::from_io(&error))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, mode);
         Err(FsError {
@@ -558,7 +627,15 @@ pub fn fchmod(handle: &FileHandle, mode: u32) -> FsResult<()> {
         use std::os::unix::fs::PermissionsExt;
         handle.with_file(|f| f.set_permissions(fs::Permissions::from_mode(mode)))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        handle.with_file(|f| {
+            let mut permissions = f.metadata()?.permissions();
+            permissions.set_readonly(mode & 0o200 == 0);
+            f.set_permissions(permissions)
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, mode);
         Err(FsError {
@@ -816,43 +893,139 @@ pub fn mkstemp(template: impl AsRef<Path>) -> FsResult<(FileHandle, PathBuf)> {
 /// Updates followed path timestamps. See `uv.fs_utime()` in `runtime/doc/luvref.txt`.
 ///
 /// # Errors
-/// Returns [`FsError`] carrying the platform errno when updating the followed-path timestamps fails.
-#[cfg(unix)]
+/// Returns [`FsError`] with `EINVAL` when a timestamp is out of range, or carrying the platform errno when updating the followed-path timestamps fails (or `ENOSYS` where setting times is unsupported).
 pub fn utime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> {
-    set_times_at(path.as_ref(), atime, mtime, false)
+    #[cfg(unix)]
+    {
+        set_times_at(path.as_ref(), atime, mtime, false)
+    }
+    #[cfg(windows)]
+    {
+        let file =
+            open_for_times(path.as_ref(), false).map_err(|error| FsError::from_io(&error))?;
+        set_file_times(&file, atime, mtime).map_err(|error| FsError::from_io(&error))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, atime, mtime);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "utime is unsupported".into(),
+            raw_os_error: None,
+        })
+    }
 }
 /// Updates symlink timestamps. See `uv.fs_lutime()` in `runtime/doc/luvref.txt`.
 ///
 /// # Errors
-/// Returns [`FsError`] carrying the platform errno when updating the symlink timestamps fails.
-#[cfg(unix)]
+/// Returns [`FsError`] with `EINVAL` when a timestamp is out of range, or carrying the platform errno when updating the symlink timestamps fails (or `ENOSYS` where setting times is unsupported).
 pub fn lutime(path: impl AsRef<Path>, atime: FsTime, mtime: FsTime) -> FsResult<()> {
-    set_times_at(path.as_ref(), atime, mtime, true)
+    #[cfg(unix)]
+    {
+        set_times_at(path.as_ref(), atime, mtime, true)
+    }
+    #[cfg(windows)]
+    {
+        let file = open_for_times(path.as_ref(), true).map_err(|error| FsError::from_io(&error))?;
+        set_file_times(&file, atime, mtime).map_err(|error| FsError::from_io(&error))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, atime, mtime);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "lutime is unsupported".into(),
+            raw_os_error: None,
+        })
+    }
 }
 /// Updates open-file timestamps. See `uv.fs_futime()` in `runtime/doc/luvref.txt`.
 ///
 /// # Errors
-/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked, or carrying the platform errno when the update fails.
-#[cfg(unix)]
+/// Returns [`FsError`] with `EINVAL` if the handle is closed or locked or a timestamp is out of range, or carrying the platform errno when the update fails (or `ENOSYS` where setting times is unsupported).
 pub fn futime(handle: &FileHandle, atime: FsTime, mtime: FsTime) -> FsResult<()> {
-    use rustix::fs::{Timestamps, futimens};
-    use rustix::time::Timespec;
-    handle.with_file(|file| {
-        futimens(
-            file,
-            &Timestamps {
-                last_access: Timespec {
-                    tv_sec: atime.sec,
-                    tv_nsec: i64::from(atime.nsec),
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Timestamps, futimens};
+        use rustix::time::Timespec;
+        handle.with_file(|file| {
+            futimens(
+                file,
+                &Timestamps {
+                    last_access: Timespec {
+                        tv_sec: atime.sec,
+                        tv_nsec: i64::from(atime.nsec),
+                    },
+                    last_modification: Timespec {
+                        tv_sec: mtime.sec,
+                        tv_nsec: i64::from(mtime.nsec),
+                    },
                 },
-                last_modification: Timespec {
-                    tv_sec: mtime.sec,
-                    tv_nsec: i64::from(mtime.nsec),
-                },
-            },
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
-    })
+            )
+            .map_err(|e| io::Error::from_raw_os_error(e.raw_os_error()))
+        })
+    }
+    #[cfg(windows)]
+    {
+        handle.with_file(|file| set_file_times(file, atime, mtime))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (handle, atime, mtime);
+        Err(FsError {
+            name: "ENOSYS",
+            message: "futime is unsupported".into(),
+            raw_os_error: None,
+        })
+    }
+}
+
+/// Converts an [`FsTime`] to a [`std::time::SystemTime`]; timestamps outside
+/// the representable range are rejected like an `EINVAL` argument.
+#[cfg(windows)]
+fn fs_time_to_system(time: FsTime) -> io::Result<std::time::SystemTime> {
+    let duration = std::time::Duration::new(time.sec.unsigned_abs(), time.nsec);
+    let epoch = std::time::SystemTime::UNIX_EPOCH;
+    let system = if time.sec >= 0 {
+        epoch.checked_add(duration)
+    } else {
+        epoch.checked_sub(duration)
+    };
+    system.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timestamp is out of range"))
+}
+
+/// The [`std::fs::FileTimes`] pair [`File::set_times`] applies.
+#[cfg(windows)]
+fn file_times(atime: FsTime, mtime: FsTime) -> io::Result<fs::FileTimes> {
+    Ok(fs::FileTimes::new()
+        .set_accessed(fs_time_to_system(atime)?)
+        .set_modified(fs_time_to_system(mtime)?))
+}
+
+/// [`File::set_times`] as an [`io::Result`].
+#[cfg(windows)]
+fn set_file_times(file: &fs::File, atime: FsTime, mtime: FsTime) -> io::Result<()> {
+    file.set_times(file_times(atime, mtime)?)
+}
+
+/// Opens `path` for a `SetFileTime`-style update. `FILE_FLAG_BACKUP_SEMANTICS`
+/// is what lets libuv's path forms reach directories as well as files;
+/// `FILE_FLAG_OPEN_REPARSE_POINT` (for `lutime`) opens the link itself rather
+/// than its target. `custom_flags` replaces rather than merges, so the flags
+/// are combined in one call.
+#[cfg(windows)]
+fn open_for_times(path: &Path, reparse_point: bool) -> io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if reparse_point {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(flags)
+        .open(path)
 }
 
 /// Copies a range between open files. See `uv.fs_sendfile()` in `runtime/doc/luvref.txt`.
@@ -1769,7 +1942,44 @@ fn stat_from_metadata(m: &Metadata) -> Stat {
         birthtime: system_time(m.created().ok()),
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn stat_from_metadata(m: &Metadata, identity: Option<&ox_sys::windows::FileIdentity>) -> Stat {
+    // Mirrors the libuv Win32 stat fill: permission bits collapse to the
+    // read-only/writable pair, `ino` is the NTFS file index, `nlink` the
+    // link count, and `dev` the volume serial number.
+    let kind = if m.is_dir() {
+        0o040_000
+    } else if m.file_type().is_symlink() {
+        0o120_000
+    } else {
+        0o100_000
+    };
+    let perms = if m.permissions().readonly() {
+        0o444
+    } else {
+        0o666
+    };
+    let size = m.len();
+    Stat {
+        dev: identity.map_or(0, |id| id.volume_serial),
+        mode: kind | perms,
+        nlink: identity.map_or(1, |id| id.links),
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        ino: identity.map_or(0, |id| id.file_index),
+        size,
+        blksize: 4096,
+        blocks: size.div_ceil(512),
+        flags: 0,
+        r#gen: 0,
+        atime: system_time(m.accessed().ok()),
+        mtime: system_time(m.modified().ok()),
+        ctime: system_time(m.created().ok()),
+        birthtime: system_time(m.created().ok()),
+    }
+}
+#[cfg(not(any(unix, windows)))]
 fn stat_from_metadata(m: &Metadata) -> Stat {
     Stat {
         dev: 0,
@@ -1843,6 +2053,8 @@ fn ownership_ids(
 }
 
 fn errno_name(raw: Option<i32>, kind: io::ErrorKind) -> &'static str {
+    #[cfg(not(unix))]
+    let _ = raw;
     #[cfg(unix)]
     if let Some(raw) = raw {
         use rustix::io::Errno;

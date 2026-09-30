@@ -1439,8 +1439,9 @@ fn dict_integer(dict: &ox_types::Dict, key: &[u8]) -> Option<i64> {
 mod tests {
     #![allow(clippy::unwrap_used)]
 
-    use super::*;
     use ox_types::WinHandle;
+
+    use super::*;
 
     fn event(name: &str, args: Vec<Object>) -> RedrawEvent {
         RedrawEvent {

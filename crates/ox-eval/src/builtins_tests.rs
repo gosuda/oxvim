@@ -3937,17 +3937,23 @@ fn findfile_and_finddir_preserve_non_ascii_name_bytes() {
     std::fs::write(directory.join("bår.txt"), b"").expect("a writable fixture file");
     let regex = VimRegex;
 
+    // Upstream joins result components with `PATHSEP`, which is a literal
+    // `/` on every platform, so Windows results keep the directory's own
+    // spelling (`C:\dir/file`).
     let arguments = vec![text("bår.txt"), text(&directory.to_string_lossy())];
     let found = Builtins::new(&regex)
         .call(&OxStr::from("findfile"), arguments, &mut Scope::new())
         .unwrap();
-    assert_eq!(found, text(&directory.join("bår.txt").to_string_lossy()));
+    assert_eq!(
+        found,
+        text(&format!("{}/bår.txt", directory.to_string_lossy()))
+    );
 
     let arguments = vec![text("café"), text(&root.to_string_lossy())];
     let found = Builtins::new(&regex)
         .call(&OxStr::from("finddir"), arguments, &mut Scope::new())
         .unwrap();
-    assert_eq!(found, text(&directory.to_string_lossy()));
+    assert_eq!(found, text(&format!("{}/café", root.to_string_lossy())));
 }
 
 /// Oracle: `nvim -u NONE --headless` running `:lockvar`, `:lockvar!`,

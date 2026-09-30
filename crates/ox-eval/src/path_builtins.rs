@@ -27,8 +27,13 @@ pub(crate) fn getcwd(args: &[Typval]) -> Result<Typval> {
 
 pub(crate) fn is_absolute_path(value: &Typval) -> Result<Typval> {
     let value = string_arg(value)?;
+    let text = value.to_string_lossy().into_owned();
+    let path = Path::new(&text);
+    // Upstream `vim_isAbsName` calls `/x` and `\x` absolute even on Windows
+    // (rooted at the current drive), where `Path::is_absolute` wants a
+    // drive prefix too.
     Ok(boolean(
-        Path::new(&value.to_string_lossy().as_ref()).is_absolute(),
+        path.is_absolute() || (cfg!(windows) && path.has_root()),
     ))
 }
 
@@ -339,8 +344,7 @@ fn create_private_dir(path: &Path) -> bool {
 /// `isdir && os_file_owned() && 0700 == (perm & 0777)` (`fileio.c:3342-3346`).
 #[cfg(unix)]
 fn is_private_dir(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
@@ -506,19 +510,46 @@ fn number_arg(value: &Typval) -> Result<i64> {
 fn absolute_name(name: &str) -> String {
     let expanded = expand_home(name);
     let path = Path::new(&expanded);
+    // Upstream `fullpath_save`/`os_get_fullpath`: join under the cwd and
+    // simplify — no canonicalization, and the name's own separators are
+    // kept verbatim (`C:\dir` + `src/file.rs` → `C:\dir\src/file.rs`).
     let absolute = if path.is_absolute() {
-        path.to_path_buf()
+        expanded
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        std::env::current_dir()
+            .unwrap_or_default()
+            .join(path)
+            .to_string_lossy()
+            .into_owned()
     };
-    let mut output = fs::canonicalize(&absolute)
-        .unwrap_or_else(|_| PathBuf::from(simplify_name(&absolute.to_string_lossy())))
-        .to_string_lossy()
-        .into_owned();
-    if absolute.is_dir() && !output.ends_with('/') {
-        output.push('/');
+    let mut output = simplify_name(&absolute);
+    if Path::new(&absolute).is_dir() && !output.bytes().last().is_some_and(is_path_sep) {
+        output.push(is_path_sep_char());
     }
     output
+}
+
+/// Upstream `vim_ispathsep` (`misc2.c`): `/` separates paths everywhere;
+/// `\` separates too under `BACKSLASH_IN_FILENAME` (Windows). Returned as
+/// a `char` for `str` APIs and reused for byte scans.
+fn is_path_sep_char() -> char {
+    std::path::MAIN_SEPARATOR
+}
+
+fn is_path_sep(byte: u8) -> bool {
+    byte == b'/' || (cfg!(windows) && byte == b'\\')
+}
+
+fn rfind_path_sep(name: &str) -> Option<usize> {
+    name.bytes().rposition(is_path_sep)
+}
+
+/// The part of `name` after its last path separator, like `gettail`.
+fn path_tail_str(name: &str) -> &str {
+    match rfind_path_sep(name) {
+        Some(index) => &name[index + 1..],
+        None => name,
+    }
 }
 
 fn expand_home(name: &str) -> String {
@@ -556,26 +587,27 @@ fn path_head(name: &str) -> String {
     if name.is_empty() {
         return ".".to_owned();
     }
-    if name.len() > 1 && name.ends_with('/') {
-        return name.trim_end_matches('/').to_owned();
+    if name.len() > 1 && name.bytes().last().is_some_and(is_path_sep) {
+        return name
+            .trim_end_matches(|character| is_path_sep(character as u8))
+            .to_owned();
     }
-    match name.rfind('/') {
-        Some(0) => "/".to_owned(),
-        Some(index) => name[..index].to_owned(),
+    match rfind_path_sep(name) {
+        Some(index) => name[..index.max(1)].to_owned(),
         None => String::new(),
     }
 }
 
 fn path_tail(name: &str) -> String {
-    if name.ends_with('/') {
+    if name.bytes().last().is_some_and(is_path_sep) {
         String::new()
     } else {
-        name.rsplit('/').next().unwrap_or(name).to_owned()
+        path_tail_str(name).to_owned()
     }
 }
 
 fn tail_dot(name: &str) -> Option<usize> {
-    let tail = name.rsplit('/').next().unwrap_or(name);
+    let tail = path_tail_str(name);
     let dot = tail.rfind('.')?;
     (dot > 0).then_some(name.len() - tail.len() + dot)
 }
@@ -585,7 +617,7 @@ fn path_root(name: &str) -> String {
 }
 
 fn path_extension(name: &str, count: usize) -> String {
-    let tail = name.rsplit('/').next().unwrap_or(name);
+    let tail = path_tail_str(name);
     let dots: Vec<usize> = tail
         .match_indices('.')
         .map(|(index, _)| index)
@@ -617,53 +649,105 @@ fn shell_escape(name: &str) -> String {
     format!("'{}'", name.replace('\'', "'\\''"))
 }
 
+/// `simplify_path` (`path.c`): upstream edits the name in place — `dir/..`
+/// pairs are cut out, `.` components dropped, redundant separators
+/// collapsed — so every separator it emits is one the input already had.
+/// Rebuilding with a platform separator would rewrite `src/file.rs` into
+/// `src\file.rs` on Windows, which upstream never does.
 pub(crate) fn simplify_name(name: &str) -> String {
     if name.is_empty() {
         return String::new();
     }
-    let absolute = name.starts_with('/');
-    let double_root = name.starts_with("//") && !name.starts_with("///");
-    let trailing_separator = name.ends_with('/');
+    let bytes = name.as_bytes();
+    // Leading separators: one makes the path absolute, exactly two is the
+    // double root upstream keeps verbatim, more collapses to one.
+    let mut leading = 0usize;
+    while bytes.get(leading).is_some_and(|byte| is_path_sep(*byte)) {
+        leading += 1;
+    }
+    let absolute = leading > 0;
+    let double_root = leading == 2;
+    let trailing_separator = bytes.last().is_some_and(|byte| is_path_sep(*byte));
+
+    // Components with the separator byte preceding each (None for the
+    // first). Separator runs collapse to their last byte.
+    let mut components: Vec<(&str, Option<u8>)> = Vec::new();
+    let mut cursor = leading;
+    let mut start = cursor;
+    let mut sep_before = None;
+    while cursor < bytes.len() {
+        if is_path_sep(bytes[cursor]) {
+            if start < cursor {
+                components.push((&name[start..cursor], sep_before));
+            }
+            sep_before = Some(bytes[cursor]);
+            cursor += 1;
+            while cursor < bytes.len() && is_path_sep(bytes[cursor]) {
+                cursor += 1;
+            }
+            start = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+    if start < bytes.len() {
+        components.push((&name[start..], sep_before));
+    }
+
     let mut current_prefix = false;
-    let mut parts: Vec<&str> = Vec::new();
-    for component in name.split('/') {
-        match component {
-            "" => {}
+    // A separator the `..` machinery keeps: removing `part/../` deletes the
+    // `..` and the separator after it, so the next component inherits the
+    // separator that preceded the removed pair.
+    let mut inherited_sep = None;
+    let mut parts: Vec<(Option<u8>, &str)> = Vec::new();
+    for (text, sep) in components {
+        match text {
             "." => {
                 current_prefix |= !absolute && parts.is_empty();
             }
-            ".." if parts.last().is_some_and(|part| *part != "..") => {
-                parts.pop();
-            }
-            ".." if absolute => {}
-            ".." => {
-                current_prefix = false;
-                parts.push(component);
-            }
-            _ => parts.push(component),
+            ".." => match parts.last() {
+                Some((popped_sep, popped)) if *popped != ".." => {
+                    inherited_sep = *popped_sep;
+                    parts.pop();
+                }
+                _ => {
+                    if absolute {
+                        // A `..` off the root is dropped; the separator
+                        // before it separates what follows from the root.
+                        inherited_sep = sep;
+                    } else {
+                        current_prefix = false;
+                        parts.push((inherited_sep.take().or(sep), ".."));
+                    }
+                }
+            },
+            _ => parts.push((inherited_sep.take().or(sep), text)),
         }
     }
-    let mut output = if parts.is_empty() {
-        String::from(if double_root {
-            "//"
-        } else if absolute {
-            "/"
-        } else {
-            "."
-        })
-    } else {
-        let mut output = parts.join("/");
-        if double_root {
-            output.insert_str(0, "//");
-        } else if absolute {
-            output.insert(0, '/');
-        } else if current_prefix {
-            output.insert_str(0, "./");
+
+    let mut output = String::new();
+    if absolute {
+        output.push_str(&name[..=usize::from(double_root)]);
+    }
+    if parts.is_empty() {
+        if output.is_empty() {
+            output.push('.');
         }
-        output
-    };
-    if trailing_separator && !output.ends_with('/') {
-        output.push('/');
+    } else {
+        for (index, (sep, text)) in parts.iter().enumerate() {
+            if index == 0 {
+                if current_prefix {
+                    output.push('.');
+                    output.push(char::from(sep.unwrap_or(b'/')));
+                }
+            } else {
+                output.push(char::from(sep.unwrap_or(b'/')));
+            }
+            output.push_str(text);
+        }
+    }
+    if trailing_separator && !output.bytes().last().is_some_and(is_path_sep) {
+        output.push(char::from(*bytes.last().unwrap_or(&b'/')));
     }
     output
 }

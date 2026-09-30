@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,10 +17,16 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 const TIMEOUT: Duration = Duration::from_secs(10);
+// Each session owns a ConPTY host plus a render loop; concurrent sessions
+// starve one another and lose cursor visibility races, so tests run serially.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 struct Terminal {
     child: Box<dyn portable_pty::Child + Send + Sync>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    // Optional so `finish` can close the ConPTY: on Windows the read pipe
+    // stays open until the master is dropped, and joining the reader would
+    // otherwise block forever after the child exits.
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Box<dyn Write + Send>,
     reader: Option<JoinHandle<()>>,
     incoming: mpsc::Receiver<Vec<u8>>,
@@ -28,11 +34,16 @@ struct Terminal {
     transcript: Vec<u8>,
     directory: PathBuf,
     finished: bool,
+    answered_cursor_query: bool,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Terminal {
     fn start(contents: &str) -> TestResult<Self> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let directory = std::env::temp_dir().join(format!(
             "oxvim-e2e-{}-{}",
             std::process::id(),
@@ -70,7 +81,7 @@ impl Terminal {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
         );
         let mut output = pair.master.try_clone_reader()?;
-        let writer = pair.master.take_writer()?;
+        let writer: Box<dyn Write + Send> = pair.master.take_writer()?;
         let child = pair.slave.spawn_command(command)?;
         drop(pair.slave);
         let (sender, incoming) = mpsc::channel();
@@ -89,7 +100,7 @@ impl Terminal {
         });
         Ok(Self {
             child,
-            master: pair.master,
+            master: Some(pair.master),
             writer,
             reader: Some(reader),
             incoming,
@@ -97,6 +108,8 @@ impl Terminal {
             transcript: Vec::new(),
             directory,
             finished: false,
+            answered_cursor_query: false,
+            _serial: serial,
         })
     }
 
@@ -108,6 +121,29 @@ impl Terminal {
         while let Ok(bytes) = self.incoming.try_recv() {
             self.parser.process(&bytes);
             self.transcript.extend(bytes);
+        }
+        self.answer_cursor_query();
+    }
+
+    // portable-pty creates the console with PSUEDOCONSOLE_INHERIT_CURSOR, so
+    // conhost emits `ESC[6n` and waits for the hosting terminal's
+    // `ESC[<row>;<col>R` reply before it keeps servicing the child's output —
+    // an unanswered query also deadlocks `ClosePseudoConsole`. The reply must
+    // arrive while conhost is actually waiting: sent ahead of the query it is
+    // forwarded to the child as input instead, which both drops it and leaks
+    // a stray keypress. Answer only once the query itself is visible.
+    fn answer_cursor_query(&mut self) {
+        if self.answered_cursor_query {
+            return;
+        }
+        if self
+            .transcript
+            .windows(4)
+            .any(|window| window == b"\x1b[6n")
+        {
+            self.answered_cursor_query = true;
+            let _ = self.writer.write_all(b"\x1b[1;1R");
+            let _ = self.writer.flush();
         }
     }
 
@@ -132,18 +168,39 @@ impl Terminal {
     }
 
     fn send(&mut self, input: &[u8]) -> TestResult {
-        self.writer.write_all(input)?;
+        // ConPTY WIN32 input mode parses bytes as a VT stream, so a lone ESC
+        // waits forever for a sequence tail (and `ESC ESC` decodes as the
+        // distinct `Alt+Esc` key). The Esc key itself goes in as a win32
+        // input-mode record: `ESC [ Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, where
+        // VK_ESCAPE is 27 and its scan code is 1.
+        #[cfg(windows)]
+        let input = {
+            const ESCAPE_KEY: &[u8] = b"\x1b[27;1;27;1;0;1_";
+            let mut framed = Vec::with_capacity(input.len());
+            for (index, &byte) in input.iter().enumerate() {
+                if byte == 0x1b && input.get(index + 1) != Some(&b'[') {
+                    framed.extend_from_slice(ESCAPE_KEY);
+                } else {
+                    framed.push(byte);
+                }
+            }
+            framed
+        };
+        self.writer.write_all(&input)?;
         self.writer.flush()?;
         Ok(())
     }
 
     fn resize(&mut self, rows: u16, columns: u16) -> TestResult {
-        self.master.resize(PtySize {
-            rows,
-            cols: columns,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        self.master
+            .as_mut()
+            .ok_or_else(|| io::Error::other("terminal already finished"))?
+            .resize(PtySize {
+                rows,
+                cols: columns,
+                pixel_width: 0,
+                pixel_height: 0,
+            })?;
         self.parser.screen_mut().set_size(rows, columns);
         Ok(())
     }
@@ -160,6 +217,27 @@ impl Terminal {
                 return Err(io::Error::other("editor did not exit after quit").into());
             }
         }
+        // Child exit and the last restore bytes race through conhost: drain
+        // until the restore tail is visible (or give it a moment) before
+        // closing the master, which would drop whatever is in flight. On
+        // Windows `]104` never reaches the stream, so wait on the cursor
+        // restore tail (`ESC[0 q`) instead.
+        #[cfg(unix)]
+        let tail: &[u8] = b"\x1b]104";
+        #[cfg(windows)]
+        let tail: &[u8] = b"\x1b[0 q";
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        while !self
+            .transcript
+            .windows(tail.len())
+            .any(|bytes| bytes == tail)
+            && Instant::now() < drain_deadline
+        {
+            self.receive(Duration::from_millis(10));
+        }
+        // Drop the master before joining: the Windows ConPTY read end only
+        // reaches EOF once the owning side closes.
+        drop(self.master.take());
         if let Some(reader) = self.reader.take() {
             reader
                 .join()
@@ -170,6 +248,10 @@ impl Terminal {
             !self.parser.screen().hide_cursor(),
             "cursor hidden after exit"
         );
+        // Windows conhost consumes OSC `]104` itself (it owns the console
+        // palette) instead of forwarding the sequence onto the ConPTY stream,
+        // so the palette-restore wire check only holds on unix.
+        #[cfg(unix)]
         assert!(
             self.transcript.windows(5).any(|bytes| bytes == b"\x1b]104"),
             "palette not restored"
@@ -192,6 +274,8 @@ impl Drop for Terminal {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+        // Close the ConPTY so the reader's blocking read reaches EOF.
+        drop(self.master.take());
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }

@@ -20,12 +20,16 @@ use differential::perf::report::{
     UiContract, Verdict, judge_comparison, materiality_open, summarize_noise, summarize_stages,
 };
 use differential::perf::runner::{ExecutionMode, RunConfig, RunOutcome, Runner};
-use differential::perf::session::{PerfSession, SessionConfig, StageTiming};
+use differential::perf::session::StageTiming;
+#[cfg(unix)]
+use differential::perf::session::{PerfSession, SessionConfig};
 use differential::perf::startuptime;
 use differential::perf::stats::{percentile, summarize};
+#[cfg(unix)]
+use differential::perf::workload::run_steady_window;
 use differential::perf::workload::{
     EngineFamily, FixtureRequirement, Kind, Profile, WorkloadId, abba_order, edit_alternation,
-    matrix, run_steady_window, scroll_alternation,
+    matrix, scroll_alternation,
 };
 
 // ===========================================================================
@@ -1399,6 +1403,7 @@ fn workload_matrix_is_closed() {
 // 17. steady_state_workloads_are_state_neutral (oracle only)
 // ===========================================================================
 
+#[cfg(unix)] // oracle nvim is a checked-in Unix binary; snapshot attach uses Unix ptys
 #[test]
 fn steady_state_workloads_are_state_neutral() -> Result<(), Box<dyn std::error::Error>> {
     // This test needs only the oracle, with no target/release/oxvim required.

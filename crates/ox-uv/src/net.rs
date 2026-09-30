@@ -2,25 +2,28 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(unix)]
 use std::time::Duration;
 
 use mio::net::{TcpListener, TcpStream, UdpSocket};
-use mio::{Interest, Token};
-use ox_loop::{DrainState, Readiness};
-
-use crate::handle::Handle;
-use crate::uv_loop::NetDispatchQueue;
-use crate::{CallbackError, CallbackErrorEvent, CallbackPhase, HandleId, UvLoop};
-
 #[cfg(unix)]
 use mio::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use mio::unix::SourceFd;
+use mio::{Interest, Token};
+use ox_loop::{DrainState, Readiness};
 #[cfg(unix)]
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 #[cfg(unix)]
@@ -29,14 +32,10 @@ use rustix::net::{AddressFamily, SocketType};
 use rustix::termios::{
     LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
 };
-#[cfg(unix)]
-use std::fs::File;
-#[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(unix)]
-use std::path::{Path, PathBuf};
+
+use crate::handle::Handle;
+use crate::uv_loop::NetDispatchQueue;
+use crate::{CallbackError, CallbackErrorEvent, CallbackPhase, HandleId, UvLoop};
 
 pub(crate) const STREAM_CHUNK: usize = 64 * 1024;
 const DATAGRAM_CHUNK: usize = 65_536;
@@ -289,6 +288,7 @@ impl StreamFlags {
     const READING: u8 = 1 << 1;
     const CONNECTING: u8 = 1 << 2;
     const REGISTERED: u8 = 1 << 3;
+    #[cfg(unix)]
     const IPC: u8 = 1 << 4;
 
     fn contains(self, flag: u8) -> bool {
@@ -851,6 +851,7 @@ pub enum PipeHandleKind {
 }
 
 impl PipeHandleKind {
+    #[cfg(unix)]
     fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",

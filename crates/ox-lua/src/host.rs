@@ -234,6 +234,24 @@ impl LuaHost {
     }
 }
 
+/// Forward-slash spelling of `path`, the form upstream writes into
+/// `package.path` via `vim.fs.joinpath`.
+#[cfg(windows)]
+fn to_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn to_slash(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Upstream `vim_isAbsName`: drive-qualified or rooted at either separator,
+/// so `/x` and `\x` are absolute even on Windows.
+fn is_absolute(path: &Path) -> bool {
+    path.is_absolute() || (cfg!(windows) && path.has_root())
+}
+
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
     // Strip every relative `package.path`/`package.cpath` entry before
@@ -253,7 +271,7 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
         let existing: String = package.get(field)?;
         let trusted = existing
             .split(';')
-            .filter(|entry| Path::new(entry).is_absolute())
+            .filter(|entry| is_absolute(Path::new(entry)))
             .collect::<Vec<_>>()
             .join(";");
         package.set(field, trusted)?;
@@ -262,12 +280,12 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
         return Ok(());
     }
     let existing: String = package.get("path")?;
-    let lua_root = runtime_root.resolve("lua");
-    let module = lua_root.join("?.lua");
-    let package_init = lua_root.join("?/init.lua");
+    // `vim.fs.joinpath` builds these entries with `/`, so they keep that
+    // spelling even on Windows.
+    let lua_root = to_slash(&runtime_root.resolve("lua"));
     let mut entries = vec![
-        module.to_string_lossy().into_owned(),
-        package_init.to_string_lossy().into_owned(),
+        format!("{lua_root}/?.lua"),
+        format!("{lua_root}/?/init.lua"),
     ];
     entries.extend(
         existing
@@ -295,14 +313,10 @@ mod tests {
         let path = |lua: &Lua| package_field(lua, "path");
         let cpath = |lua: &Lua| package_field(lua, "cpath");
         let has_relative = |field: &str| -> bool {
-            !field.is_empty()
-                && field
-                    .split(';')
-                    .any(|entry| !Path::new(entry).is_absolute())
+            !field.is_empty() && field.split(';').any(|entry| !is_absolute(Path::new(entry)))
         };
-        let contains_entry = |field: &str, entry: &str| {
-            field.split(';').any(|candidate| candidate == entry)
-        };
+        let contains_entry =
+            |field: &str, entry: &str| field.split(';').any(|candidate| candidate == entry);
         let defaults = Lua::new();
         let default_path = path(&defaults);
         let default_cpath = cpath(&defaults);
@@ -324,13 +338,19 @@ mod tests {
             !has_relative(&unresolved_cpath),
             "unresolved root left relative cpath entries: {unresolved_cpath}"
         );
-        for entry in default_path.split(';').filter(|e| Path::new(e).is_absolute()) {
+        for entry in default_path
+            .split(';')
+            .filter(|e| is_absolute(Path::new(e)))
+        {
             assert!(
                 contains_entry(&unresolved_path, entry),
                 "absolute path entry {entry} was dropped: {unresolved_path}"
             );
         }
-        for entry in default_cpath.split(';').filter(|e| Path::new(e).is_absolute()) {
+        for entry in default_cpath
+            .split(';')
+            .filter(|e| is_absolute(Path::new(e)))
+        {
             assert!(
                 contains_entry(&unresolved_cpath, entry),
                 "absolute cpath entry {entry} was dropped: {unresolved_cpath}"
@@ -343,12 +363,18 @@ mod tests {
         let fresh = Lua::new();
         configure_package_path(&fresh, &RuntimeRoot::new(PathBuf::from("/rt"))).unwrap();
         let seeded = path(&fresh);
-        assert!(seeded.starts_with("/rt/lua/?.lua;/rt/lua/?/init.lua;"), "{seeded}");
+        assert!(
+            seeded.starts_with("/rt/lua/?.lua;/rt/lua/?/init.lua;"),
+            "{seeded}"
+        );
         assert!(
             !has_relative(&seeded),
             "resolved root left relative path entries: {seeded}"
         );
-        for entry in default_path.split(';').filter(|e| Path::new(e).is_absolute()) {
+        for entry in default_path
+            .split(';')
+            .filter(|e| is_absolute(Path::new(e)))
+        {
             assert!(
                 contains_entry(&seeded, entry),
                 "absolute path entry {entry} was dropped: {seeded}"
@@ -359,7 +385,10 @@ mod tests {
             !has_relative(&seeded_cpath),
             "resolved root left relative cpath entries: {seeded_cpath}"
         );
-        for entry in default_cpath.split(';').filter(|e| Path::new(e).is_absolute()) {
+        for entry in default_cpath
+            .split(';')
+            .filter(|e| is_absolute(Path::new(e)))
+        {
             assert!(
                 contains_entry(&seeded_cpath, entry),
                 "absolute cpath entry {entry} was dropped: {seeded_cpath}"
@@ -424,6 +453,15 @@ mod tests {
             "",
             "planted launch-directory package was loaded"
         );
+        // Windows keeps a directory locked while it is the process cwd, and
+        // a parallel test may have snapshotted `planted` as cwd and restore
+        // it after our own restore.
+        for _ in 0..50 {
+            match std::fs::remove_dir_all(&planted) {
+                Ok(()) => return,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            }
+        }
         std::fs::remove_dir_all(&planted).unwrap();
     }
 }

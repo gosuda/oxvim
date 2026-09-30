@@ -2,14 +2,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::fs::OpenOptions;
-use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
-use std::ptr::NonNull;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -23,10 +25,11 @@ use ox_uv::fs_watch::{FsEvent, FsEventOptions, FsEventRecord, WatchError};
 use ox_uv::net::{NetEvent, Tcp, Udp};
 #[cfg(unix)]
 use ox_uv::net::{Pipe, Tty, TtyMode};
+#[cfg(unix)]
 use ox_uv::process::{self, Process, ProcessPipe, SpawnOptions, StdioConfig};
-use ox_uv::thread;
 use ox_uv::{
     Async, CallbackError, Check, Handle, HandleId, Idle, Prepare, RunMode, Signal, Timer, UvLoop,
+    thread,
 };
 
 #[cfg(unix)]
@@ -81,6 +84,8 @@ fn signal_number(value: Value) -> mlua::Result<i32> {
 }
 
 fn signal_name(lua: &Lua, number: i32) -> mlua::Result<Value> {
+    #[cfg(not(unix))]
+    let _ = lua;
     #[cfg(unix)]
     if let Some((name, _)) = SIGNALS.iter().find(|(_, candidate)| *candidate == number) {
         return Ok(Value::String(lua.create_string(*name)?));
@@ -185,10 +190,7 @@ impl LoopAccess {
     /// Reads loop state through the callback-scoped pointer when one exists.
     /// Outside callbacks, a failed borrow is reported instead of being
     /// converted into a fabricated status value.
-    pub(crate) fn with_loop_ref<R>(
-        &self,
-        operation: impl FnOnce(&UvLoop) -> R,
-    ) -> mlua::Result<R> {
+    pub(crate) fn with_loop_ref<R>(&self, operation: impl FnOnce(&UvLoop) -> R) -> mlua::Result<R> {
         if let Some(active_loop) = self.active_loop.get() {
             // SAFETY: `active_loop` is installed only for the synchronous
             // lifetime of the `&mut UvLoop` supplied to `callback`.
@@ -343,13 +345,16 @@ struct StreamCallbacks {
     writes: HashMap<u64, Function>,
     /// Pipe-only: callback of the write being queued; a synchronously flushed
     /// completion claims it during `ProcessPipe::write` before its id is known.
+    #[cfg(unix)]
     pending_write: Option<Function>,
     /// Pipe-only: set while a `ProcessPipe::write` call holds the pipe borrow.
     /// Every completion it delivers — this write or an earlier buffered one
     /// flushed by it — parks instead of invoking Lua under the borrow.
+    #[cfg(unix)]
     write_in_flight: bool,
     /// Pipe-only: (callback, result) parked in completion order while a write
     /// call is in flight; delivered in order once the pipe borrow is released.
+    #[cfg(unix)]
     parked_writes: VecDeque<(Function, Result<(), String>)>,
     shutdown: Option<Function>,
     accepted_tcp: VecDeque<Tcp>,
@@ -882,6 +887,7 @@ impl UserData for LuaProcessPipe {
     }
 }
 
+#[cfg(unix)]
 #[derive(Clone)]
 struct LuaProcess {
     inner: Rc<RefCell<Option<Process>>>,
@@ -889,6 +895,7 @@ struct LuaProcess {
     closing: Rc<Cell<bool>>,
 }
 
+#[cfg(unix)]
 impl Drop for LuaProcess {
     fn drop(&mut self) {
         if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
@@ -903,6 +910,7 @@ impl Drop for LuaProcess {
     }
 }
 
+#[cfg(unix)]
 impl UserData for LuaProcess {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("get_pid", |_, this, ()| {
@@ -1425,11 +1433,7 @@ impl LuaFsEvent {
         let result = self.access.with_loop(move |uv_loop| {
             let event_callback = move |_: &mut UvLoop, result: FsResult<FsEventRecord>| {
                 let item = match result {
-                    Ok(record) => Ok((
-                        path_bytes(&record.filename),
-                        record.change,
-                        record.rename,
-                    )),
+                    Ok(record) => Ok((path_bytes(&record.filename), record.change, record.rename)),
                     Err(error) => Err(error.to_string()),
                 };
                 if let Ok(mut pending) = queue.lock() {
@@ -1485,7 +1489,11 @@ impl LuaFsEvent {
         }
         // Move ownership now: a subsequent start must never be closed by this
         // deferred teardown, even when both operations originate in a callback.
-        let event = self.state.try_borrow_mut().ok().and_then(|mut state| state.take());
+        let event = self
+            .state
+            .try_borrow_mut()
+            .ok()
+            .and_then(|mut state| state.take());
         if let Some(event) = event {
             self.access.apply(Box::new(move |uv_loop| {
                 let _ = event.close(uv_loop);
@@ -1521,7 +1529,6 @@ impl LuaFsEvent {
             lua.create_string(path)?,
         )]))
     }
-
 }
 impl Drop for LuaFsEvent {
     fn drop(&mut self) {
@@ -2406,6 +2413,7 @@ struct LuaTty {
     access: LoopAccess,
     closing: Rc<Cell<bool>>,
 }
+#[cfg(unix)]
 impl Drop for LuaTty {
     fn drop(&mut self) {
         if Rc::strong_count(&self.inner) != 1 || self.closing.replace(true) {
@@ -2549,15 +2557,16 @@ mod loop_access_tests {
     reason = "the lifecycle tests construct a host, drive Lua, and panic on assertion failure"
 )]
 mod fs_event_lifecycle_tests {
-    use super::LuaFsEvent;
-    use crate::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
-    use mlua::AnyUserData;
-    use ox_types::{OxStr, Typval};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::rc::Rc;
 
+    use mlua::AnyUserData;
+    use ox_types::{OxStr, Typval};
+
+    use super::LuaFsEvent;
+    use crate::{BuiltinHost, LuaHost, RuntimeRoot, Scheduler, Work};
 
     struct TestScheduler {
         queue: RefCell<VecDeque<Work>>,
@@ -2589,10 +2598,8 @@ mod fs_event_lifecycle_tests {
 
     impl TempWatchDir {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "oxvim-uv-handles-{label}-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("oxvim-uv-handles-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("create watch dir");
             Self { path }
@@ -2609,9 +2616,8 @@ mod fs_event_lifecycle_tests {
         let scheduler = Rc::new(TestScheduler {
             queue: RefCell::new(VecDeque::new()),
         });
-        let runtime = RuntimeRoot::new(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"),
-        );
+        let runtime =
+            RuntimeRoot::new(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../runtime"));
         LuaHost::new(runtime, Rc::new(TestBuiltins), scheduler).expect("create host")
     }
 
@@ -2796,7 +2802,8 @@ mod fs_event_lifecycle_tests {
                 .expect("unseal directory");
             return;
         }
-        let result = host.lua()
+        let result = host
+            .lua()
             .load(
                 r"
                 local handle = assert(vim.uv.new_fs_event())
