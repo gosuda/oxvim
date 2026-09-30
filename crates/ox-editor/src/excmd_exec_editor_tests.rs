@@ -4459,8 +4459,8 @@ fn in_range_addresses_survive_the_domain_check() {
 fn each_address_domain_gets_its_own_limit() {
     let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
     // ADDR_OTHER: unbounded, so the address never reaches the domain check.
-    // `:resize` still fails on its own screen-extent limit, which is E36, not
-    // the E16 this test is about.
+    // `99resize` clamps to the last window like upstream and applies the
+    // resize instead of erroring.
     executor.execute_line(&editor, "99bnext").unwrap();
     assert_vim_error(executor.execute_line(&editor, "99close"), "E16");
     assert_vim_error(executor.execute_line(&editor, "99buffer"), "E16");

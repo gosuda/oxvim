@@ -3642,20 +3642,22 @@ fn command_resize<F: FileIO>(
     editor: &mut Editor,
     command: &ExCommand,
 ) -> Flow {
-    // `ex_resize` (ex_docmd.c:5911-5936): an address selects the window,
-    // `+N`/`-N` are relative to the current height, and a bare `:resize`
-    // means Rows - 1 ("as high as possible").
+    // `ex_resize` (ex_docmd.c:5947-5973): an address selects the window,
+    // `:vertical` resizes width instead of height, `+N`/`-N` are relative
+    // to the current extent, and a bare `:resize`/`:vert resize` means
+    // Rows - 1 / Columns ("as high/wide as possible").
     let args = command.args.trim();
-    let signed = args
-        .parse::<isize>()
-        .ok()
-        .unwrap_or_else(|| match args.as_bytes().first() {
-            Some(b'+') => 1,
-            Some(b'-') => -1,
-            _ => 0,
-        });
+    let vertical = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::Vertical);
+    // Upstream uses `atol`: unparseable arguments (including a bare "+"
+    // or "-") contribute 0, and the sign still marks the resize relative.
+    let signed = args.parse::<isize>().ok().unwrap_or(0);
+    let relative = matches!(args.as_bytes().first(), Some(b'+' | b'-'));
     let window = if command.range.is_some() {
-        // `:Nresize` selects the Nth window (ex_docmd.c:5915-5918).
+        // `:Nresize` selects the Nth window; a number past the last
+        // window clamps to it (ex_docmd.c:5950-5952).
         let target = match resolve_range_raw(editor, command) {
             Ok((_, end)) => end.max(1),
             Err(message) => return error_flow(runtime, "E16", message),
@@ -3664,7 +3666,7 @@ fn command_resize<F: FileIO>(
             .current_tabpage()
             .and_then(|tab| editor.tabpage_windows(tab).ok())
             .unwrap_or_default();
-        window_by_number(&windows, target)
+        window_by_number(&windows, target).or_else(|| windows.last().copied())
     } else {
         editor.current_window()
     };
@@ -3675,21 +3677,32 @@ fn command_resize<F: FileIO>(
             "Cannot rotate when another window is split",
         );
     };
-    // The relative base is the window's layout height (upstream
-    // `wp->w_height`), not its text height minus the status line.
-    let current_height = editor
+    // The relative base is the window's layout extent (upstream
+    // `wp->w_height`/`wp->w_width`), not its text extent minus the
+    // status line.
+    let tabpage = editor
         .current_tabpage()
-        .and_then(|tab| editor.tabpage(tab).ok())
+        .and_then(|tab| editor.tabpage(tab).ok());
+    let current_extent = tabpage
         .and_then(|tabpage| tabpage.layout().window_geometry(window).ok())
-        .map_or(1, |geometry| geometry.height);
-    let height = if args.starts_with(['+', '-']) {
-        signed + current_height.cast_signed()
+        .map_or(1, |geometry| {
+            if vertical {
+                geometry.width
+            } else {
+                geometry.height
+            }
+        });
+    let extent = if relative {
+        signed + current_extent.cast_signed()
     } else if args.is_empty() {
-        editor
-            .current_tabpage()
-            .and_then(|tab| editor.tabpage(tab).ok())
-            .map_or(24, |tabpage| tabpage.layout().size().height)
-            .saturating_sub(1)
+        tabpage.map_or(if vertical { 80 } else { 24 }, |tabpage| {
+            let size = tabpage.layout().size();
+            if vertical {
+                size.width
+            } else {
+                size.height.saturating_sub(1)
+            }
+        })
             .max(1)
             .cast_signed()
     } else {
@@ -3697,7 +3710,12 @@ fn command_resize<F: FileIO>(
     }
     .max(1)
     .cast_unsigned();
-    match editor.set_window_height(window, height) {
+    let result = if vertical {
+        editor.set_window_width(window, extent)
+    } else {
+        editor.set_window_height(window, extent)
+    };
+    match result {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, "E36", error.to_string()),
     }
