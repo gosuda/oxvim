@@ -519,7 +519,23 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
             }
         }
 
-        forward_terminal_events(&mut client, &mut state)?;
+        if let Err(error) = forward_terminal_events(&mut client, &mut state) {
+            if mouse_capture_emitted {
+                let _ = apply_mouse_capture(&mut shared, false);
+            }
+            session.restore()?;
+            // A send that fails because the child already quit is the same
+            // clean exit the receive path treats as success — the queued
+            // key or resize simply arrived after `:wq`/`qall` ran.
+            if let TuiError::Client(client_error) = &error {
+                if clean_eof(client_error) || client.exited_successfully() {
+                    return Ok(());
+                }
+                let failure = process_failure(client_error);
+                failure.write_diagnostic(&mut io::stderr())?;
+            }
+            return Err(error);
+        }
     }
 }
 

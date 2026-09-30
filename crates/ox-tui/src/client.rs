@@ -475,6 +475,13 @@ impl Client {
         }
     }
 
+    /// Whether the child already exited successfully. A send that failed
+    /// because the child quit is not a transport failure — the RPC peer is
+    /// gone only because the editor finished shutting down first.
+    pub fn exited_successfully(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(status)) if status.success())
+    }
+
     fn eof_error(&mut self) -> ClientError {
         self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -870,6 +877,38 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_successfully_is_true_only_after_a_clean_exit() {
+        let mut live_command = Command::new("sh");
+        live_command.args(["-c", "cat >/dev/null"]);
+        let mut live = Client::spawn(live_command).unwrap();
+        assert!(!live.exited_successfully());
+
+        let mut done_command = Command::new("sh");
+        done_command.args(["-c", "exit 0"]);
+        let mut done = Client::spawn(done_command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done.exited_successfully() {
+            assert!(
+                Instant::now() < deadline,
+                "child should have exited cleanly"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut failed_command = Command::new("sh");
+        failed_command.args(["-c", "exit 7"]);
+        let mut failed = Client::spawn(failed_command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while failed.child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "child should have exited");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!failed.exited_successfully());
+        let _ = live.shutdown();
     }
 
     #[cfg(unix)]
