@@ -1008,8 +1008,24 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
     machine: &Rc<RefCell<ModeMachine>>,
+    budget: usize,
 ) -> Flow {
+    // A self-replenishing queue (a register that replays itself) cannot
+    // empty, so the host drive passes a finite budget: `line_breakcheck`'s
+    // os_breakcheck cadence (`os/input.c:218-232`) becomes a turn boundary
+    // that lets queued input — including the Ctrl-C that flushes this
+    // typeahead — arrive. `usize::MAX` keeps unbounded paths (`:normal`,
+    // `feedkeys()`) draining in one call.
+    let mut consumed = 0_usize;
     while !access.with_ex_editor(|editor| editor.typeahead().is_empty()) {
+        if consumed >= budget {
+            return Flow::Normal;
+        }
+        // A single `run_once` can consume thousands of keys (insert mode
+        // slurps contiguous text), so the budget counts drained bytes like
+        // upstream's per-character `line_breakcheck`, with a floor of one so
+        // a refill that nets zero progress still spends budget.
+        let before = access.with_ex_editor(|editor| editor.typeahead().len());
         let result = {
             let mut null = crate::indent::NullExprEval;
             let mut eval = crate::indent::IgnoreExprEval::new(&mut null);
@@ -1069,6 +1085,8 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
                 return flow;
             }
         }
+        let drained = before.saturating_sub(access.with_ex_editor(|editor| editor.typeahead().len()));
+        consumed += drained.max(1);
     }
     Flow::Normal
 }
@@ -1869,8 +1887,9 @@ impl<F: FileIO> ExExecutor<F> {
         self.runtime.did_emsg
     }
 
-    /// Consumes queued input through `machine` until nothing is left, running
-    /// finished command lines and mapping right-hand sides as they appear.
+    /// Consumes queued input through `machine` until nothing is left or
+    /// `budget` keys ran, running finished command lines and mapping
+    /// right-hand sides as they appear.
     ///
     /// The host's input loop, `:normal` and `feedkeys()` all reach the same
     /// [`drain_typeahead`] through this, so a mapping behaves the same however
@@ -1883,6 +1902,7 @@ impl<F: FileIO> ExExecutor<F> {
         &mut self,
         access: &E,
         machine: &Rc<RefCell<ModeMachine>>,
+        budget: usize,
     ) -> Result<ExecOutcome, ExecError> {
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let before = access.with_ex_editor(|editor| {
@@ -1900,6 +1920,7 @@ impl<F: FileIO> ExExecutor<F> {
             &mut self.scope,
             self.lua.as_ref(),
             machine,
+            budget,
         );
         let after = access.with_ex_editor(|editor| {
             let buffer = editor.current_buffer();
@@ -5922,7 +5943,7 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
             {
                 break error_flow(runtime, "E523", error.to_string());
             }
-            let flow = drain_typeahead(runtime, access, scope, lua, &machine);
+            let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
             if !matches!(flow, Flow::Normal) {
                 break flow;
             }
@@ -5944,7 +5965,7 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
                 {
                     break error_flow(runtime, "E523", error.to_string());
                 }
-                let flow = drain_typeahead(runtime, access, scope, lua, &machine);
+                let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
                 if !matches!(flow, Flow::Normal) {
                     break flow;
                 }

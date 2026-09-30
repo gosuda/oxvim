@@ -1222,11 +1222,25 @@ impl AppState {
         };
         let keys = Keys::from_encoded(encoded.as_bytes().to_vec())
             .map_err(|error| ApiError::exception(error.to_string()))?;
-        self.session.with_editor_mut(|editor| {
-            editor
-                .typeahead_mut()
-                .append(&keys, TypeaheadFlags::default());
-        });
+        // `process_ctrl_c` (`os/input.c:550-575`): input before the last
+        // Ctrl-C is dropped and the queue flushed, so a Ctrl-C lands first
+        // even when a self-replenishing typeahead (a register replaying
+        // itself) keeps producing mapped bytes ahead of it.
+        if let Some(ctrl_c) = keys.as_bytes().iter().rposition(|byte| *byte == 0x03) {
+            let tail = Keys::from_encoded(keys.as_bytes()[ctrl_c..].to_vec())
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            self.session.with_editor_mut(|editor| {
+                let typeahead = editor.typeahead_mut();
+                typeahead.flush();
+                typeahead.append(&tail, TypeaheadFlags::default());
+            });
+        } else {
+            self.session.with_editor_mut(|editor| {
+                editor
+                    .typeahead_mut()
+                    .append(&keys, TypeaheadFlags::default());
+            });
+        }
         Ok(Object::Integer(count))
     }
 
@@ -2384,6 +2398,13 @@ fn fire_pending_transitions_for_state(state: &Rc<RefCell<AppState>>) {
     }
 }
 
+/// Keys one input drive may consume before yielding a turn: bounded so the
+/// next queued message can reach `dispatch_input`'s Ctrl-C handling even when
+/// a self-replenishing typeahead never empties. Sized like upstream's input
+/// `KEY_BUFFER_SIZE` (`tui/input.h`) so a full batched `nvim_input` still
+/// drains inside one turn.
+const TYPEAHEAD_TURN_BUDGET: usize = 0x1000;
+
 fn drive_input_parts(
     session: &Rc<ApiSession>,
     ex: &Rc<RefCell<ExExecutor>>,
@@ -2397,7 +2418,14 @@ fn drive_input_parts(
     session.with_render_state(|_, _, chrome| chrome.hide_history_pager());
     loop {
         mode.borrow_mut().set_no_more_input(false);
-        let result = ex.borrow_mut().run_typeahead(session.as_ref(), mode);
+        // Upstream pumps input inside `vgetorpeek` (`line_breakcheck`,
+        // `os/input.c:218-232`) so a Ctrl-C is seen while a mapping floods
+        // the queue; here one turn's drain is bounded so the next incoming
+        // message can reach `dispatch_input`'s Ctrl-C handling instead of
+        // starving behind a self-replenishing queue.
+        let result = ex
+            .borrow_mut()
+            .run_typeahead(session.as_ref(), mode, TYPEAHEAD_TURN_BUDGET);
         mode.borrow_mut().set_no_more_input(true);
         let outcome = match result {
             Ok(outcome) => outcome,
