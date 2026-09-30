@@ -5768,10 +5768,17 @@ fn command_execute<F: FileIO, E: ExEditorAccess>(
         }
     }
     let line = pieces.join(" ");
-    let logical = vec![LogicalLine {
-        text: line,
-        first_line: runtime.scripts.current_line(),
-    }];
+    let mut logical = match runtime.scripts.join_logical_lines(&line) {
+        Ok(lines) => lines,
+        Err(error) => return error_flow(runtime, error.code, error.message),
+    };
+    // `:execute` runs as one command (upstream `do_cmdline` over the joined
+    // string): throwpoints point at its invocation line, not the split
+    // offsets inside the string.
+    let first_line = runtime.scripts.current_line();
+    for line in &mut logical {
+        line.first_line = first_line;
+    }
     let program = parse_program(
         &runtime.user_commands,
         access.with_ex_editor(|editor| editor.current_buffer()),
