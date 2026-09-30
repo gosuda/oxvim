@@ -2394,8 +2394,8 @@ behavior!(
     "one",
     position(1, 0),
     ">>",
-    "        one",
-    position(1, 8),
+    "\tone",
+    position(1, 0),
     "normal"
 );
 behavior!(

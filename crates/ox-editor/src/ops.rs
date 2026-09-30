@@ -5,6 +5,7 @@ use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
 use crate::buffer::BufferTextEditRequest;
+use crate::builtins::position::vcol_to_byte;
 use crate::extmark::ExtmarkPosition;
 use crate::indent::{self, ExprEval, IndentAmount, IndentExprError, Method};
 use crate::{
@@ -164,14 +165,69 @@ fn deletion_plan(
     }
 }
 
-fn shiftwidth(editor: &Editor, buffer: BufHandle) -> usize {
-    match editor.options().get_buffer(buffer, "shiftwidth") {
-        Ok(OptionValue::Number(width)) => usize::try_from(*width)
-            .ok()
-            .filter(|width| *width > 0)
-            .unwrap_or(2),
-        _ => 2,
+/// `>`/`<` edit plan: resolves 'shiftwidth'/'tabstop'/'expandtab' and
+/// 'shiftround' once, then rewrites each shifted line's indent run.
+fn shift_plan(
+    editor: &Editor,
+    buffer: BufHandle,
+    lines: &mut [Vec<u8>],
+    base: usize,
+    range: EditRange,
+    add: bool,
+) -> Vec<BufferTextEditRequest> {
+    let opts = indent::IndentOptions::capture(editor, buffer);
+    let shiftround = matches!(
+        editor.options().get_global("shiftround"),
+        Ok(OptionValue::Boolean(true))
+    );
+    mutate_indent(lines, base, range, add, &opts, shiftround)
+}
+
+/// Post-edit cursor for one operator invocation. Indent/unindent follow
+/// `op_shift`'s `beginline(BL_SOL | BL_FIX)` finish on the shifted first
+/// line — `coladvance(w_curswant)` while 'startofline' is off — while every
+/// other operator lands through [`cursor_after`]. A visual-block shift keeps
+/// its block column (`block_col`), matching `op_shift`'s block branch.
+fn operator_cursor(
+    editor: &Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    operator: Operator,
+    lines: &[Vec<u8>],
+    line_count: usize,
+    range: EditRange,
+) -> Result<Position, OperatorError> {
+    if !matches!(operator, Operator::Indent | Operator::Unindent)
+        || range.kind == MotionKind::BlockWise
+    {
+        return Ok(cursor_after(lines, line_count, range));
     }
+    let lnum = range.start.lnum.min(line_count.max(1));
+    let line: &[u8] = lines.first().map_or(&[], Vec::as_slice);
+    let sol = matches!(
+        editor.options().get_global("startofline"),
+        Ok(OptionValue::Boolean(true))
+    );
+    let col = if sol {
+        first_nonblank(line)
+    } else {
+        let opts = indent::IndentOptions::capture(editor, buffer);
+        let (raw, pending, cursor) = {
+            let state = editor.window(window)?;
+            (state.curswant, state.set_curswant, state.cursor)
+        };
+        // `w_set_curswant` marks `curswant` stale: readers recompute the
+        // wanted column from the cursor's virtual column (`getvvcol`).
+        let want = if pending {
+            let text = editor.buffer(buffer)?.text()?;
+            let cursor_line = text.line(cursor.lnum).map_err(BufferStateError::from)?;
+            crate::builtins::position::cursor_vcol(&cursor_line, cursor.col, opts.tabstop)
+        } else {
+            usize::try_from(raw).unwrap_or(0)
+        };
+        vcol_to_byte(line, want, opts.tabstop)
+    };
+    Ok(Position { lnum, col })
 }
 
 /// Post-edit cursor position. `lines` is the operator's span window, which
@@ -284,7 +340,6 @@ pub fn apply(
     let range = clamp_lnms(range, old_count);
     let (normalized, mut lines) = span_lines(text, operator, range, old_count)?;
     let base = normalized.start.lnum;
-    let shiftwidth = shiftwidth(editor, buffer);
     let plan = match operator {
         Operator::Yank => OperatorEditPlan::None,
         Operator::Delete => deletion_plan(&lines, old_count, base, normalized, false),
@@ -292,12 +347,13 @@ pub fn apply(
         Operator::Lowercase | Operator::Uppercase | Operator::ToggleCase => {
             OperatorEditPlan::Batch(mutate_case(&mut lines, base, normalized, operator))
         }
-        Operator::Indent | Operator::Unindent => OperatorEditPlan::Batch(mutate_indent(
+        Operator::Indent | Operator::Unindent => OperatorEditPlan::Batch(shift_plan(
+            editor,
+            buffer,
             &mut lines,
             base,
             normalized,
             operator == Operator::Indent,
-            shiftwidth,
         )),
         Operator::Format => unreachable!("Format returns through apply_reindent"),
     };
@@ -338,7 +394,9 @@ pub fn apply(
     } else {
         old_count
     };
-    let cursor = cursor_after(&lines, line_count, normalized);
+    let cursor = operator_cursor(
+        editor, buffer, window, operator, &lines, line_count, normalized,
+    )?;
     match plan {
         OperatorEditPlan::None => {}
         OperatorEditPlan::DeleteLines { start, end } => {
@@ -630,13 +688,47 @@ fn mutate_case(
     requests
 }
 
+/// Leading whitespace of `line` measured in display cells — tabs expand to
+/// the next 'tabstop' boundary (`linetabsize_col` of the indent run).
+fn indent_columns(line: &[u8], tabstop: usize) -> usize {
+    let mut cols = 0usize;
+    for byte in line {
+        match byte {
+            b' ' => cols = cols.saturating_add(1),
+            b'\t' => cols = cols.saturating_add(tabstop - (cols % tabstop)),
+            _ => break,
+        }
+    }
+    cols
+}
+
+/// The canonical indent run for `cols` display cells (`indent.c:set_indent`
+/// fills with tabs to tabstop boundaries first unless 'expandtab' is set,
+/// then pads the remainder with spaces).
+fn indent_bytes(cols: usize, tabstop: usize, expandtab: bool) -> Vec<u8> {
+    if expandtab || tabstop == 0 {
+        return vec![b' '; cols];
+    }
+    let mut bytes = vec![b'\t'; cols / tabstop];
+    bytes.resize(cols / tabstop + cols % tabstop, b' ');
+    bytes
+}
+
+/// `shift_line`/`set_indent`: each shifted line's indent is recomputed to
+/// `current ± amount * 'shiftwidth'` display cells and the leading
+/// whitespace run is rewritten to the canonical tab/space form.
+/// 'shiftround' snaps the base indent to a 'shiftwidth' multiple first.
+/// Blockwise shifts keep the upstream behavior of inserting literal spaces
+/// at the block edge (`shift_block`).
 fn mutate_indent(
     lines: &mut [Vec<u8>],
     base: usize,
     range: EditRange,
     add: bool,
-    width: usize,
+    opts: &indent::IndentOptions,
+    shiftround: bool,
 ) -> Vec<BufferTextEditRequest> {
+    let width = opts.shiftwidth;
     let mut requests = Vec::new();
     for (row_offset, line) in lines[range.start.lnum - base..=range.end.lnum - base]
         .iter_mut()
@@ -647,7 +739,28 @@ fn mutate_indent(
         } else {
             0
         };
-        if add {
+        if col == 0 {
+            let mut current = indent_columns(line, opts.tabstop);
+            if shiftround && width != 0 {
+                current = (current / width).saturating_mul(width);
+            }
+            let target = if add {
+                current.saturating_add(width)
+            } else {
+                current.saturating_sub(width)
+            };
+            let run = line
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            let bytes = indent_bytes(target, opts.tabstop, opts.flags.contains(indent::IndentFlags::EXPANDTAB));
+            line.splice(0..run, bytes.iter().copied());
+            requests.push(BufferTextEditRequest {
+                start: ExtmarkPosition::new(range.start.lnum - 1 + row_offset, 0),
+                end: ExtmarkPosition::new(range.start.lnum - 1 + row_offset, run),
+                replacement: vec![bytes],
+            });
+        } else if add {
             if width == 0 {
                 continue;
             }

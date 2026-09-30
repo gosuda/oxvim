@@ -5,9 +5,10 @@ use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
+use crate::builtins::position::{cursor_vcol, display_len, vcol_to_byte};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
-use crate::motion::{FindDirection, FindMotion, resolve, resolve_find};
+use crate::motion::{FindDirection, FindMotion, Motion, resolve, resolve_find};
 use crate::ops::{self, EditRange, Operator};
 use crate::put::PutDirection;
 use crate::register::{RegisterContent, RegisterKind};
@@ -51,6 +52,29 @@ pub struct InsertState;
 /// Replace mode has no extra retained state beyond the insert session.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReplaceState;
+
+/// One in-flight `v_b_I`/`v_b_A` session (`ops.c` `block_insert` /
+/// `op_insert`/`op_append`): the first block line receives the live
+/// insert; on `<Esc>` the bytes it gained are replayed on each remaining
+/// covered line at its own target column.
+#[derive(Clone, Debug)]
+struct BlockInsert {
+    /// Line the live insert runs on (the block's first line).
+    first_lnum: usize,
+    /// Byte column the live insert began at.
+    first_col: usize,
+    /// The first line's content just before the insert began (after any
+    /// leading-edge padding), used to diff out the typed run on `<Esc>`.
+    before: Vec<u8>,
+    /// `(lnum, byte col, padding)` targets on the remaining block lines —
+    /// `padding` spaces precede the replayed bytes on lines too short to
+    /// reach the block edge (`bdp->endspaces`/`is_short` handling).
+    targets: Vec<(usize, usize, usize)>,
+    /// Cleared when the insert leaves the single-line run it replays
+    /// (`<NL>` inside it ends upstream's captured text too).
+    valid: bool,
+}
+
 /// In-progress `i_CTRL-V`/`i_CTRL-Q` literal insertion (`edit.c`
 /// `ins_literal`): after the chord, the next key inserts literally, or a
 /// digit run / `x`/`o`/`u`/`U` prefix forms a charcode.
@@ -278,6 +302,9 @@ pub struct ModeMachine {
     recordbuff: Vec<u8>,
     /// Encoded keys replayed by `.` (`redobuff.cur.body`), paste-shaped.
     redo_buf: Vec<u8>,
+    /// A live `v_b_I`/`v_b_A` insert, waiting for `<Esc>` to replay the
+    /// typed run on the other block lines (`ops.c:block_insert`).
+    block_insert: Option<BlockInsert>,
     /// Captured paste-stream content between the paste start/end keys.
     paste_capture: Option<Vec<u8>>,
     /// Complete captured paste streams waiting for `nvim_paste` replay.
@@ -294,6 +321,7 @@ impl Default for ModeMachine {
             last_find: None,
             last_visual: None,
             completed_ex_command: None,
+            block_insert: None,
             cmdline_history: Vec::new(),
             pending_mapping_action: None,
             map_depth: 0,
@@ -1172,12 +1200,12 @@ impl ModeMachine {
                     VisualKind::Line,
                 ))));
             }
-            if key == 'u' || key == 'U' {
+            if matches!(key, 'u' | 'U' | '~') {
                 return Ok(Some(Mode::OperatorPending(OperatorPendingState {
-                    operator: if key == 'u' {
-                        Operator::Lowercase
-                    } else {
-                        Operator::Uppercase
+                    operator: match key {
+                        'u' => Operator::Lowercase,
+                        'U' => Operator::Uppercase,
+                        _ => Operator::ToggleCase,
                     },
                     count: state.count.max(1),
                     count_was_set: state.count != 0,
@@ -1187,6 +1215,13 @@ impl ModeMachine {
                     force_motion: None,
                     search: None,
                 })));
+            }
+            if matches!(key, '*' | '#') {
+                self.ident_match(editor, key == '#', false, state.count.max(1))?;
+                return Ok(Some(Mode::default()));
+            }
+            if matches!(key, 'n' | 'N') {
+                return self.visual_match(editor, key == 'n', state.count.max(1));
             }
             if key == 'f' {
                 Self::goto_file_under_cursor(editor)?;
@@ -1372,6 +1407,10 @@ impl ModeMachine {
             }
             'n' | 'N' => {
                 self.repeat_search(editor, key == 'N', count)?;
+                Ok(Some(Mode::default()))
+            }
+            '*' | '#' => {
+                self.ident_match(editor, key == '#', true, state.count.max(1))?;
                 Ok(Some(Mode::default()))
             }
             'p' | 'P' => {
@@ -1856,6 +1895,41 @@ impl ModeMachine {
         }))
     }
 
+    /// `dgn`/`cgN` (`current_search` reaching the operator through
+    /// ops.c:3510): the range is the located match itself — inclusive of its
+    /// last character — not the span from cursor to match.
+    fn operator_pending_search_match(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut OperatorPendingState,
+        forward: bool,
+        eval: &mut dyn ExprEval,
+    ) -> Result<Option<Mode>, ModeError> {
+        let Some((start, end)) = self.search_match(
+            editor,
+            forward,
+            state.count.saturating_mul(state.motion_count.max(1)),
+        )?
+        else {
+            beep_flush(editor);
+            return Ok(Some(Mode::default()));
+        };
+        let ctx = context(editor)?;
+        let range = EditRange {
+            start,
+            end: prev_position(&ctx.lines, end),
+            kind: MotionKind::CharacterWise,
+            inclusive: true,
+        };
+        let change = state.operator == Operator::Change;
+        self.apply_operator(editor, state, range, eval)?;
+        Ok(Some(if change {
+            Mode::Insert(InsertState)
+        } else {
+            Mode::default()
+        }))
+    }
+
     fn operator_pending_rest(
         &mut self,
         editor: &mut Editor,
@@ -1865,6 +1939,9 @@ impl ModeMachine {
     ) -> Result<Option<Mode>, ModeError> {
         if state.prefix == "g" {
             state.prefix.clear();
+            if matches!(key, 'n' | 'N') {
+                return self.operator_pending_search_match(editor, state, key == 'n', eval);
+            }
             let command = format!("g{key}");
             return self.finish_operator_motion(editor, state, &command, eval);
         }
@@ -1970,14 +2047,20 @@ impl ModeMachine {
             (_, "G", _) if state.count_was_set || state.motion_count != 0 => "G_count",
             _ => command,
         };
-        if let Some(motion) = resolve(
-            &ctx.lines,
-            ctx.cursor,
-            resolved_command,
-            count,
-            option_bool(editor, "startofline", true),
-            (ctx.topline, ctx.bottomline),
-        ) {
+        let display = if is_display_motion(command) {
+            display_motion(editor, &ctx, command, count)?
+        } else {
+            resolve(
+                &ctx.lines,
+                ctx.cursor,
+                resolved_command,
+                count,
+                option_bool(editor, "startofline", true),
+                (ctx.topline, ctx.bottomline),
+            )
+            .map(|motion| (motion, None))
+        };
+        if let Some((motion, want)) = display {
             let change = state.operator == Operator::Change;
             if motion.is_jump {
                 push_jump(editor, ctx.buffer, ctx.cursor);
@@ -1988,6 +2071,12 @@ impl ModeMachine {
                 EditRange::from_motion(ctx.cursor, motion),
                 eval,
             )?;
+            if let Some(want) = want
+                && let Ok(state) = editor.window_mut(ctx.window)
+            {
+                state.curswant = want;
+                state.set_curswant = false;
+            }
             return Ok(Some(if change {
                 Mode::Insert(InsertState)
             } else {
@@ -2080,6 +2169,26 @@ impl ModeMachine {
                 };
                 return self.finish_visual_operator(editor, state, operator, eval);
             }
+            if matches!(key, 'n' | 'N') {
+                let Some((start, end)) =
+                    self.search_match(editor, key == 'n', state.count.max(1))?
+                else {
+                    beep_flush(editor);
+                    return Ok(None);
+                };
+                let ctx = context(editor)?;
+                let last = prev_position(&ctx.lines, end);
+                let (anchor, cursor) = if key == 'n' {
+                    (start, last)
+                } else {
+                    (last, start)
+                };
+                state.anchor = anchor;
+                state.cursor = cursor;
+                state.kind = VisualKind::Character;
+                editor.set_window_cursor(ctx.window, cursor)?;
+                return Ok(None);
+            }
             let command = format!("g{key}");
             return Self::extend_visual_motion(editor, state, &command);
         }
@@ -2140,6 +2249,9 @@ impl ModeMachine {
                 self.join_lines(editor, start_lnum, end_lnum)?;
                 Ok(Some(Mode::default()))
             }
+            'I' | 'A' if state.kind == VisualKind::Block => {
+                self.block_insert_begin(editor, state, key == 'A')
+            }
             'd' | 'x' | 'X' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self
                 .finish_visual_operator(
                     editor,
@@ -2168,15 +2280,27 @@ impl ModeMachine {
         command: &str,
     ) -> Result<Option<Mode>, ModeError> {
         let ctx = context(editor)?;
-        if let Some(motion) = resolve(
-            &ctx.lines,
-            ctx.cursor,
-            command,
-            state.count.max(1),
-            option_bool(editor, "startofline", true),
-            (ctx.topline, ctx.bottomline),
-        ) {
+        let display = if is_display_motion(command) {
+            display_motion(editor, &ctx, command, state.count.max(1))?
+        } else {
+            resolve(
+                &ctx.lines,
+                ctx.cursor,
+                command,
+                state.count.max(1),
+                option_bool(editor, "startofline", true),
+                (ctx.topline, ctx.bottomline),
+            )
+            .map(|motion| (motion, None))
+        };
+        if let Some((motion, want)) = display {
             editor.set_window_cursor(ctx.window, motion.target)?;
+            if let Some(want) = want
+                && let Ok(state) = editor.window_mut(ctx.window)
+            {
+                state.curswant = want;
+                state.set_curswant = false;
+            }
             extend_visual(state, motion.target, ctx.cursor);
         }
         state.count = 0;
@@ -2469,13 +2593,13 @@ impl ModeMachine {
     fn insert(
         &mut self,
         editor: &mut Editor,
-        _state: &mut InsertState,
+        state: &mut InsertState,
         key: char,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
         let ctx = cursor_context(editor)?;
         if self.insert_literal.is_some() || self.pending_insert_ctrl_r {
-            return self.insert_pending(editor, &ctx, _state, key, eval);
+            return self.insert_pending(editor, &ctx, state, key, eval);
         }
         self.insert_anchor.get_or_insert(ctx.cursor);
         if key == '\u{0f}' {
@@ -2488,6 +2612,7 @@ impl ModeMachine {
             CtrlBslash::Exit => {
                 self.completion.reset();
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
+                self.block_insert_finish(editor)?;
                 return Ok(Some(Mode::default()));
             }
             CtrlBslash::Consumed => return Ok(None),
@@ -2529,9 +2654,13 @@ impl ModeMachine {
             '\u{1b}' => {
                 self.completion.reset();
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
+                self.block_insert_finish(editor)?;
                 Ok(Some(Mode::default()))
             }
             '\n' | '\r' => {
+                if let Some(block) = self.block_insert.as_mut() {
+                    block.valid = false;
+                }
                 insert::newline(
                     editor,
                     ctx.buffer,
@@ -3220,14 +3349,19 @@ impl ModeMachine {
         visual: bool,
     ) -> Result<(), ModeError> {
         let ctx = context(editor)?;
-        let Some(mut motion) = resolve(
-            &ctx.lines,
-            ctx.cursor,
-            command,
-            count,
-            option_bool(editor, "startofline", true),
-            (ctx.topline, ctx.bottomline),
-        ) else {
+        let Some((mut motion, curswant)) = (if is_display_motion(command) {
+            display_motion(editor, &ctx, command, count)?
+        } else {
+            resolve(
+                &ctx.lines,
+                ctx.cursor,
+                command,
+                count,
+                option_bool(editor, "startofline", true),
+                (ctx.topline, ctx.bottomline),
+            )
+            .map(|motion| (motion, None))
+        }) else {
             beep_flush(editor);
             return Ok(());
         };
@@ -3255,10 +3389,18 @@ impl ModeMachine {
             motion.target.col = col;
         }
         editor.set_window_cursor(ctx.window, motion.target)?;
-        if let Some(curswant) = keep_curswant
+        if let Some(curswant) = keep_curswant.or(curswant)
             && let Ok(state) = editor.window_mut(ctx.window)
         {
             state.curswant = curswant;
+            state.set_curswant = false;
+        }
+        // `$`/`g_` leave `w_curswant` at MAXCOL so vertical motions keep
+        // landing at the end of each line (`nv_dollar`/`nv_g_underscore`).
+        if matches!(command, "$" | "g_")
+            && let Ok(state) = editor.window_mut(ctx.window)
+        {
+            state.curswant = i64::MAX;
             state.set_curswant = false;
         }
 
@@ -3568,6 +3710,132 @@ impl ModeMachine {
         editor.set_window_cursor(ctx.window, result.target)?;
         Ok(())
     }
+
+    /// `nv_ident` `*`/`#`/`g*`/`g#` (normal.c:2890): searches for the
+    /// 'iskeyword' run under the cursor — expanding both ways from it — as
+    /// the new last pattern, so `n`/`N` repeat it. `bounded` adds the
+    /// `\<`/`\>` guards the non-`g` forms carry; `g`-forms search the raw
+    /// run.
+    fn ident_match(
+        &mut self,
+        editor: &mut Editor,
+        backward: bool,
+        bounded: bool,
+        count: usize,
+    ) -> Result<(), ModeError> {
+        let ctx = context(editor)?;
+        let line = &ctx.lines[ctx.cursor.lnum - 1];
+        let Some((start, end)) = ident_under(line, ctx.cursor.col) else {
+            beep_flush(editor);
+            return Ok(());
+        };
+        let word = String::from_utf8_lossy(&line[start..end]);
+        let pattern = if bounded {
+            format!("\\<{word}\\>")
+        } else {
+            word.into_owned()
+        };
+        let direction = if backward {
+            SearchDirection::Backward
+        } else {
+            SearchDirection::Forward
+        };
+        match self.search.search(
+            &ctx.lines,
+            ctx.cursor,
+            &pattern,
+            direction,
+            count,
+            option_bool(editor, "wrapscan", true),
+        ) {
+            Ok(result) => {
+                push_jump(editor, ctx.buffer, ctx.cursor);
+                editor.set_window_cursor(ctx.window, result.target)?;
+            }
+            Err(_) => beep_flush(editor),
+        }
+        Ok(())
+    }
+
+    /// `current_search` (search.c:2444) reduced to its start-anchored
+    /// scans: the match containing or starting at the cursor wins; without
+    /// one the count-th match in `forward` direction does, honoring
+    /// 'wrapscan' on that final scan like upstream's second pass. Returns
+    /// `(match_start, match_end)` — `match_end` exclusive — or `None`
+    /// when the pattern is missing or no match exists.
+    fn search_match(
+        &mut self,
+        editor: &mut Editor,
+        forward: bool,
+        count: usize,
+    ) -> Result<Option<(Position, Position)>, ModeError> {
+        let ctx = context(editor)?;
+        let wrapscan = option_bool(editor, "wrapscan", true);
+        // Scanning backward from one byte past the cursor surfaces the
+        // latest match starting at or before it; that match's end then
+        // tells whether the cursor sits inside it (the "first round"
+        // upstream runs without 'wrapscan').
+        let probe = Position {
+            lnum: ctx.cursor.lnum,
+            col: ctx.cursor.col.saturating_add(1),
+        };
+        let containing = self
+            .search
+            .preview(&ctx.lines, probe, "", SearchDirection::Backward, 1, false, None)
+            .ok()
+            .filter(|m| (m.match_end.lnum, m.match_end.col) > (ctx.cursor.lnum, ctx.cursor.col));
+        if let Some(m) = containing {
+            if count == 1 {
+                return Ok(Some((m.match_start, m.match_end)));
+            }
+            let direction = if forward {
+                SearchDirection::Forward
+            } else {
+                SearchDirection::Backward
+            };
+            return Ok(self
+                .search
+                .preview(&ctx.lines, m.match_start, "", direction, count - 1, wrapscan, None)
+                .ok()
+                .map(|m| (m.match_start, m.match_end)));
+        }
+        let direction = if forward {
+            SearchDirection::Forward
+        } else {
+            SearchDirection::Backward
+        };
+        Ok(self
+            .search
+            .preview(&ctx.lines, ctx.cursor, "", direction, count, wrapscan, None)
+            .ok()
+            .map(|m| (m.match_start, m.match_end)))
+    }
+
+    /// `v_gn`/`v_gN` (normal.c:5475): Visual-selects the next search
+    /// match — `gn` leaves the cursor on the match's last character,
+    /// `gN` on its first.
+    fn visual_match(
+        &mut self,
+        editor: &mut Editor,
+        forward: bool,
+        count: usize,
+    ) -> Result<Option<Mode>, ModeError> {
+        let Some((start, end)) = self.search_match(editor, forward, count)? else {
+            beep_flush(editor);
+            return Ok(Some(Mode::default()));
+        };
+        let ctx = context(editor)?;
+        let last = prev_position(&ctx.lines, end);
+        let (anchor, cursor) = if forward {
+            (start, last)
+        } else {
+            (last, start)
+        };
+        editor.set_window_cursor(ctx.window, cursor)?;
+        let mut visual = VisualState::new(anchor, VisualKind::Character);
+        visual.extend(cursor);
+        Ok(Some(Mode::Visual(visual)))
+    }
     /// `<c-w>` window commands from Normal mode (`normal.c:nv_window`).
     /// Handles split, close, resize, and directional navigation.
     fn wincmd(editor: &mut Editor, key: char, count: usize) {
@@ -3674,6 +3942,128 @@ impl ModeMachine {
             None => beep_flush(editor),
         }
     }
+    /// `v_b_I`/`v_b_A` entry (`ops.c` `op_insert`/`op_append`): computes
+    /// every covered line's insert column from the block edges, moves the
+    /// cursor to the first line's edge (padding a short line out to the
+    /// edge for `A`, the way upstream's `ins_char(' ')` loop does), and
+    /// opens Insert. `<Esc>` replays the typed run via
+    /// [`Self::block_insert_finish`].
+    fn block_insert_begin(
+        &mut self,
+        editor: &mut Editor,
+        state: &VisualState,
+        append: bool,
+    ) -> Result<Option<Mode>, ModeError> {
+        let ctx = context(editor)?;
+        let top = state.anchor.lnum.min(state.cursor.lnum);
+        let bottom = state.anchor.lnum.max(state.cursor.lnum);
+        let left = state.anchor.col.min(state.cursor.col);
+        let right = state.anchor.col.max(state.cursor.col);
+        let is_max = editor
+            .window(ctx.window)
+            .is_ok_and(|window| window.curswant == i64::MAX);
+        let mut targets = Vec::new();
+        for lnum in top..=bottom {
+            let line = &ctx.lines[lnum - 1];
+            let (col, pad) = if append {
+                if is_max {
+                    (line.len(), 0)
+                } else if line.len() > right {
+                    (right + 1, 0)
+                } else {
+                    (line.len(), right + 1 - line.len())
+                }
+            } else {
+                if line.len() < left {
+                    continue;
+                }
+                (left.min(line.len()), 0)
+            };
+            targets.push((lnum, col, pad));
+        }
+        let Some(&(first_lnum, first_col, first_pad)) = targets.first() else {
+            beep_flush(editor);
+            return Ok(Some(Mode::default()));
+        };
+        if first_pad > 0 {
+            let cursor = Position {
+                lnum: first_lnum,
+                col: first_col,
+            };
+            editor.replace_buffer_text(
+                ctx.buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(first_lnum - 1, first_col),
+                    end: ExtmarkPosition::new(first_lnum - 1, first_col),
+                    replacement: vec![vec![b' '; first_pad]],
+                },
+                cursor,
+                cursor,
+                self.timestamp,
+            )?;
+        }
+        let insert_col = first_col + first_pad;
+        let cursor = Position {
+            lnum: first_lnum,
+            col: insert_col,
+        };
+        editor.set_window_cursor(ctx.window, cursor)?;
+        let before = editor
+            .buffer(ctx.buffer)?
+            .text()?
+            .line(first_lnum)
+            .map_err(BufferStateError::from)?;
+        self.block_insert = Some(BlockInsert {
+            first_lnum,
+            first_col: insert_col,
+            before: before.clone(),
+            targets: targets.split_off(1),
+            valid: true,
+        });
+        Ok(Some(Mode::Insert(InsertState)))
+    }
+
+    /// `<Esc>` out of a `v_b_I`/`v_b_A` session (`ops.c:1635-1674`
+    /// `block_insert`): diffs the typed run out of the first line and
+    /// replays it on each remaining covered line at its own column.
+    fn block_insert_finish(&mut self, editor: &mut Editor) -> Result<(), ModeError> {
+        let Some(block) = self.block_insert.take() else {
+            return Ok(());
+        };
+        if !block.valid {
+            return Ok(());
+        }
+        let ctx = cursor_context(editor)?;
+        let line = editor
+            .buffer(ctx.buffer)?
+            .text()?
+            .line(block.first_lnum)
+            .map_err(BufferStateError::from)?;
+        let keep = block.before.len().saturating_sub(block.first_col);
+        let end = line.len().saturating_sub(keep);
+        if end < block.first_col {
+            return Ok(());
+        }
+        let typed = line[block.first_col..end].to_vec();
+        for &(lnum, col, pad) in &block.targets {
+            let mut replacement = Vec::with_capacity(pad + typed.len());
+            replacement.resize(pad, b' ');
+            replacement.extend_from_slice(&typed);
+            editor.replace_buffer_text(
+                ctx.buffer,
+                &BufferTextEditRequest {
+                    start: ExtmarkPosition::new(lnum - 1, col),
+                    end: ExtmarkPosition::new(lnum - 1, col),
+                    replacement: vec![replacement],
+                },
+                ctx.cursor,
+                ctx.cursor,
+                self.timestamp,
+            )?;
+        }
+        Ok(())
+    }
+
     fn advance_insert_cursor(editor: &mut Editor, line_end: bool) -> Result<(), ModeError> {
         let ctx = cursor_context(editor)?;
         let owned_line = editor
@@ -4123,6 +4513,450 @@ fn append_digit(value: usize, key: char) -> usize {
     value
         .saturating_mul(10)
         .saturating_add((key as u8).saturating_sub(b'0') as usize)
+}
+
+/// The `g`-motion keys [`display_motion`] implements — every other `g{key}`
+/// falls through to `resolve` (`nv_g_cmd`).
+fn is_display_motion(command: &str) -> bool {
+    matches!(command, "gj" | "gk" | "g0" | "g$" | "g^" | "gm")
+}
+
+/// The 'iskeyword' run at or after `col` on `line`
+/// (`find_ident_at_pos`, normal.c): a cursor on an ident byte expands the
+/// run both directions, else the scan moves forward to the next run on the
+/// line. Returns the byte range, or `None` past the last run.
+fn ident_under(line: &[u8], col: usize) -> Option<(usize, usize)> {
+    let isident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let mut start = col.min(line.len());
+    if start < line.len() && isident(line[start]) {
+        while start > 0 && isident(line[start - 1]) {
+            start -= 1;
+        }
+    } else {
+        while start < line.len() && !isident(line[start]) {
+            start += 1;
+        }
+    }
+    if start == line.len() {
+        return None;
+    }
+    let mut end = start;
+    while end < line.len() && isident(line[end]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
+/// The last character of the match ending at `end` (exclusive) —
+/// `dec_cursor` semantics for positioning a selection's active edge.
+fn prev_position(lines: &[Vec<u8>], end: Position) -> Position {
+    let lnum = end.lnum.clamp(1, lines.len().max(1));
+    let line = &lines[lnum - 1];
+    if end.col > 0 {
+        return Position {
+            lnum,
+            col: crate::motion::prev_char_boundary(line, end.col),
+        };
+    }
+    if lnum > 1 {
+        return Position {
+            lnum: lnum - 1,
+            col: lines[lnum - 2].len().saturating_sub(1),
+        };
+    }
+    Position { lnum: 1, col: 0 }
+}
+
+/// Max sign depth over the buffer's rows — the sweep the compositor runs
+/// over `extmarks.render_ordered()` (`compute_signcolumn`'s live count,
+/// capped at the 3 slots upstream reserves).
+fn live_sign_slots(editor: &Editor, buffer: BufHandle) -> usize {
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    if let Ok(state) = editor.buffer(buffer) {
+        for mark in state.extmarks.render_ordered() {
+            if mark.placement.attributes.sign_text.is_none() {
+                continue;
+            }
+            let start = mark.position().row;
+            let end = mark.placement.end.map_or(start, |end| end.position.row);
+            starts.push(start);
+            ends.push(end.max(start));
+        }
+    }
+    starts.sort_unstable();
+    ends.sort_unstable();
+    let (mut slots, mut live, mut expired) = (0usize, 0usize, 0usize);
+    for &start in &starts {
+        while expired < ends.len() && ends[expired] < start {
+            live -= 1;
+            expired += 1;
+        }
+        live += 1;
+        slots = slots.max(live);
+    }
+    slots.min(3)
+}
+
+/// 'signcolumn' bounds — (minimum, maximum) dedicated columns from the
+/// optionstr.c set-time parse; "number" contributes no dedicated columns
+/// and degrades to "auto" without numbers. Mirrors the compositor copy.
+fn signcolumn_bounds(value: &str, numbers: bool) -> (usize, usize) {
+    let first_digit = |rest: &str| -> usize {
+        rest.chars()
+            .find_map(|character| character.to_digit(10))
+            .map_or(1, |digit| usize::try_from(digit).unwrap_or(1))
+    };
+    if let Some(rest) = value.strip_prefix("yes:") {
+        let width = first_digit(rest);
+        return (width, width);
+    }
+    if value == "yes" {
+        return (1, 1);
+    }
+    if value == "no" {
+        return (0, 0);
+    }
+    if value.starts_with("number") && numbers {
+        return (0, 0);
+    }
+    if let Some(rest) = value.strip_prefix("auto:") {
+        let rest = rest.trim_matches(|character| character == '[' || character == ']');
+        return match rest.split_once('-') {
+            Some((low, high)) => (first_digit(low), first_digit(high)),
+            None => (0, first_digit(rest)),
+        };
+    }
+    (0, 1)
+}
+
+fn digits(count: usize) -> usize {
+    let mut count = count.max(1);
+    let mut width = 0;
+    while count > 0 {
+        count /= 10;
+        width += 1;
+    }
+    width
+}
+
+/// Display width of the window's text area — `w_view_width - win_col_off`:
+/// window width minus the sign/number gutter (`screen.c:win_col_off`),
+/// floored at 1 the way the compositor does.
+fn display_text_width(
+    editor: &Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    line_count: usize,
+) -> usize {
+    let (width, height) = editor
+        .window_geometry(window)
+        .map_or((0, 0), |geometry| (geometry.width, geometry.height));
+    let number_on = matches!(
+        editor.options().get_window(window, "number"),
+        Ok(OptionValue::Boolean(true))
+    );
+    let relative_on = matches!(
+        editor.options().get_window(window, "relativenumber"),
+        Ok(OptionValue::Boolean(true))
+    );
+    let signcolumn = match editor.options().get_window(window, "signcolumn") {
+        Ok(OptionValue::String(value)) => value.as_str(),
+        _ => "auto",
+    };
+    let statuscolumn_on = matches!(
+        editor.options().get_window(window, "statuscolumn"),
+        Ok(OptionValue::String(value)) if !value.is_empty()
+    );
+    let numbers = number_on || relative_on || statuscolumn_on;
+    let (min_sc, max_sc) = signcolumn_bounds(signcolumn, numbers);
+    let sign_width = min_sc.max(max_sc.min(live_sign_slots(editor, buffer))).saturating_mul(2);
+    let number_width = if number_on || relative_on {
+        let minimum = match editor.options().get_window(window, "numberwidth") {
+            Ok(OptionValue::Number(value)) => usize::try_from((*value).clamp(1, 20)).unwrap_or(4),
+            _ => 4,
+        };
+        // 'relativenumber' alone sizes the gutter from the window's row
+        // count; 'number' widens past `digits + 1` on longer buffers.
+        let extent = if number_on { line_count } else { height };
+        minimum.max(digits(extent).saturating_add(1))
+    } else {
+        0
+    };
+    width.saturating_sub(sign_width.saturating_add(number_width)).max(1)
+}
+
+/// `nv_screengo`/`nv_g_home_m_cmd`/`nv_g_dollar_cmd`: the screen-line
+/// `g`-motions. Returns the resolved motion plus the `w_curswant` value
+/// upstream leaves behind — `None` when `w_set_curswant` says to recompute
+/// it from the cursor, like every horizontal motion does. nvim's default
+/// 'cpoptions' lacks 'n' so `win_col_off2` is 0 and every display row of a
+/// wrapped line shares the text width; `w_leftcol` is always 0 and folds
+/// are not modeled.
+fn display_motion(
+    editor: &mut Editor,
+    ctx: &Context,
+    command: &str,
+    count: usize,
+) -> Result<Option<(Motion, Option<i64>)>, ModeError> {
+    let wrap = match editor.options().get_window(ctx.window, "wrap") {
+        Ok(OptionValue::Boolean(value)) => *value,
+        _ => true,
+    };
+    if !wrap && matches!(command, "gj" | "gk") {
+        // With 'nowrap' these are plain `j`/`k` (`nv_g_cmd`).
+        return Ok(resolve(
+            &ctx.lines,
+            ctx.cursor,
+            &command[1..],
+            count,
+            option_bool(editor, "startofline", true),
+            (ctx.topline, ctx.bottomline),
+        )
+        .map(|motion| (motion, None)));
+    }
+    let width = display_text_width(editor, ctx.buffer, ctx.window, ctx.lines.len());
+    let tabstop = match editor.options().get_buffer(ctx.buffer, "tabstop") {
+        Ok(OptionValue::Number(value)) if *value > 0 => usize::try_from(*value).unwrap_or(8),
+        _ => 8,
+    };
+    let (curswant, set_curswant, coladd) = {
+        let state = editor.window(ctx.window)?;
+        (state.curswant, state.set_curswant, state.coladd)
+    };
+    let line_at = |lnum: usize| -> &[u8] { &ctx.lines[lnum - 1] };
+    let cur_vcol = cursor_vcol(line_at(ctx.cursor.lnum), ctx.cursor.col, tabstop)
+        .saturating_add(usize::try_from(coladd.max(0)).unwrap_or(usize::MAX));
+    let motion = |target, inclusive, want: Option<i64>| {
+        Some((
+            Motion {
+                target,
+                kind: MotionKind::CharacterWise,
+                inclusive,
+                is_jump: false,
+                keep_curswant: false,
+            },
+            want,
+        ))
+    };
+
+    match command {
+        "gj" | "gk" => {
+            let forward = command == "gj";
+            let mut linelen = display_len(line_at(ctx.cursor.lnum), tabstop);
+            let mut lnum = ctx.cursor.lnum;
+            let mut want = seed_row_want(curswant, set_curswant, cur_vcol, linelen, width);
+            for _ in 0..count.max(1) {
+                if !display_row_step(
+                    &mut lnum,
+                    &mut linelen,
+                    &mut want,
+                    &ctx.lines,
+                    tabstop,
+                    width,
+                    forward,
+                ) {
+                    return Ok(None);
+                }
+            }
+            let col = vcol_to_byte(
+                line_at(lnum),
+                usize::try_from(want).unwrap_or(0),
+                tabstop,
+            );
+            let want = if curswant == i64::MAX { i64::MAX } else { want };
+            Ok(motion(Position { lnum, col }, curswant == i64::MAX, Some(want)))
+        }
+        "g0" | "g^" | "gm" => {
+            let col = display_row_home(
+                command,
+                line_at(ctx.cursor.lnum),
+                cur_vcol,
+                width,
+                tabstop,
+                wrap,
+            );
+            Ok(motion(Position { lnum: ctx.cursor.lnum, col }, false, None))
+        }
+        _ => Ok(display_row_dollar(
+            &ctx.lines,
+            ctx.cursor,
+            count,
+            width,
+            tabstop,
+            cur_vcol,
+            wrap,
+            ctx.lines.len(),
+        )
+        .map(|(target, want)| {
+            (
+                Motion {
+                    target,
+                    kind: MotionKind::CharacterWise,
+                    inclusive: true,
+                    is_jump: false,
+                    keep_curswant: false,
+                },
+                Some(want),
+            )
+        })),
+    }
+}
+
+/// `nv_g_home_m_cmd`/`nv_g_dollar_cmd`'s home half (normal.c:5243): byte
+/// column of the current display row's first cell (`g0`), first non-blank
+/// cell (`g^`), or middle cell (`gm`). With 'nowrap' the row is the whole
+/// line and `w_leftcol` is 0, so `g0` is column 0 and `gm` halves the text
+/// width rather than a row start.
+fn display_row_home(
+    command: &str,
+    line: &[u8],
+    cur_vcol: usize,
+    width: usize,
+    tabstop: usize,
+    wrap: bool,
+) -> usize {
+    let row_start = cur_vcol / width * width;
+    let i = if command == "gm" {
+        if wrap { row_start + width / 2 } else { width / 2 }
+    } else if wrap {
+        row_start
+    } else {
+        0
+    };
+    let mut col = vcol_to_byte(line, i, tabstop);
+    if command == "g^" {
+        while col < line.len() && (line[col] == b' ' || line[col] == b'\t') {
+            col += 1;
+        }
+    }
+    col
+}
+
+/// `nv_g_dollar_cmd` (normal.c:5322): last cell of the current display row
+/// with 'wrap' (whole text column with 'nowrap'); a count steps down
+/// `count - 1` rows first. `w_curswant` lands on MAXCOL after the move.
+#[expect(clippy::too_many_arguments, reason = "mirrors nv_g_dollar's locals")]
+fn display_row_dollar(
+    lines: &[Vec<u8>],
+    cursor: Position,
+    count: usize,
+    width: usize,
+    tabstop: usize,
+    cur_vcol: usize,
+    wrap: bool,
+    line_count: usize,
+) -> Option<(Position, i64)> {
+    let mut lnum = cursor.lnum;
+    let mut linelen = display_len(&lines[lnum - 1], tabstop);
+    let mut i = if wrap {
+        (cur_vcol / width) * width + width - 1
+    } else {
+        width.saturating_sub(1)
+    };
+    let mut want = 0i64;
+    if count > 1 {
+        want = seed_want_for_dollar(width, cur_vcol);
+        for _ in 0..count - 1 {
+            if wrap {
+                if !display_row_step(
+                    &mut lnum, &mut linelen, &mut want, lines, tabstop, width, true,
+                ) {
+                    return None;
+                }
+            } else if lnum >= line_count {
+                return None;
+            } else {
+                lnum += 1;
+                linelen = display_len(&lines[lnum - 1], tabstop);
+            }
+        }
+        i = if wrap {
+            usize::try_from(want).unwrap_or(0)
+        } else {
+            width.saturating_sub(1)
+        };
+    }
+    let line = &lines[lnum - 1];
+    let mut col = vcol_to_byte(line, i, tabstop);
+    if col > 0 && cursor_vcol(line, col, tabstop) > i {
+        col = crate::motion::prev_char_boundary(line, col);
+    }
+    let want = if count > 1 && wrap {
+        want
+    } else {
+        vcol_as_i64(cursor_vcol(line, col, tabstop))
+    };
+    Some((Position { lnum, col }, want))
+}
+
+/// Display rows `linelen` cells occupy in a window `width` cells wide.
+fn display_rows_of(linelen: usize, width: usize) -> usize {
+    linelen.max(1).div_ceil(width)
+}
+
+/// `usize` to `i64` conversion saturating at `i64::MAX` (vcols are small in
+/// practice; the saturation mirrors upstream's MAXCOL sentinel handling).
+fn vcol_as_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// `nv_screengo`'s want-column seeding: MAXCOL ("stuck at end") wants the
+/// last cell of the current row; otherwise the want column clamps into the
+/// line's last row. The result is an absolute vcol within the current line.
+fn seed_row_want(
+    curswant: i64,
+    set_curswant: bool,
+    cur_vcol: usize,
+    linelen: usize,
+    width: usize,
+) -> i64 {
+    if curswant == i64::MAX {
+        return vcol_as_i64(cur_vcol / width * width + width - 1);
+    }
+    let want = if set_curswant { vcol_as_i64(cur_vcol) } else { curswant };
+    want.clamp(0, vcol_as_i64(display_rows_of(linelen, width) * width) - 1)
+}
+
+/// One `nv_screengo` row step in `direction`: `want` moves by a display row
+/// inside `linelen` or carries onto the next/previous buffer line. Returns
+/// `false` where upstream's count loop breaks (top/bottom of buffer).
+fn display_row_step(
+    lnum: &mut usize,
+    linelen: &mut usize,
+    want: &mut i64,
+    lines: &[Vec<u8>],
+    tabstop: usize,
+    width: usize,
+    forward: bool,
+) -> bool {
+    let row = vcol_as_i64(width);
+    if forward {
+        if want.saturating_add(row) < vcol_as_i64(display_rows_of(*linelen, width) * width) {
+            *want += row;
+        } else if *lnum >= lines.len() {
+            return false;
+        } else {
+            *lnum += 1;
+            *linelen = display_len(&lines[*lnum - 1], tabstop);
+            *want %= row;
+        }
+    } else if *want >= row {
+        *want -= row;
+    } else if *lnum <= 1 {
+        return false;
+    } else {
+        *lnum -= 1;
+        *linelen = display_len(&lines[*lnum - 1], tabstop);
+        *want += vcol_as_i64(display_rows_of(*linelen, width).saturating_sub(1) * width);
+    }
+    true
+}
+
+/// `nv_g_dollar_cmd`'s count>1 seed: `w_curswant` starts at MAXCOL, which
+/// `nv_screengo` resolves to the last cell of the current display row.
+fn seed_want_for_dollar(width: usize, cur_vcol: usize) -> i64 {
+    vcol_as_i64(cur_vcol / width * width + width - 1)
 }
 fn operator_for(key: char) -> Operator {
     match key {
