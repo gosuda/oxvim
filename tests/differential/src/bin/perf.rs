@@ -9,10 +9,9 @@
 //! prints the deterministic expanded matrix and spawns no engine. All
 //! `println!`/`eprintln!` here is this binary's own CLI output.
 
-use std::env;
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::{env, fmt};
 
 use differential::perf::runner::{
     DryRunPlan, ExecutionMode, RunConfig, RunError, RunOutcome, Runner,
@@ -240,15 +239,39 @@ fn resolve_valgrind(value: &str) -> Result<PathBuf, ConfigError> {
 fn resolve_command(name: &str) -> Option<PathBuf> {
     let segments = env::var_os("PATH")?;
     env::split_paths(&segments)
-        .map(|directory| directory.join(name))
+        .flat_map(|directory| {
+            candidate_names(name)
+                .into_iter()
+                .map(move |file_name| directory.join(file_name))
+        })
         .find(|candidate| is_executable_file(candidate))
 }
 
+/// `name` itself, plus on Windows — where executables are recognized by
+/// extension rather than a mode bit — `name` suffixed with each `PATHEXT`
+/// entry, matching how `CreateProcess` resolves a bare name.
+fn candidate_names(name: &str) -> Vec<String> {
+    let mut names = vec![name.to_owned()];
+    #[cfg(windows)]
+    if let Some(pathext) = env::var_os("PATHEXT") {
+        for entry in env::split_paths(&pathext) {
+            names.push(format!("{name}{}", entry.to_string_lossy().to_lowercase()));
+        }
+    }
+    names
+}
+
+#[cfg(unix)]
 fn is_executable_file(candidate: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::metadata(candidate)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(candidate: &Path) -> bool {
+    candidate.is_file()
 }
 
 // ---------------------------------------------------------------------------

@@ -54,7 +54,7 @@ pub fn server_address_new(name: Option<&str>) -> String {
     // `get_appname` (`server.c:122,127`); this port always runs as nvim.
     let base = name.unwrap_or("nvim");
     if cfg!(windows) {
-        format!("//./pipe/{base}.{}.{}", std::process::id(), count)
+        format!("\\\\.\\pipe\\{base}.{}.{}", std::process::id(), count)
     } else {
         let dir = stdpath(StdPath::Run)
             .first()
@@ -83,9 +83,15 @@ mod tests {
 
     #[test]
     fn generated_address_lands_in_the_run_directory() {
-        let dir = stdpath(StdPath::Run).remove(0);
         let address = server_address_new(None);
-        assert!(address.starts_with(&format!("{dir}/nvim.")), "{address}");
+        if cfg!(windows) {
+            // `\\.\pipe\nvim.<pid>.<counter>` — the run "directory" is the
+            // object namespace root on Windows (`server.c:127`).
+            assert!(address.starts_with("\\\\.\\pipe\\nvim."), "{address}");
+        } else {
+            let dir = stdpath(StdPath::Run).remove(0);
+            assert!(address.starts_with(&format!("{dir}/nvim.")), "{address}");
+        }
     }
 
     #[test]
@@ -99,7 +105,7 @@ mod tests {
     fn generated_address_carries_the_requested_name() {
         let address = server_address_new(Some("xtest1.2.3.4"));
         let tail = address
-            .rsplit('/')
+            .rsplit(['/', '\\'])
             .next()
             .expect("address always has a separator");
         assert!(tail.starts_with("xtest1.2.3.4."), "{tail}");
@@ -108,7 +114,7 @@ mod tests {
     #[test]
     fn bare_names_expand_and_paths_bind_verbatim() {
         let expanded = prepare_server_address("xtest1.2.3.4");
-        let tail = expanded.rsplit('/').next().unwrap_or_default();
+        let tail = expanded.rsplit(['/', '\\']).next().unwrap_or_default();
         assert!(tail.starts_with("xtest1.2.3.4."), "{expanded}");
         assert!(
             tail.contains(&format!(".{}.", std::process::id())),

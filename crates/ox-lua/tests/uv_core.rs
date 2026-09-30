@@ -579,6 +579,9 @@ fn callback_file_read_preserves_bytes_and_error_first_shape() {
     std::fs::remove_file(path).unwrap();
 }
 
+// `vim.uv.spawn`/`new_pipe` are unix-only for now: ox-uv has no Windows
+// named-pipe or spawn backend yet.
+#[cfg(unix)]
 #[test]
 fn spawned_cat_echoes_through_created_stdio_pipe() {
     let (host, scheduler) = host();
@@ -837,6 +840,7 @@ fn failing_fs_open_callback_receives_error_as_first_argument() {
     assert!(error.contains("ENOENT"), "unexpected error string: {error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
     let (host, scheduler) = host();
@@ -880,6 +884,7 @@ fn pipe_write_callback_fires_only_when_the_loop_pumps_the_write() {
 /// open without ever draining it, so an `O_NONBLOCK` write loop fills the
 /// pipe and `WouldBlock` marks the exact capacity — the same probe on Linux
 /// and macOS.
+#[cfg(unix)]
 fn stdin_pipe_capacity() -> usize {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -922,6 +927,7 @@ fn stdin_pipe_capacity() -> usize {
     accepted.max(1)
 }
 
+#[cfg(unix)]
 #[test]
 fn pipe_write_flushing_earlier_write_parks_completion_until_borrow_release() {
     let (host, scheduler) = host();
@@ -1070,6 +1076,7 @@ fn fs_metadata_surface_round_trips_on_a_real_file() {
         &scheduler,
         r"
         local uv = vim.uv
+        local win = uv.os_uname().sysname:match('Windows') ~= nil
         local path = test_dir .. '/data.txt'
         local fd = assert(uv.fs_open(path, 'w', tonumber('644', 8)))
         assert(uv.fs_write(fd, 'hello uv', 0) == 8)
@@ -1082,14 +1089,22 @@ fn fs_metadata_surface_round_trips_on_a_real_file() {
 
         local st2 = assert(uv.fs_stat(path))
         assert(st2.size == 5 and st2.type == 'file' and st2.blksize > 0)
-        assert(uv.fs_realpath(path) == path)
+        -- Windows realpath is the canonical `\\?\`-prefixed native spelling.
+        local resolved = assert(uv.fs_realpath(path))
+        assert(resolved == path or (win and resolved:gsub('\\', '/'):match('data%.txt$')), resolved)
         assert(uv.fs_access(path, 'rw') == true)
         local denied, _, denied_name = uv.fs_access(path, 'x')
-        assert(denied == nil and denied_name == 'EACCES', denied_name)
+        -- Windows files carry no execute bit, so access 'x' succeeds.
+        if win then
+          assert(denied == true)
+        else
+          assert(denied == nil and denied_name == 'EACCES', denied_name)
+        end
 
         assert(uv.fs_chmod(path, tonumber('600', 8)))
         local st3 = assert(uv.fs_stat(path))
-        assert(st3.mode % 512 == tonumber('600', 8), st3.mode)
+        -- `_wchmod` collapses to the read-only attribute: 0666 on Windows.
+        assert(st3.mode % 512 == tonumber(win and '666' or '600', 8), st3.mode)
 
         assert(uv.fs_utime(path, 1000000000, 1000000000))
         assert(assert(uv.fs_stat(path)).mtime.sec == 1000000000)
@@ -1123,6 +1138,7 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
         &scheduler,
         r"
         local uv = vim.uv
+        local win = uv.os_uname().sysname:match('Windows') ~= nil
 
         -- mkdir / rmdir
         assert(uv.fs_mkdir(test_dir .. '/sub', tonumber('755', 8)))
@@ -1157,7 +1173,8 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
         assert(uv.fs_link(test_dir .. '/renamed', test_dir .. '/hard'))
         assert(uv.fs_unlink(test_dir .. '/hard'))
         assert(uv.fs_symlink(test_dir .. '/renamed', test_dir .. '/soft', { dir = false }))
-        assert(uv.fs_readlink(test_dir .. '/soft') == test_dir .. '/renamed')
+        -- Windows normalizes the stored target to `\` separators.
+        assert(uv.fs_readlink(test_dir .. '/soft') == test_dir .. (win and '\\' or '/') .. 'renamed')
         assert(assert(uv.fs_lstat(test_dir .. '/soft')).type == 'link')
         assert(assert(uv.fs_stat(test_dir .. '/soft')).type == 'file')
         assert(uv.fs_lutime(test_dir .. '/soft', 1000000001, 1000000001))
@@ -1170,8 +1187,12 @@ fn fs_directory_surface_round_trips_through_scandir_and_links() {
         assert(clash == nil and clash_name == 'EEXIST', clash_name)
 
         -- statfs
-        local stats = assert(uv.fs_statfs(test_dir))
-        assert(stats.bsize > 0 and stats.blocks > 0 and stats.bavail <= stats.blocks)
+        local stats, _, stats_name = uv.fs_statfs(test_dir)
+        if uv.os_uname().sysname:match('Windows') ~= nil then
+          assert(stats == nil and stats_name == 'ENOSYS', stats_name)
+        else
+          assert(stats.bsize > 0 and stats.blocks > 0 and stats.bavail <= stats.blocks)
+        end
 
         -- sendfile
         local in_fd = assert(uv.fs_open(test_dir .. '/copy', 'r', 0))
@@ -1296,7 +1317,12 @@ fn misc_surface_reports_process_and_system_state() {
         &scheduler,
         r"
         local uv = vim.uv
-        assert(type(uv.cwd()) == 'string' and vim.startswith(uv.cwd(), '/'))
+        local win = uv.os_uname().sysname:match('Windows') ~= nil
+        if win then
+          assert(type(uv.cwd()) == 'string' and uv.cwd():match('^%a:[/\\]'), uv.cwd())
+        else
+          assert(type(uv.cwd()) == 'string' and vim.startswith(uv.cwd(), '/'))
+        end
         assert(type(uv.os_tmpdir()) == 'string' and #uv.os_tmpdir() > 0)
         assert(type(uv.os_homedir()) == 'string' and #uv.os_homedir() > 0)
         assert(type(uv.exepath()) == 'string' and #uv.exepath() > 0)
@@ -1315,7 +1341,9 @@ fn misc_surface_reports_process_and_system_state() {
         assert(uv.get_free_memory() > 0 and uv.get_free_memory() <= uv.get_total_memory())
         assert(type(uv.os_getenv('PATH')) == 'string')
         local environment = uv.os_environ()
-        assert(type(environment) == 'table' and environment.PATH == uv.os_getenv('PATH'))
+        -- Windows stores the variable as `Path`; lookup stays case-insensitive.
+        local environ_path = environment.PATH or environment.Path
+        assert(type(environ_path) == 'string' and environ_path == uv.os_getenv('PATH'))
         local missing, missing_err, missing_name = uv.os_getenv('OXVIM_UNSET_ENV_VAR_12345')
         assert(missing == nil and missing_name == 'ENOENT' and type(missing_err) == 'string')
         misc_ok = true

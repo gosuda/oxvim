@@ -368,6 +368,19 @@ fn comma_entries(value: &str) -> Vec<&str> {
     value.split(',').filter(|entry| !entry.is_empty()).collect()
 }
 
+/// Joins with `/` unconditionally: upstream `path_join`/`concat_fnames`
+/// treats `/` as the canonical separator on every platform (`TO_SLASH`
+/// keeps that spelling through the runtime path tables), so
+/// `Path::join`'s platform `\` would produce spellings the file IO
+/// layer never registered.
+fn join_slash(dir: &Path, leaf: &str) -> PathBuf {
+    PathBuf::from(format!(
+        "{}/{}",
+        dir.to_string_lossy().trim_end_matches('/'),
+        leaf
+    ))
+}
+
 /// Returns the cached search path, rebuilding it when 'runtimepath' or
 /// 'packpath' changed. Upstream keeps the same cache behind
 /// `runtime_search_path_valid`, invalidated by `did_set_runtimepackpath`.
@@ -406,7 +419,7 @@ pub(crate) fn find_runtime_files(session: &ApiSession, name: &str, all: bool) ->
                 continue;
             }
             for pattern in name.split([' ', '\t']).filter(|part| !part.is_empty()) {
-                let joined = item.path.join(pattern);
+                let joined = join_slash(&item.path, pattern);
                 for path in file_io.expand(&joined.to_string_lossy(), MatchKind::DirsAndFiles) {
                     found.push(path);
                     if !all {
@@ -433,11 +446,11 @@ pub fn runtime_get_named(
     with_search_path(session, |items, file_io| {
         let mut found = Vec::new();
         for item in items {
-            if is_lua && !file_io.is_dir(&item.path.join("lua")) {
+            if is_lua && !file_io.is_dir(&join_slash(&item.path, "lua")) {
                 continue;
             }
             for pattern in patterns {
-                let candidate = item.path.join(pattern);
+                let candidate = join_slash(&item.path, pattern);
                 if file_io.is_readable(&candidate) {
                     found.push(candidate);
                     if !all {

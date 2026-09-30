@@ -19,8 +19,7 @@
 //! `:wshada!` skips the merge with the old file (`shada_write_file`,
 //! `shada.c:2703-2735`).
 
-use std::io::Cursor;
-use std::io::Write as _;
+use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1376,10 +1375,11 @@ impl ApplyState<'_, '_> {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::excmd_exec::{ExExecutor, ExecError, TestEditorAccess};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    use super::*;
+    use crate::excmd_exec::{ExExecutor, ExecError, TestEditorAccess};
 
     /// Upstream `'shada'` default plus the buffer-list flag.
     // Upstream comma grammar: each part is one flag. `!'100` would hide the
@@ -1705,8 +1705,13 @@ mod tests {
             "upstream E886 text: {}",
             exception.message()
         );
+        // The io detail is preserved whatever strerror spells it as.
         assert!(
-            exception.message().contains("No such file or directory"),
+            exception.message().contains(if cfg!(windows) {
+                "(os error 2)"
+            } else {
+                "No such file or directory"
+            }),
             "io detail is preserved: {}",
             exception.message()
         );

@@ -695,7 +695,16 @@ pub fn uptime() -> Result<f64> {
         Ok(ox_sys::macos::uptime()?)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "uptime fits comfortably in the double mantissa"
+        )]
+        Ok(ox_sys::windows::uptime_ms() as f64 / 1000.0)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Err(Error::Unsupported {
             feature: "uptime",

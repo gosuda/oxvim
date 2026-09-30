@@ -256,6 +256,38 @@ impl Client {
             .map_err(|_| ClientError::Protocol("nvim_input returned a negative byte count".into()))
     }
 
+    /// Send a bracketed-paste payload through `nvim_paste`.
+    ///
+    /// This is the upstream paste path (`paste.c`): the editor treats the
+    /// whole payload as one paste — keymaps do not fire per character and
+    /// `'paste'` semantics apply, unlike a keystream via `nvim_input`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Encode`] if the request cannot be encoded,
+    /// [`ClientError::Write`] if the request cannot be written,
+    /// [`ClientError::Read`] on a stdout read failure, [`ClientError::Decode`]
+    /// on malformed msgpack, [`ClientError::Eof`] when the child closes its
+    /// stream, [`ClientError::UnexpectedResponse`] for a mismatched reply id,
+    /// [`ClientError::Remote`] for a server-side rejection, or
+    /// [`ClientError::Protocol`] if the result is not boolean.
+    pub fn paste(&mut self, data: OxStr) -> Result<bool, ClientError> {
+        let result = self.request(
+            OxStr::from("nvim_paste"),
+            vec![
+                Object::String(data),
+                Object::Boolean(true),
+                Object::Integer(-1),
+            ],
+        )?;
+        match result {
+            Object::Boolean(consumed) => Ok(consumed),
+            _ => Err(ClientError::Protocol(
+                "nvim_paste returned a non-boolean result".into(),
+            )),
+        }
+    }
+
     /// Send a mouse event to the server at terminal coordinates.
     ///
     /// Grid `0` lets the server decide which window the position targets, as

@@ -1011,11 +1011,13 @@ fn vim_scope_is_read_only() {
 
 /// Restores one process environment binding on drop: a value present before
 /// the test is written back, absence is restored by unsetting.
+#[cfg(unix)]
 struct EnvGuard {
     name: &'static str,
     prior: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl EnvGuard {
     fn take(name: &'static str) -> Self {
         Self {
@@ -1025,6 +1027,7 @@ impl EnvGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.prior {

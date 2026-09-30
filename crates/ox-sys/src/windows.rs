@@ -1,16 +1,23 @@
 //! Audited Windows system-information queries used by the safe runtime.
 
+use std::fs::File;
 use std::io;
+use std::os::windows::io::AsRawHandle;
 
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, RtlNtStatusToDosError};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx,
+};
 use windows_sys::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemInfo, GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW,
-    PROCESSOR_ARCHITECTURE_ALPHA, PROCESSOR_ARCHITECTURE_ALPHA64, PROCESSOR_ARCHITECTURE_AMD64,
-    PROCESSOR_ARCHITECTURE_ARM, PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_IA32_ON_WIN64,
+    ComputerNameDnsHostname, GetComputerNameExW, GetSystemInfo, GetTickCount64,
+    GlobalMemoryStatusEx, MEMORYSTATUSEX, OSVERSIONINFOW, PROCESSOR_ARCHITECTURE_ALPHA,
+    PROCESSOR_ARCHITECTURE_ALPHA64, PROCESSOR_ARCHITECTURE_AMD64, PROCESSOR_ARCHITECTURE_ARM,
+    PROCESSOR_ARCHITECTURE_ARM64, PROCESSOR_ARCHITECTURE_IA32_ON_WIN64,
     PROCESSOR_ARCHITECTURE_IA64, PROCESSOR_ARCHITECTURE_INTEL, PROCESSOR_ARCHITECTURE_MIPS,
     PROCESSOR_ARCHITECTURE_PPC, PROCESSOR_ARCHITECTURE_SHX, SYSTEM_INFO,
 };
@@ -166,6 +173,90 @@ pub fn physical_memory() -> io::Result<PhysicalMemory> {
     })
 }
 
+/// Milliseconds since boot, the basis of libuv's `uv.uptime()`.
+#[must_use]
+pub fn uptime_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
+/// NTFS identity values libuv exposes through `stat` (`ino`, `nlink`, `dev`).
+#[derive(Clone, Copy, Debug)]
+pub struct FileIdentity {
+    /// Serial number of the volume containing the file.
+    pub volume_serial: u64,
+    /// Index identifying the file within its volume.
+    pub file_index: u64,
+    /// Number of hard links to the file.
+    pub links: u64,
+    /// `FILE_BASIC_INFO.ChangeTime` as FILETIME ticks — the NTFS metadata
+    /// change timestamp libuv reports as `st_ctime` (distinct from
+    /// `CreationTime`, which is `birthtime`). `None` when the extended
+    /// query failed; `BY_HANDLE_FILE_INFORMATION` does not carry it.
+    pub change_time: Option<i64>,
+}
+
+/// Queries NTFS identity fields for an open file.
+///
+/// # Errors
+///
+/// Returns the OS error when the by-handle query fails (for example on
+/// filesystems without a file index, such as some network shares).
+pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
+    let handle = file.as_raw_handle().cast::<std::ffi::c_void>();
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle` is a live file handle and `info` a writable,
+    // correctly sized out-buffer; both retain no pointer after returning.
+    let ok = unsafe { GetFileInformationByHandle(handle, &raw mut info) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: same handle/buffer contract; failure only drops ChangeTime.
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileBasicInfo,
+            (&raw mut basic).cast::<std::ffi::c_void>(),
+            dword_size::<FILE_BASIC_INFO>(),
+        )
+    };
+    let change_time = (basic_ok != 0).then_some(basic.ChangeTime);
+    Ok(FileIdentity {
+        volume_serial: u64::from(info.dwVolumeSerialNumber),
+        file_index: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        links: u64::from(info.nNumberOfLinks),
+        change_time,
+    })
+}
+
+/// DNS hostname of the local machine — the value `gethostname()` returns,
+/// which upstream `os_get_hostname` reports. Unlike the `COMPUTERNAME`
+/// environment variable it cannot be spoofed by the process environment and
+/// stays available in a minimal-environment embed.
+///
+/// # Errors
+///
+/// Returns the OS error when the query fails or the name is not UTF-16.
+pub fn hostname() -> io::Result<String> {
+    let mut size = 0_u32;
+    // First call deliberately fails with ERROR_MORE_DATA and yields the
+    // required length in `size`.
+    unsafe { GetComputerNameExW(ComputerNameDnsHostname, std::ptr::null_mut(), &raw mut size) };
+    if size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buffer = vec![0_u16; size as usize];
+    // SAFETY: `size` chars of writable, initialized buffer; the call stores
+    // the written length back into `size` and retains no pointer.
+    if unsafe { GetComputerNameExW(ComputerNameDnsHostname, buffer.as_mut_ptr(), &raw mut size) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    String::from_utf16(&buffer[..size as usize])
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{physical_memory, system_identity, utf16_z};
@@ -188,6 +279,32 @@ mod tests {
         // The i686 CI target runs under WOW64 on a 64-bit Windows host.
         // GetNativeSystemInfo would incorrectly change this to x86_64.
         assert_eq!(system_identity()?.machine, "i686");
+        Ok(())
+    }
+
+    #[test]
+    fn hostname_matches_the_dns_name_not_the_environment() -> std::io::Result<()> {
+        let name = super::hostname()?;
+        assert!(!name.is_empty());
+        // `GetComputerNameExW(ComputerNameDnsHostname)` agrees with
+        // COMPUTERNAME on an ordinary machine, while ignoring it when the
+        // variable is spoofed or absent.
+        if let Ok(env_name) = std::env::var("COMPUTERNAME") {
+            assert_eq!(name.to_uppercase(), env_name.to_uppercase());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_identity_reports_change_time() -> std::io::Result<()> {
+        let path = std::env::temp_dir().join(format!("ox-sys-id-{}", std::process::id()));
+        std::fs::write(&path, b"x")?;
+        let file = std::fs::File::open(&path)?;
+        let identity = super::file_identity(&file)?;
+        std::fs::remove_file(&path)?;
+        assert_ne!(identity.file_index, 0);
+        assert!(identity.links >= 1);
+        assert!(identity.change_time.is_some_and(|time| time > 0));
         Ok(())
     }
 

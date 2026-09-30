@@ -1,23 +1,22 @@
 //! Process builtins: job control, channel writes, and the shell-backed
 //! `system`/`systemlist` (upstream `eval/funcs.c`, `channel.c`).
 
-use crate::excmd_exec::ExEditorAccess;
+use std::cell::RefCell;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+use ox_eval::{EvalError, Scope};
+use ox_types::{OxStr, Special, Typval};
+use ox_uv::process::PtySize;
+
+use crate::excmd_exec::{
+    EvalHost, ExEditorAccess, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error,
+};
 use crate::job::DEFAULT_PTY_SIZE;
 use crate::options::OptionValue;
 use crate::script::FileIO;
 use crate::{Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions};
-use ox_eval::EvalError;
-use ox_eval::Scope;
-use ox_types::{OxStr, Special, Typval};
-use ox_uv::process::PtySize;
-use std::cell::RefCell;
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::rc::Rc;
-
-use crate::excmd_exec::{
-    EvalHost, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error,
-};
 
 /// Routes one process builtin.
 ///
@@ -143,10 +142,24 @@ fn shell_argv(editor: &Editor) -> Vec<String> {
     };
     let shell = read("shell", if cfg!(windows) { "cmd.exe" } else { "sh" });
     let mut argv = split_shell_words(&shell);
-    argv.extend(split_shell_words(&read(
-        "shellcmdflag",
-        if cfg!(windows) { "/c" } else { "-c" },
-    )));
+    // Upstream `set_init_default_shell` derives 'shellcmdflag' from 'shell':
+    // a cmd-family shell gets "/s /c". The generated option table can
+    // only hold the unconditional `-c` default, so on Windows a still-default
+    // `-c` under a cmd-family shell resolves here. The check is the
+    // executable basename like upstream's `mch_check_shell` — a `cmd`
+    // substring anywhere in the path (e.g. `cmd-wrapper\bash.exe`) is
+    // not cmd.
+    let cmd_family = cfg!(windows)
+        && argv
+            .first()
+            .and_then(|word| Path::new(word.trim_matches('"')).file_stem())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("cmd"));
+    let shellcmdflag = read("shellcmdflag", "-c");
+    argv.extend(split_shell_words(if cmd_family && shellcmdflag == "-c" {
+        "/s /c"
+    } else {
+        &shellcmdflag
+    }));
     argv
 }
 
@@ -826,13 +839,15 @@ fn value_bool(value: &Typval) -> bool {
 #[cfg(all(test, unix))]
 mod tests {
 
-    use crate::excmd_exec::{LuaExec, LuaExecError};
-    use crate::{Editor, ExExecutor, Geometry, JobEvent, TestEditorAccess};
-    use ox_eval::Scope;
-    use ox_types::{Funcref, Object, OxStr, Typval};
     use std::cell::Cell;
     use std::path::Path;
     use std::rc::Rc;
+
+    use ox_eval::Scope;
+    use ox_types::{Funcref, Object, OxStr, Typval};
+
+    use crate::excmd_exec::{LuaExec, LuaExecError};
+    use crate::{Editor, ExExecutor, Geometry, JobEvent, TestEditorAccess};
 
     fn global(scope: &Scope, name: &str) -> Option<Typval> {
         scope
@@ -856,9 +871,7 @@ mod tests {
 
     #[test]
     fn chansend_to_pty_delivers_stdout_and_exit_events_without_dropping() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
         let source = r#"
@@ -930,9 +943,7 @@ mod tests {
     // message row is reserved), so the child must see "39 120".
     #[test]
     fn terminal_job_pty_matches_the_window_geometry() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
         editor
@@ -955,9 +966,7 @@ mod tests {
     // the window it can be displayed in.
     #[test]
     fn bare_pty_jobstart_uses_the_window_geometry() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
         editor
@@ -980,9 +989,7 @@ mod tests {
     // os/pty_proc_unix.c:460-461).
     #[test]
     fn pty_jobstart_without_a_window_keeps_the_default_size() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
         exec.execute_script(
@@ -1005,9 +1012,7 @@ mod tests {
     // `vim.fn` re-entry to the nested executor's never-pumped manager.
     #[test]
     fn chansend_poll_defers_swept_events_for_a_later_drain() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
         editor
@@ -1049,17 +1054,12 @@ mod tests {
             fn execute_file(&self, _: &Path) -> Result<(), LuaExecError> {
                 Err(LuaExecError::Load("unused".to_owned()))
             }
-            fn invoke_callback(&self,
-                _: usize,
-                _: Vec<Object>,
-            ) -> Result<Object, LuaExecError> {
+            fn invoke_callback(&self, _: usize, _: Vec<Object>) -> Result<Object, LuaExecError> {
                 self.0.set(self.0.get() + 1);
                 Err(LuaExecError::Runtime("must not run here".to_owned()))
             }
         }
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
         let host = Rc::new(ProbingLua(Cell::new(0)));
@@ -1132,9 +1132,7 @@ mod tests {
 
     #[test]
     fn job_event_burst_delivers_each_event_once_in_order() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
         exec.execute_script(
@@ -1176,9 +1174,7 @@ mod tests {
     // could never serve it.
     #[test]
     fn lua_event_without_a_host_reports_e5108_and_requeues_the_batch() {
-        let _guard = crate::PROCESS_STATE_GUARD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = crate::lock_process_state();
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = ExExecutor::new();
         exec.execute_script(

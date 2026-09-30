@@ -128,9 +128,10 @@ impl TuiState {
     pub fn apply_redraw(&mut self, events: &[RedrawEvent], now: TimeMs) -> Result<(), TuiError> {
         self.current_time = now;
         for redraw in events {
-            match self.screen.apply_event(redraw)? {
-                ApplyOutcome::Applied => self.capture_highlight(redraw),
-                ApplyOutcome::Unknown(event) => self.apply_client_event(&event)?,
+            match self.screen.apply_event(redraw) {
+                Err(error) => return Err(error.into()),
+                Ok(ApplyOutcome::Applied) => self.capture_highlight(redraw),
+                Ok(ApplyOutcome::Unknown(event)) => self.apply_client_event(&event)?,
             }
         }
         self.chrome.finish_batch(now);
@@ -363,11 +364,18 @@ impl TuiState {
                     "message history entry must be an array".into(),
                 ));
             };
-            require_arity(fields, 2, "msg_history_show entry")?;
+            // Upstream sends `[kind, content, append]` (message.c
+            // `msg_history_show`); tolerate the two-field legacy shape.
+            if fields.len() != 2 && fields.len() != 3 {
+                return Err(TuiError::Protocol(format!(
+                    "msg_history_show entry expected 2 or 3 arguments, got {}",
+                    fields.len()
+                )));
+            }
             history.push(HistoryEntry {
                 kind: object_string(&fields[0], "msg_history_show kind")?.clone(),
                 content: chunks_from_object(&fields[1], "msg_history_show content")?,
-                append: false,
+                append: fields.len() == 3 && as_bool(fields, 2, "msg_history_show")?,
             });
         }
         self.chrome
@@ -617,9 +625,26 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
         match event::read().map_err(TuiError::Input)? {
             Event::Key(key) => {
+                // Windows reports key releases as distinct events; the editor
+                // protocol has presses only, so a release must not re-encode
+                // as another press.
+                if key.kind == event::KeyEventKind::Release {
+                    continue;
+                }
                 state.chrome.keypress();
                 if let Some(input) = encode_key(key) {
                     client.input(OxStr::from(input.as_str()))?;
+                }
+            }
+            Event::Paste(data) => {
+                state.chrome.keypress();
+                match client.paste(OxStr::from(data.as_str())) {
+                    // A refused paste (`'nomodifiable'`, a cancelled
+                    // `vim.paste`, ...) is a remote rejection the server
+                    // already reports in the message area, not a transport
+                    // failure the session should die on.
+                    Ok(_) | Err(ClientError::Remote(_)) => {}
+                    Err(error) => return Err(TuiError::Client(error)),
                 }
             }
             Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
@@ -857,11 +882,15 @@ fn paint_message_surfaces(
     }
     if let (Some(rect), Some(history)) = (layout.history, &state.chrome.history_float) {
         let mut text = Vec::new();
-        for entry in &history.entries {
+        for (index, entry) in history.entries.iter().enumerate() {
+            // An `append` entry continues the previous message's line
+            // (`msg_ext_append` in ui.txt), not a fresh row.
+            if index > 0 && !entry.append {
+                text.push(b'\n');
+            }
             for chunk in &entry.content {
                 text.extend_from_slice(chunk.text.as_bytes());
             }
-            text.push(b'\n');
         }
         canvas.paint_surface(rect, &text, HighlightGroup::NormalFloat, 1.0);
     }

@@ -229,21 +229,34 @@ fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u
     }
 
     let mut raw = None;
-    if rest.len() == 1 {
+    if rest.len() == 1 && modifiers != 0 {
+        // `extract_modifiers` (`keycodes.c:608-637`): the transforms are not
+        // gated on `simplify` except the final Ctrl fold.
         let byte = rest.as_bytes()[0];
-        if simplify && modifiers & MOD_MASK_SHIFT != 0 && byte.is_ascii_alphabetic() {
-            modifiers &= !MOD_MASK_SHIFT;
-            raw = Some(byte.to_ascii_uppercase());
-        } else if simplify && modifiers & MOD_MASK_CTRL != 0 {
-            let upper = byte.to_ascii_uppercase();
-            raw = match upper {
-                b'?' => Some(0x7f),
-                b'@'..=b'_' => Some(upper & 0x1f),
-                _ => None,
-            };
-            if raw.is_some() {
-                modifiers &= !MOD_MASK_CTRL;
+        let mut key = byte;
+        if modifiers & MOD_MASK_SHIFT != 0 && byte.is_ascii_alphabetic() {
+            key = byte.to_ascii_uppercase();
+            // With <C-S-a> the shift modifier is kept; with <S-a>, <A-S-a>
+            // and <S-A> it is not.
+            if modifiers & MOD_MASK_CTRL == 0 {
+                modifiers &= !MOD_MASK_SHIFT;
             }
+        }
+        // <C-H> and <C-h> mean the same thing, always use "H".
+        if modifiers & MOD_MASK_CTRL != 0 && byte.is_ascii_alphabetic() {
+            key = byte.to_ascii_uppercase();
+        }
+        if simplify && modifiers & MOD_MASK_CTRL != 0 && ((b'?'..=b'_').contains(&key)) {
+            key = match key {
+                b'?' => 0x7f,
+                _ => key & 0x1f,
+            };
+            modifiers &= !MOD_MASK_CTRL;
+        }
+        // Emit the byte directly once every modifier folded into it; left-
+        // over modifiers fall to the KS_MODIFIER triple below.
+        if key != byte || modifiers == 0 {
+            raw = Some(key);
         }
     }
 

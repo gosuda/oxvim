@@ -531,10 +531,22 @@ impl Compositor {
                 let bytes = buffer.line(line_number)?;
                 let line_text = String::from_utf8_lossy(&bytes);
                 let wrapped = wrapped_segments(&line_text, text_width);
+                // The `topline` line alone may start below its first wrapped
+                // segment (`state.skiprows`, upstream `w_skipcol`) so the
+                // cursor's segment of an over-height line stays on screen.
+                let skip = if line_number == state.topline {
+                    state.skiprows
+                } else {
+                    0
+                };
                 let line_start_row = screen_row;
                 let available_rows = text_height.saturating_sub(screen_row);
-                let truncated = wrapped.len() > available_rows;
-                for (segment, segment_cell_start) in wrapped.iter().take(text_height - screen_row) {
+                let truncated = wrapped.len().saturating_sub(skip) > available_rows;
+                for (segment, segment_cell_start) in wrapped
+                    .iter()
+                    .skip(skip)
+                    .take(text_height - screen_row)
+                {
                     if number_width != 0 {
                         // Wrapped continuation rows keep an empty number
                         // gutter; only the first segment of a buffer line
@@ -699,6 +711,9 @@ impl Compositor {
                 let cursor_line = buffer.line(state.cursor.lnum).unwrap_or_default();
                 let cursor_line = String::from_utf8_lossy(&cursor_line);
                 let cursor_col = display_column(&cursor_line, state.cursor.col);
+                // `skiprows` only applies to the `topline` line's own height
+                // contribution; a cursor inside that line sits `skiprows`
+                // rows higher than its raw wrapped position. And
                 // `grid_cursor_goto` must stay inside its grid: wrapped
                 // segments can push `before_cursor` past the text area when
                 // the window narrows, so the cursor clamps to the bottom
@@ -706,6 +721,11 @@ impl Compositor {
                 (
                     before_cursor
                         .saturating_add(cursor_col / text_width)
+                        .saturating_sub(if state.cursor.lnum == state.topline {
+                            state.skiprows
+                        } else {
+                            0
+                        })
                         .min(text_height.saturating_sub(1)),
                     gutter
                         .saturating_add(cursor_col % text_width)

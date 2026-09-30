@@ -467,7 +467,7 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
                 }
                 _ => wc_path.push(MAX_STAR_STAR_EXPAND),
             }
-            if tail.get(cursor).is_some_and(|byte| *byte != b'/') {
+            if tail.get(cursor).is_some_and(|byte| !is_path_sep(*byte)) {
                 return Err(EvalError::new(
                     "E343",
                     0,
@@ -660,11 +660,13 @@ fn path_expand(regex: &dyn RegexEngine, found: &mut Vec<String>, pattern: &str) 
     let mut component_end = None;
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'\\' && cursor + 1 < bytes.len() {
+        // `\` escapes the next byte on Unix; on Windows a doubled `\\`
+        // escapes a literal separator while a single `\` separates.
+        if bytes[cursor] == b'\\' && (!cfg!(windows) || bytes.get(cursor + 1) == Some(&b'\\')) {
             cursor += 2;
             continue;
         }
-        if bytes[cursor] == b'/' {
+        if is_path_sep(bytes[cursor]) {
             if component_end.is_some() {
                 break;
             }
@@ -825,12 +827,18 @@ pub fn glob_to_regex(pattern: &str) -> Option<String> {
 }
 
 /// `backslash_halve`: drop a backslash that escapes the next character.
+/// Under `BACKSLASH_IN_FILENAME` a single `\` is a path separator, so only a
+/// doubled `\\` is consumed there.
 fn remove_backslashes(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut output = Vec::with_capacity(bytes.len());
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'\\' && cursor + 1 < bytes.len() {
+        if bytes[cursor] == b'\\'
+            && bytes
+                .get(cursor + 1)
+                .is_some_and(|next| !cfg!(windows) || *next == b'\\')
+        {
             output.push(bytes[cursor + 1]);
             cursor += 2;
             continue;
@@ -846,7 +854,9 @@ fn has_wildcard(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
     let mut cursor = 0;
     while cursor < bytes.len() {
-        if bytes[cursor] == b'\\' && cursor + 1 < bytes.len() {
+        // `\` escapes the next byte on Unix; on Windows a doubled `\\`
+        // escapes a literal separator while a single `\` separates.
+        if bytes[cursor] == b'\\' && (!cfg!(windows) || bytes.get(cursor + 1) == Some(&b'\\')) {
             cursor += 2;
             continue;
         }
@@ -903,7 +913,7 @@ fn expand_env(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut cursor = 0;
     if bytes.first() == Some(&b'~')
-        && (bytes.len() == 1 || bytes[1] == b'/')
+        && (bytes.len() == 1 || is_path_sep(bytes[1]))
         && let Some(home) = std::env::var_os("HOME")
     {
         output.push_str(&home.to_string_lossy());
@@ -962,11 +972,11 @@ fn report(candidate: &str) -> String {
     let Some(tail) = simplified.strip_prefix(current.as_ref()) else {
         return simplified;
     };
-    if current.ends_with('/') {
+    if current.bytes().last().is_some_and(is_path_sep) {
         return tail.to_owned();
     }
-    match tail.strip_prefix('/') {
-        Some(tail) => tail.trim_start_matches('/').to_owned(),
+    match tail.strip_prefix(['/', '\\']) {
+        Some(tail) => tail.trim_start_matches(['/', '\\']).to_owned(),
         None => simplified,
     }
 }
@@ -983,29 +993,50 @@ fn full_name(name: &str) -> String {
 }
 
 fn is_absolute(path: &str) -> bool {
-    path.starts_with('/')
+    if is_path_sep_at(path.as_bytes(), 0) {
+        return true;
+    }
+    // `x:/` and `x:\` drive-rooted names are absolute under
+    // BACKSLASH_IN_FILENAME (upstream `vim_isAbsName`).
+    cfg!(windows)
+        && path.len() > 2
+        && path.as_bytes()[0].is_ascii_alphabetic()
+        && path.as_bytes()[1] == b':'
+        && is_path_sep(path.as_bytes()[2])
 }
 
-/// `rel_to_curdir` (`file_search.c:1459-1464`): `.`, `..`, `./x`, `../x`.
+fn is_path_sep(byte: u8) -> bool {
+    byte == b'/' || (cfg!(windows) && byte == b'\\')
+}
+
+fn is_path_sep_at(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index).is_some_and(|byte| is_path_sep(*byte))
+}
+
+/// `rel_to_curdir` (`file_search.c:1459-1464`): `.`, `..`, `./x`, `../x`
+/// (`./` and `../` read `.\` and `..\` too on Windows).
 fn is_relative_to_curdir(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.first() != Some(&b'.') {
         return false;
     }
     match bytes.get(1) {
-        None | Some(b'/') => true,
-        Some(b'.') => matches!(bytes.get(2), None | Some(b'/')),
+        None => true,
+        Some(byte) if is_path_sep(*byte) => true,
+        Some(b'.') => bytes.get(2).is_none_or(|byte| is_path_sep(*byte)),
         Some(_) => false,
     }
 }
 
 fn after_pathsep(path: &str) -> bool {
-    path.ends_with('/')
+    path.bytes().last().is_some_and(is_path_sep)
 }
 
 /// `path_tail`, as the index just past the last separator.
 fn path_tail_index(path: &str) -> usize {
-    path.rfind('/').map_or(0, |offset| offset + 1)
+    path.bytes()
+        .rposition(is_path_sep)
+        .map_or(0, |offset| offset + 1)
 }
 
 /// `path_with_url`: a scheme followed by `://`.
@@ -1023,7 +1054,7 @@ fn path_with_url(path: &str) -> bool {
 /// trailing separator, which is how upstream avoids re-pushing a directory
 /// onto itself.
 fn path_equal(left: &str, right: &str) -> bool {
-    left.trim_end_matches('/') == right.trim_end_matches('/')
+    left.trim_end_matches(['/', '\\']) == right.trim_end_matches(['/', '\\'])
 }
 
 fn is_dir(path: &str) -> bool {

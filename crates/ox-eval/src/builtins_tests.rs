@@ -3044,6 +3044,26 @@ fn simplify_preserves_only_explicit_current_directory_prefixes() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn simplify_keeps_the_drive_root_above_dotdot() {
+    for (input, expected) in [
+        ("C:\\foo\\..", "C:\\"),
+        ("C:\\..", "C:\\"),
+        ("C:\\foo\\bar\\..\\..", "C:\\"),
+        ("C:\\foo\\..\\bar", "C:\\bar"),
+        ("C:\\a\\..\\..\\b", "C:\\b"),
+        ("c:/foo/../bar", "c:/bar"),
+        ("C:foo\\..", "C:"),
+    ] {
+        assert_eq!(
+            call("simplify", vec![text(input)]).unwrap(),
+            text(expected),
+            "input: {input}",
+        );
+    }
+}
+
 #[test]
 fn resolve_uses_real_file_types() {
     let root = std::env::temp_dir().join(format!("ox-eval-path-{}", std::process::id()));
@@ -3940,17 +3960,23 @@ fn findfile_and_finddir_preserve_non_ascii_name_bytes() {
     std::fs::write(directory.join("bår.txt"), b"").expect("a writable fixture file");
     let regex = VimRegex;
 
+    // Upstream joins result components with `PATHSEP`, which is a literal
+    // `/` on every platform, so Windows results keep the directory's own
+    // spelling (`C:\dir/file`).
     let arguments = vec![text("bår.txt"), text(&directory.to_string_lossy())];
     let found = Builtins::new(&regex)
         .call(&OxStr::from("findfile"), arguments, &mut Scope::new())
         .unwrap();
-    assert_eq!(found, text(&directory.join("bår.txt").to_string_lossy()));
+    assert_eq!(
+        found,
+        text(&format!("{}/bår.txt", directory.to_string_lossy()))
+    );
 
     let arguments = vec![text("café"), text(&root.to_string_lossy())];
     let found = Builtins::new(&regex)
         .call(&OxStr::from("finddir"), arguments, &mut Scope::new())
         .unwrap();
-    assert_eq!(found, text(&directory.to_string_lossy()));
+    assert_eq!(found, text(&format!("{}/café", root.to_string_lossy())));
 }
 
 /// Oracle: `nvim -u NONE --headless` running `:lockvar`, `:lockvar!`,
