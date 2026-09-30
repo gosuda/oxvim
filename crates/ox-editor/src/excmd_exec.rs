@@ -18016,17 +18016,7 @@ pub(crate) fn read_option(editor: &Editor, option: &str) -> Typval {
     } else {
         (SetLayer::Effective, option)
     };
-    if let Some(value) = option_value(editor, name, layer) {
-        return option_to_typval(value);
-    }
-    // `&no<opt>` reads a boolean option negated (`&noendofline` ⇄ 'eol'):
-    // upstream's option lookup accepts the `no` prefix on bool names.
-    if let Some(base) = name.strip_prefix("no")
-        && let Some(OptionValue::Boolean(value)) = option_value(editor, base, layer)
-    {
-        return Typval::Number(i64::from(!value));
-    }
-    Typval::Number(0)
+    option_value(editor, name, layer).map_or(Typval::Number(0), option_to_typval)
 }
 
 /// Trim the white space `skipwhite` trims, and nothing else.
