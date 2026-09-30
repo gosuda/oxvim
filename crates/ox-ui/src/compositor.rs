@@ -420,11 +420,11 @@ impl Compositor {
             } else {
                 0
             };
-            // Grid::write_text rejects out-of-bounds offsets, so the gutter
-            // may never reach the layer's last column in a narrow window.
-            let gutter = sign_width
-                .saturating_add(number_width)
-                .min(geometry.width.saturating_sub(1));
+            // Upstream never clamps the gutter (`win_col_off` = sign +
+            // number fields): a window narrower than the gutter shows only
+            // the clipped gutter cells, and buffer text does not draw at
+            // all. Draw calls guard on their start column instead.
+            let gutter = sign_width.saturating_add(number_width);
             let text_height = grid_height;
             let text_width = geometry.width.saturating_sub(gutter).max(1);
             // Bin sign marks by buffer row once per redraw so each drawn
@@ -533,7 +533,9 @@ impl Compositor {
                         } else {
                             (line_nr_ids.0, " ".repeat(number_width))
                         };
-                        grid.write_text(screen_row, sign_width, &digits_text, line_nr_id)?;
+                        if sign_width < geometry.width {
+                            grid.write_text(screen_row, sign_width, &digits_text, line_nr_id)?;
+                        }
                     }
                     if sign_width != 0 {
                         grid.set_hl_span(screen_row, 0, sign_width, sign_id)?;
@@ -542,7 +544,10 @@ impl Compositor {
                             .into_iter()
                             .flatten()
                             .take(sign_slots);
-                        for (slot, mark_index) in binned.enumerate() {
+                        for (slot, mark_index) in binned
+                            .enumerate()
+                            .take_while(|(slot, _)| *slot * 2 < geometry.width)
+                        {
                             let attributes = &marks[*mark_index].placement.attributes;
                             let mut text = attributes
                                 .sign_text
@@ -563,7 +568,9 @@ impl Compositor {
                             grid.write_text(screen_row, slot * 2, &text, hl_id)?;
                         }
                     }
-                    grid.write_text(screen_row, gutter, segment, 0)?;
+                    if gutter < geometry.width {
+                        grid.write_text(screen_row, gutter, segment, 0)?;
+                    }
                     apply_extmark_highlights(
                         &mut grid,
                         screen_row,
@@ -605,7 +612,9 @@ impl Compositor {
                             namespace: mark.namespace.get(),
                             mark: mark.id.get(),
                             row,
-                            col: gutter.saturating_add(draw_col % text_width),
+                            col: gutter
+                                .saturating_add(draw_col % text_width)
+                                .min(geometry.width.saturating_sub(1)),
                             buffer_row: mark.position().row,
                         });
                     }
@@ -654,7 +663,9 @@ impl Compositor {
                 let cursor_col = display_column(&cursor_line, state.cursor.col);
                 (
                     before_cursor.saturating_add(cursor_col / text_width),
-                    gutter.saturating_add(cursor_col % text_width),
+                    gutter
+                        .saturating_add(cursor_col % text_width)
+                        .min(geometry.width.saturating_sub(1)),
                 )
             });
             self.layers.push(layer);
