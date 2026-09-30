@@ -6812,7 +6812,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     if !matches!(flow, Flow::Normal) {
         return flow;
     }
-    let text = match runtime.scripts.io().read_to_string(path) {
+    let text = match read_file_text(runtime, access, buffer, path) {
         Ok(text) => text,
         Err(error) => {
             return error_flow(
@@ -6822,7 +6822,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
             );
         }
     };
-    let text = match Buffer::from_bytes(text.as_bytes()) {
+    let text = match Buffer::from_bytes(&text) {
         Ok(text) => text,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
@@ -9418,6 +9418,237 @@ fn current_buffer_name(editor: &Editor) -> String {
         .unwrap_or_default()
 }
 
+/// One file's detected end-of-line style plus the text as the buffer holds
+/// it (`fileio.c` `readfile`'s format decision and line normalization).
+pub struct FileRead {
+    /// File bytes with line separators normalized to `\n`: DOS drops each CR
+    /// before NL, MAC maps CR→NL and NL→CR, UNIX is verbatim.
+    pub text: Vec<u8>,
+    /// The 'fileformat' to set buffer-local.
+    pub fileformat: &'static str,
+    /// 'endofline' — false when the file's last line is unterminated.
+    pub eol: bool,
+}
+
+/// `readfile`'s EOL guess (fileio.c:1440-1520): 'binary' forces UNIX and
+/// skips detection entirely; an empty 'fileformats' keeps the buffer's own
+/// 'fileformat'. Otherwise the first NL decides dos-vs-unix (a CR-preceded
+/// NL is DOS when 'dos' is tried, a bare one UNIX when 'unix' is tried), a
+/// UNIX verdict on a file containing earlier CRs is re-scored against MAC by
+/// raw CR-vs-NL counts, no NL at all is MAC when CRs exist and 'mac' is
+/// tried, and an empty/no-marker file takes the first 'fileformats' entry.
+/// A DOS read that meets a bare NL rewinds and starts over as UNIX when
+/// 'unix' is also tried.
+#[allow(clippy::too_many_lines)] // one decision tree, upstream-ordered
+fn read_file_format(bytes: &[u8], formats: &str, fallback: &str, binary: bool) -> FileRead {
+    let fallback = match fallback {
+        "dos" => "dos",
+        "mac" => "mac",
+        _ => "unix",
+    };
+    if binary {
+        return FileRead {
+            text: bytes.to_vec(),
+            fileformat: fallback,
+            eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+        };
+    }
+    if formats.is_empty() {
+        return FileRead {
+            text: bytes.to_vec(),
+            fileformat: fallback,
+            eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+        };
+    }
+    let try_mac = formats.contains('m');
+    let try_dos = formats.contains('d');
+    let try_unix = formats.contains('x') || formats.contains('u');
+    let default = || match formats.chars().next() {
+        Some('m') => "mac",
+        Some('d') => "dos",
+        _ => "unix",
+    };
+    let mut format: Option<&'static str> = None;
+    if try_dos || try_unix {
+        let mut cr_before_nl = 0usize;
+        for (index, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                format = Some(
+                    if !try_unix || (try_dos && index > 0 && bytes[index - 1] == b'\r') {
+                        "dos"
+                    } else {
+                        "unix"
+                    },
+                );
+                break;
+            } else if *byte == b'\r' {
+                cr_before_nl += 1;
+            }
+        }
+        if format == Some("unix") && try_mac && cr_before_nl > 0 {
+            let (mut nls, mut crs) = (1usize, 1usize);
+            for byte in bytes {
+                match byte {
+                    b'\n' => nls += 1,
+                    b'\r' => crs += 1,
+                    _ => {}
+                }
+            }
+            if crs > nls {
+                format = Some("mac");
+            }
+        }
+    }
+    let fileformat = format.unwrap_or_else(|| {
+        if try_mac && bytes.contains(&b'\r') {
+            "mac"
+        } else {
+            default()
+        }
+    });
+    // A bare NL inside a DOS read sends upstream back to the top as UNIX
+    // when 'unix' is in 'fileformats' (`goto retry` on `ff_error`).
+    let fileformat = if fileformat == "dos"
+        && try_unix
+        && bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+    {
+        "unix"
+    } else {
+        fileformat
+    };
+    let text = match fileformat {
+        "dos" => {
+            let mut out = Vec::with_capacity(bytes.len());
+            for (index, byte) in bytes.iter().enumerate() {
+                if *byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+                    continue;
+                }
+                out.push(*byte);
+            }
+            out
+        }
+        "mac" => bytes
+            .iter()
+            .map(|byte| match byte {
+                b'\r' => b'\n',
+                b'\n' => b'\r',
+                _ => *byte,
+            })
+            .collect(),
+        _ => bytes.to_vec(),
+    };
+    FileRead {
+        eol: text.is_empty() || text.ends_with(b"\n"),
+        text,
+        fileformat,
+    }
+}
+
+/// Serializes buffer text for `:w` (`bufwrite.c`): 'dos' joins with CRLF,
+/// 'mac' with CR, 'unix' with LF; the trailing EOL is written whenever
+/// 'endofline' is set or 'fixeol' fixes it, but never under 'binary'
+/// without 'endofline'.
+fn buffer_file_bytes(
+    editor: &Editor,
+    buffer: BufHandle,
+    bytes: &[u8],
+) -> Vec<u8> {
+    let bool_option = |name: &str, default: bool| {
+        match editor.options().get_buffer(buffer, name) {
+            Ok(OptionValue::Boolean(value)) => *value,
+            _ => default,
+        }
+    };
+    let fileformat = match editor.options().get_buffer(buffer, "fileformat") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => "unix".to_owned(),
+    };
+    let binary = bool_option("binary", false);
+    let eol = bool_option("endofline", true);
+    let fixeol = bool_option("fixeol", true);
+    // `to_bytes` marks a terminated last line with one trailing `\n`; strip
+    // it so the separator join doesn't double it with the EOL write below.
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut out = Vec::with_capacity(bytes.len() + 8);
+    if fileformat == "mac" {
+        for byte in body {
+            out.push(match byte {
+                b'\n' => b'\r',
+                _ => *byte,
+            });
+        }
+        if eol || (fixeol && !binary) {
+            out.push(b'\r');
+        }
+    } else {
+        let separator = if fileformat == "dos" { b"\r\n".as_slice() } else { b"\n".as_slice() };
+        let mut parts = body.split(|byte| *byte == b'\n').peekable();
+        while let Some(part) = parts.next() {
+            out.extend_from_slice(part);
+            if parts.peek().is_some() {
+                out.extend_from_slice(separator);
+            }
+        }
+        if eol || (fixeol && !binary) {
+            out.extend_from_slice(separator);
+        }
+    }
+    out
+}
+
+/// Runs `readfile`'s format detection for `bytes`, consulting 'fileformats'
+/// and, when `buffer` is given, that buffer's 'fileformat' fallback and
+/// 'binary'. With a handle the detected values land buffer-local.
+pub fn detect_file_format(
+    editor: &mut Editor,
+    buffer: Option<BufHandle>,
+    bytes: &[u8],
+) -> FileRead {
+    let value = |name: &str| match buffer {
+        Some(_) => option_value(editor, name, SetLayer::Effective).cloned(),
+        None => editor.options().get_global(name).ok().cloned(),
+    };
+    let formats = match value("fileformats") {
+        Some(OptionValue::String(value)) => value,
+        _ => "unix,dos".to_owned(),
+    };
+    let fallback = match value("fileformat") {
+        Some(OptionValue::String(value)) => value,
+        _ => "unix".to_owned(),
+    };
+    let binary = matches!(value("binary"), Some(OptionValue::Boolean(true)));
+    let read = read_file_format(bytes, &formats, &fallback, binary);
+    if let Some(buffer) = buffer {
+        let _ = editor.options_mut().set_buffer(
+            buffer,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(buffer, "endofline", OptionValue::Boolean(read.eol));
+    }
+    read
+}
+
+/// Loads `path` for `buffer` the way `readfile` does: run the 'fileformats'
+/// EOL detection, normalize line separators to `\n`, then record the result
+/// as the buffer-local 'fileformat' and 'endofline'.
+fn read_file_text<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    buffer: BufHandle,
+    path: &Path,
+) -> std::io::Result<Vec<u8>> {
+    let bytes = runtime.scripts.io().read_bytes(path)?;
+    Ok(access.with_ex_editor(|editor| {
+        detect_file_format(editor, Some(buffer), &bytes).text
+    }))
+}
+
 /// Splits read bytes into buffer lines. A trailing newline terminates the last
 /// line rather than starting an empty one; text without it still contributes a
 /// final line, as `readfile`'s "noeol" handling does.
@@ -9641,18 +9872,15 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
     if !perform_write {
         return command_write_did_cmd(runtime, access, buffer, &path);
     }
-    let mut bytes = match access.with_ex_editor(|editor| {
+    let bytes = match access.with_ex_editor(|editor| {
         editor
             .buffer(buffer)
             .and_then(|state| state.text().map_err(Into::into))
-            .map(ox_text::Buffer::to_bytes)
+            .map(|text| buffer_file_bytes(editor, buffer, &text.to_bytes()))
     }) {
         Ok(bytes) => bytes,
         Err(error) => return error_flow(runtime, "E749", error.to_string()),
     };
-    if bytes.last().is_some_and(|byte| *byte != b'\n') {
-        bytes.push(b'\n');
-    }
     let contents = String::from_utf8_lossy(&bytes);
     if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
         return error_flow(
@@ -12218,7 +12446,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Ok(entered());
     }
 
-    let content = match runtime.scripts.io().read_to_string(&path) {
+    let content = match read_file_text(runtime, access, buffer, &path) {
         Ok(content) => content,
         Err(error) => {
             rollback_buffer_switch(access, buffer, &mut restore, true);
@@ -12228,7 +12456,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             });
         }
     };
-    let text = match Buffer::from_bytes(content.as_bytes()) {
+    let text = match Buffer::from_bytes(&content) {
         Ok(text) => text,
         Err(error) => {
             rollback_buffer_switch(access, buffer, &mut restore, true);
@@ -13078,19 +13306,28 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
     // There is no current window to give the loader a display context. Keep
     // the bootstrap path that creates the first tabpage around already-read
     // text; normal argument navigation always takes the branch above.
-    let text = match runtime.scripts.io().read_to_string(Path::new(name)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    let bytes = match runtime.scripts.io().read_bytes(Path::new(name)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             return error_flow(runtime, "E484", format!("Can't open file {name}: {error}"));
         }
     };
-    let buffer_text = match Buffer::from_bytes(text.as_bytes()) {
+    let read = access.with_ex_editor(|editor| detect_file_format(editor, None, &bytes));
+    let buffer_text = match Buffer::from_bytes(&read.text) {
         Ok(buffer) => buffer,
         Err(error) => return error_flow(runtime, "E474", error.to_string()),
     };
     let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
         let handle = editor.create_buffer_with(buffer_text, true)?;
+        let _ = editor.options_mut().set_buffer(
+            handle,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         let state = editor.buffer_mut(handle)?;
         state.set_name(OxStr::from(name));
         state.mark_saved();
@@ -17779,7 +18016,17 @@ pub(crate) fn read_option(editor: &Editor, option: &str) -> Typval {
     } else {
         (SetLayer::Effective, option)
     };
-    option_value(editor, name, layer).map_or(Typval::Number(0), option_to_typval)
+    if let Some(value) = option_value(editor, name, layer) {
+        return option_to_typval(value);
+    }
+    // `&no<opt>` reads a boolean option negated (`&noendofline` ⇄ 'eol'):
+    // upstream's option lookup accepts the `no` prefix on bool names.
+    if let Some(base) = name.strip_prefix("no")
+        && let Some(OptionValue::Boolean(value)) = option_value(editor, base, layer)
+    {
+        return Typval::Number(i64::from(!value));
+    }
+    Typval::Number(0)
 }
 
 /// Trim the white space `skipwhite` trims, and nothing else.

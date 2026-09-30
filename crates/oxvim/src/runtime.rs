@@ -330,20 +330,29 @@ fn seed_default_swap_directory(
 /// exist yet still opens as a named empty buffer, like upstream's buffer
 /// creation during argument-list setup; other read failures are `E484`,
 /// matching `:edit`'s error for an unreadable file.
-fn read_startup_file(file: &str) -> Result<Buffer, AppError> {
-    // `RealFileIO` decodes lossily, so a startup file with invalid UTF-8
-    // opens with replacement characters instead of failing like `:edit`
-    // on an unreadable file.
-    let bytes = match fs::read(file) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(AppError::Ex(format!(
-                "E484: Can't open file {file}: {error}"
-            )));
-        }
-    };
-    let text = String::from_utf8_lossy(&bytes);
+fn read_startup_file(file: &str) -> Result<Vec<u8>, AppError> {
+    match fs::read(file) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(AppError::Ex(format!(
+            "E484: Can't open file {file}: {error}"
+        ))),
+    }
+}
+
+/// `readfile`'s line-ending pass for one startup file: run the
+/// 'fileformats' guess, then `from_bytes` re-derives 'eol' from the
+/// normalized text.
+fn startup_file_read(
+    editor: &mut Editor,
+    buffer: Option<BufHandle>,
+    bytes: &[u8],
+) -> ox_editor::excmd_exec::FileRead {
+    ox_editor::excmd_exec::detect_file_format(editor, buffer, bytes)
+}
+
+fn startup_file_buffer(read: &ox_editor::excmd_exec::FileRead) -> Result<Buffer, AppError> {
+    let text = String::from_utf8_lossy(&read.text);
     Buffer::from_bytes(text.as_bytes()).map_err(|error| AppError::Ex(format!("E474: {error}")))
 }
 
@@ -444,11 +453,18 @@ fn open_startup_files(
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
-        let text = read_startup_file(file)?;
+        let bytes = read_startup_file(file)?;
         if index == 0 && first_into_current {
             let current = editor
                 .current_buffer()
                 .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
+            if flags.binary {
+                let _ = editor
+                    .options_mut()
+                    .set_buffer(current, "binary", OptionValue::Boolean(true));
+            }
+            let read = startup_file_read(editor, Some(current), &bytes);
+            let text = startup_file_buffer(&read)?;
             if let Ok(state) = editor.buffer_mut(current) {
                 state.load(text);
                 state.set_name(OxStr::from(file.as_str()));
@@ -457,9 +473,29 @@ fn open_startup_files(
             handles.push(current);
             continue;
         }
+        let read = if flags.binary {
+            // `-b` sets 'binary' before the read (`open_buffer`), which
+            // forces UNIX and skips detection entirely.
+            ox_editor::excmd_exec::FileRead {
+                eol: bytes.is_empty() || bytes.ends_with(b"\n"),
+                text: bytes.clone(),
+                fileformat: "unix",
+            }
+        } else {
+            startup_file_read(editor, None, &bytes)
+        };
+        let text = startup_file_buffer(&read)?;
         let handle = editor
             .create_buffer_with(text, true)
             .map_err(|error| AppError::Editor(error.to_string()))?;
+        let _ = editor.options_mut().set_buffer(
+            handle,
+            "fileformat",
+            OptionValue::String(read.fileformat.to_owned()),
+        );
+        let _ = editor
+            .options_mut()
+            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
