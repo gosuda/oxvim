@@ -286,11 +286,16 @@ mod tests {
     fn hostname_matches_the_dns_name_not_the_environment() -> std::io::Result<()> {
         let name = super::hostname()?;
         assert!(!name.is_empty());
-        // `GetComputerNameExW(ComputerNameDnsHostname)` agrees with
-        // COMPUTERNAME on an ordinary machine, while ignoring it when the
-        // variable is spoofed or absent.
+        // COMPUTERNAME is the NetBIOS name, cut to 15 characters, and an
+        // administrator can set it apart from the DNS hostname; the two only
+        // have to agree on a shared prefix.
         if let Ok(env_name) = std::env::var("COMPUTERNAME") {
-            assert_eq!(name.to_uppercase(), env_name.to_uppercase());
+            let dns = name.to_uppercase();
+            let netbios = env_name.to_uppercase();
+            assert!(
+                dns.starts_with(&netbios) || netbios.starts_with(&dns),
+                "DNS hostname {name} unrelated to COMPUTERNAME {env_name}"
+            );
         }
         Ok(())
     }

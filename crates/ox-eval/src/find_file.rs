@@ -502,9 +502,7 @@ fn init_context(path: &str, stopdirs: Option<&str>) -> Result<Option<Context>> {
         if tail > 0 {
             kept = tail - 1;
             // Never walk into "..", which would restart the search upwards.
-            if fix_path.starts_with("..")
-                && (kept == 2 || fix_path.as_bytes().get(2) == Some(&b'/'))
-            {
+            if fix_path.starts_with("..") && (kept == 2 || is_path_sep_at(fix_path.as_bytes(), 2)) {
                 return Ok(None);
             }
             expanded.push_str(&fix_path[..kept]);
