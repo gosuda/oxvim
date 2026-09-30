@@ -44,12 +44,20 @@ impl Terminal {
         let serial = SERIAL
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let directory = std::env::temp_dir().join(format!(
-            "oxvim-e2e-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&directory)?;
+        // Failed sessions keep their directory for the transcript dump, so a
+        // reused pid can collide with leftovers; skip to the next free name.
+        let directory = loop {
+            let candidate = std::env::temp_dir().join(format!(
+                "oxvim-e2e-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         let home = directory.join("home");
         fs::create_dir(&home)?;
         fs::write(directory.join("document.txt"), contents)?;
@@ -186,8 +194,50 @@ impl Terminal {
             }
             framed
         };
-        self.writer.write_all(&input)?;
-        self.writer.flush()?;
+        // ConPTY's input VT parser keeps only ~256 bytes of a pending escape
+        // sequence: a win32-input record that straddles that boundary is
+        // dropped while the text around it still lands. Split the stream so
+        // every `ESC[...final` unit stays inside one write (and each write is
+        // under the parser's window) — the way a real terminal's bytes
+        // actually arrive.
+        let mut index = 0;
+        let mut write_from = 0;
+        let mut limit = input.len().min(256);
+        while index < input.len() {
+            if input[index] == 0x1b && index + 1 < input.len() {
+                // Flush the accumulated text run before the sequence.
+                if index > write_from {
+                    self.writer.write_all(&input[write_from..index])?;
+                    self.writer.flush()?;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // A CSI runs to its final byte (0x40-0x7E, which covers both
+                // `ESC[` sequences and `_`-terminated win32 records).
+                let mut end = index + 2;
+                while end < input.len() && !(0x40..=0x7e).contains(&input[end]) {
+                    end += 1;
+                }
+                end = (end + 1).min(input.len());
+                self.writer.write_all(&input[index..end])?;
+                self.writer.flush()?;
+                std::thread::sleep(Duration::from_millis(1));
+                index = end;
+                write_from = index;
+                limit = index + 256;
+            } else if index >= limit {
+                self.writer.write_all(&input[write_from..index])?;
+                self.writer.flush()?;
+                std::thread::sleep(Duration::from_millis(1));
+                write_from = index;
+                limit = index + 256;
+            } else {
+                index += 1;
+            }
+        }
+        if write_from < input.len() {
+            self.writer.write_all(&input[write_from..])?;
+            self.writer.flush()?;
+        }
         Ok(())
     }
 
@@ -429,6 +479,136 @@ fn unicode_insertion_arrows_undo_and_redo_preserve_file_bytes() -> TestResult {
     assert_eq!(
         fs::read(terminal.directory.join("document.txt"))?,
         "café\u{ac00}X🙂anchor\n".as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn single_burst_of_keys_edits_and_saves_exact_bytes() -> TestResult {
+    let mut terminal = Terminal::start("keep\n")?;
+    terminal.wait("initial editor frame", |screen| {
+        screen.contents().contains("keep") && !screen.hide_cursor()
+    })?;
+    // One write carrying insert text, the Esc transition, a motion and the
+    // write-quit command: typeahead must segment it the same as separate
+    // keystrokes.
+    let mut burst = Vec::from(&b"i"[..]);
+    for _ in 0..40 {
+        burst.extend_from_slice(b"BURST-");
+    }
+    burst.extend_from_slice(b"\x1b0:wq\r");
+    terminal.send(&burst)?;
+    terminal.finish()?;
+    let expected = format!("{}keep\n", "BURST-".repeat(40));
+    assert_eq!(
+        fs::read(terminal.directory.join("document.txt"))?,
+        expected.as_bytes()
+    );
+    Ok(())
+}
+
+#[test]
+fn resize_storm_leaves_a_consistent_editable_session() -> TestResult {
+    let mut terminal = Terminal::start("storm\n")?;
+    terminal.wait("initial editor frame", |screen| {
+        screen.contents().contains("storm") && !screen.hide_cursor()
+    })?;
+    // Resize back-to-back with no settling time: every intermediate size is
+    // transient, only the last matters, and the editor must not drop keys
+    // buffered across the storm.
+    for (rows, columns) in [
+        (10, 40),
+        (30, 100),
+        (12, 30),
+        (50, 120),
+        (24, 80),
+        (8, 20),
+        (40, 90),
+        (24, 80),
+    ] {
+        terminal.resize(rows, columns)?;
+    }
+    terminal.send(b"iEND\x1b:wq\r")?;
+    terminal.finish()?;
+    assert_eq!(
+        fs::read(terminal.directory.join("document.txt"))?,
+        b"ENDstorm\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_bytes_and_broken_sequences_do_not_wedge_the_editor() -> TestResult {
+    let mut terminal = Terminal::start("sane\n")?;
+    terminal.wait("initial editor frame", |screen| {
+        screen.contents().contains("sane") && !screen.hide_cursor()
+    })?;
+    // Invalid UTF-8, NUL/DEL, an unknown-but-complete kitty CSI and a
+    // padding key release record are all undeliverable keys; the editor may
+    // beep but must keep servicing real input afterward. No dangling tails:
+    // a pending sequence would swallow the following key on ConPTY.
+    terminal.send(b"\xff\xfe\x80\x00\x7f\x1b[>0;1u\x1b[65;1;65;0;0;1_")?;
+    terminal.send(b"G")?;
+    terminal.wait("motion still lands after garbage input", |screen| {
+        let (row, _column) = screen.cursor_position();
+        row == 0 && !screen.hide_cursor()
+    })?;
+    terminal.send(b"dd:wq\r")?;
+    terminal.finish()?;
+    assert_eq!(fs::read(terminal.directory.join("document.txt"))?, b"\n");
+    Ok(())
+}
+
+#[test]
+fn killing_the_editor_mid_session_reaps_everything() -> TestResult {
+    let mut terminal = Terminal::start("doomed\n")?;
+    terminal.wait("initial editor frame", |screen| {
+        screen.contents().contains("doomed") && !screen.hide_cursor()
+    })?;
+    terminal.send(b"inever-saved")?;
+    terminal.receive(Duration::from_millis(300));
+    terminal.child.kill()?;
+    let deadline = Instant::now() + TIMEOUT;
+    while terminal.child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::other("killed editor did not exit").into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // `finish` asserts a clean quit, so close the session manually: drop the
+    // master for reader EOF, join it, then hand the terminal to Drop.
+    drop(terminal.master.take());
+    if let Some(reader) = terminal.reader.take() {
+        reader
+            .join()
+            .map_err(|_| io::Error::other("PTY reader panicked"))?;
+    }
+    terminal.finished = true;
+    Ok(())
+}
+
+#[test]
+fn deep_file_end_edit_saves_byte_exact_content() -> TestResult {
+    let mut document = String::new();
+    for line in 0..3000 {
+        document.push_str("line ");
+        document.push_str(&line.to_string());
+        document.push('\n');
+    }
+    let mut terminal = Terminal::start(&document)?;
+    terminal.wait("initial editor frame", |screen| {
+        screen.contents().contains("line 0") && !screen.hide_cursor()
+    })?;
+    terminal.send(b"G")?;
+    terminal.wait("cursor on the last line", |screen| {
+        screen.contents().contains("line 2999") && !screen.hide_cursor()
+    })?;
+    terminal.send(b"A END\x1b:wq\r")?;
+    terminal.finish()?;
+    let expected = format!("{} END\n", document.trim_end());
+    assert_eq!(
+        fs::read(terminal.directory.join("document.txt"))?,
+        expected.into_bytes()
     );
     Ok(())
 }

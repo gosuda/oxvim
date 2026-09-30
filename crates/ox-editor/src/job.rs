@@ -132,8 +132,11 @@ type StdioPump = std::thread::JoinHandle<()>;
 struct Job {
     process: Process,
     input: Option<JobInput>,
-    _stdout_pipe: Option<StdioPump>,
-    _stderr_pipe: Option<StdioPump>,
+    /// Keep-alive plus drain tracking: the pump handle must stay alive for
+    /// the stream to deliver, and `drained` consults its presence to know
+    /// which streams owe an EOF.
+    stdout_pipe: Option<StdioPump>,
+    stderr_pipe: Option<StdioPump>,
     callbacks: JobCallbacks,
     stdout: StreamState,
     stderr: StreamState,
@@ -154,6 +157,17 @@ struct Job {
     /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
     /// past editor exit and terminates every other one (`channel_close_on_exit`).
     detached: bool,
+}
+
+impl Job {
+    /// The process exited and every captured stream drained. Reader pumps
+    /// queue their final `Data`/`Eof` independently of the exit notification,
+    /// so an exited process alone does not imply buffered output is complete.
+    fn drained(&self) -> bool {
+        self.status >= 0
+            && (self.stdout_pipe.is_none() || self.stdout.eof)
+            && (self.stderr_pipe.is_none() || self.stderr.eof)
+    }
 }
 /// Resolve the PTY slave path behind a child that was spawned through one.
 ///
@@ -295,28 +309,42 @@ impl JobManager {
             }
             let mut spawned = process::spawn(&mut self.loop_, spawn_options, on_exit)
                 .map_err(|error| error.to_string())?;
-            let input = spawned
-                .pipes
-                .stdin
-                .take()
-                .map(|stdin| pipe_writer(id, stdin).map(JobInput::Pipe))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            let stdout_pipe = spawned
-                .pipes
-                .stdout
-                .take()
-                .map(|stream| pipe_reader(id, StreamKind::Stdout, stream, Arc::clone(&self.raw)))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            let stderr_pipe = spawned
-                .pipes
-                .stderr
-                .take()
-                .map(|stream| pipe_reader(id, StreamKind::Stderr, stream, Arc::clone(&self.raw)))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            (spawned.process, input, stdout_pipe, stderr_pipe)
+            let pumps = (|| {
+                let input = spawned
+                    .pipes
+                    .stdin
+                    .take()
+                    .map(|stdin| pipe_writer(id, stdin).map(JobInput::Pipe))
+                    .transpose()?;
+                let stdout_pipe = spawned
+                    .pipes
+                    .stdout
+                    .take()
+                    .map(|stream| {
+                        pipe_reader(id, StreamKind::Stdout, stream, Arc::clone(&self.raw))
+                    })
+                    .transpose()?;
+                let stderr_pipe = spawned
+                    .pipes
+                    .stderr
+                    .take()
+                    .map(|stream| {
+                        pipe_reader(id, StreamKind::Stderr, stream, Arc::clone(&self.raw))
+                    })
+                    .transpose()?;
+                Ok::<_, std::io::Error>((input, stdout_pipe, stderr_pipe))
+            })();
+            match pumps {
+                Ok((input, stdout_pipe, stderr_pipe)) => {
+                    (spawned.process, input, stdout_pipe, stderr_pipe)
+                }
+                Err(error) => {
+                    // The child is not in the job table yet, so teardown
+                    // cannot reach it; terminate before reporting failure.
+                    let _ = spawned.process.kill(None);
+                    return Err(error.to_string());
+                }
+            }
         };
 
         let pid = process.pid();
@@ -333,8 +361,8 @@ impl JobManager {
             Job {
                 process,
                 input,
-                _stdout_pipe: stdout_pipe,
-                _stderr_pipe: stderr_pipe,
+                stdout_pipe,
+                stderr_pipe,
                 callbacks: options.callbacks,
                 stdout: StreamState {
                     buffered: options.stdout_buffered,
@@ -440,18 +468,8 @@ impl JobManager {
             }
             if ids
                 .iter()
-                .all(|id| self.jobs.get(id).is_none_or(|job| job.status >= 0))
+                .all(|id| self.jobs.get(id).is_none_or(Job::drained))
             {
-                // EOF readiness can trail the waiter notification by one turn.
-                for _ in 0..4 {
-                    match self.poll() {
-                        Ok(mut polled) => events.append(&mut polled),
-                        Err(error) => {
-                            self.defer_events(events);
-                            return Err(error);
-                        }
-                    }
-                }
                 break;
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {

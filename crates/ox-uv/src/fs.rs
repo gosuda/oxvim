@@ -982,14 +982,23 @@ pub fn futime(handle: &FileHandle, atime: FsTime, mtime: FsTime) -> FsResult<()>
 
 /// Converts an [`FsTime`] to a [`std::time::SystemTime`]; timestamps outside
 /// the representable range are rejected like an `EINVAL` argument.
+///
+/// The `nsec` fraction always counts forward from `sec`, matching the
+/// timespec contract the unix path passes through: `{-1, 500ms}` is a half
+/// second *before* the epoch, not a second and a half.
 #[cfg(windows)]
 fn fs_time_to_system(time: FsTime) -> io::Result<std::time::SystemTime> {
-    let duration = std::time::Duration::new(time.sec.unsigned_abs(), time.nsec);
+    let seconds = std::time::Duration::new(time.sec.unsigned_abs(), 0);
+    let fraction = std::time::Duration::new(0, time.nsec);
     let epoch = std::time::SystemTime::UNIX_EPOCH;
     let system = if time.sec >= 0 {
-        epoch.checked_add(duration)
+        epoch
+            .checked_add(seconds)
+            .and_then(|value| value.checked_add(fraction))
     } else {
-        epoch.checked_sub(duration)
+        epoch
+            .checked_sub(seconds)
+            .and_then(|value| value.checked_add(fraction))
     };
     system.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "timestamp is out of range"))
 }

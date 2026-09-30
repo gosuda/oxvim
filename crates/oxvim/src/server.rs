@@ -2259,6 +2259,127 @@ fn drain_turn_boundary(state: &Rc<RefCell<AppState>>) -> (Vec<(u64, Vec<u8>)>, R
     };
     (writes, drained)
 }
+
+/// One turn of the event-loop-independent background work
+/// [`NetworkRuntime::poll_background`] drives every 10 ms on unix: PTY flush,
+/// deferred job events, scheduled Lua work, pending typeahead, quit
+/// absorption, transition and buffer-callback drains — then a redraw, but
+/// only when the turn produced progress (an unconditional redraw re-emits
+/// cursor and window events every tick, which toggles `DECSCUSR`/`?25` on
+/// the wire and hides the cursor between frames on ConPTY).
+///
+/// `writes` carries the `(channel, bytes)` batches emitted this turn; the
+/// caller owns transport (uv streams on unix, locked stdout in the embed
+/// pump). `exiting` marks that a quit was absorbed this turn.
+struct BackgroundTick {
+    writes: Vec<(u64, Vec<u8>)>,
+    exiting: bool,
+}
+
+/// Runs the background tick body independent of any event loop. An empty
+/// `writes` means the turn produced no progress worth flushing.
+///
+/// # Errors
+///
+/// Returns the PTY flush or redraw failure as a [`ox_uv::CallbackError`].
+fn poll_background_work(
+    state: &Rc<RefCell<AppState>>,
+    hostless_job_event_passes: &mut usize,
+) -> Result<BackgroundTick, ox_uv::CallbackError> {
+    let (session, ex, nested_ex, mode, lua_work, typeahead_pending, mut exiting, mut exit_code) = {
+        let state = state.borrow();
+        (
+            state.session.clone(),
+            state.ex.clone(),
+            state.nested_ex.clone(),
+            state.mode.clone(),
+            state.lua_work.clone(),
+            state.typeahead_pending(),
+            state.exiting,
+            state.exit_code,
+        )
+    };
+    let changed = ex
+        .borrow_mut()
+        .flush_pty_output(&*session)
+        .map_err(ox_uv::CallbackError::new)?;
+    let delivered =
+        match deliver_deferred_job_events(&session, &ex, &nested_ex, hostless_job_event_passes) {
+            Ok(delivered) => delivered,
+            Err(error) => {
+                report_job_callback_error(&session, &error);
+                false
+            }
+        };
+    // A jobwait flush that no Lua boundary claimed (Vimscript caller)
+    // is served here; the events are already delivered, so only the
+    // marker is taken.
+    let _ = ex.borrow_mut().take_lua_flush_pending();
+    // Run scheduled callbacks without keeping an AppState borrow alive:
+    // callbacks can pump the accept loop and re-enter this state.
+    let worked = drain_lua_work_queue(&lua_work, &session);
+    // Timers and job callbacks feed keys outside any RPC turn; upstream
+    // services pending typeahead on the same main-loop turn
+    // (state.c:100-113), so the tick drives it the same way.
+    let drove = if typeahead_pending {
+        match drive_input_parts(
+            &session,
+            &ex,
+            &nested_ex,
+            &mode,
+            &mut exiting,
+            &mut exit_code,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                report_server_error(&session, error.message());
+                true
+            }
+        }
+    } else {
+        false
+    };
+    // Job `on_exit` and scheduled callbacks above run user code that
+    // can record quits; promote them before the exit check stops us.
+    absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
+    // Setter- or startup-recorded transitions drain on the background
+    // tick the same way key-driven ones do, still with no AppState
+    // borrow held.
+    fire_pending_transitions_for_state(state);
+    let (buffer_writes, drained) = drain_buffer_callbacks_for_state(state);
+    if let Err(error) = &drained {
+        report_server_error(&session, error);
+    }
+    // Buffer callbacks can re-enter and request a quit after the first
+    // promotion above, so promote their result before checking state.
+    absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
+    if exiting {
+        let mut state = state.borrow_mut();
+        state.exiting = true;
+        state.exit_code = exit_code;
+    }
+    if state.borrow().should_exit() {
+        return Ok(BackgroundTick {
+            writes: Vec::new(),
+            exiting: true,
+        });
+    }
+    if !delivered && !changed && !worked && !drove && buffer_writes.is_empty() && drained.is_ok() {
+        return Ok(BackgroundTick {
+            writes: Vec::new(),
+            exiting: false,
+        });
+    }
+    let redraw_writes = state
+        .borrow_mut()
+        .redraw()
+        .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
+    let writes = buffer_writes.into_iter().chain(redraw_writes).collect();
+    Ok(BackgroundTick {
+        writes,
+        exiting: false,
+    })
+}
 /// Drains insert-lifecycle transitions and staged mode switches recorded
 /// during a dispatch without holding an `AppState` borrow: transition
 /// autocmds run user code that can reenter this state, so every dispatch
@@ -2624,22 +2745,6 @@ fn dispatch_echo(
     Ok(result)
 }
 
-/// Queues raw `nvim_ui_send` content for the next redraw pass
-/// (`nvim_ui_send`, `api/ui.c:1102-1106`). Upstream forwards the payload to
-/// every UI that negotiated `stdout_tty`, and a well-formed call cannot
-/// fail — one String with no eligible UI attached still succeeds. The
-/// documented signature is `nvim_ui_send({content})` (`api.txt:3824-3837`);
-/// `channel_id` is an implicit API parameter, not part of the wire
-/// signature, so the legacy two-argument shape is malformed and rejected
-/// before queueing. The error texts reproduce the generated dispatcher
-/// exactly (the arity check plus `OxStr`'s `Wrong type for argument 1` in
-/// `ox-api-macros`), because every entry path — RPC, `nvim_call_atomic`,
-/// and the Lua `vim.api` bindings — crosses here instead of the registry
-/// handler, and a client must see the same failure it would get from the
-/// advertised level-15 API. The queue rides the editor sink, so all paths
-/// share one queue and `AppState::drain_ui_sends` stays the one owner of
-/// frame assembly.
-
 /// The generated-dispatcher error a malformed `nvim_ui_send` call gets:
 /// every count other than one is the arity error — the legacy leading
 /// `channel_id` shape included, because `channel_id` is an implicit API
@@ -2655,6 +2760,21 @@ fn ui_send_validation_error(params: &[Object]) -> ApiError {
     ApiError::exception("Wrong type for argument 1 when calling nvim_ui_send, expecting String")
 }
 
+/// Queues raw `nvim_ui_send` content for the next redraw pass
+/// (`nvim_ui_send`, `api/ui.c:1102-1106`). Upstream forwards the payload to
+/// every UI that negotiated `stdout_tty`, and a well-formed call cannot
+/// fail — one String with no eligible UI attached still succeeds. The
+/// documented signature is `nvim_ui_send({content})` (`api.txt:3824-3837`);
+/// `channel_id` is an implicit API parameter, not part of the wire
+/// signature, so the legacy two-argument shape is malformed and rejected
+/// before queueing. The error texts reproduce the generated dispatcher
+/// exactly (the arity check plus `OxStr`'s `Wrong type for argument 1` in
+/// `ox-api-macros`), because every entry path — RPC, `nvim_call_atomic`,
+/// and the Lua `vim.api` bindings — crosses here instead of the registry
+/// handler, and a client must see the same failure it would get from the
+/// advertised level-15 API. The queue rides the editor sink, so all paths
+/// share one queue and `AppState::drain_ui_sends` stays the one owner of
+/// frame assembly.
 fn queue_ui_send(session: &ApiSession, params: &[Object]) -> Result<Object, ApiError> {
     let [Object::String(content)] = params else {
         return Err(ui_send_validation_error(params));
@@ -2873,6 +2993,7 @@ fn run_embed_stdio_pump(state: &Rc<RefCell<AppState>>) -> Result<i64, AppError> 
         .map_err(AppError::Io)?;
     let mut decoder = IncrementalDecoder::new();
     let mut output = io::stdout().lock();
+    let mut hostless_job_event_passes = 0;
     'pump: loop {
         match incoming.recv_timeout(Duration::from_millis(10)) {
             Ok(Ok(chunk)) => {
@@ -2908,34 +3029,25 @@ fn run_embed_stdio_pump(state: &Rc<RefCell<AppState>>) -> Result<i64, AppError> 
         if state.borrow().should_exit() {
             break 'pump;
         }
-        // Idle boundary: flush pending redraws the unix pump timers would
-        // have served by now, so cursor and screen updates queued after the
-        // last request still reach the client. Skip the pass entirely when
-        // nothing is pending — an unconditional `redraw` re-emits cursor and
-        // window events every tick, which toggles `DECSCUSR`/`?25` on the
-        // wire and hides the cursor between frames on ConPTY.
-        let (buffer_writes, drained) = drain_turn_boundary(state);
-        let mut flushed = buffer_writes;
-        if drained.is_ok() {
-            let pending = {
-                let server = state.borrow();
-                server.has_pending_ui_sends() || server.has_pending_redraws()
-            };
-            if pending {
-                match state.borrow_mut().redraw() {
-                    Ok(writes) => flushed.extend(writes),
-                    Err(error) => {
-                        report_server_error(&state.borrow().session, &error.to_string());
+        // Idle boundary: run the same background tick `poll_background`
+        // serves on unix — deferred job events, scheduled Lua work, pending
+        // typeahead, transitions and buffer callbacks all progress without
+        // an RPC — then flush the turn's stdio writes. An empty turn emits
+        // nothing; see `poll_background_work` for why redraws stay gated on
+        // progress.
+        match poll_background_work(state, &mut hostless_job_event_passes) {
+            Ok(tick) => {
+                for (channel, bytes) in tick.writes {
+                    if channel == CHAN_STDIO.get() {
+                        output.write_all(&bytes).map_err(AppError::Io)?;
                     }
                 }
             }
-        }
-        for (channel, bytes) in flushed {
-            if channel == CHAN_STDIO.get() {
-                output.write_all(&bytes).map_err(AppError::Io)?;
+            Err(error) => {
+                output.flush().map_err(AppError::Io)?;
+                return Err(AppError::Server(error.to_string()));
             }
         }
-        drained.map_err(AppError::Server)?;
         output.flush().map_err(AppError::Io)?;
     }
     state.borrow_mut().run_exit()?;
@@ -3833,101 +3945,14 @@ impl NetworkRuntime {
             uv_loop.stop();
             return Ok(());
         }
-        let (session, ex, nested_ex, mode, lua_work, typeahead_pending, mut exiting, mut exit_code) = {
-            let state = self.state.borrow();
-            (
-                state.session.clone(),
-                state.ex.clone(),
-                state.nested_ex.clone(),
-                state.mode.clone(),
-                state.lua_work.clone(),
-                state.typeahead_pending(),
-                state.exiting,
-                state.exit_code,
-            )
-        };
-        let changed = ex
-            .borrow_mut()
-            .flush_pty_output(&*session)
-            .map_err(ox_uv::CallbackError::new)?;
-        let delivered = match deliver_deferred_job_events(
-            &session,
-            &ex,
-            &nested_ex,
-            &mut self.hostless_job_event_passes,
-        ) {
-            Ok(delivered) => delivered,
-            Err(error) => {
-                report_job_callback_error(&session, &error);
-                false
-            }
-        };
-        // A jobwait flush that no Lua boundary claimed (Vimscript caller)
-        // is served here; the events are already delivered, so only the
-        // marker is taken.
-        let _ = ex.borrow_mut().take_lua_flush_pending();
-        // Run scheduled callbacks without keeping an AppState borrow alive:
-        // callbacks can pump the accept loop and re-enter this state.
-        let worked = drain_lua_work_queue(&lua_work, &session);
-        // Timers and job callbacks feed keys outside any RPC turn; upstream
-        // services pending typeahead on the same main-loop turn
-        // (state.c:100-113), so the tick drives it the same way.
-        let drove = if typeahead_pending {
-            match drive_input_parts(
-                &session,
-                &ex,
-                &nested_ex,
-                &mode,
-                &mut exiting,
-                &mut exit_code,
-            ) {
-                Ok(()) => true,
-                Err(error) => {
-                    report_server_error(&session, error.message());
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        // Job `on_exit` and scheduled callbacks above run user code that
-        // can record quits; promote them before the exit check stops us.
-        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
-        // Setter- or startup-recorded transitions drain on the background
-        // tick the same way key-driven ones do, still with no AppState
-        // borrow held.
-        fire_pending_transitions_for_state(&self.state);
-        let (buffer_writes, drained) = drain_buffer_callbacks_for_state(&self.state);
-        if let Err(error) = &drained {
-            report_server_error(&session, error);
-        }
-        // Buffer callbacks can re-enter and request a quit after the first
-        // promotion above, so promote their result before checking state.
-        absorb_pending_quit_parts(&ex, &nested_ex, &mut exiting, &mut exit_code);
-        if exiting {
-            let mut state = self.state.borrow_mut();
-            state.exiting = true;
-            state.exit_code = exit_code;
-        }
-        if self.shutdown || self.state.borrow().should_exit() {
+        let tick = poll_background_work(&self.state, &mut self.hostless_job_event_passes)?;
+        if tick.exiting {
             uv_loop.stop();
             return Ok(());
         }
-        if !delivered
-            && !changed
-            && !worked
-            && !drove
-            && buffer_writes.is_empty()
-            && drained.is_ok()
-        {
+        if tick.writes.is_empty() {
             return Ok(());
         }
-        let redraw_writes = self
-            .state
-            .borrow_mut()
-            .redraw()
-            .map_err(|error| ox_uv::CallbackError::new(error.to_string()))?;
-        let writes = buffer_writes.into_iter().chain(redraw_writes);
         // Peers live on the accept loop, so their writes go through it, not
         // the main-loop `uv_loop` this tick received. The pump timer and
         // this tick are both main-loop callbacks, so the borrow is free.
@@ -3936,7 +3961,7 @@ impl NetworkRuntime {
         // would forbid the `&mut self` that `remove_peer` takes below.
         let accept_uv = Rc::clone(&self.accept_uv);
         let mut accept_uv = accept_uv.borrow_mut();
-        for (channel, bytes) in writes {
+        for (channel, bytes) in tick.writes {
             if channel == CHAN_STDIO.get() {
                 let mut output = io::stdout().lock();
                 output
@@ -7721,6 +7746,7 @@ mod tests {
     }
 
     /// A unique pipe path under the temp dir; tests never share names.
+    #[cfg(unix)] // pipe addresses are Unix-domain sockets
     fn pipe_path(label: &str) -> String {
         std::env::temp_dir()
             .join(format!("oxvim-w2b-{}.{}.sock", std::process::id(), label))

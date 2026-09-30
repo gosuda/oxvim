@@ -589,7 +589,9 @@ fn path_head(name: &str) -> String {
     }
     if name.len() > 1 && name.bytes().last().is_some_and(is_path_sep) {
         return name
-            .trim_end_matches(|character| is_path_sep(character as u8))
+            .trim_end_matches(|character: char| {
+                character.is_ascii() && is_path_sep(character as u8)
+            })
             .to_owned();
     }
     match rfind_path_sep(name) {
