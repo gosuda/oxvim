@@ -467,6 +467,7 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
     // arrives between programming and the first loop turn must still reach the
     // restore path instead of killing the process with OSC 4 still in effect.
     let signals = ShutdownSignals::install()?;
+    client.watch_shutdown(signals.watch());
     let mut state = TuiState::new(
         env::var("COLORFGBG").ok().as_deref(),
         MotionPolicy::from_environment(),
@@ -513,6 +514,11 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
                     render_current_frame(&mut session, &mut damage, &grid, &state, capabilities)?;
                 }
             }
+            Err(ClientError::Interrupted) => {
+                // A wait interrupted by a terminating signal surfaces at the
+                // `signals.pending()` check on the next loop turn.
+                continue;
+            }
             Err(error) => {
                 if finish_run(
                     &mut session,
@@ -530,6 +536,9 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
         // `:wq`'s stream close can race the `nvim_input` reply: a clean
         // child exit surfacing here is the normal quit path, not a failure.
         if let Err(error) = forward_terminal_events(&mut client, &mut state) {
+            if matches!(&error, TuiError::Client(ClientError::Interrupted)) {
+                continue;
+            }
             if let TuiError::Client(client_error) = &error
                 && finish_run(
                     &mut session,
