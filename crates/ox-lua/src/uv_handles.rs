@@ -2336,9 +2336,13 @@ fn install_udp_tty(
         uv.set(
             "new_tty",
             lua.create_function(move |lua, (fd, readable): (i32, bool)| {
-                // `/dev/fd` is the self-fd path on both Linux (a symlink to
-                // `/proc/self/fd`) and macOS (a device directory of its own).
+                // `/dev/fd` exists on macOS as a device directory; on Linux
+                // it is only an optional symlink to `/proc/self/fd`, so the
+                // procfs path is the portable one there.
+                #[cfg(target_os = "macos")]
                 let path = format!("/dev/fd/{fd}");
+                #[cfg(not(target_os = "macos"))]
+                let path = format!("/proc/self/fd/{fd}");
                 let file = OpenOptions::new()
                     .read(readable)
                     .write(!readable)

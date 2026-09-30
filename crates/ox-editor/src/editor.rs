@@ -3950,6 +3950,7 @@ impl Editor {
             self.previous_window = previous.filter(|current| *current != window);
         }
         self.windows.insert(window, tab);
+        self.options.copy_window_options(target, window);
         self.apply_effective_directory();
         Ok(window)
     }

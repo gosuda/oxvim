@@ -397,7 +397,9 @@ impl Compositor {
             // 'number'/'relativenumber' reserve a gutter after the sign
             // column sized like upstream's `numberwidth`: the option is the
             // floor, a longer line count widens it to digits + 1
-            // (screen.c:win_col_off).
+            // (screen.c:win_col_off). With 'relativenumber' alone upstream
+            // sizes the gutter from the window's row count instead — only
+            // `w_height` rows ever carry relative numbers.
             let number_on = matches!(
                 editor.options().get_window(window, "number"),
                 Ok(OptionValue::Boolean(true))
@@ -413,11 +415,16 @@ impl Compositor {
                     }
                     _ => 4,
                 };
-                minimum.max(digits(line_count).saturating_add(1))
+                let extent = if number_on { line_count } else { grid_height };
+                minimum.max(digits(extent).saturating_add(1))
             } else {
                 0
             };
-            let gutter = sign_width.saturating_add(number_width);
+            // Grid::write_text rejects out-of-bounds offsets, so the gutter
+            // may never reach the layer's last column in a narrow window.
+            let gutter = sign_width
+                .saturating_add(number_width)
+                .min(geometry.width.saturating_sub(1));
             let text_height = grid_height;
             let text_width = geometry.width.saturating_sub(gutter).max(1);
             // Bin sign marks by buffer row once per redraw so each drawn
@@ -445,7 +452,7 @@ impl Compositor {
             let cursor_hl = number_width != 0
                 && matches!(
                     editor.options().get_window(window, "cursorlineopt"),
-                    Ok(OptionValue::String(opt)) if opt.split(',').any(|item| item == "number")
+                    Ok(OptionValue::String(opt)) if opt.split(',').any(|item| matches!(item, "number" | "both"))
                 )
                 && matches!(
                     editor.options().get_window(window, "cursorline"),
@@ -476,8 +483,8 @@ impl Compositor {
                     // (`{1:…}`) spanning the entire fill line, not just the
                     // `~` glyph. Fill the remaining columns with the same
                     // highlight so the row compares equal to the upstream grid.
-                    if text_width > 1 {
-                        grid.set_hl_span(screen_row, 1, text_width, non_text_id)?;
+                    if geometry.width > 1 {
+                        grid.set_hl_span(screen_row, 1, geometry.width, non_text_id)?;
                     }
                     screen_row += 1;
                     line_number += 1;

@@ -430,7 +430,10 @@ pub fn getrusage() -> Result<Rusage> {
         Ok(Rusage {
             utime: seconds(usage.ru_utime.tv_sec, usage.ru_utime.tv_usec),
             stime: seconds(usage.ru_stime.tv_sec, usage.ru_stime.tv_usec),
-            maxrss: field(usage.ru_maxrss),
+            // Darwin reports `ru_maxrss` in bytes; libuv normalizes it to
+            // kilobytes on Apple platforms (uv__getrusage), as documented on
+            // `uv_rusage_t.maxrss`.
+            maxrss: field(usage.ru_maxrss / 1024),
             ixrss: field(usage.ru_ixrss),
             idrss: field(usage.ru_idrss),
             isrss: field(usage.ru_isrss),

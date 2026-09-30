@@ -796,6 +796,13 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     let channel_ids = session.with_editor(|editor| editor.channel_ids());
     primary.set_channel_ids(channel_ids.clone());
     nested.set_channel_ids(channel_ids);
+    // The nested executor shares durable definitions with the primary so
+    // reentrant dispatch observes the same user commands, functions, quit
+    // bus, and session state — the same wiring `build_embedded_core` uses.
+    nested.share_user_commands_from(&primary);
+    nested.share_user_functions_from(&primary);
+    nested.share_quit_bus_from(&primary);
+    nested.share_session_from(&primary);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
         Rc::new(crate::server::EditorBuiltins {
@@ -845,13 +852,15 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     lua.globals()
         .set("arg", arguments)
         .map_err(|error| AppError::Lua(error.to_string()))?;
-    lua.load(&source)
+    let executed = lua
+        .load(&source)
         .set_name(format!("@{}", script.path))
         .exec()
-        .map_err(|error| AppError::Lua(error.to_string()))?;
+        .map_err(|error| AppError::Lua(error.to_string()));
     // `print()` lands in the editor message stream via `nvim_out_write`
     // (executor.c:nlua_print); flush it to the process's stdout/stderr like
-    // the batch path so `nvim -l` scripts emit their output.
+    // the batch path so `nvim -l` scripts emit their output — including the
+    // output a script printed before failing, which upstream still emits.
     let mut sink = PrintfSink::default();
     session.with_editor(|editor| {
         for (message, destination) in editor.messages().iter().zip(editor.message_destinations()) {
@@ -860,7 +869,7 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
         sink.finish(editor.message_routing).map_err(AppError::Io)?;
         Ok::<(), AppError>(())
     })?;
-    Ok(())
+    executed
 }
 
 struct ImmediateScheduler;

@@ -264,9 +264,9 @@ pub fn resident_set() -> io::Result<u64> {
     Ok(info.resident_size)
 }
 
-/// Process resource usage from `getrusage(RUSAGE_SELF)`, matching
-/// `uv_getrusage` (field units stay platform-native: `ru_maxrss` is bytes on
-/// macOS, kilobytes on Linux, exactly as libuv passes it through).
+/// Process resource usage from `getrusage(RUSAGE_SELF)` with platform-native
+/// field units (`ru_maxrss` is bytes on macOS); the `ox-uv` layer normalizes
+/// `maxrss` to kilobytes like libuv's `uv__getrusage`.
 ///
 /// # Errors
 ///
