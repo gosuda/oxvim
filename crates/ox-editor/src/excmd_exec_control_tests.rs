@@ -552,28 +552,29 @@ fn finally_runs_after_break_exits_loop() {
 #[test]
 fn uncaught_throw_returns_vim_error_with_message_and_throwpoint() {
     // ex_docmd.c: `:throw` creates a VimException with kind=Throw; uncaught,
-    // it becomes ExecError::Vim.  Throwpoint for `:execute_line` is
-    // "command line" (no source stack frame).
+    // it becomes ExecError::Vim. `v:throwpoint` at the bare cmdline is
+    // empty (no estack frames).
     let mut executor = ExExecutor::new();
     let editor = TestEditorAccess::new(Editor::new());
     let result = executor.execute_line(&editor, "throw \"oops\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Throw);
     assert_eq!(exception.message(), "oops");
-    assert_eq!(exception.throwpoint, "command line");
+    assert_eq!(exception.throwpoint, "");
 }
 
 #[test]
 fn script_throw_has_script_throwpoint_with_line_number() {
-    // ex_docmd.c: throwpoint for a sourced script is "script name[line]".
-    // The line number is the physical source line of the `:throw`.
+    // `estack_sfile` (runtime.c:164): a lone script frame renders bare
+    // (initial `last_type` is ETYPE_SCRIPT) — `{name}, line {lnum}` with
+    // the physical source line of the `:throw`.
     let mut executor = ExExecutor::new();
     let editor = TestEditorAccess::new(Editor::new());
     let result = executor.execute_script(&editor, "my.vim", "let g:dummy = 0\nthrow \"err\"");
     let exception = vim_error(result.map(|_| ()));
     assert_eq!(exception.kind, VimExceptionKind::Throw);
     assert_eq!(exception.message(), "err");
-    assert_eq!(exception.throwpoint, "script my.vim[2]");
+    assert_eq!(exception.throwpoint, "my.vim, line 2");
 }
 
 // ===========================================================================

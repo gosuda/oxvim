@@ -617,7 +617,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(
         global_string(exec.scope(), "throwpoint").as_deref(),
-        Some("function BrokenBuiltin[1]..script <test>[1]")
+        Some("<test>[7]..function BrokenBuiltin, line 1")
     );
 }
 
@@ -642,7 +642,7 @@ fn public_function_entry_points_preserve_user_throw() {
         };
         assert_eq!(exception.kind, VimExceptionKind::Throw);
         assert_eq!(exception.message(), "wtf");
-        assert_eq!(exception.throwpoint, "function Foo[1]..script <test>[1]");
+        assert_eq!(exception.throwpoint, "function Foo, line 1");
     }
 }
 
@@ -772,11 +772,11 @@ fn recursion_exceeds_maxfuncdepth_e132() {
     let mut scope = Scope::new();
     for _ in 0..MAX_FUNC_DEPTH {
         funcs
-            .begin_call("Recurse", 0, vec![], 1, 1, &mut scope)
+            .begin_call("Recurse", 0, vec![], 1, 1, &mut scope, 0)
             .unwrap();
     }
     let err = funcs
-        .begin_call("Recurse", 0, vec![], 1, 1, &mut scope)
+        .begin_call("Recurse", 0, vec![], 1, 1, &mut scope, 0)
         .unwrap_err();
     assert_eq!(err.code, "E132");
 }

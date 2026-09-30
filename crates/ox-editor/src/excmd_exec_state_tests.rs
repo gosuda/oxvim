@@ -1916,8 +1916,8 @@ fn e121_in_script_has_line_numbered_throwpoint() {
                     .message()
                     .contains("Undefined variable: g:nonexistent")
             );
-            // Throwpoint includes the script name and line 2.
-            assert_eq!(vim_exc.throwpoint, "script test[2]");
+            // `estack_sfile`: lone script frame renders `name, line N`.
+            assert_eq!(vim_exc.throwpoint, "test, line 2");
         }
         other => panic!("expected Vim E121, got {other:?}"),
     }
@@ -1943,7 +1943,7 @@ fn e488_from_call_trailing_characters() {
                 vim_exc.message(),
                 "Vim(call):E488: Trailing characters: trailing"
             );
-            assert_eq!(vim_exc.throwpoint, "command line");
+            assert_eq!(vim_exc.throwpoint, "");
         }
         other => panic!("expected Vim E488, got {other:?}"),
     }

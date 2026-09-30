@@ -1282,7 +1282,7 @@ impl AppState {
         if let Some(pending) = self.ex.borrow_mut().take_pending_edit_mode() {
             Self::apply_pending_edit_mode(&self.session, &self.mode, pending)?;
         }
-        let outcome = outcome.map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
+        let outcome = outcome.map_err(|error| map_api_exec_error(error))?;
         if let ExecOutcome::Quit(code) = outcome {
             self.exiting = true;
             self.exit_code = code;
@@ -5085,43 +5085,17 @@ fn format_autocmd_exec_error(action: &AutocmdAction, error: &ExecError) -> Strin
     )
 }
 
-#[derive(Clone, Copy)]
-enum ApiOperation {
-    Command,
-    Exec2,
-    Eval,
-    CallFunction,
+/// The RPC error's throwpoint: `v:throwpoint` already carries the merged
+/// `estack_sfile` rendering for every operation, so a non-empty value
+/// prefixes the message verbatim (`{throwpoint}: {message}`); an empty
+/// one means the error raised at the bare command line.
+fn api_throwpoint(raw: &str) -> Option<&str> {
+    (!raw.is_empty()).then_some(raw)
 }
 
-fn api_throwpoint(operation: ApiOperation, raw: &str) -> Option<String> {
-    match operation {
-        ApiOperation::Command => None,
-        ApiOperation::Exec2 => {
-            let line = raw
-                .strip_prefix("script <nvim>[")?
-                .strip_suffix(']')?
-                .parse::<usize>()
-                .ok()?;
-            Some(format!("nvim_exec2(), line {line}"))
-        }
-        ApiOperation::Eval | ApiOperation::CallFunction => {
-            let functions = raw
-                .split_once("..script ")
-                .map_or(raw, |(functions, _)| functions)
-                .strip_prefix("function ")?;
-            let (frames, line) = functions.strip_suffix(']')?.rsplit_once('[')?;
-            let line = line.parse::<usize>().ok()?;
-            Some(format!(
-                "function {}, line {line}",
-                frames.replace("..function ", "..")
-            ))
-        }
-    }
-}
-
-fn map_api_exec_error(operation: ApiOperation, error: ExecError) -> ApiError {
+fn map_api_exec_error(error: ExecError) -> ApiError {
     let message = match error {
-        ExecError::Vim(exception) => match api_throwpoint(operation, &exception.throwpoint) {
+        ExecError::Vim(exception) => match api_throwpoint(&exception.throwpoint) {
             Some(throwpoint) => format!("{throwpoint}: {}", exception.message()),
             None => exception.message(),
         },
@@ -5197,13 +5171,13 @@ impl CommandExecutor for ServerCommandHost {
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .execute_commands(session, commands)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.ex.clone())
         } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
             let result = guard
                 .execute_commands(session, commands)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.nested_ex.clone())
         } else {
@@ -5220,13 +5194,13 @@ impl CommandExecutor for ServerCommandHost {
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .execute_line(session, command)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.ex.clone())
         } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
             let result = guard
                 .execute_line(session, command)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.nested_ex.clone())
         } else {
@@ -5243,13 +5217,13 @@ impl CommandExecutor for ServerCommandHost {
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .execute_script(session, "<nvim>", source)
-                .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.ex.clone())
         } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
             let result = guard
                 .execute_script(session, "<nvim>", source)
-                .map_err(|error| map_api_exec_error(ApiOperation::Exec2, error))
+                .map_err(|error| map_api_exec_error(error))
                 .map(|_| ());
             (result, self.nested_ex.clone())
         } else {
@@ -5358,12 +5332,12 @@ impl CommandExecutor for ServerCommandHost {
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .evaluate_expression(session, expression)
-                .map_err(|error| map_api_exec_error(ApiOperation::Eval, error));
+                .map_err(|error| map_api_exec_error(error));
             (result, self.ex.clone())
         } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
             let result = guard
                 .evaluate_expression(session, expression)
-                .map_err(|error| map_api_exec_error(ApiOperation::Eval, error));
+                .map_err(|error| map_api_exec_error(error));
             (result, self.nested_ex.clone())
         } else {
             return Err(ApiError::exception(
@@ -5390,12 +5364,12 @@ impl CommandExecutor for ServerCommandHost {
         let (result, owner) = if let Ok(mut guard) = self.ex.try_borrow_mut() {
             let result = guard
                 .call_builtin(session, name, args)
-                .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error));
+                .map_err(|error| map_api_exec_error(error));
             (result, self.ex.clone())
         } else if let Ok(mut guard) = self.nested_ex.try_borrow_mut() {
             let result = guard
                 .call_builtin(session, name, args)
-                .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error));
+                .map_err(|error| map_api_exec_error(error));
             (result, self.nested_ex.clone())
         } else {
             return Err(ApiError::exception(
@@ -5410,7 +5384,7 @@ impl CommandExecutor for ServerCommandHost {
         if let Ok(mut ex) = self.ex.try_borrow_mut() {
             return ex
                 .change_directory(session, path)
-                .map_err(|error| map_api_exec_error(ApiOperation::Command, error));
+                .map_err(|error| map_api_exec_error(error));
         }
         let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
             return Err(ApiError::exception(
@@ -5419,7 +5393,7 @@ impl CommandExecutor for ServerCommandHost {
         };
         nested
             .change_directory(session, path)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+            .map_err(|error| map_api_exec_error(error))
     }
 
     fn fork(&self) -> Option<Box<dyn CommandExecutor>> {
@@ -5458,7 +5432,7 @@ impl CommandExecutor for ExApiExecutor<'_> {
         self.outcome = self
             .executor
             .execute_commands(session, commands)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))?;
+            .map_err(|error| map_api_exec_error(error))?;
         Ok(())
     }
 
@@ -5514,7 +5488,7 @@ impl CommandExecutor for ExApiExecutor<'_> {
     fn evaluate(&mut self, session: &ApiSession, expression: &str) -> Result<Typval, ApiError> {
         self.executor
             .evaluate_expression(session, expression)
-            .map_err(|error| map_api_exec_error(ApiOperation::Eval, error))
+            .map_err(|error| map_api_exec_error(error))
     }
 
     fn call_builtin(
@@ -5528,12 +5502,12 @@ impl CommandExecutor for ExApiExecutor<'_> {
         }
         self.executor
             .call_builtin(session, name, args)
-            .map_err(|error| map_api_exec_error(ApiOperation::CallFunction, error))
+            .map_err(|error| map_api_exec_error(error))
     }
     fn change_directory(&mut self, session: &ApiSession, path: &str) -> Result<(), ApiError> {
         self.executor
             .change_directory(session, path)
-            .map_err(|error| map_api_exec_error(ApiOperation::Command, error))
+            .map_err(|error| map_api_exec_error(error))
     }
 }
 
@@ -5736,7 +5710,6 @@ fn execute_scoped_ex(
     context: &ApiDispatchContext,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
-    operation: ApiOperation,
     execute: impl FnOnce(&mut ExExecutor) -> Result<ExecOutcome, ExecError>,
 ) -> Result<ExecOutcome, ApiError> {
     context
@@ -5754,7 +5727,7 @@ fn execute_scoped_ex(
         ));
     };
     deliver_pending_lua_flush(session, &owner, ex, nested_ex);
-    result.map_err(|error| map_api_exec_error(operation, error))
+    result.map_err(map_api_exec_error)
 }
 
 /// Executes the deprecated string command API on the selected pair.
@@ -5772,7 +5745,6 @@ fn dispatch_scoped_nvim_command(
         context,
         ex,
         nested_ex,
-        ApiOperation::Command,
         |executor| executor.execute_line(session, command),
     )
     .map(|_| ())
@@ -5813,7 +5785,6 @@ fn dispatch_scoped_nvim_exec2(
         context,
         ex,
         nested_ex,
-        ApiOperation::Exec2,
         |executor| executor.execute_script(session, "<nvim>", source),
     );
     let captured = result.map(|_| {

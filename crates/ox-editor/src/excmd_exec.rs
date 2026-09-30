@@ -161,6 +161,21 @@ impl VimException {
             },
         }
     }
+
+    /// Display text for the messages area (`emsg`'d body): the raw
+    /// `{code}: {value}` without the `Vim({cmdname}):` prefix that
+    /// `v:exception` carries. Upstream prints the same string `emsg` was
+    /// given; callers of `catch`/`v:exception` see [`Self::message`]
+    /// instead.
+    #[must_use]
+    pub fn emsg_text(&self) -> String {
+        let value = typval_to_display(&self.value, false);
+        match &self.kind {
+            VimExceptionKind::Throw => value,
+            VimExceptionKind::Error(code) if code.is_empty() => value,
+            VimExceptionKind::Error(code) => format!("{code}: {value}"),
+        }
+    }
 }
 
 /// Public Ex execution failure.
@@ -201,7 +216,10 @@ impl fmt::Display for ExecError {
             Self::DuplicateCommand { name } => f
                 .write_str("E174: Command already exists: add ! to replace it")
                 .and_then(|()| write!(f, " ({name})")),
-            Self::Vim(exception) => write!(f, "{}\n{}", exception.message(), exception.throwpoint),
+            Self::Vim(exception) => match exception.throwpoint.as_str() {
+                "" => f.write_str(&exception.message()),
+                throwpoint => write!(f, "{}\n{}", exception.message(), throwpoint),
+            },
             Self::NotImplemented(name) => write!(f, "not implemented: {name}"),
         }
     }
@@ -819,6 +837,10 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// (`cause_errthrow` returns false, `should_abort` returns false). When
     /// nonzero, errors become catchable exceptions.
     pub(crate) try_depth: usize,
+    /// Monotonic counter giving every script-source and function-call
+    /// frame a push order; `throwpoint` merges both stacks through it,
+    /// matching upstream's single `estack` list.
+    pub(crate) frame_order: Cell<u64>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -852,6 +874,7 @@ impl<F: FileIO> ExRuntime<F> {
             swap_names: Rc::new(RefCell::new(HashMap::new())),
             swap_written: Rc::new(RefCell::new(BTreeSet::new())),
             preserve_exit: Rc::new(RefCell::new(false)),
+            frame_order: Cell::new(0),
         }
     }
 
@@ -880,16 +903,79 @@ impl<F: FileIO> ExRuntime<F> {
         }
     }
 
+    /// Next push order for a script-source or function-call frame.
+    fn next_frame_order(&self) -> u64 {
+        let order = self.frame_order.get();
+        self.frame_order.set(order + 1);
+        order
+    }
+
+    /// `v:throwpoint`: `estack_sfile`'s merged walk (runtime.c:164) over
+    /// the two frame stacks, outermost to innermost joined by `..`. The
+    /// keyword (`function `/`script `) prints only on a frame-type
+    /// transition; outer frames carry their `[{es_lnum}]` call line; the
+    /// innermost frame renders `name, line {lnum}`. Empty at the command
+    /// line, matching upstream's `''` there.
     pub(crate) fn throwpoint(&self) -> String {
-        let function = self.functions.throwpoint_prefix();
-        let script = self.scripts.throwpoint_tail();
-        if function.is_empty() {
-            script
-        } else if script == "command line" {
-            function
-        } else {
-            format!("{function}..{script}")
+        #[derive(Copy, Clone, Eq, PartialEq)]
+        enum Kind {
+            Script,
+            Function,
         }
+        let mut frames: Vec<(u64, Kind, &str, usize)> = self
+            .scripts
+            .source_stack()
+            .iter()
+            .filter(|frame| !frame.alias)
+            .map(|frame| {
+                (
+                    frame.order,
+                    Kind::Script,
+                    frame.name.as_str(),
+                    frame.current_line,
+                )
+            })
+            .collect();
+        frames.extend(self.functions.call_stack().iter().map(|frame| {
+            (
+                frame.order,
+                Kind::Function,
+                frame.name.as_str(),
+                frame.current_line,
+            )
+        }));
+        if frames.is_empty() {
+            return String::new();
+        }
+        frames.sort_by_key(|(order, ..)| *order);
+        let last = frames.len() - 1;
+        let mut result = String::new();
+        let mut last_kind = Kind::Script;
+        for (index, (_, kind, name, current_line)) in frames.iter().enumerate() {
+            // `estack_sfile` (runtime.c:193-210): the type keyword prints
+            // only where the frame type changes; `last_type` starts at
+            // ETYPE_SCRIPT, so a leading script frame prints bare while a
+            // leading function frame prints `function `. An outer frame's
+            // `[{es_lnum}]` is its sourcing line frozen where it invoked
+            // the child — the same `current_line` every frame carries.
+            if *kind != last_kind {
+                result.push_str(match kind {
+                    Kind::Script => "script ",
+                    Kind::Function => "function ",
+                });
+                last_kind = *kind;
+            }
+            // The `nvim_exec2` pseudo-source is named `nvim_exec2()`
+            // upstream (`do_source_str` names the estack entry); oxvim
+            // stores the internal `<nvim>` tag, so rename at display.
+            let name = if *name == "<nvim>" { "nvim_exec2()" } else { name };
+            if index == last {
+                let _ = write!(result, "{name}, line {current_line}");
+            } else {
+                let _ = write!(result, "{name}[{current_line}]..");
+            }
+        }
+        result
     }
 
     pub(crate) fn exception(&self, code: &'static str, message: impl Into<String>) -> VimException {
@@ -2012,7 +2098,10 @@ impl<F: FileIO> ExExecutor<F> {
         let lines = join_source_lines(&mut self.runtime, access, text, cfg!(windows))?;
         let caller_script = self.scope.script.clone();
         let caller_augroup = self.runtime.current_augroup;
-        let sid = self.runtime.scripts.push_source(source_name.to_owned());
+        let sid = self
+            .runtime
+            .scripts
+            .push_source(source_name.to_owned(), self.runtime.next_frame_order());
         let lines = expand_script_lines(&self.runtime.scripts, lines, sid);
         self.runtime.scripts.load_script_scope(sid, &mut self.scope);
         let program = parse_program(
@@ -2040,6 +2129,7 @@ impl<F: FileIO> ExExecutor<F> {
                 Err(error) => Err(error),
             };
         self.runtime.scripts.store_script_scope(sid, &self.scope);
+        self.runtime.scripts.pop_source();
         self.scope.script = caller_script;
         self.runtime.current_augroup = caller_augroup;
         result
@@ -2552,21 +2642,44 @@ fn parse_put_expression<P: UserCommandProvider + ?Sized>(
 /// API `TRY_WRAP`) the error is displayed here via `emsg` and `did_emsg`
 /// is recorded; the flow still propagates to end the program. Returns the
 /// error message to display in that case, or `None` when the flow must
-/// propagate untouched (inside `:try`, or a `:throw`/silent exception).
+/// propagate without a message (inside `:try`, or a silent exception). An
+/// uncaught `:throw` *does* display here — `E605` — and still aborts.
 fn swallow_error_message(runtime: &ExRuntime<impl FileIO>, flow: &Flow) -> Option<String> {
     if runtime.try_depth != 0 {
         return None;
     }
-    match flow {
+    let (message, throwpoint) = match flow {
         Flow::Exception(exception) => {
-            if matches!(exception.kind, VimExceptionKind::Error(_)) && !exception.silent {
-                Some(exception.message())
-            } else {
-                None
+            if exception.silent {
+                return None;
+            }
+            match &exception.kind {
+                // `e_exception_not_caught_str` (errors.h): an uncaught
+                // `:throw` displays E605 and still fails the command
+                // (bufwrite.c:1861-1866).
+                VimExceptionKind::Throw => (
+                    format!("E605: Exception not caught: {}", exception.emsg_text()),
+                    exception.throwpoint.clone(),
+                ),
+                VimExceptionKind::Error(_) => {
+                    // The frames already unwound by the time this displays,
+                    // so the processing prefix comes from the throwpoint
+                    // frozen at raise — not the now-empty live stacks.
+                    (exception.emsg_text(), exception.throwpoint.clone())
+                }
             }
         }
-        Flow::NotImplemented(name) => Some(format!("E117: Unknown function: {name}")),
-        _ => None,
+        Flow::NotImplemented(name) => (
+            format!("E117: Unknown function: {name}"),
+            runtime.throwpoint(),
+        ),
+        _ => return None,
+    };
+    match throwpoint.as_str() {
+        "" => Some(message),
+        throwpoint => Some(format!(
+            "Error detected while processing {throwpoint}:\n{message}"
+        )),
     }
 }
 
@@ -2752,7 +2865,8 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     Ok(value) => value,
                     Err(flow) => return flow,
                 };
-                let Some(block) = find_if(program, pc, end) else {
+                let (markers, terminated) = if_markers(program, pc, end);
+                let Some(block) = if_block(program, pc, markers, terminated.unwrap_or(end)) else {
                     return Flow::Exception(runtime.unterminated_block("E171", "Missing :endif"));
                 };
                 let mut chosen = None;
@@ -2789,14 +2903,59 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         return flow;
                     }
                 }
+                if terminated.is_none() {
+                    // `do_cmdline`'s epilogue (ex_docmd.c:763-769): the body
+                    // already ran; a getline-ended input now reports the
+                    // missing closer while a bare cmdline string ends
+                    // silently.
+                    if instruction.cmdline {
+                        return Flow::Normal;
+                    }
+                    return Flow::Exception(runtime.unterminated_block("E171", "Missing :endif"));
+                }
                 pc = block.end + 1;
                 continue;
             }
             "while" => {
-                let Some(block_end) = find_matching(program, pc, end, "while", "endwhile") else {
-                    return Flow::Exception(
-                        runtime.unterminated_block("E170", "Missing :endwhile"),
-                    );
+                let block_end = match find_matching(program, pc, end, "while", "endwhile") {
+                    Some(block_end) => block_end,
+                    None => {
+                        // Missing `:endwhile` (`do_cmdline` epilogue): the
+                        // body gets exactly one pass — the absent closer is
+                        // the only back edge — and the error reports only
+                        // when a getline-ended input finishes.
+                        match eval_condition(
+                            runtime,
+                            access,
+                            scope,
+                            lua,
+                            skipwhite_trim(&command.args),
+                        ) {
+                            Ok(true) => match run_program(
+                                runtime,
+                                access,
+                                scope,
+                                lua,
+                                program,
+                                pc + 1,
+                                end,
+                            ) {
+                                Flow::Normal | Flow::Continue | Flow::Break => {}
+                                flow => {
+                                    display_error_message(runtime, access, &flow);
+                                    return flow;
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(flow) => return flow,
+                        }
+                        if instruction.cmdline {
+                            return Flow::Normal;
+                        }
+                        return Flow::Exception(
+                            runtime.unterminated_block("E170", "Missing :endwhile"),
+                        );
+                    }
                 };
                 loop {
                     match eval_condition(runtime, access, scope, lua, skipwhite_trim(&command.args))
@@ -2829,8 +2988,42 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     // keeps the pre-existing locked-list signal.
                     Err((code, message)) => return error_flow(runtime, code, message),
                 };
-                let Some(block_end) = find_matching(program, pc, end, "for", "endfor") else {
-                    return Flow::Exception(runtime.unterminated_block("E170", "Missing :endfor"));
+                let block_end = match find_matching(program, pc, end, "for", "endfor") {
+                    Some(block_end) => block_end,
+                    None => {
+                        // Missing `:endfor` (`do_cmdline` epilogue): the
+                        // loop binds only the first element and the body
+                        // runs once; the error reports only when a
+                        // getline-ended input finishes.
+                        if let Some(first) = values.into_iter().next() {
+                            if let Err(flow) =
+                                assign_target(runtime, access, scope, target, first, false)
+                            {
+                                return flow;
+                            }
+                            match run_program(
+                                runtime,
+                                access,
+                                scope,
+                                lua,
+                                program,
+                                pc + 1,
+                                end,
+                            ) {
+                                Flow::Normal | Flow::Continue | Flow::Break => {}
+                                flow => {
+                                    display_error_message(runtime, access, &flow);
+                                    return flow;
+                                }
+                            }
+                        }
+                        if instruction.cmdline {
+                            return Flow::Normal;
+                        }
+                        return Flow::Exception(
+                            runtime.unterminated_block("E170", "Missing :endfor"),
+                        );
+                    }
                 };
                 let mut back_edges: usize = 0;
                 for value in values {
@@ -4728,7 +4921,15 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
     );
     let function = runtime
         .functions
-        .begin_call(name, sid, args, first_line, last_line, scope)
+        .begin_call(
+            name,
+            sid,
+            args,
+            first_line,
+            last_line,
+            scope,
+            runtime.next_frame_order(),
+        )
         .map_err(|error| userfunc_error_flow(runtime, error))?;
     if let Some(receiver) = receiver {
         scope
@@ -4748,9 +4949,13 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
             .scripts
             .script_name(sid)
             .map_or_else(|| format!("<SNR>{sid}"), std::borrow::ToOwned::to_owned);
-        runtime
-            .scripts
-            .push_alias_source(sid, function.context.seq, function.context.lnum, name);
+        runtime.scripts.push_alias_source(
+            sid,
+            function.context.seq,
+            function.context.lnum,
+            name,
+            runtime.next_frame_order(),
+        );
     }
     if switched_script {
         runtime.scripts.load_script_scope(sid, scope);
@@ -4842,9 +5047,16 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let text = runtime
         .scripts
         .read_script(path)
-        .map_err(|error| ExecError::Io {
-            path: path.to_path_buf(),
-            message: error.to_string(),
+        // `E484: Can't open file {path}` — upstream reports the bare
+        // path, not the OS error (`do_source`'s `EMSG2`, ex_cmds2.c).
+        .map_err(|error| {
+            let _ = error;
+            ExecError::Vim(
+                runtime.exception(
+                    "E484",
+                    format!("Can't open file {}", path.display()),
+                ),
+            )
         })?;
     let lines = join_source_lines(runtime, access, &text, cfg!(windows))?;
     let name = runtime
@@ -4855,7 +5067,7 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
         .to_string();
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
-    let sid = runtime.scripts.push_source(name);
+    let sid = runtime.scripts.push_source(name, runtime.next_frame_order());
     let lines = expand_script_lines(&runtime.scripts, lines, sid);
     runtime.scripts.load_script_scope(sid, scope);
     if load_once {
@@ -15360,6 +15572,13 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
             // 0 nothing displays and the break preserves throw-unwind
             // parity for API callers.
             if display_error_message(runtime, access, &action_flow) {
+                // An uncaught `:throw` displays E605 *and* still aborts
+                // (`bufwrite.c:1861-1866`); other displayed errors are
+                // swallowed and the remaining autocmds run.
+                if matches!(&action_flow, Flow::Exception(exception) if matches!(exception.kind, VimExceptionKind::Throw)) {
+                    flow = action_flow;
+                    break;
+                }
                 continue;
             }
             flow = action_flow;
@@ -16688,7 +16907,13 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
         let name = format!("command {name}");
         runtime
             .scripts
-            .push_alias_source(sid, runtime.scripts.current_seq(), 0, name);
+            .push_alias_source(
+                sid,
+                runtime.scripts.current_seq(),
+                0,
+                name,
+                runtime.next_frame_order(),
+            );
         if switched {
             runtime.scripts.load_script_scope(sid, scope);
         }
@@ -19008,49 +19233,64 @@ struct IfBranch {
     end: usize,
 }
 
-fn find_if(program: &[Instruction], open: usize, limit: usize) -> Option<IfBlock> {
+/// `:if`-body marker scan: the depth-0 `elseif`/`else` line positions and
+/// the depth-0 `endif` position. `terminated == None` means the program
+/// ended inside the block — upstream still picks and runs a branch from
+/// the markers before reporting the missing closer.
+fn if_markers(
+    program: &[Instruction],
+    open: usize,
+    limit: usize,
+) -> (Vec<usize>, Option<usize>) {
     let mut depth = 0usize;
     let mut markers = Vec::new();
     let mut index = open + 1;
     while index < limit {
         match program[index].name() {
             "if" => depth += 1,
-            "endif" if depth == 0 => {
-                let mut branches = Vec::new();
-                let mut condition =
-                    Some(skipwhite_trim(&program[open].command.as_ref()?.args).to_owned());
-                let mut start = open + 1;
-                for marker in markers {
-                    branches.push(IfBranch {
-                        condition,
-                        start,
-                        end: marker,
-                    });
-                    condition = match program[marker].name() {
-                        "elseif" => {
-                            Some(skipwhite_trim(&program[marker].command.as_ref()?.args).to_owned())
-                        }
-                        _ => None,
-                    };
-                    start = marker + 1;
-                }
-                branches.push(IfBranch {
-                    condition,
-                    start,
-                    end: index,
-                });
-                return Some(IfBlock {
-                    branches,
-                    end: index,
-                });
-            }
+            "endif" if depth == 0 => return (markers, Some(index)),
             "endif" => depth = depth.saturating_sub(1),
             "elseif" | "else" if depth == 0 => markers.push(index),
             _ => {}
         }
         index += 1;
     }
-    None
+    (markers, None)
+}
+
+/// Builds the branch table over `[open + 1, close)` from a marker scan.
+/// `close` is the `endif` position when the block terminated, else the
+/// program end.
+fn if_block(
+    program: &[Instruction],
+    open: usize,
+    markers: Vec<usize>,
+    close: usize,
+) -> Option<IfBlock> {
+    let mut branches = Vec::new();
+    let mut condition = Some(skipwhite_trim(&program[open].command.as_ref()?.args).to_owned());
+    let mut start = open + 1;
+    for marker in markers {
+        branches.push(IfBranch {
+            condition,
+            start,
+            end: marker,
+        });
+        condition = match program[marker].name() {
+            "elseif" => Some(skipwhite_trim(&program[marker].command.as_ref()?.args).to_owned()),
+            _ => None,
+        };
+        start = marker + 1;
+    }
+    branches.push(IfBranch {
+        condition,
+        start,
+        end: close,
+    });
+    Some(IfBlock {
+        branches,
+        end: close,
+    })
 }
 
 struct TryBlock {
