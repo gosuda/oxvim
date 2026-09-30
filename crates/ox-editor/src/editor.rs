@@ -31,6 +31,9 @@ use crate::typeahead::Typeahead;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
 
+/// Extmark namespace backing placed multicursors (`mc_ns`, src/nvim/mcursor.c).
+const MCURSOR_NAMESPACE: &str = "mcursor";
+
 /// Cloneable allocator for the process-wide dynamic channel key space.
 #[derive(Clone, Debug)]
 pub struct ChannelIds(Rc<Cell<u64>>);
@@ -972,6 +975,59 @@ impl Editor {
         self.buffers
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownBuffer(resolved))
+    }
+
+    /// Places a multicursor at `position` in `buffer` (`mc_add`,
+    /// src/nvim/mcursor.c): the cursor rides the extmark store so it tracks
+    /// later edits and dies with the buffer, and an existing cursor at the
+    /// position is left alone rather than duplicated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::NoCurrentTabpage`] or
+    /// [`EditorError::UnknownBuffer`] like [`Self::buffer`], plus extmark
+    /// store failures.
+    ///
+    /// Returns whether a cursor was placed.
+    pub fn add_mcursor(
+        &mut self,
+        buffer: BufHandle,
+        position: Position,
+    ) -> Result<bool, EditorError> {
+        let state = self.buffer_mut(buffer)?;
+        let namespace = state.extmarks.create_namespace(MCURSOR_NAMESPACE)?;
+        let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
+        if !state.extmarks.query(namespace, point, point, Some(1))?.is_empty() {
+            return Ok(false);
+        }
+        state
+            .extmarks
+            .set(namespace, None, crate::ExtmarkPlacement::new(point))?;
+        Ok(true)
+    }
+
+    /// Counts multicursors across every live buffer (`mc_count`,
+    /// src/nvim/mcursor.c).
+    #[must_use]
+    pub fn mcursor_count(&self) -> usize {
+        self.buffers()
+            .iter()
+            .filter_map(|handle| self.buffer(*handle).ok())
+            .filter_map(|state| {
+                state.extmarks.namespace(MCURSOR_NAMESPACE).and_then(|namespace| {
+                    state
+                        .extmarks
+                        .query(
+                            namespace,
+                            ExtmarkPosition::new(0, 0),
+                            ExtmarkPosition::new(usize::MAX, usize::MAX),
+                            None,
+                        )
+                        .ok()
+                })
+            })
+            .map(|marks| marks.len())
+            .sum()
     }
 
     /// Renames a live buffer and preserves its old name as the alternate buffer.
@@ -2315,9 +2371,13 @@ impl Editor {
             _ => MessageDestination::Stdout,
         };
         let kind = message.kind;
+        let identity = self
+            .pending_echo_identity
+            .take()
+            .unwrap_or_else(|| MessageIdentity::of(kind));
         self.messages.push(message);
         self.message_destinations.push(destination);
-        self.message_identities.push(MessageIdentity::of(kind));
+        self.message_identities.push(identity);
     }
 
     /// Discards messages appended at or after `len`.
@@ -2475,10 +2535,20 @@ impl Editor {
         } else {
             tab
         };
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&resolved)
-            .ok_or(EditorError::UnknownTabpage(resolved))?
-            .resize(geometry)?;
+            .ok_or(EditorError::UnknownTabpage(resolved))?;
+        tabpage.resize(geometry)?;
+        // A shrunken frame can leave a window's cursor below its new text
+        // area; scroll each tiled window's topline back into view the way
+        // `win_new_height`/`validate_cursor` do after a screen resize
+        // (window.c), instead of emitting a cursor past the window grid.
+        for window in tabpage.layout().windows() {
+            let height = tabpage.tiled_window_text_height(window)?;
+            let state = tabpage.window_mut(window)?;
+            state.topline = cursor_visible_topline(state.topline, state.cursor.lnum, height);
+        }
         Ok(())
     }
 

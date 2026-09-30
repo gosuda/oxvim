@@ -224,6 +224,15 @@ impl Emitter {
                 .filter_map(|(id, grid)| (*id == channel_id).then_some(*grid))
                 .collect::<BTreeSet<_>>();
             let layout_changed = current_grids != previous_grids;
+            // window.c:969-978 — under ext_multigrid a window that left the
+            // screen (tab switch, split close, float hidden) is reported as
+            // hidden; its grid keeps its cells, and a later `win_pos` for the
+            // same handle resurfaces it.
+            if options.ext_multigrid {
+                for grid in previous_grids.difference(&current_grids) {
+                    channel.emit(UiEvent::new("win_hide", vec![Object::Integer(*grid)]))?;
+                }
+            }
             for layer in compositor.layers() {
                 let key = (channel_id, layer.grid.id());
                 let previous = self

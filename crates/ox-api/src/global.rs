@@ -23,6 +23,8 @@ use crate::{
 const MAX_CONVERSION_DEPTH: usize = 100;
 const MAX_FUNC_ARGS: usize = 20;
 const NVIM_MAX_PATH_LENGTH: usize = 4096;
+/// Largest valid cursor column (upstream `MAXCOL`, src/nvim/pos_defs.h:17-19).
+const MAXCOL: i64 = 0x7fff_ffff;
 
 /// Execution seam deliberately owned by the future Ex-command host.
 pub trait CommandExecutor {
@@ -3938,6 +3940,54 @@ impl StlBuilder {
     }
 }
 
+/// Adds a multicursor in the given buffer (`nvim_mcursor`,
+/// src/nvim/api/vim.c:1462): the `[row, col]` position is (1,0)-indexed,
+/// the column clamps to the line length like `nvim_win_set_cursor`, and the
+/// reply is the total extra-cursor count (`mc_count`).
+#[api(since = 15)]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "the generated dispatcher binds and moves owned RPC arguments"
+)]
+pub fn nvim_mcursor(
+    session: &ApiSession,
+    buf: BufHandle,
+    pos: Vec<i64>,
+) -> Result<i64, ApiError> {
+    let buffer = crate::buffer::resolve_buffer(session, buf)?;
+    if pos.len() != 2 {
+        return Err(ApiError::validation(
+            "Invalid 'pos': expected [row, col] array",
+        ));
+    }
+    let position = session.with_editor(|editor| {
+        let text = editor
+            .buffer(buffer)
+            .map_err(exception)?
+            .text()
+            .map_err(exception)?;
+        let row = usize::try_from(pos[0])
+            .ok()
+            .filter(|row| (1..=text.line_count()).contains(row))
+            .ok_or_else(|| ApiError::validation("Invalid cursor line: out of range"))?;
+        // VALIDATE_RANGE's column bound precedes the silent end-of-line
+        // clamp (api/vim.c:1477-1482; check_cursor_col).
+        if pos[1] < 0 || pos[1] > MAXCOL {
+            return Err(ApiError::validation("Invalid cursor column: out of range"));
+        }
+        let col = usize::try_from(pos[1])
+            .map_err(|_| ApiError::exception("Cursor column exceeds addressable range"))?
+            .min(text.line(row).map_err(exception)?.len());
+        Ok::<_, ApiError>(ox_text::Position { lnum: row, col })
+    })?;
+    let count = session.with_editor_mut(|editor| {
+        editor.add_mcursor(buffer, position).map_err(exception)?;
+        Ok::<_, ApiError>(editor.mcursor_count())
+    })?;
+    i64::try_from(count)
+        .map_err(|_| ApiError::exception("mcursor count exceeds API integer range"))
+}
+
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(
         nvim_get_current_buf__API_META(),
@@ -3947,6 +3997,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
         nvim_set_current_buf__API_META(),
         nvim_set_current_buf__API_DISPATCH,
     )?;
+    registry.register(nvim_mcursor__API_META(), nvim_mcursor__API_DISPATCH)?;
     registry.register(
         nvim_get_current_win__API_META(),
         nvim_get_current_win__API_DISPATCH,

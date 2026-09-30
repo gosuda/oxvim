@@ -3078,6 +3078,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             command_echo(runtime, access, scope, lua, name, &command.args)
         }
         "messages" => access.with_ex_editor(command_messages),
+        "version" => access.with_ex_editor(command_version),
         "help" => command_help(runtime, access, scope, lua, command),
         "eval" => match eval_text(runtime, access, scope, lua, skipwhite_trim(&command.args)) {
             Ok(_) => Flow::Normal,
@@ -4926,12 +4927,7 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
 ) -> Flow {
     if let Ok(value) = eval_text(runtime, access, scope, lua, args) {
         access.with_ex_editor(|editor| {
-            push_text_message(
-                editor,
-                typval_to_display(&value, false),
-                name == "echoerr",
-                name == "echomsg",
-            );
+            push_echo_command_message(editor, name, typval_to_display(&value, false));
         });
         return Flow::Normal;
     }
@@ -4956,10 +4952,24 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     let separator = if name == "echon" { "" } else { " " };
     let text = pieces.join(separator);
     access.with_ex_editor(|editor| {
-        push_text_message(editor, text, name == "echoerr", name == "echomsg");
+        push_echo_command_message(editor, name, text);
     });
     Flow::Normal
 }
+
+/// `:echo` family output keeps its command name as the wire kind
+/// (`echo`/`echon`/`echomsg`/`echoerr`); `:echomsg` and `:echoerr` enter
+/// message history (message.c `do_one_msg` callers mark `MSG_HIST`).
+fn push_echo_command_message(editor: &mut Editor, name: &str, text: String) {
+    editor.arm_echo_identity(OxStr::from(name.as_bytes()), Object::Nil);
+    push_text_message(
+        editor,
+        text,
+        name == "echoerr",
+        name == "echomsg" || name == "echoerr",
+    );
+}
+
 fn command_messages(editor: &mut Editor) -> Flow {
     let history = editor
         .messages()
@@ -4976,7 +4986,52 @@ fn command_messages(editor: &mut Editor) -> Flow {
     } else {
         history
     };
+    // ex_docmd.c `ex_messages`: an ext_messages UI gets a dedicated
+    // `msg_history_show` listing every retained entry; everyone else gets
+    // the joined text as an ordinary message. The sentinel kind tells the
+    // publisher to swap the wire event while keeping this text as the
+    // grid-message fallback.
+    editor.arm_echo_identity(OxStr::from("history_show"), Object::Nil);
     push_info_text_message(editor, output);
+    Flow::Normal
+}
+
+/// `:version` (`ex_docmd.c` `ex_version` → `list_version`): the compiled-in
+/// banner, sourced from the same canonical metadata `--version` prints so
+/// the two can never disagree.
+fn command_version(editor: &mut Editor) -> Flow {
+    let version = ox_rpc::canonical_metadata()
+        .ok()
+        .and_then(|metadata| {
+            fn lookup<'a>(dict: &'a Object, name: &str) -> Option<&'a Object> {
+                let Object::Dict(dict) = dict else {
+                    return None;
+                };
+                dict.0.iter()
+                    .find(|(key, _)| key.as_bytes() == name.as_bytes())
+                    .map(|(_, value)| value)
+            }
+            let version = lookup(&metadata, "version")?;
+            let number = |name: &str| match lookup(version, name) {
+                Some(Object::Integer(value)) => Some(*value),
+                _ => None,
+            };
+            Some(format!(
+                "OXVIM v{}.{}.{}\nAPI level {} (compatible: {})\nBuild type: {}",
+                number("major")?,
+                number("minor")?,
+                number("patch")?,
+                number("api_level")?,
+                number("api_compatible")?,
+                if cfg!(debug_assertions) {
+                    "Debug"
+                } else {
+                    "Release"
+                },
+            ))
+        })
+        .unwrap_or_else(|| "OXVIM".to_owned());
+    push_info_text_message(editor, version);
     Flow::Normal
 }
 
@@ -14137,8 +14192,11 @@ fn command_registers<F: FileIO>(
     args: &str,
 ) -> Flow {
     let requested = args.trim();
+    // Upstream lists every register that can hold content; `@` is a repeat
+    // operator, not a stored register, so `:registers` stops at `/`
+    // (register.c `ex_display`).
     let names = if requested.is_empty() {
-        "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/@"
+        "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/"
     } else {
         requested
     };
