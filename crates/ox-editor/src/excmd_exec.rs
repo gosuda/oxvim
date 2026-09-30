@@ -1722,19 +1722,7 @@ impl<F: FileIO> ExExecutor<F> {
         access: &E,
         line: &str,
     ) -> Result<ExecOutcome, ExecError> {
-        let logical = if line.contains('\n') {
-            self.runtime
-                .scripts
-                .join_logical_lines(line)
-                .map_err(|error| {
-                    ExecError::Vim(self.runtime.exception(error.code, error.message))
-                })?
-        } else {
-            vec![LogicalLine {
-                text: line.to_owned(),
-                first_line: 1,
-            }]
-        };
+        let logical = split_cmdline(line);
         let program = parse_program(
             &self.runtime.user_commands,
             access.with_ex_editor(|editor| editor.current_buffer()),
@@ -2227,6 +2215,47 @@ fn expand_script_lines<F: FileIO>(
             first_line: line.first_line,
         })
         .collect()
+}
+
+/// Splits a cmdline string into physical lines the way `do_cmdline` hands
+/// input to `do_one_cmd` (`ex_docmd.c`): a newline inside a quoted string
+/// is content the expression scanner consumes, a newline outside ends the
+/// line. Used by the `nvim_command`-shaped entries (`execute_line`,
+/// `:execute`) rather than the sourced-file reader, whose
+/// `join_logical_lines` additionally owns `#!` headers, heredocs, and
+/// DOS/Unix separator detection.
+fn split_cmdline(text: &str) -> Vec<LogicalLine> {
+    let mut lines = Vec::new();
+    let mut start = 0_usize;
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut escaped = false;
+    let mut first_line = 1_usize;
+    for (offset, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_double => escaped = true,
+            b'"' if !in_single => in_double = !in_double,
+            b'\'' if !in_double => in_single = !in_single,
+            b'\n' if !in_double && !in_single => {
+                lines.push(LogicalLine {
+                    text: text[start..offset].to_owned(),
+                    first_line,
+                });
+                start = offset + 1;
+                first_line += 1;
+            }
+            _ => {}
+        }
+    }
+    lines.push(LogicalLine {
+        text: text[start..].to_owned(),
+        first_line,
+    });
+    lines
 }
 
 /// Parses a program with the user-command view of `buffer` (the current
@@ -5768,10 +5797,7 @@ fn command_execute<F: FileIO, E: ExEditorAccess>(
         }
     }
     let line = pieces.join(" ");
-    let mut logical = match runtime.scripts.join_logical_lines(&line) {
-        Ok(lines) => lines,
-        Err(error) => return error_flow(runtime, error.code, error.message),
-    };
+    let mut logical = split_cmdline(&line);
     // `:execute` runs as one command (upstream `do_cmdline` over the joined
     // string): throwpoints point at its invocation line, not the split
     // offsets inside the string.
