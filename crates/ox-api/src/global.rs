@@ -2368,6 +2368,8 @@ fn replace_termcode_notation(input: &[u8], do_lt: bool, special: bool) -> Vec<u8
             push_encoded(&mut output, byte);
         } else if let Some(code) = special_keycode(notation) {
             output.extend_from_slice(&code);
+        } else if let Some(code) = modifier_termcode(notation) {
+            output.extend_from_slice(&code);
         } else {
             for byte in &input[offset..=end] {
                 push_encoded(&mut output, *byte);
@@ -2536,6 +2538,23 @@ fn special_keycode(notation: &[u8]) -> Option<[u8; 3]> {
     let encoded = Keys::special(pair.0, pair.1).ok()?;
     let bytes = encoded.as_bytes();
     Some([bytes[0], bytes[1], bytes[2]])
+}
+
+/// Decodes modifier-prefixed key notation (`<A-x>`, `<C-S-x>`, `<M-F3>`, ...)
+/// that the named-termcode tables cannot express: the typeahead notation
+/// parser emits the `KS_MODIFIER` atom plus the key's encoded bytes.
+fn modifier_termcode(notation: &[u8]) -> Option<Vec<u8>> {
+    if !notation.contains(&b'-') {
+        return None;
+    }
+    let text = std::str::from_utf8(notation).ok()?;
+    let encoded = Keys::parse_notation(&format!("<{text}>"), "\\", "\\");
+    let bytes = encoded.as_bytes();
+    // A notation the parser also could not resolve comes back as literal
+    // text; only a real decode is accepted here — including plain bytes like
+    // `<S-A>` -> 'A', which carry no `K_SPECIAL` lead.
+    (!bytes.is_empty() && !bytes.starts_with(format!("<{text}>").as_bytes()))
+        .then(|| bytes.to_vec())
 }
 
 fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {

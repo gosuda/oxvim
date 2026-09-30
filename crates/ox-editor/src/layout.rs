@@ -60,6 +60,10 @@ pub struct WindowState {
     pub cursor: Position,
     /// One-based first buffer line displayed by the window.
     pub topline: usize,
+    /// Wrapped screen rows of the `topline` line skipped before the first
+    /// drawn segment — the row component of upstream `w_skipcol`, used when
+    /// the cursor sits inside a `topline` line taller than the window.
+    pub skiprows: usize,
     /// Upstream `w_curswant`: the zero-based virtual column the cursor wants
     /// to keep across vertical motions (`move.c`).
     pub curswant: i64,
@@ -91,6 +95,7 @@ impl WindowState {
             alternate_buffer: None,
             cursor,
             topline: 1,
+            skiprows: 0,
             curswant: 0,
             set_curswant: true,
             coladd: 0,

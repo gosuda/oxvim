@@ -13,7 +13,9 @@ use crate::put::PutDirection;
 use crate::register::{RegisterContent, RegisterKind};
 use crate::search::{SearchDirection, SearchState};
 use crate::textobject;
-use crate::typeahead::{K_SPECIAL, KE_FILLER, KS_SPECIAL, KS_ZERO, Keys};
+use crate::typeahead::{
+    K_SPECIAL, KE_FILLER, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_META,
+};
 use crate::{
     BufferRelease, BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkId,
     ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind,
@@ -724,6 +726,14 @@ impl ModeMachine {
                 Key::Special(KS_EXTRA, b'B') | Key::Special(b'k', b'b') => Ok(Step::Key('\u{8}')),
                 Key::Special(b'k', b'l') => Ok(Step::Left),
                 Key::Special(b'k', b'r') => Ok(Step::Right),
+                // An unmapped Alt/Meta-prefixed key is the terminal's
+                // `ESC`-prefix form (`getchar.c` `mod_mask`): deliver `ESC`
+                // now and let the queued key itself arrive next.
+                Key::Special(KS_MODIFIER, mask)
+                    if mask & (MOD_MASK_ALT | MOD_MASK_META) != 0 =>
+                {
+                    Ok(Step::Key('\u{1b}'))
+                }
                 Key::Special(_, _) => Ok(Step::ProcessEvents),
             };
         }
