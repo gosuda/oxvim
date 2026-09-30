@@ -671,30 +671,7 @@ pub(crate) fn simplify_name(name: &str) -> String {
     let double_root = leading == 2;
     let trailing_separator = bytes.last().is_some_and(|byte| is_path_sep(*byte));
 
-    // Components with the separator byte preceding each (None for the
-    // first). Separator runs collapse to their last byte.
-    let mut components: Vec<(&str, Option<u8>)> = Vec::new();
-    let mut cursor = leading;
-    let mut start = cursor;
-    let mut sep_before = None;
-    while cursor < bytes.len() {
-        if is_path_sep(bytes[cursor]) {
-            if start < cursor {
-                components.push((&name[start..cursor], sep_before));
-            }
-            sep_before = Some(bytes[cursor]);
-            cursor += 1;
-            while cursor < bytes.len() && is_path_sep(bytes[cursor]) {
-                cursor += 1;
-            }
-            start = cursor;
-        } else {
-            cursor += 1;
-        }
-    }
-    if start < bytes.len() {
-        components.push((&name[start..], sep_before));
-    }
+    let components = path_components(name, leading);
 
     // A drive prefix followed by a separator (`C:\`) is the volume root
     // `..` can never remove — `C:` alone is a drive-relative component,
@@ -779,15 +756,47 @@ pub(crate) fn simplify_name(name: &str) -> String {
     // A `..` reduction ending exactly on a drive root keeps the separator
     // the removed pair consumed: `C:\foo\..` simplifies to `C:\`, not the
     // drive-relative `C:`.
-    if protected > 0 && parts.len() == protected && !absolute {
-        if let Some(sep) = inherited_sep {
-            if !output.bytes().last().is_some_and(is_path_sep) {
-                output.push(char::from(sep));
-            }
-        }
+    if protected > 0
+        && parts.len() == protected
+        && !absolute
+        && let Some(sep) = inherited_sep
+        && !output.bytes().last().is_some_and(is_path_sep)
+    {
+        output.push(char::from(sep));
     }
     if trailing_separator && !output.bytes().last().is_some_and(is_path_sep) {
         output.push(char::from(*bytes.last().unwrap_or(&b'/')));
     }
     output
+}
+
+/// Splits `name` into components, each tagged with the separator byte that
+/// preceded it (`None` for the first). `leading` skips the leading separator
+/// run already classified by the caller; separator runs collapse to their
+/// last byte.
+fn path_components(name: &str, leading: usize) -> Vec<(&str, Option<u8>)> {
+    let bytes = name.as_bytes();
+    let mut components = Vec::new();
+    let mut cursor = leading;
+    let mut start = cursor;
+    let mut sep_before = None;
+    while cursor < bytes.len() {
+        if is_path_sep(bytes[cursor]) {
+            if start < cursor {
+                components.push((&name[start..cursor], sep_before));
+            }
+            sep_before = Some(bytes[cursor]);
+            cursor += 1;
+            while cursor < bytes.len() && is_path_sep(bytes[cursor]) {
+                cursor += 1;
+            }
+            start = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+    if start < bytes.len() {
+        components.push((&name[start..], sep_before));
+    }
+    components
 }

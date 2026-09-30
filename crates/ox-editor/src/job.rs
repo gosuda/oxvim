@@ -129,6 +129,11 @@ type StdioPump = ProcessPipe;
 #[cfg(not(unix))]
 type StdioPump = std::thread::JoinHandle<()>;
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "rpc/detached/terminal/pty are independent channel flags mirrored
+              from upstream job options, not states of one machine"
+)]
 struct Job {
     process: Process,
     input: Option<JobInput>,
@@ -157,16 +162,22 @@ struct Job {
     /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
     /// past editor exit and terminates every other one (`channel_close_on_exit`).
     detached: bool,
+    /// Spawned on a pseudoterminal: its output arrives on the PTY master held
+    /// in `input` rather than a `stdout_pipe`, but the stream still owes an
+    /// EOF before the job is drained.
+    pty: bool,
 }
 
 impl Job {
     /// The process exited and every captured stream drained. Reader pumps
     /// queue their final `Data`/`Eof` independently of the exit notification,
     /// so an exited process alone does not imply buffered output is complete.
+    /// A PTY child has no `stdout_pipe`/`stderr_pipe` — its output arrives on
+    /// the master held in `input` — but still owes a `Stdout` EOF.
     fn drained(&self) -> bool {
-        self.status >= 0
-            && (self.stdout_pipe.is_none() || self.stdout.eof)
-            && (self.stderr_pipe.is_none() || self.stderr.eof)
+        let stdout_owed = self.stdout_pipe.is_some() || self.pty;
+        let stderr_owed = self.stderr_pipe.is_some();
+        self.status >= 0 && (!stdout_owed || self.stdout.eof) && (!stderr_owed || self.stderr.eof)
     }
 }
 /// Resolve the PTY slave path behind a child that was spawned through one.
@@ -379,6 +390,7 @@ impl JobManager {
                 pty_output: Vec::new(),
                 terminal_exit_message: true,
                 detached: options.detached,
+                pty: options.pty,
             },
         );
         Ok(pid)

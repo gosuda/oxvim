@@ -4032,13 +4032,24 @@ fn hostname() -> Result<Typval> {
     let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
         .or_else(|_| std::env::var("HOSTNAME"))
-        // Upstream falls back to gethostname() (`os_get_hostname`); the
-        // equivalent ambient value on Windows is COMPUTERNAME.
-        .or_else(|_| std::env::var("COMPUTERNAME"))
+        // Upstream falls back to gethostname() (`os_get_hostname`); on
+        // Windows that is the DNS hostname, which the ambient COMPUTERNAME
+        // variable only approximates and can spoof.
+        .or_else(|_| os_hostname())
         .map_err(|error| {
             EvalError::new("E500", 0, format!("Cannot determine hostname: {error}"))
         })?;
     Ok(Typval::String(OxStr::from(name.as_str())))
+}
+
+#[cfg(windows)]
+fn os_hostname() -> std::result::Result<String, std::env::VarError> {
+    ox_sys::windows::hostname().map_err(|_| std::env::VarError::NotPresent)
+}
+
+#[cfg(not(windows))]
+fn os_hostname() -> std::result::Result<String, std::env::VarError> {
+    Err(std::env::VarError::NotPresent)
 }
 
 fn slice(args: &[Typval]) -> Result<Typval> {

@@ -781,14 +781,14 @@ fn xdg_home_fallback(env: &str, fallback: &str) -> String {
             return text;
         }
     }
-    if root == "LOCALAPPDATA" {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return Path::new(&profile)
-                .join("AppData")
-                .join("Local")
-                .to_string_lossy()
-                .into_owned();
-        }
+    if root == "LOCALAPPDATA"
+        && let Some(profile) = std::env::var_os("USERPROFILE")
+    {
+        return Path::new(&profile)
+            .join("AppData")
+            .join("Local")
+            .to_string_lossy()
+            .into_owned();
     }
     expand_home(fallback)
 }

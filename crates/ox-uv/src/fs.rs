@@ -1957,8 +1957,10 @@ fn stat_from_metadata(m: &Metadata) -> Stat {
 #[cfg(windows)]
 fn stat_from_metadata(m: &Metadata, identity: Option<&ox_sys::windows::FileIdentity>) -> Stat {
     // Mirrors the libuv Win32 stat fill: permission bits collapse to the
-    // read-only/writable pair, `ino` is the NTFS file index, `nlink` the
-    // link count, and `dev` the volume serial number.
+    // read-only/writable pair — plus the execute/search bits on directories —
+    // `ino` is the NTFS file index, `nlink` the link count, `dev` the volume
+    // serial number, and `ctime` the NTFS ChangeTime (metadata change),
+    // distinct from `birthtime` (creation).
     let kind = if m.is_dir() {
         0o040_000
     } else if m.file_type().is_symlink() {
@@ -1971,6 +1973,7 @@ fn stat_from_metadata(m: &Metadata, identity: Option<&ox_sys::windows::FileIdent
     } else {
         0o666
     };
+    let perms = perms | if m.is_dir() { 0o111 } else { 0 };
     let size = m.len();
     Stat {
         dev: identity.map_or(0, |id| id.volume_serial),
@@ -1987,9 +1990,28 @@ fn stat_from_metadata(m: &Metadata, identity: Option<&ox_sys::windows::FileIdent
         r#gen: 0,
         atime: system_time(m.accessed().ok()),
         mtime: system_time(m.modified().ok()),
-        ctime: system_time(m.created().ok()),
+        ctime: identity
+            .and_then(|id| id.change_time)
+            .and_then(filetime_to_system_time)
+            .unwrap_or_else(|| system_time(m.created().ok())),
         birthtime: system_time(m.created().ok()),
     }
+}
+
+/// Converts a FILETIME value (100 ns ticks since 1601-01-01) to the
+/// `FsTime` layout, returning `None` before the Unix epoch.
+#[cfg(windows)]
+fn filetime_to_system_time(ticks: i64) -> Option<FsTime> {
+    const FILETIME_EPOCH_OFFSET: i64 = 116_444_736_000_000_000;
+    let unix_ticks = ticks.checked_sub(FILETIME_EPOCH_OFFSET)?;
+    if unix_ticks < 0 {
+        return None;
+    }
+    let unix_ticks = u64::try_from(unix_ticks).ok()?;
+    Some(FsTime {
+        sec: i64::try_from(unix_ticks / 10_000_000).unwrap_or(i64::MAX),
+        nsec: u32::try_from(unix_ticks % 10_000_000 * 100).unwrap_or(u32::MAX),
+    })
 }
 #[cfg(not(any(unix, windows)))]
 fn stat_from_metadata(m: &Metadata) -> Stat {
@@ -2065,8 +2087,27 @@ fn ownership_ids(
 }
 
 fn errno_name(raw: Option<i32>, kind: io::ErrorKind) -> &'static str {
-    #[cfg(not(unix))]
-    let _ = raw;
+    #[cfg(windows)]
+    if let Some(raw) = raw {
+        // libuv's `uv_translate_sys_error` maps these Win32 codes; the
+        // `ErrorKind` fallback below cannot tell apart e.g. ENOTEMPTY.
+        let name = match raw {
+            2 | 3 | 15 => "ENOENT", // FILE_NOT_FOUND, PATH_NOT_FOUND, INVALID_DRIVE
+            4 => "EMFILE",          // TOO_MANY_OPEN_FILES
+            5 => "EACCES",          // ACCESS_DENIED
+            17 => "EXDEV",          // NOT_SAME_DEVICE
+            80 | 183 => "EEXIST",   // FILE_EXISTS, ALREADY_EXISTS
+            87 | 122 => "EINVAL",   // INVALID_PARAMETER, INSUFFICIENT_BUFFER
+            109 | 232 => "EPIPE",   // BROKEN_PIPE, NO_DATA
+            145 => "ENOTEMPTY",     // DIR_NOT_EMPTY
+            206 => "ENAMETOOLONG",  // FILENAME_EXCED_RANGE
+            267 => "ENOTDIR",       // DIRECTORY
+            _ => "",
+        };
+        if !name.is_empty() {
+            return name;
+        }
+    }
     #[cfg(unix)]
     if let Some(raw) = raw {
         use rustix::io::Errno;
