@@ -837,6 +837,36 @@ fn wincmd_embedded_count_resizes_by_the_count() {
     );
 }
 
+// The count is consumed before the `check_nextcmd` scan, so a `|` tail
+// still splits after a digit-prefixed key (`wincmd 10< | cmd` runs the
+// tail; upstream accepts it the same way).
+#[test]
+fn wincmd_counted_key_splits_the_bar_tail() {
+    let (editor, buffer, _) = editor_with_window();
+
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    editor.editor_mut().buffer_mut(buffer).unwrap().mark_saved();
+    exec.execute_line(&editor, "vsplit").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let width = editor.editor().window_geometry(window).unwrap().width;
+
+    exec.execute_line(&editor, "wincmd 10< | setlocal modified")
+        .unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 10
+    );
+    assert!(
+        editor
+            .editor()
+            .buffer(buffer)
+            .unwrap()
+            .flags
+            .contains(crate::BufferFlags::MODIFIED)
+    );
+}
+
 // A literal `|` is the window-command key itself (maximize width): only the
 // second bar separates the next command, which then runs normally — the
 // oracle maximizes the window and applies `setlocal modified`, no E474.

@@ -1206,11 +1206,19 @@ fn command_end(
 /// `EX_TRLBAR` can never be added to `wincmd`.
 fn wincmd_command_end(input: &str, args_start: usize) -> usize {
     let bytes = input.as_bytes();
-    let Some(&key) = bytes.get(args_start) else {
+    // Digits leading the argument are the command's count (`wincmd 10<`),
+    // the same way a `:10wincmd` prefix range is: the window key is the
+    // first non-digit byte after them.
+    let mut key_start = args_start;
+    while matches!(bytes.get(key_start), Some(b'0'..=b'9')) {
+        key_start += 1;
+    }
+    key_start = skip_ascii_space(input, key_start);
+    let Some(&key) = bytes.get(key_start) else {
         // NEEDARG rejects an empty argument before the handler ever runs.
         return input.len();
     };
-    let mut cursor = args_start + 1;
+    let mut cursor = key_start + 1;
     if key == b'g' || key == 0x07 {
         // The `g`/Ctrl-G forms consume a second command character; a
         // missing one stays missing so the handler reports E474 instead of
