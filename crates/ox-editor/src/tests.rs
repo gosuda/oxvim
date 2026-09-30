@@ -1021,6 +1021,34 @@ fn replace_lines(
 }
 
 #[test]
+fn set_window_height_scrolls_topline_to_keep_cursor_visible() {
+    // `win_new_height`/`validate_cursor` (window.c): when a window shrinks
+    // below the cursor's screen row, its topline follows the cursor instead
+    // of leaving the cursor past the new text area.
+    let (mut editor, buffer, window) = editor_with_scrolled_window(
+        &[
+            b"l01", b"l02", b"l03", b"l04", b"l05", b"l06", b"l07", b"l08", b"l09", b"l10",
+        ],
+        position(10, 0),
+        6,
+        20,
+    );
+    let tab = editor.current_tabpage().unwrap();
+    editor.split_above(tab, window, buffer, false).unwrap();
+    editor.set_window_height(window, 2).unwrap();
+    let height = editor.window_text_height(window).unwrap();
+    assert!(
+        height < 5,
+        "expected the shrink to drop the window under the cursor row, got {height}"
+    );
+    // Cursor line 10 sits on the bottom row: topline = 10 - height + 1.
+    assert_eq!(
+        editor.window(window).unwrap().topline,
+        10usize.saturating_sub(height).saturating_add(1)
+    );
+}
+
+#[test]
 fn topline_follows_content_when_editing_above_topline() {
     // Buffer: aaa bbb ccc ddd www xxx yyy zzz; topline=www(5), cursor=zzz(8).
     let (mut editor, buffer, window) = editor_with_scrolled_window(

@@ -3763,8 +3763,16 @@ fn command_wincmd<F: FileIO>(
     if matches!(key, '<' | '>' | '+' | '-' | '_' | '|' | '=') {
         // `do_window` (window.c:5193-5380): < > grow/shrink columns, + -
         // rows, _ and | maximize, = equalizes — the same chords the
-        // Normal-mode `CTRL-W` prefix takes through `nv_window`.
-        let count = wincmd_range_count(command).unwrap_or(1).max(1);
+        // Normal-mode `CTRL-W` prefix takes through `nv_window`. The count
+        // may be a post-command count (`wincmd 10<`) or a pre-command
+        // range (`:10wincmd <`) — `ex_wincmd` hands `eap->line2` to
+        // `do_window` for both (ex_docmd.c:6583).
+        let count = command
+            .count
+            .and_then(|value| usize::try_from(value).ok())
+            .or_else(|| wincmd_range_count(command))
+            .unwrap_or(1)
+            .max(1);
         if key == '=' {
             return match editor.equalize_tabpage(tab) {
                 Ok(()) => Flow::Normal,

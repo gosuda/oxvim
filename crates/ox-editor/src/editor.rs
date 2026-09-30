@@ -2623,10 +2623,15 @@ impl Editor {
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.resize(geometry)?;
-        // A shrunken frame can leave a window's cursor below its new text
-        // area; scroll each tiled window's topline back into view the way
-        // `win_new_height`/`validate_cursor` do after a screen resize
-        // (window.c), instead of emitting a cursor past the window grid.
+        Self::revalidate_window_toplines(tabpage)?;
+        Ok(())
+    }
+
+    /// Scrolls each tiled window's topline back into view after its frame
+    /// changed, the way `win_new_height`/`validate_cursor` do after a
+    /// resize (window.c) — a shrunken frame can otherwise leave the cursor
+    /// below the new text area and emit it past the window grid.
+    fn revalidate_window_toplines(tabpage: &mut TabpageState) -> Result<(), EditorError> {
         for window in tabpage.layout().windows() {
             let height = tabpage.tiled_window_text_height(window)?;
             let state = tabpage.window_mut(window)?;
@@ -2649,10 +2654,12 @@ impl Editor {
         } else {
             tab
         };
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&resolved)
-            .ok_or(EditorError::UnknownTabpage(resolved))?
-            .equalize()?;
+            .ok_or(EditorError::UnknownTabpage(resolved))?;
+        tabpage.equalize()?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
 
@@ -2937,10 +2944,12 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&tab)
-            .ok_or(EditorError::UnknownTabpage(tab))?
-            .set_window_width(resolved, width)?;
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        tabpage.set_window_width(resolved, width)?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
 
@@ -2964,10 +2973,12 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
-        self.tabpages
+        let tabpage = self
+            .tabpages
             .get_mut(&tab)
-            .ok_or(EditorError::UnknownTabpage(tab))?
-            .set_window_height(resolved, height)?;
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        tabpage.set_window_height(resolved, height)?;
+        Self::revalidate_window_toplines(tabpage)?;
         Ok(())
     }
     /// Returns the renderable text-row count for a window.

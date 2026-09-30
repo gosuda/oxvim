@@ -813,6 +813,30 @@ fn wincmd_two_key_form_gates_the_tail_on_the_window_command() {
     );
 }
 
+// ex_docmd.c:6583 — digits between the command name and the key are the
+// count (`wincmd 10<` resizes by 10), identical to a pre-command
+// `:10wincmd <` range: both land in `eap->line2` for `do_window`.
+#[test]
+fn wincmd_embedded_count_resizes_by_the_count() {
+    let (editor, _, _) = editor_with_window();
+
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "vsplit").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let width = editor.editor().window_geometry(window).unwrap().width;
+    exec.execute_line(&editor, "wincmd 10<").unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 10
+    );
+    exec.execute_line(&editor, "wincmd 5>").unwrap();
+    assert_eq!(
+        editor.editor().window_geometry(window).unwrap().width,
+        width - 5
+    );
+}
+
 // A literal `|` is the window-command key itself (maximize width): only the
 // second bar separates the next command, which then runs normally — the
 // oracle maximizes the window and applies `setlocal modified`, no E474.
