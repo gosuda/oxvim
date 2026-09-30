@@ -232,6 +232,11 @@ impl Emitter {
                 for grid in previous_grids.difference(&current_grids) {
                     let destroyed =
                         *grid % 2 == 0 && !compositor.live_window_grids().contains(grid);
+                    if destroyed {
+                        // A destroyed window never resurfaces and grid ids are
+                        // never reused, so its retained snapshot only leaks.
+                        self.previous.remove(&(channel_id, *grid));
+                    }
                     let event = if destroyed { "win_close" } else { "win_hide" };
                     channel.emit(UiEvent::new(event, vec![Object::Integer(*grid)]))?;
                 }
