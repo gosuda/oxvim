@@ -487,3 +487,141 @@ fn shared_buffer_modified_flag_updates_both_split_statuslines() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hidden window grids on tabpage switches (window.c `ui_call_win_hide`:976).
+// ---------------------------------------------------------------------------
+
+/// Grid ids reported by `win_hide` argsets in a decoded frame.
+fn win_hide_grids(decoded: &Object) -> Vec<i64> {
+    let mut grids = Vec::new();
+    for event in redraw_events(decoded) {
+        let Object::Array(parts) = event else {
+            continue;
+        };
+        let Some(Object::String(name)) = parts.first() else {
+            continue;
+        };
+        if name.to_string_lossy() != "win_hide" {
+            continue;
+        }
+        for args in parts.iter().skip(1) {
+            if let Object::Array(args) = args
+                && let Some(Object::Integer(grid)) = args.first()
+            {
+                grids.push(*grid);
+            }
+        }
+    }
+    grids
+}
+
+/// Grid ids announced by `win_pos` argsets in a decoded frame.
+fn win_pos_grids(decoded: &Object) -> Vec<i64> {
+    let mut grids = Vec::new();
+    for event in redraw_events(decoded) {
+        let Object::Array(parts) = event else {
+            continue;
+        };
+        let Some(Object::String(name)) = parts.first() else {
+            continue;
+        };
+        if name.to_string_lossy() != "win_pos" {
+            continue;
+        }
+        for args in parts.iter().skip(1) {
+            if let Object::Array(args) = args
+                && let Some(Object::Integer(grid)) = args.first()
+            {
+                grids.push(*grid);
+            }
+        }
+    }
+    grids
+}
+
+#[test]
+fn tab_switch_hides_the_departed_window_grid() {
+    let mut editor = Editor::new();
+    let first = editor
+        .create_buffer_with(
+            Buffer::from_lines(&[b"first tab".to_vec()], true).unwrap(),
+            true,
+        )
+        .unwrap();
+    let second = editor
+        .create_buffer_with(
+            Buffer::from_lines(&[b"second tab".to_vec()], true).unwrap(),
+            true,
+        )
+        .unwrap();
+    let tab1 = editor
+        .create_tabpage(first, Geometry::new(0, 0, 20, 8).unwrap())
+        .unwrap();
+    let tab2 = editor
+        .create_tabpage(second, Geometry::new(0, 0, 20, 8).unwrap())
+        .unwrap();
+    editor.set_current_tabpage(tab1).unwrap();
+
+    let mut highlights = HlState::new();
+    let mut compositor = Compositor::new(20, 8);
+    compositor
+        .refresh_from_editor(&editor, 20, 8, &mut highlights)
+        .unwrap();
+    let mut channels = UiChannels::new();
+    channels
+        .attach(
+            1,
+            20,
+            8,
+            UiOptions {
+                ext_linegrid: true,
+                ext_multigrid: true,
+                ..UiOptions::default()
+            },
+        )
+        .unwrap();
+    let mut emitter = Emitter::new();
+    let mut chrome = ChromeState::new();
+
+    // Frame one places tabpage one's window grid on screen.
+    let frames = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let placed = decode(&frames[&1]).unwrap();
+    let placed_grids = win_pos_grids(&placed);
+    assert_eq!(placed_grids.len(), 1, "one window grid: {placed_grids:?}");
+    let tab1_grid = placed_grids[0];
+
+    // Switching to tabpage two must hide the departed grid, otherwise the
+    // client keeps compositing it over the tabline and the new window.
+    editor.set_current_tabpage(tab2).unwrap();
+    compositor
+        .refresh_from_editor(&editor, 20, 8, &mut highlights)
+        .unwrap();
+    let frames = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let switched = decode(&frames[&1]).unwrap();
+    assert!(
+        win_hide_grids(&switched).contains(&tab1_grid),
+        "expected win_hide for grid {tab1_grid}: {switched:?}"
+    );
+
+    // Switching back repositions the same grid, resurfacing it.
+    editor.set_current_tabpage(tab1).unwrap();
+    compositor
+        .refresh_from_editor(&editor, 20, 8, &mut highlights)
+        .unwrap();
+    let frames = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let back = decode(&frames[&1]).unwrap();
+    assert!(
+        win_pos_grids(&back).contains(&tab1_grid),
+        "expected win_pos to resurface grid {tab1_grid}: {back:?}"
+    );
+}

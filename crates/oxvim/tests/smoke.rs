@@ -226,6 +226,22 @@ fn redraw_names(value: &Value) -> Vec<&str> {
         .collect()
 }
 
+/// Drains redraw notifications until one carries `event` or `limit`
+/// batches pass (each typed command produces several batches).
+#[expect(
+    clippy::panic,
+    reason = "absent redraw events are assertion failures in the smoke harness"
+)]
+fn redraw_until(oxvim: &mut Embedded, event: &str, limit: usize) -> Value {
+    for _ in 0..limit {
+        let redraw = oxvim.next_message();
+        if redraw_names(&redraw).contains(&event) {
+            return redraw;
+        }
+    }
+    panic!("{event} never arrived within {limit} redraws")
+}
+
 fn contains_string(value: &Value, expected: &str) -> bool {
     match value {
         Value::String(value) => value.as_str() == Some(expected),
@@ -233,6 +249,19 @@ fn contains_string(value: &Value, expected: &str) -> bool {
         Value::Map(entries) => entries
             .iter()
             .any(|(key, value)| contains_string(key, expected) || contains_string(value, expected)),
+        _ => false,
+    }
+}
+
+fn has_string_containing(value: &Value, needle: &str) -> bool {
+    match value {
+        Value::String(value) => value.as_str().is_some_and(|text| text.contains(needle)),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| has_string_containing(value, needle)),
+        Value::Map(entries) => entries.iter().any(|(key, value)| {
+            has_string_containing(key, needle) || has_string_containing(value, needle)
+        }),
         _ => false,
     }
 }
@@ -1424,11 +1453,6 @@ fn valid_notification_produces_no_response() {
     assert_eq!(info[0], Value::from(1));
 }
 
-#[expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "test asserts the exact error and redraw response variants"
-)]
 #[test]
 fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
     let mut oxvim = Embedded::spawn();
@@ -1466,7 +1490,7 @@ fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
         oxvim.request("nvim_input", vec![Value::from(":q")]),
         Value::from(2)
     );
-    let cmdline = oxvim.next_message();
+    let cmdline = redraw_until(&mut oxvim, "cmdline_show", 30);
     let cmdline_names = redraw_names(&cmdline);
     assert_eq!(cmdline_names.last(), Some(&"flush"));
     assert!(
@@ -1474,32 +1498,24 @@ fn rejected_quit_on_modified_buffer_emits_error_and_redraw() {
         "cmdline_show missing: {cmdline_names:?}"
     );
 
-    // Press <CR>. The quit is rejected because the buffer is modified.
-    let error = oxvim.request_error("nvim_input", vec![Value::from("\r")]);
-    let Value::Array(error_fields) = error else {
-        panic!("error response is not an array")
-    };
-    assert_eq!(error_fields.len(), 2);
-    assert_eq!(error_fields[0], Value::from(0));
-    let error_text = error_fields[1]
-        .as_str()
-        .expect("error text is not a string");
-    assert!(error_text.contains("E37"), "expected E37, got {error_text}");
+    // Press <CR>. The quit is rejected because the buffer is modified, but
+    // `nvim_input` only acknowledges consumed bytes (api/vim.c): the E37
+    // rejection reaches the UI as a message event, never the RPC result.
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from("\r")]),
+        Value::from(1)
+    );
 
-    let redraw = oxvim.next_message();
+    let redraw = redraw_until(&mut oxvim, "msg_show", 30);
     let redraw_names = redraw_names(&redraw);
     assert_eq!(redraw_names.last(), Some(&"flush"));
-    assert!(
-        redraw_names.contains(&"cmdline_hide"),
-        "cmdline_hide missing: {redraw_names:?}"
-    );
     assert!(
         redraw_names.contains(&"msg_show"),
         "msg_show missing: {redraw_names:?}"
     );
     assert!(
-        contains_string(&redraw, error_text),
-        "redraw should contain the error text"
+        has_string_containing(&redraw, "E37"),
+        "redraw should contain the E37 error text"
     );
 }
 
@@ -2301,4 +2317,138 @@ fn autocmd_action_reenters_api_without_executor_error() {
     );
     let _ = std::fs::remove_file(&target);
     let _ = std::fs::remove_file(&marker);
+}
+
+/// `:messages` must reach an `ext_messages` UI as `msg_history_show` with
+/// every history-retained entry and its wire kind (`ex_docmd.c`
+/// `ex_messages`), and the pager must close on the next UI interaction
+/// (`wait_return`'s `msg_history_hide`).
+#[test]
+fn messages_command_emits_history_show_then_hide() {
+    let mut oxvim = Embedded::spawn();
+    assert_eq!(
+        oxvim.request(
+            "nvim_ui_attach",
+            vec![
+                Value::from(80),
+                Value::from(24),
+                Value::Map(vec![
+                    (Value::from("rgb"), Value::Boolean(true)),
+                    (Value::from("ext_messages"), Value::Boolean(true)),
+                ]),
+            ],
+        ),
+        Value::Nil,
+    );
+    let _initial = oxvim.next_message();
+
+    // Store one echomsg and one echoerr entry in message history.
+    for command in [":echomsg \"stored one\"", ":echoerr \"stored err\""] {
+        assert_eq!(
+            oxvim.request("nvim_input", vec![Value::from(command)]),
+            Value::from(command.len() as u64)
+        );
+        assert_eq!(
+            oxvim.request("nvim_input", vec![Value::from("\r")]),
+            Value::from(1)
+        );
+        // An error message opens the hit-return state: dismiss it so the
+        // next input reaches the command line.
+        assert_eq!(
+            oxvim.request("nvim_input", vec![Value::from("\u{1b}")]),
+            Value::from(1)
+        );
+        let _ = oxvim.next_message();
+    }
+
+    // `:messages` produces msg_history_show with both entries.
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from(":messages")]),
+        Value::from(9)
+    );
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from("\r")]),
+        Value::from(1)
+    );
+    let redraw = redraw_until(&mut oxvim, "msg_history_show", 30);
+    let names = redraw_names(&redraw);
+    assert!(
+        !names.contains(&"msg_show"),
+        ":messages must not also msg_show its joined text: {names:?}"
+    );
+    assert!(
+        has_string_containing(&redraw, "echomsg") && has_string_containing(&redraw, "echoerr"),
+        "history entries should carry echomsg/echoerr kinds: {redraw:?}"
+    );
+    assert!(
+        has_string_containing(&redraw, "stored one")
+            && has_string_containing(&redraw, "stored err"),
+        "history entries should carry the stored texts: {redraw:?}"
+    );
+
+    // The next UI interaction closes the pager with msg_history_hide.
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from("j")]),
+        Value::from(1)
+    );
+    let redraw = redraw_until(&mut oxvim, "msg_history_hide", 30);
+    let names = redraw_names(&redraw);
+    assert!(
+        names.contains(&"msg_history_hide"),
+        "msg_history_hide missing after input: {names:?}"
+    );
+}
+
+/// `:registers` lists the stored registers without arguments
+/// (`ex_display`): `@` is a repeat operator, not a register, so it must
+/// not error the listing.
+#[test]
+fn registers_command_lists_stored_registers() {
+    let mut oxvim = Embedded::spawn();
+    assert_eq!(
+        oxvim.request(
+            "nvim_ui_attach",
+            vec![
+                Value::from(80),
+                Value::from(24),
+                Value::Map(vec![
+                    (Value::from("rgb"), Value::Boolean(true)),
+                    (Value::from("ext_messages"), Value::Boolean(true)),
+                ]),
+            ],
+        ),
+        Value::Nil,
+    );
+    let _initial = oxvim.next_message();
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from(":let @a = \"AA\"")]),
+        Value::from(14)
+    );
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from("\r")]),
+        Value::from(1)
+    );
+    let _ = oxvim.next_message();
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from(":registers")]),
+        Value::from(10)
+    );
+    assert_eq!(
+        oxvim.request("nvim_input", vec![Value::from("\r")]),
+        Value::from(1)
+    );
+    let redraw = redraw_until(&mut oxvim, "msg_show", 30);
+    let names = redraw_names(&redraw);
+    assert!(
+        names.contains(&"msg_show"),
+        "register listing should msg_show: {names:?}"
+    );
+    assert!(
+        has_string_containing(&redraw, "\"a   AA"),
+        "listing should contain the \"a register: {redraw:?}"
+    );
+    assert!(
+        !has_string_containing(&redraw, "E354"),
+        "listing must not hit E354: {redraw:?}"
+    );
 }

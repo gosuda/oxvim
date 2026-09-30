@@ -2056,7 +2056,7 @@ impl AppState {
                     match self.drive_input() {
                         Ok(()) => {
                             let (frames, failure) = self.redraw_reporting();
-                            redraws = frames;
+                            merge_redraw_frames(&mut redraws, frames);
                             // A redraw failure still owes the client its
                             // reply, and the dropped success may own freshly
                             // allocated reply refs: release them before the
@@ -2081,7 +2081,7 @@ impl AppState {
                                 });
                             });
                             let (frames, failure) = self.redraw_reporting();
-                            redraws = frames;
+                            merge_redraw_frames(&mut redraws, frames);
                             if let Some(message) = failure
                                 && result.is_ok()
                             {
@@ -2090,21 +2090,13 @@ impl AppState {
                                 }
                                 result = Err(ApiError::exception(message));
                             }
-                            // Only the input methods replace the dispatch
-                            // result with the drive failure; every other
-                            // request keeps the result it was given and sees
-                            // the drive error through the message log above.
-                            // The dropped Ok value may own freshly allocated
-                            // reply refs (exec_lua returning a function after
-                            // feeding input): release them before the drive
-                            // error takes the reply slot, or the registry
-                            // entry leaks.
-                            if is_input {
-                                if owns_result_refs && let Ok(value) = &result {
-                                    self.free_reply_refs(value);
-                                }
-                                result = Err(error);
-                            }
+                            // Every request keeps the result it was given and
+                            // sees the drive error through the message log
+                            // above. Upstream answers the input methods with
+                            // their enqueue acknowledgement alone
+                            // (`nvim_input` returns the consumed byte count;
+                            // api/vim.c), so an editing error fed through keys
+                            // is a message-area event, never the RPC result.
                         }
                     }
                 }
@@ -2149,7 +2141,7 @@ impl AppState {
                             match self.drive_input() {
                                 Ok(()) => {
                                     let (frames, failure) = self.redraw_reporting();
-                                    redraws = frames;
+                                    merge_redraw_frames(&mut redraws, frames);
                                     if let Some(message) = failure {
                                         let event = ox_rpc::nvim_error_event(
                                             &ApiError::exception(message),
@@ -2171,6 +2163,7 @@ impl AppState {
                                     let (frames, failure) = self.redraw_reporting();
                                     let event = ox_rpc::nvim_error_event(&error)
                                         .map_err(|error| AppError::Server(error.to_string()))?;
+                                    writes.extend(redraws);
                                     writes.push((channel.get(), event));
                                     writes.extend(frames);
                                     if let Some(message) = failure {
@@ -2316,6 +2309,9 @@ fn drive_input_parts(
     exiting: &mut bool,
     exit_code: &mut i64,
 ) -> Result<(), ApiError> {
+    // `wait_return` (message.c) closes a shown history pager on the key that
+    // resumes input; a redraw without input must leave it open.
+    session.with_render_state(|_, _, chrome| chrome.hide_history_pager());
     loop {
         mode.borrow_mut().set_no_more_input(false);
         let result = ex.borrow_mut().run_typeahead(session.as_ref(), mode);
@@ -2346,6 +2342,18 @@ fn drive_input_parts(
         for data in repeats {
             ox_api::nvim_paste(session, OxStr(data), false, -1)?;
         }
+    }
+}
+
+/// Merges a later redraw pass into the frames accumulated this turn.
+///
+/// One RPC turn can redraw more than once (dispatch emits a batch, the
+/// typeahead drive emits another): upstream sends each flush as its own
+/// notification, so the later bytes append to the channel's pending writes
+/// rather than replacing the earlier batch.
+fn merge_redraw_frames(redraws: &mut BTreeMap<u64, Vec<u8>>, frames: BTreeMap<u64, Vec<u8>>) {
+    for (channel_id, frame) in frames {
+        redraws.entry(channel_id).or_default().extend(frame);
     }
 }
 
@@ -2542,6 +2550,42 @@ fn show_message_in_chrome(
         Object::String(text) => text.clone(),
         value => OxStr::from(format!("{value:?}").as_bytes()),
     };
+    if identity.history_show {
+        // `:messages`: the sentinel identity swaps the wire event to
+        // `msg_history_show`, built from every history-retained entry. A
+        // caller-supplied `opts.kind = "history_show"` reaches the plain
+        // `msg_show` path below instead.
+        let entries = session.with_editor(|editor| {
+            editor
+                .messages()
+                .iter()
+                .zip(editor.message_identities().iter())
+                .filter(|(entry, _)| entry.history)
+                .filter_map(|(entry, identity)| match &entry.content {
+                    Object::String(text) => Some((
+                        identity.kind.clone(),
+                        vec![ContentChunk::new(0, text.clone())],
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        session.with_render_state(|_, _, chrome| {
+            chrome.history_show(
+                &entries,
+                MessageState {
+                    kind: OxStr::from("echo"),
+                    content: vec![ContentChunk::new(0, text)],
+                    replace_last: false,
+                    history: false,
+                    append: false,
+                    id: Object::Nil,
+                    trigger: OxStr::from(""),
+                },
+            );
+        });
+        return;
+    }
     session.with_render_state(|_, _, chrome| {
         chrome.show_message(MessageState {
             kind: identity.kind.clone(),
@@ -2720,6 +2764,7 @@ fn method_is_mutating(method: &str) -> bool {
                 | "nvim_input_mouse"
                 | "nvim_feedkeys"
                 | "nvim_paste"
+                | "nvim_mcursor"
                 | "nvim_put"
                 | "nvim_ui_set_option"
         )
@@ -9577,6 +9622,73 @@ mod tests {
             matches!(&messages[0], Message::Response { msgid: 9, result: Ok(_) }),
             "the input request must be answered successfully, got {:?}",
             messages[0]
+        );
+    }
+
+    // Fed keys that run an erroring command still earn their enqueue
+    // acknowledgement: upstream's input methods only report bytes accepted,
+    // while the editing error rides the message-area redraw ahead of the
+    // response (api/vim.c). Returning the drive error in the response made a
+    // strict client exit on an ordinary `:bogus` or `:q` on a dirty buffer.
+    #[test]
+    #[expect(clippy::unwrap_used, reason = "the fixture must build")]
+    fn errored_fed_input_still_acks_and_reports_through_messages() {
+        let mut state = message_state();
+        state
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 12,
+                    method: OxStr::from("nvim_input"),
+                    params: vec![Object::String(OxStr::from(":"))],
+                },
+            )
+            .unwrap();
+        // The `:` key queues the Normal→Cmdline transition; the dispatch
+        // boundary drain does not run for a direct `process_message` call,
+        // so fire it like every production caller does after the borrow
+        // drops, before the command text arrives on the next request.
+        state.fire_pending_transitions();
+        let writes = state
+            .process_message(
+                CHAN_STDIO,
+                Message::Request {
+                    msgid: 13,
+                    method: OxStr::from("nvim_input"),
+                    params: vec![Object::String(OxStr::from("bogus_command\r"))],
+                },
+            )
+            .unwrap();
+        let response = writes.iter().rev().find_map(|(_, bytes)| {
+            let mut decoder = IncrementalDecoder::new();
+            decoder
+                .feed(bytes)
+                .ok()
+                .and_then(|messages| messages.into_iter().next())
+        });
+        assert!(
+            matches!(
+                &response,
+                Some(Message::Response {
+                    msgid: 13,
+                    result: Ok(Object::Integer(_)),
+                })
+            ),
+            "the input request must keep its byte acknowledgement, got {response:?}"
+        );
+        // The message layer renders into this UI's grid cell by cell, so the
+        // error text never appears as one contiguous string in the frame;
+        // the message log is the durable proof the drive error was published
+        // to the attached UI rather than answered in the response.
+        assert!(
+            state.session.with_editor(|editor| editor
+                .messages()
+                .iter()
+                .any(|message| message.kind == MessageKind::Error
+                    && matches!(&message.content,
+                        Object::String(text) if text.as_bytes().windows(b"Not an editor command".len())
+                            .any(|window| window == b"Not an editor command")))),
+            "the editing error must reach the message log for the attached UI"
         );
     }
 }

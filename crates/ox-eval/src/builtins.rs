@@ -286,6 +286,7 @@ impl<'a> Builtins<'a> {
             "matchfuzzy" | "matchfuzzypos" => self.matchfuzzy(name, &args, scope),
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
+            "mkdir" => path_builtins::mkdir(&args),
             "nr2char" => nr2char(&args),
             "or" => binary_number(&args, |left, right| left | right),
             "pow" => float_binary(&args, f64::powf),
@@ -1617,6 +1618,7 @@ pub fn is_builtin_implemented(name: &str) -> bool {
             | "matchfuzzypos"
             | "max"
             | "min"
+            | "mkdir"
             | "nr2char"
             | "or"
             | "pathshorten"

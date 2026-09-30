@@ -219,11 +219,17 @@ impl TuiState {
                 | b"menu_show"
                 | b"menu_hide"
                 | b"set_title"
-                | b"set_icon" => {
+                | b"set_icon"
+                | b"msg_set_pos"
+                | b"win_extmark" => {
                     // These carry no client-rendered content, so they are
                     // consumed intentionally: the client must survive its
                     // first redraw regardless of which core negotiation/status
-                    // events the server emits.
+                    // events the server emits. `msg_set_pos` positions the
+                    // server-side message grid while this client lays out
+                    // messages in its own chrome, and `win_extmark` reports
+                    // watched-extmark positions for multigrid compositors;
+                    // extmark cell contents already arrive through grid_line.
                 }
                 b"cmdline_show" => self.apply_cmdline_show(args)?,
                 b"cmdline_pos" => {
@@ -277,6 +283,7 @@ impl TuiState {
                 b"msg_show" => self.apply_message_show(args)?,
                 b"msg_clear" => self.chrome.message_clear(),
                 b"msg_history_show" => self.apply_history_show(args)?,
+                b"msg_history_hide" => self.chrome.history_hide(),
                 b"msg_showcmd" | b"msg_showmode" | b"msg_ruler" => {
                     let kind = event.name.clone();
                     self.chrome.message_show(MessageUpdate {
@@ -2034,6 +2041,43 @@ mod tests {
             event("visual_bell", vec![]),
             event("hl_group_set", vec![Object::Integer(0), Object::Integer(1)]),
             event("update_menu", vec![Object::Integer(0)]),
+        ];
+        assert!(state.apply_redraw(&batch, TimeMs(0)).is_ok());
+    }
+
+    #[test]
+    fn compositor_positioning_events_are_consumed() {
+        let mut state = TuiState::default();
+        let event = |name: &str, args: Vec<Object>| RedrawEvent {
+            name: OxStr::from(name),
+            argsets: vec![args],
+        };
+        // Every argset the emitter produces for these two events: the client
+        // owns message layout and has no multigrid extmark surface, so both
+        // are consumed rather than reaching the not-implemented rejection.
+        let batch = vec![
+            event(
+                "msg_set_pos",
+                vec![
+                    Object::Integer(4),
+                    Object::Integer(20),
+                    Object::Boolean(false),
+                    Object::String(OxStr::from(" ")),
+                    Object::Integer(60),
+                    Object::Integer(0),
+                ],
+            ),
+            event(
+                "win_extmark",
+                vec![
+                    Object::Integer(2),
+                    Object::Window(ox_types::WinHandle::try_from(1001).unwrap()),
+                    Object::Integer(1),
+                    Object::Integer(2),
+                    Object::Integer(0),
+                    Object::Integer(0),
+                ],
+            ),
         ];
         assert!(state.apply_redraw(&batch, TimeMs(0)).is_ok());
     }

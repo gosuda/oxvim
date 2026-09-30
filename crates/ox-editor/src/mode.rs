@@ -1143,6 +1143,10 @@ impl ModeMachine {
                 Self::goto_file_under_cursor(editor)?;
                 return Ok(Some(Mode::default()));
             }
+            if key == 't' || key == 'T' {
+                Self::goto_tabpage(editor, key == 'T', state.count);
+                return Ok(Some(Mode::default()));
+            }
             let command = format!("g{key}");
             Self::move_command(editor, &command, state.count.max(1), false)?;
             return Ok(Some(Mode::default()));
@@ -3188,6 +3192,39 @@ impl ModeMachine {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `gt`/`gT` (window.c `goto_tabpage`:4866): without a count `gt` cycles
+    /// forward and `gT` cycles backward, both wrapping the ends; with a
+    /// count `gt` jumps to that tabpage number (E475 territory — a missing
+    /// page just beeps) and `{N}gT` repeats the backward step N times.
+    fn goto_tabpage(editor: &mut Editor, backwards: bool, count: usize) {
+        let tabs = editor.tabpages();
+        if tabs.len() <= 1 {
+            if !backwards && count > 1 {
+                beep_flush(editor);
+            }
+            return;
+        }
+        let current = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_index(tab))
+            .unwrap_or(1);
+        let last = tabs.len();
+        let target = if backwards {
+            let steps = count.max(1) % last;
+            (current - 1 + last - steps) % last + 1
+        } else if count == 0 {
+            if current >= last { 1 } else { current + 1 }
+        } else {
+            count
+        };
+        match tabs.get(target - 1) {
+            Some(tab) => {
+                let _ = editor.set_current_tabpage(*tab);
+            }
+            None => beep_flush(editor),
         }
     }
     fn advance_insert_cursor(editor: &mut Editor, line_end: bool) -> Result<(), ModeError> {

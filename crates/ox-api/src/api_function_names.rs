@@ -1850,6 +1850,19 @@ pub(crate) const API_FUNCTIONS: &[FunctionMetadata] = &[
         ],
     },
     FunctionMetadata {
+        name: "nvim_mcursor",
+        since: 15,
+        deprecated_since: None,
+        method: false,
+        fast: false,
+        textlock: false,
+        returns: TypeRef::Integer,
+        params: &[
+            ("buf", TypeRef::Buffer, false),
+            ("pos", TypeRef::Named("ArrayOf(Integer, 2)"), false),
+        ],
+    },
+    FunctionMetadata {
         name: "nvim_get_color_by_name",
         since: 1,
         deprecated_since: None,

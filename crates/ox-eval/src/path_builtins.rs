@@ -381,6 +381,92 @@ fn mkdtemp(parent: &Path) -> Option<PathBuf> {
     None
 }
 
+/// `mkdir()` (`eval/fs.c:1088-1157`) for stateless hosts: `os_mkdir` and
+/// `os_mkdir_recurse` straight on `std::fs`. The editor-facing twin in
+/// `fs_builtins` resolves 'D'/'R' against a function frame; here they hit
+/// `can_add_defer`'s E193 exactly like upstream outside one.
+pub(crate) fn mkdir(args: &[Typval]) -> Result<Typval> {
+    let mut name = string_arg(&args[0])?.to_string_lossy().into_owned();
+    if name.is_empty() {
+        // FAIL, reported through the return value only (1099-1101).
+        return Ok(Typval::Number(0));
+    }
+    // Remove trailing slashes (1103-1106).
+    while name.ends_with('/') {
+        name.pop();
+    }
+    let mut prot: i64 = 0o755;
+    let mut parents = false;
+    if args.len() > 1 {
+        if args.len() > 2 {
+            // `prot` is read before the flags string (1112-1117), so
+            // `mkdir('abc', [], [])` reports E745 and not E730.
+            prot = number_arg(&args[2])?;
+            if prot == -1 {
+                return Ok(Typval::Number(0));
+            }
+        }
+        let flags = string_arg(&args[1])?.to_string_lossy().into_owned();
+        if flags.contains('D') || flags.contains('R') {
+            return Err(EvalError::new("E193", 0, "defer not inside a function"));
+        }
+        parents = flags.contains('p');
+    }
+    let mode = u32::try_from(prot)
+        .map_err(|_| EvalError::new("E474", 0, format!("Invalid argument: {prot}")))?;
+    let dir = Path::new(&name);
+    if parents {
+        mkdir_recurse(dir, mode).map_err(|(failed, error)| e739(&failed, &error))?;
+    } else {
+        // `vim_mkdir_emsg` (ex_docmd.c:7042-7052).
+        create_dir(dir, mode).map_err(|error| e739(dir, &error))?;
+    }
+    Ok(Typval::Number(1))
+}
+
+/// `os_mkdir_recurse` (`os/fs.c:1052-1097`): leaf-up from the deepest
+/// existing ancestor; a path that already names a directory is success.
+fn mkdir_recurse(dir: &Path, mode: u32) -> std::result::Result<(), (PathBuf, std::io::Error)> {
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut current = dir.to_path_buf();
+    loop {
+        if current.is_dir() {
+            break;
+        }
+        missing.push(current.clone());
+        match current.parent() {
+            // An empty parent is the head of a relative path
+            // (`get_past_head`).
+            Some(parent) if !parent.as_os_str().is_empty() => current = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        create_dir(&dir, mode).map_err(|error| (dir, error))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_dir(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new().mode(mode).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir(path: &Path, _mode: u32) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+/// `e_mkdir` (`errors.h:55`): "Cannot create directory %s: %s".
+fn e739(path: &Path, error: &std::io::Error) -> EvalError {
+    EvalError::new(
+        "E739",
+        0,
+        format!("Cannot create directory {}: {}", path.display(), error),
+    )
+}
+
 /// `findfile()`/`finddir()` — `findfilendir` (`eval/fs.c:542-605`).
 ///
 /// `{path}` defaults to the buffer-local `'path'`, then the global one, then

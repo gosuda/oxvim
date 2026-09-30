@@ -1422,7 +1422,7 @@ fn option_value_scope_distinguishes_global_and_local() {
 #[test]
 fn core_registry_metadata_matches_cross_family_sample() {
     let registry = crate::core().unwrap();
-    assert_eq!(registry.len(), 262);
+    assert_eq!(registry.len(), 263);
     let expected = [
         ("nvim_buf_get_lines", 1, TypeRef::ArrayOf(&TypeRef::String)),
         ("nvim_buf_get_text", 9, TypeRef::ArrayOf(&TypeRef::String)),
@@ -1731,6 +1731,53 @@ fn cursor_column_rejects_values_above_maxcol_before_clamping() {
         crate::window::nvim_win_get_cursor(&session, window),
         Ok(vec![1, 3])
     );
+}
+
+#[test]
+fn nvim_mcursor_validates_arguments_before_extmark_insert() {
+    // api/vim.c:1462-1484: buffer lookup precedes 'pos' validation, which
+    // precedes the range checks; only then does mc_add dedupe positions.
+    let (editor, buffer, _, _) = editor_with_lines(&["abc", "z"]);
+    let session = session_with(editor);
+    let missing = crate::BufHandle::try_from(9999).unwrap();
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, missing, vec![5, 0]),
+        Err(ApiError::validation("Invalid buffer id: 9999"))
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1]),
+        Err(ApiError::validation(
+            "Invalid 'pos': expected [row, col] array"
+        ))
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![0, 0]),
+        Err(ApiError::validation("Invalid cursor line: out of range"))
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![3, 0]),
+        Err(ApiError::validation("Invalid cursor line: out of range"))
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1, -1]),
+        Err(ApiError::validation("Invalid cursor column: out of range"))
+    );
+    assert_eq!(
+        crate::global::nvim_mcursor(&session, buffer, vec![1, i64::MAX]),
+        Err(ApiError::validation("Invalid cursor column: out of range"))
+    );
+}
+
+#[test]
+fn nvim_mcursor_dedupes_positions_and_returns_global_count() {
+    let (editor, buffer, _, _) = editor_with_lines(&["abc", "z"]);
+    let session = session_with(editor);
+    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 2]), Ok(1));
+    // Re-adding the tracked position is a no-op: mc_add dedupes.
+    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 2]), Ok(1));
+    // An over-long column clamps to the EOL insertion point (a new position).
+    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![1, 99]), Ok(2));
+    assert_eq!(crate::global::nvim_mcursor(&session, buffer, vec![2, 0]), Ok(3));
 }
 
 #[derive(Clone)]
