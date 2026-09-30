@@ -475,6 +475,22 @@ impl Client {
         }
     }
 
+    /// Wait briefly for the child to exit and report whether it was clean.
+    ///
+    /// A broken pipe on the request write can outrun the reader's EOF
+    /// notification when the child quits between a keypress and its request;
+    /// confirming the exit keeps that race on the clean path.
+    pub fn successful_exit(&mut self) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return status.success(),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(None) | Err(_) => return false,
+            }
+        }
+    }
+
     fn eof_error(&mut self) -> ClientError {
         self.stdin.take();
         let deadline = Instant::now() + Duration::from_secs(1);

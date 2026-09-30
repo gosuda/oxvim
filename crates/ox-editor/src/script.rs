@@ -829,18 +829,10 @@ pub fn expand_home(path: &str) -> String {
 }
 
 fn home_dir() -> Option<std::ffi::OsString> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .or_else(|| {
-            #[cfg(windows)]
-            {
-                std::env::var_os("USERPROFILE").filter(|home| !home.is_empty())
-            }
-            #[cfg(not(windows))]
-            {
-                None
-            }
-        })
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    #[cfg(windows)]
+    let home = home.or_else(|| std::env::var_os("USERPROFILE").filter(|home| !home.is_empty()));
+    home
 }
 
 /// One `stdpath()` selector, `f_stdpath`'s `what` argument
