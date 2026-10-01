@@ -10407,6 +10407,41 @@ fn show_current_file<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor)
     Flow::Normal
 }
 
+/// `buf_write` (`bufwrite.c:1184-1190`): a forced write to a file missing
+/// its user-write bit gains u+w for the write, and the mode is restored
+/// after a successful close. Returns the mode to restore, or `None` when
+/// no chmod happened — not forced, no metadata, already user-writable, or
+/// the chmod itself failed (the write then fails honestly as E212).
+fn force_writable<F: FileIO>(runtime: &ExRuntime<F>, path: &Path, forceit: bool) -> Option<u32> {
+    if !forceit {
+        return None;
+    }
+    let meta = runtime.scripts.io().metadata(path, true).ok()?;
+    if meta.mode & 0o200 != 0 {
+        return None;
+    }
+    runtime
+        .scripts
+        .io()
+        .set_permissions(path, meta.mode | 0o200)
+        .ok()
+        .map(|()| meta.mode)
+}
+
+/// cpoptions flag check for the write paths (`bufwrite.c` `vim_strchr`).
+fn cpo_contains<E: ExEditorAccess>(access: &E, flag: char) -> bool {
+    access.with_ex_editor(|editor| {
+        matches!(
+            option_value(editor, "cpoptions", SetLayer::Effective).cloned(),
+            Some(OptionValue::String(value)) if value.contains(flag)
+        )
+    })
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "buf_write's gate ordering is one sequential contract"
+)]
 fn command_write<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -10488,6 +10523,11 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         Err(error) => return error_flow(runtime, "E749", error.to_string()),
     };
     let contents = String::from_utf8_lossy(&bytes);
+    let restore_perm = force_writable(
+        runtime,
+        &path,
+        command.bang && !cpo_contains::<E>(access, 'W'),
+    );
     if let Err(error) = runtime.scripts.io().write_string(&path, &contents) {
         return error_flow(
             runtime,
@@ -10495,6 +10535,18 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             format!("Can't open file for writing: {error}"),
         );
     }
+    if let Some(mode) = restore_perm {
+        let _ = runtime.scripts.io().set_permissions(&path, mode);
+    }
+    // `bufwrite.c:1191`: a forced write to the buffer's own file clears
+    // 'readonly' unless cpoptions contains 'Z'.
+    let clear_readonly = command.bang
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| write_overwrites_buffer(state.name(), &path))
+        })
+        && !cpo_contains::<E>(access, 'Z');
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
             // The saved name keeps the written path's exact bytes: a lossy
@@ -10508,6 +10560,12 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             state.set_name(saved);
             state.mark_saved();
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
+        }
+        if clear_readonly {
+            let _ =
+                editor
+                    .options_mut()
+                    .set_buffer(buffer, "readonly", OptionValue::Boolean(false));
         }
     });
     // `buf_write` (`bufwrite.c:1861-1866`): post hooks receive the same
@@ -12801,6 +12859,11 @@ fn command_wqall<F: FileIO, E: ExEditorAccess>(
             bytes.push(b'\n');
         }
         let path = PathBuf::from(name);
+        let restore_perm = force_writable(
+            runtime,
+            &path,
+            command.bang && !cpo_contains::<E>(access, 'W'),
+        );
         if let Err(error) = runtime
             .scripts
             .io()
@@ -12812,10 +12875,21 @@ fn command_wqall<F: FileIO, E: ExEditorAccess>(
                 format!("Can't open file for writing: {error}"),
             );
         }
+        if let Some(mode) = restore_perm {
+            let _ = runtime.scripts.io().set_permissions(&path, mode);
+        }
+        let clear_readonly = command.bang && !cpo_contains::<E>(access, 'Z');
         access.with_ex_editor(|editor| {
             if let Ok(state) = editor.buffer_mut(buffer) {
                 state.mark_saved();
                 state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            }
+            if clear_readonly {
+                let _ = editor.options_mut().set_buffer(
+                    buffer,
+                    "readonly",
+                    OptionValue::Boolean(false),
+                );
             }
         });
     }
