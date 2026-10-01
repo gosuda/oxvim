@@ -7,7 +7,7 @@ fn push_alias_source_reports_sid_without_allocating() {
     let mut ctx = ScriptCtx::new(RealFileIO);
     let next_before = ctx.allocate_sid("other.vim");
     let sid = 42;
-    ctx.push_alias_source(sid, 7, 1, "command Hit".to_owned());
+    ctx.push_alias_source(sid, 7, 1, "command Hit".to_owned(), 0);
     assert_eq!(ctx.current_sid(), Some(sid));
     assert_eq!(ctx.current_seq(), 7);
     let next_after = ctx.allocate_sid("another.vim");
@@ -17,7 +17,7 @@ fn push_alias_source_reports_sid_without_allocating() {
 #[test]
 fn push_alias_source_preserves_quoted_snr_expansion() {
     let mut ctx = ScriptCtx::new(RealFileIO);
-    ctx.push_alias_source(8, 1, 1, "command Hit".to_owned());
+    ctx.push_alias_source(8, 1, 1, "command Hit".to_owned(), 0);
     let command = r#"let g:name = '<SNR>''tail' | call <SNR>Func()"#;
     assert_eq!(
         ctx.expand_snr(command, 8),
@@ -32,7 +32,7 @@ fn push_alias_source_preserves_quoted_snr_expansion() {
 #[test]
 fn push_alias_source_expands_snr_after_an_unpaired_apostrophe() {
     let mut ctx = ScriptCtx::new(RealFileIO);
-    ctx.push_alias_source(8, 1, 1, "command Hit".to_owned());
+    ctx.push_alias_source(8, 1, 1, "command Hit".to_owned(), 0);
     for (line, expected) in [
         (
             r#"echo "don't" | call <SNR>Func()"#,

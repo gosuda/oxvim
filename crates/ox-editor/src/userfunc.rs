@@ -84,6 +84,10 @@ pub struct CallFrame {
     caller_argument: ScopeMap,
     /// One-based function-body line currently executing.
     pub current_line: usize,
+    /// Position on the merged execution stack (`estack_T` in
+    /// `runtime_defs.h`): one counter shared with script-source frames, so
+    /// the throwpoint renderer interleaves both frame kinds in push order.
+    pub order: u64,
 }
 
 /// User-function definition/call failure.
@@ -313,6 +317,7 @@ impl UserFunctions {
         first_line: usize,
         last_line: usize,
         scope: &mut Scope,
+        order: u64,
     ) -> Result<UserFunc, UserFuncError> {
         if self.call_stack.len() >= MAX_FUNC_DEPTH {
             return Err(UserFuncError::new(
@@ -379,6 +384,7 @@ impl UserFunctions {
             caller_local,
             caller_argument,
             current_line: 0,
+            order,
         });
         Ok(function)
     }
@@ -404,15 +410,6 @@ impl UserFunctions {
         &self.call_stack
     }
 
-    /// Upstream-style call-stack throwpoint prefix.
-    #[must_use]
-    pub fn throwpoint_prefix(&self) -> String {
-        self.call_stack
-            .iter()
-            .map(|frame| format!("function {}[{}]", frame.name, frame.current_line))
-            .collect::<Vec<_>>()
-            .join("..")
-    }
 }
 
 /// Parses the parameter list between the signature parentheses into

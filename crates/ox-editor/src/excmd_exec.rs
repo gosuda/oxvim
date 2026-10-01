@@ -19,7 +19,7 @@ use ox_excmd::{
     AddrType, Address, AddressBase, CommandFlags, CommandModifier, ErrorCode, ExCommand,
     ModifierKind, ParseError, Parser as ExParser, Range, RangeKind, ResolvedCommand,
     UserCommandInfo, UserCommandMatch, UserCommandProvider, effective_addr_type, effective_flags,
-    resolve_command,
+    parse_modifiers, resolve_command,
 };
 use ox_regex::{
     CompileError as RegexCompileError, Magic, Text as RegexText, compile as compile_regex,
@@ -123,6 +123,15 @@ pub struct VimException {
     /// prefixed with. `None` is upstream's NULL `cmdname` — a user command, an
     /// unresolvable command name, or no command at all — and prefixes `Vim:`.
     pub command: Option<String>,
+    /// Raised under `:silent!` (`emsg_silent`, ex_docmd.c:2373-2379): the
+    /// failure still aborts the cmdline, but nothing is printed and the
+    /// top-level call reports success.
+    pub silent: bool,
+    /// Whether `:try`/`:catch` can see this exception. Upstream raises no
+    /// exception object for a name it cannot resolve (`did_emsg_syntax`,
+    /// ex_docmd.c:2125-2141): the cmdline simply ends, so `catch` never
+    /// matches — `try` still runs `finally`.
+    pub catchable: bool,
 }
 
 impl VimException {
@@ -138,10 +147,33 @@ impl VimException {
         let value = typval_to_display(&self.value, false);
         match &self.kind {
             VimExceptionKind::Throw => value,
+            // A code-less error (`:echoerr`) renders `Vim({cmd}):{text}`
+            // with no `E..:` segment — upstream builds it from the
+            // `emsg`'d text and `cmdname` alone (`get_exception_string`,
+            // ex_eval.c:383-401).
+            VimExceptionKind::Error(code) if code.is_empty() => match &self.command {
+                Some(command) => format!("Vim({command}):{value}"),
+                None => format!("Vim:{value}"),
+            },
             VimExceptionKind::Error(code) => match &self.command {
                 Some(command) => format!("Vim({command}):{code}: {value}"),
                 None => format!("Vim:{code}: {value}"),
             },
+        }
+    }
+
+    /// Display text for the messages area (`emsg`'d body): the raw
+    /// `{code}: {value}` without the `Vim({cmdname}):` prefix that
+    /// `v:exception` carries. Upstream prints the same string `emsg` was
+    /// given; callers of `catch`/`v:exception` see [`Self::message`]
+    /// instead.
+    #[must_use]
+    pub fn emsg_text(&self) -> String {
+        let value = typval_to_display(&self.value, false);
+        match &self.kind {
+            VimExceptionKind::Throw => value,
+            VimExceptionKind::Error(code) if code.is_empty() => value,
+            VimExceptionKind::Error(code) => format!("{code}: {value}"),
         }
     }
 }
@@ -184,7 +216,10 @@ impl fmt::Display for ExecError {
             Self::DuplicateCommand { name } => f
                 .write_str("E174: Command already exists: add ! to replace it")
                 .and_then(|()| write!(f, " ({name})")),
-            Self::Vim(exception) => write!(f, "{}\n{}", exception.message(), exception.throwpoint),
+            Self::Vim(exception) => match exception.throwpoint.as_str() {
+                "" => f.write_str(&exception.message()),
+                throwpoint => write!(f, "{}\n{}", exception.message(), throwpoint),
+            },
             Self::NotImplemented(name) => write!(f, "not implemented: {name}"),
         }
     }
@@ -802,6 +837,10 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// (`cause_errthrow` returns false, `should_abort` returns false). When
     /// nonzero, errors become catchable exceptions.
     pub(crate) try_depth: usize,
+    /// Monotonic counter giving every script-source and function-call
+    /// frame a push order; `throwpoint` merges both stacks through it,
+    /// matching upstream's single `estack` list.
+    pub(crate) frame_order: Cell<u64>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -835,6 +874,7 @@ impl<F: FileIO> ExRuntime<F> {
             swap_names: Rc::new(RefCell::new(HashMap::new())),
             swap_written: Rc::new(RefCell::new(BTreeSet::new())),
             preserve_exit: Rc::new(RefCell::new(false)),
+            frame_order: Cell::new(0),
         }
     }
 
@@ -863,16 +903,79 @@ impl<F: FileIO> ExRuntime<F> {
         }
     }
 
+    /// Next push order for a script-source or function-call frame.
+    fn next_frame_order(&self) -> u64 {
+        let order = self.frame_order.get();
+        self.frame_order.set(order + 1);
+        order
+    }
+
+    /// `v:throwpoint`: `estack_sfile`'s merged walk (runtime.c:164) over
+    /// the two frame stacks, outermost to innermost joined by `..`. The
+    /// keyword (`function `/`script `) prints only on a frame-type
+    /// transition; outer frames carry their `[{es_lnum}]` call line; the
+    /// innermost frame renders `name, line {lnum}`. Empty at the command
+    /// line, matching upstream's `''` there.
     pub(crate) fn throwpoint(&self) -> String {
-        let function = self.functions.throwpoint_prefix();
-        let script = self.scripts.throwpoint_tail();
-        if function.is_empty() {
-            script
-        } else if script == "command line" {
-            function
-        } else {
-            format!("{function}..{script}")
+        #[derive(Copy, Clone, Eq, PartialEq)]
+        enum Kind {
+            Script,
+            Function,
         }
+        let mut frames: Vec<(u64, Kind, &str, usize)> = self
+            .scripts
+            .source_stack()
+            .iter()
+            .filter(|frame| !frame.alias)
+            .map(|frame| {
+                (
+                    frame.order,
+                    Kind::Script,
+                    frame.name.as_str(),
+                    frame.current_line,
+                )
+            })
+            .collect();
+        frames.extend(self.functions.call_stack().iter().map(|frame| {
+            (
+                frame.order,
+                Kind::Function,
+                frame.name.as_str(),
+                frame.current_line,
+            )
+        }));
+        if frames.is_empty() {
+            return String::new();
+        }
+        frames.sort_by_key(|(order, ..)| *order);
+        let last = frames.len() - 1;
+        let mut result = String::new();
+        let mut last_kind = Kind::Script;
+        for (index, (_, kind, name, current_line)) in frames.iter().enumerate() {
+            // `estack_sfile` (runtime.c:193-210): the type keyword prints
+            // only where the frame type changes; `last_type` starts at
+            // ETYPE_SCRIPT, so a leading script frame prints bare while a
+            // leading function frame prints `function `. An outer frame's
+            // `[{es_lnum}]` is its sourcing line frozen where it invoked
+            // the child — the same `current_line` every frame carries.
+            if *kind != last_kind {
+                result.push_str(match kind {
+                    Kind::Script => "script ",
+                    Kind::Function => "function ",
+                });
+                last_kind = *kind;
+            }
+            // The `nvim_exec2` pseudo-source is named `nvim_exec2()`
+            // upstream (`do_source_str` names the estack entry); oxvim
+            // stores the internal `<nvim>` tag, so rename at display.
+            let name = if *name == "<nvim>" { "nvim_exec2()" } else { name };
+            if index == last {
+                let _ = write!(result, "{name}, line {current_line}");
+            } else {
+                let _ = write!(result, "{name}[{current_line}]..");
+            }
+        }
+        result
     }
 
     pub(crate) fn exception(&self, code: &'static str, message: impl Into<String>) -> VimException {
@@ -922,6 +1025,8 @@ impl<F: FileIO> ExRuntime<F> {
             value: Box::new(Typval::String(OxStr(message.into_bytes()))),
             throwpoint: self.throwpoint(),
             command,
+            silent: false,
+            catchable: true,
         }
     }
 }
@@ -970,6 +1075,7 @@ pub(crate) fn program_from_commands(commands: &[ExCommand], line: usize) -> Vec<
                 command: Some(command),
                 line,
                 retried: false,
+                cmdline: true,
             }
         })
         .collect()
@@ -1008,8 +1114,24 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
     machine: &Rc<RefCell<ModeMachine>>,
+    budget: usize,
 ) -> Flow {
+    // A self-replenishing queue (a register that replays itself) cannot
+    // empty, so the host drive passes a finite budget: `line_breakcheck`'s
+    // os_breakcheck cadence (`os/input.c:218-232`) becomes a turn boundary
+    // that lets queued input — including the Ctrl-C that flushes this
+    // typeahead — arrive. `usize::MAX` keeps unbounded paths (`:normal`,
+    // `feedkeys()`) draining in one call.
+    let mut consumed = 0_usize;
     while !access.with_ex_editor(|editor| editor.typeahead().is_empty()) {
+        if consumed >= budget {
+            return Flow::Normal;
+        }
+        // A single `run_once` can consume thousands of keys (insert mode
+        // slurps contiguous text), so the budget counts drained bytes like
+        // upstream's per-character `line_breakcheck`, with a floor of one so
+        // a refill that nets zero progress still spends budget.
+        let before = access.with_ex_editor(|editor| editor.typeahead().len());
         let result = {
             let mut null = crate::indent::NullExprEval;
             let mut eval = crate::indent::IgnoreExprEval::new(&mut null);
@@ -1048,14 +1170,11 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
         }
         let command = machine.borrow_mut().take_ex_command();
         if let Some(command) = command {
-            let logical = vec![LogicalLine {
-                text: command,
-                first_line: runtime.scripts.current_line().max(1),
-            }];
-            let program = parse_program(
+            let program = parse_cmdline_program(
                 &runtime.user_commands,
                 access.with_ex_editor(|editor| editor.current_buffer()),
-                &logical,
+                &command,
+                runtime.scripts.current_line().max(1),
             );
             let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
             if !matches!(flow, Flow::Normal) {
@@ -1069,6 +1188,8 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
                 return flow;
             }
         }
+        let drained = before.saturating_sub(access.with_ex_editor(|editor| editor.typeahead().len()));
+        consumed += drained.max(1);
     }
     Flow::Normal
 }
@@ -1704,23 +1825,11 @@ impl<F: FileIO> ExExecutor<F> {
         access: &E,
         line: &str,
     ) -> Result<ExecOutcome, ExecError> {
-        let logical = if line.contains('\n') {
-            self.runtime
-                .scripts
-                .join_logical_lines(line)
-                .map_err(|error| {
-                    ExecError::Vim(self.runtime.exception(error.code, error.message))
-                })?
-        } else {
-            vec![LogicalLine {
-                text: line.to_owned(),
-                first_line: 1,
-            }]
-        };
-        let program = parse_program(
+        let program = parse_cmdline_program(
             &self.runtime.user_commands,
             access.with_ex_editor(|editor| editor.current_buffer()),
-            &logical,
+            line,
+            1,
         );
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let flow = run_program(
@@ -1869,8 +1978,9 @@ impl<F: FileIO> ExExecutor<F> {
         self.runtime.did_emsg
     }
 
-    /// Consumes queued input through `machine` until nothing is left, running
-    /// finished command lines and mapping right-hand sides as they appear.
+    /// Consumes queued input through `machine` until nothing is left or
+    /// `budget` keys ran, running finished command lines and mapping
+    /// right-hand sides as they appear.
     ///
     /// The host's input loop, `:normal` and `feedkeys()` all reach the same
     /// [`drain_typeahead`] through this, so a mapping behaves the same however
@@ -1883,6 +1993,7 @@ impl<F: FileIO> ExExecutor<F> {
         &mut self,
         access: &E,
         machine: &Rc<RefCell<ModeMachine>>,
+        budget: usize,
     ) -> Result<ExecOutcome, ExecError> {
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let before = access.with_ex_editor(|editor| {
@@ -1900,6 +2011,7 @@ impl<F: FileIO> ExExecutor<F> {
             &mut self.scope,
             self.lua.as_ref(),
             machine,
+            budget,
         );
         let after = access.with_ex_editor(|editor| {
             let buffer = editor.current_buffer();
@@ -1986,7 +2098,10 @@ impl<F: FileIO> ExExecutor<F> {
         let lines = join_source_lines(&mut self.runtime, access, text, cfg!(windows))?;
         let caller_script = self.scope.script.clone();
         let caller_augroup = self.runtime.current_augroup;
-        let sid = self.runtime.scripts.push_source(source_name.to_owned());
+        let sid = self
+            .runtime
+            .scripts
+            .push_source(source_name.to_owned(), self.runtime.next_frame_order());
         let lines = expand_script_lines(&self.runtime.scripts, lines, sid);
         self.runtime.scripts.load_script_scope(sid, &mut self.scope);
         let program = parse_program(
@@ -2014,6 +2129,7 @@ impl<F: FileIO> ExExecutor<F> {
                 Err(error) => Err(error),
             };
         self.runtime.scripts.store_script_scope(sid, &self.scope);
+        self.runtime.scripts.pop_source();
         self.scope.script = caller_script;
         self.runtime.current_augroup = caller_augroup;
         result
@@ -2124,6 +2240,12 @@ pub(crate) struct Instruction {
     /// parse failure is final instead of deferring again, so a line that
     /// never resolves raises instead of recursing.
     retried: bool,
+    /// Whether this slot came from a `nvim_command`-shaped cmdline string
+    /// (one `do_cmdline` over the whole text) rather than a sourced logical
+    /// line: upstream aborts a name it cannot resolve there with
+    /// `did_emsg_syntax` and no catchable exception (`ex_docmd.c:2125-2141,
+    /// 745-753`), while a sourced line throws E492 normally.
+    cmdline: bool,
 }
 
 impl Instruction {
@@ -2158,6 +2280,10 @@ fn flow_to_result(flow: Flow) -> Result<ExecOutcome, ExecError> {
         Flow::Finish => Ok(ExecOutcome::Finished),
 
         Flow::Quit(code) => Ok(ExecOutcome::Quit(code)),
+        // An error suppressed by `:silent!` still aborted the program, but
+        // the caller observes silent success (upstream `emsg_silent`: the
+        // line stops, nothing is reported).
+        Flow::Exception(exception) if exception.silent => Ok(ExecOutcome::Completed),
         Flow::Exception(exception) => Err(ExecError::Vim(exception)),
         Flow::NotImplemented(name) => Err(ExecError::NotImplemented(name)),
         Flow::Break => Err(ExecError::Editor(
@@ -2229,56 +2355,260 @@ pub(crate) fn parse_program(
             .map_or((line.text.as_str(), None), |(command, body)| {
                 (command, Some(body))
             });
-        let commands = match parser.parse(command_text) {
-            Ok(commands) => commands,
+        append_line_instructions(
+            &parser,
+            command_text,
+            heredoc_body,
+            line.first_line,
+            false,
+            &mut program,
+        );
+    }
+    program
+}
+
+/// Parses a `nvim_command`-shaped input: a single buffer of text where each
+/// command's own argument grammar decides how much it consumes — the
+/// `do_cmdline`/`do_one_cmd` model (`ex_docmd.c`) rather than the
+/// sourced-file line reader `join_logical_lines` implements. `|` and `\n`
+/// separators are the parser's job here (bar-separated commands, quoted
+/// string newlines, comment lines, `:normal`-style rest-of-line arguments).
+///
+/// The returned [`Instruction::line`] is `first_line` for every command:
+/// throwpoints point at the invocation, not at offsets inside the string.
+pub(crate) fn parse_cmdline_program(
+    users: &Rc<RefCell<UserCommandRegistry>>,
+    buffer: Option<BufHandle>,
+    text: &str,
+    first_line: usize,
+) -> Vec<Instruction> {
+    let registry = users.borrow();
+    let provider = UserCommandLookup {
+        registry: &registry,
+        buffer,
+    };
+    let parser = ExParser::with_user_commands(&provider);
+    let mut program = Vec::new();
+    append_line_instructions(&parser, text, None, first_line, true, &mut program);
+    program
+}
+
+fn append_line_instructions<P: UserCommandProvider + ?Sized>(
+    parser: &ExParser<'_, P>,
+    command_text: &str,
+    heredoc_body: Option<&str>,
+    first_line: usize,
+    cmdline: bool,
+    program: &mut Vec<Instruction>,
+) {
+    const COMMAND_LIMIT: usize = 1_024;
+    let bytes = command_text.as_bytes();
+    let mut cursor = 0_usize;
+    let mut count = 0_usize;
+    while cursor < command_text.len() {
+        // `*ea.cmdlinep` is where `do_one_cmd` started reading: the whole
+        // line for the first command, and the text just past the separator
+        // — including any whitespace before the command itself — for each
+        // one after it (ex_docmd.c append_command echo).
+        let raw_start = cursor;
+        while cursor < command_text.len() && matches!(bytes[cursor], b' ' | b'\t' | b':') {
+            cursor += 1;
+        }
+        if cursor >= command_text.len() {
+            break;
+        }
+        match bytes[cursor] {
+            // `"` at command position comments to the newline, and a bare
+            // newline is an empty command (ex_docmd.c:2505-2516).
+            b'"' => match command_text[cursor..].find('\n') {
+                Some(relative) => {
+                    cursor += relative + 1;
+                    continue;
+                }
+                None => break,
+            },
+            b'\n' => {
+                cursor += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if count == COMMAND_LIMIT {
+            program.push(deferred_instruction(
+                &command_text[raw_start..],
+                first_line,
+                cmdline,
+            ));
+            return;
+        }
+        // The slice starts at `raw_start` — the chunk boundary `*ea.cmdlinep`
+        // points at — so the leading whitespace stays visible to the parser
+        // (`=<< trim` measures its terminator indent from exactly it).
+        let (command, next) = match parser.parse_first(&command_text[raw_start..]) {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => break,
             // A line that does not parse is stored deferred: the slot keeps
             // no command and `run_instructions` re-resolves it against the
             // live user-command view when its turn comes.
             Err(_) => {
-                if let Some(commands) = parse_put_expression(&parser, command_text) {
-                    commands
+                if cursor == 0
+                    && let Some(commands) = parse_put_expression(parser, command_text)
+                {
+                    let mut read_from = 0_usize;
+                    for command in commands {
+                        let next_from = command.span.end.min(command_text.len());
+                        push_instruction(
+                            program,
+                            command,
+                            command_text,
+                            read_from,
+                            0,
+                            heredoc_body,
+                            first_line,
+                            cmdline,
+                        );
+                        read_from = next_from;
+                        if matches!(bytes.get(read_from), Some(b'|' | b'\n')) {
+                            read_from += 1;
+                        }
+                    }
                 } else {
-                    program.push(Instruction {
-                        command: None,
-                        source: command_text.to_owned(),
-                        typed: command_text.to_owned(),
-                        raw: command_text.to_owned(),
-                        line: line.first_line,
-                        retried: false,
-                    });
-                    continue;
+                    program.push(deferred_instruction(
+                        &command_text[raw_start..],
+                        first_line,
+                        cmdline,
+                    ));
                 }
+                return;
             }
         };
-        // `*ea.cmdlinep` is where `do_one_cmd` started reading: the whole line
-        // for the first command, and the text just past the `|` for each one
-        // after it. `append_command` echoes from there to the end of the line,
-        // so the indentation of `  99print` inside a `:try` shows up in the
-        // message exactly as written.
-        let mut read_from = 0;
-        for mut command in commands {
-            let raw = command_text[read_from..].to_owned();
-            read_from = command.span.end.min(command_text.len());
-            if command_text.as_bytes().get(read_from) == Some(&b'|') {
-                read_from += 1;
+        count += 1;
+        // `ex_append`/`ex_insert`/`ex_change` read input lines from the
+        // cmdline source itself until a lone `.`: those lines are data,
+        // never commands (upstream get_str_line).
+        let reads_lines = matches!(command.command.name(), "append" | "insert" | "change");
+        push_instruction(
+            program,
+            command,
+            command_text,
+            raw_start,
+            raw_start,
+            heredoc_body,
+            first_line,
+            cmdline,
+        );
+        let end = raw_start + next;
+        match bytes.get(end) {
+            // A comment quote `separate_nextcmd` found in an argument is
+            // written over with NUL, so nothing after it is reachable
+            // (ex_docmd.c:4170-4178). `ex_append`/`ex_insert` still read
+            // their input lines after the newline the comment ends at.
+            Some(b'"') => {
+                if reads_lines
+                    && let Some(relative) = command_text[end..].find('\n')
+                {
+                    cursor = consume_append_lines(
+                        program,
+                        command_text,
+                        end + relative + 1,
+                        first_line,
+                        cmdline,
+                    );
+                    continue;
+                }
+                break;
             }
-            let typed = command_text[command.span.start..command.span.end.min(command_text.len())]
-                .to_owned();
-            if let Some(body) = heredoc_body {
-                command.args.push('\n');
-                command.args.push_str(body);
+            Some(b'|' | b'\n') => {
+                if reads_lines && bytes[end] == b'\n' {
+                    cursor = consume_append_lines(
+                        program,
+                        command_text,
+                        end + 1,
+                        first_line,
+                        cmdline,
+                    );
+                    continue;
+                }
+                cursor = end + 1;
             }
-            program.push(Instruction {
-                source: render_command(&command),
-                command: Some(command),
-                typed,
-                raw,
-                line: line.first_line,
-                retried: false,
-            });
+            _ => break,
         }
     }
-    program
+}
+
+/// The `ex_append` input loop over a cmdline string: each following line is
+/// emitted as a raw instruction whose `raw` is the literal line (the
+/// executor walks `program[pc].raw`, matching how upstream `ex_append`
+/// pulls lines from the string until a lone `.`). Returns the position
+/// just past the consumed input.
+fn consume_append_lines(
+    program: &mut Vec<Instruction>,
+    command_text: &str,
+    mut cursor: usize,
+    first_line: usize,
+    cmdline: bool,
+) -> usize {
+    while cursor < command_text.len() {
+        let line_end = command_text[cursor..]
+            .find('\n')
+            .map_or(command_text.len(), |rel| cursor + rel);
+        let line = &command_text[cursor..line_end];
+        program.push(deferred_instruction(line, first_line, cmdline));
+        cursor = if line_end == command_text.len() {
+            command_text.len()
+        } else {
+            line_end + 1
+        };
+        if line.trim() == "." {
+            break;
+        }
+    }
+    cursor
+}
+
+fn deferred_instruction(raw: &str, first_line: usize, cmdline: bool) -> Instruction {
+    Instruction {
+        command: None,
+        source: raw.to_owned(),
+        typed: raw.to_owned(),
+        raw: raw.to_owned(),
+        line: first_line,
+        retried: false,
+        cmdline,
+    }
+}
+
+/// Emits one parsed command as an [`Instruction`]. `raw_start` is the
+/// `*ea.cmdlinep` position for this command (just past the previous
+/// separator, including whitespace) so `raw` echoes exactly what was
+/// written; `parse_base` is the offset the command's span is relative to.
+fn push_instruction(
+    program: &mut Vec<Instruction>,
+    mut command: ExCommand,
+    command_text: &str,
+    raw_start: usize,
+    parse_base: usize,
+    heredoc_body: Option<&str>,
+    first_line: usize,
+    cmdline: bool,
+) {
+    let raw = command_text[raw_start..].to_owned();
+    let typed = command_text[parse_base + command.span.start
+        ..(parse_base + command.span.end).min(command_text.len())]
+        .to_owned();
+    if let Some(body) = heredoc_body {
+        command.args.push('\n');
+        command.args.push_str(body);
+    }
+    program.push(Instruction {
+        source: render_command(&command),
+        command: Some(command),
+        typed,
+        raw,
+        line: first_line,
+        retried: false,
+        cmdline,
+    });
 }
 
 fn parse_put_expression<P: UserCommandProvider + ?Sized>(
@@ -2306,25 +2636,50 @@ fn parse_put_expression<P: UserCommandProvider + ?Sized>(
     None
 }
 
-/// Upstream `cause_errthrow` (`ex_eval.c:189`): when `trylevel == 0` (no
-/// active `:try` block) and the error is not an explicit `:throw`, the error
-/// displays via `emsg` but does not abort script execution. Returns the
-/// error message to display if the flow should be swallowed, or `None` if it
-/// should propagate.
+/// Upstream `emsg()` displays the error and sets `did_emsg`, which then
+/// ends the `do_cmdline` loop (ex_docmd.c:745-753) — the message and the
+/// abort are separate. When `trylevel == 0` (no active `:try` block and no
+/// API `TRY_WRAP`) the error is displayed here via `emsg` and `did_emsg`
+/// is recorded; the flow still propagates to end the program. Returns the
+/// error message to display in that case, or `None` when the flow must
+/// propagate without a message (inside `:try`, or a silent exception). An
+/// uncaught `:throw` *does* display here — `E605` — and still aborts.
 fn swallow_error_message(runtime: &ExRuntime<impl FileIO>, flow: &Flow) -> Option<String> {
     if runtime.try_depth != 0 {
         return None;
     }
-    match flow {
+    let (message, throwpoint) = match flow {
         Flow::Exception(exception) => {
-            if matches!(exception.kind, VimExceptionKind::Error(_)) {
-                Some(exception.message())
-            } else {
-                None
+            if exception.silent {
+                return None;
+            }
+            match &exception.kind {
+                // `e_exception_not_caught_str` (errors.h): an uncaught
+                // `:throw` displays E605 and still fails the command
+                // (bufwrite.c:1861-1866).
+                VimExceptionKind::Throw => (
+                    format!("E605: Exception not caught: {}", exception.emsg_text()),
+                    exception.throwpoint.clone(),
+                ),
+                VimExceptionKind::Error(_) => {
+                    // The frames already unwound by the time this displays,
+                    // so the processing prefix comes from the throwpoint
+                    // frozen at raise — not the now-empty live stacks.
+                    (exception.emsg_text(), exception.throwpoint.clone())
+                }
             }
         }
-        Flow::NotImplemented(name) => Some(format!("E117: Unknown function: {name}")),
-        _ => None,
+        Flow::NotImplemented(name) => (
+            format!("E117: Unknown function: {name}"),
+            runtime.throwpoint(),
+        ),
+        _ => return None,
+    };
+    match throwpoint.as_str() {
+        "" => Some(message),
+        throwpoint => Some(format!(
+            "Error detected while processing {throwpoint}:\n{message}"
+        )),
     }
 }
 
@@ -2400,18 +2755,42 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 match attempt {
                     Ok(Some(_)) => {
                         let flow = run_deferred_line(runtime, access, scope, lua, instruction);
-                        if !matches!(flow, Flow::Normal)
-                            && !display_error_message(runtime, access, &flow)
-                        {
+                        if !matches!(flow, Flow::Normal) {
+                            display_error_message(runtime, access, &flow);
                             return flow;
                         }
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let flow = exec_error_flow(runtime, ExecError::Parse(error));
-                        if !display_error_message(runtime, access, &flow) {
-                            return flow;
+                        let mut flow = exec_error_flow(runtime, ExecError::Parse(error));
+                        if let Flow::Exception(exception) = &mut flow
+                            && matches!(exception.kind, VimExceptionKind::Error(_))
+                        {
+                            // `did_emsg_syntax` (ex_docmd.c:2125-2141):
+                            // inside a cmdline string the name that does not
+                            // resolve ends the whole cmdline without an
+                            // exception `:catch` can match; a sourced line
+                            // throws E492 like any other error.
+                            exception.catchable = !instruction.cmdline;
+                            // The modifier stack parses even when the
+                            // command cannot, so `silent! nosuchcmd` still
+                            // silences the failure (emsg_silent).
+                            if source_silent_bang(&instruction.source) {
+                                exception.silent = true;
+                            }
                         }
+                        // A sourced `silent!` swallows the failure whole:
+                        // nothing is printed and the next line still runs.
+                        if is_silent_exception(&flow) && !instruction.cmdline {
+                            pc += 1;
+                            continue;
+                        }
+                        display_error_message(runtime, access, &flow);
+                        // `did_emsg` aborts the whole do_cmdline
+                        // (ex_docmd.c:745-753): nothing after the failed
+                        // command runs unless `:silent!` or `:catch`
+                        // took the failure instead.
+                        return flow;
                     }
                 }
             } else {
@@ -2423,7 +2802,8 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 // to. `run_deferred_line` reproduces that per-command cadence
                 // while keeping bar-split structural blocks on one program.
                 let flow = run_deferred_line(runtime, access, scope, lua, instruction);
-                if !matches!(flow, Flow::Normal) && !display_error_message(runtime, access, &flow) {
+                if !matches!(flow, Flow::Normal) {
+                    display_error_message(runtime, access, &flow);
                     return flow;
                 }
             }
@@ -2454,11 +2834,11 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         raw: instruction.raw.clone(),
                         line: instruction.line,
                         retried: false,
+                        cmdline: instruction.cmdline,
                     };
                     let flow = run_deferred_line(runtime, access, scope, lua, &probe);
-                    if !matches!(flow, Flow::Normal)
-                        && !display_error_message(runtime, access, &flow)
-                    {
+                    if !matches!(flow, Flow::Normal) {
+                        display_error_message(runtime, access, &flow);
                         return flow;
                     }
                     pc += 1;
@@ -2485,7 +2865,8 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     Ok(value) => value,
                     Err(flow) => return flow,
                 };
-                let Some(block) = find_if(program, pc, end) else {
+                let (markers, terminated) = if_markers(program, pc, end);
+                let Some(block) = if_block(program, pc, markers, terminated.unwrap_or(end)) else {
                     return Flow::Exception(runtime.unterminated_block("E171", "Missing :endif"));
                 };
                 let mut chosen = None;
@@ -2522,14 +2903,59 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         return flow;
                     }
                 }
+                if terminated.is_none() {
+                    // `do_cmdline`'s epilogue (ex_docmd.c:763-769): the body
+                    // already ran; a getline-ended input now reports the
+                    // missing closer while a bare cmdline string ends
+                    // silently.
+                    if instruction.cmdline {
+                        return Flow::Normal;
+                    }
+                    return Flow::Exception(runtime.unterminated_block("E171", "Missing :endif"));
+                }
                 pc = block.end + 1;
                 continue;
             }
             "while" => {
-                let Some(block_end) = find_matching(program, pc, end, "while", "endwhile") else {
-                    return Flow::Exception(
-                        runtime.unterminated_block("E170", "Missing :endwhile"),
-                    );
+                let block_end = match find_matching(program, pc, end, "while", "endwhile") {
+                    Some(block_end) => block_end,
+                    None => {
+                        // Missing `:endwhile` (`do_cmdline` epilogue): the
+                        // body gets exactly one pass — the absent closer is
+                        // the only back edge — and the error reports only
+                        // when a getline-ended input finishes.
+                        match eval_condition(
+                            runtime,
+                            access,
+                            scope,
+                            lua,
+                            skipwhite_trim(&command.args),
+                        ) {
+                            Ok(true) => match run_program(
+                                runtime,
+                                access,
+                                scope,
+                                lua,
+                                program,
+                                pc + 1,
+                                end,
+                            ) {
+                                Flow::Normal | Flow::Continue | Flow::Break => {}
+                                flow => {
+                                    display_error_message(runtime, access, &flow);
+                                    return flow;
+                                }
+                            },
+                            Ok(false) => {}
+                            Err(flow) => return flow,
+                        }
+                        if instruction.cmdline {
+                            return Flow::Normal;
+                        }
+                        return Flow::Exception(
+                            runtime.unterminated_block("E170", "Missing :endwhile"),
+                        );
+                    }
                 };
                 loop {
                     match eval_condition(runtime, access, scope, lua, skipwhite_trim(&command.args))
@@ -2562,8 +2988,42 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     // keeps the pre-existing locked-list signal.
                     Err((code, message)) => return error_flow(runtime, code, message),
                 };
-                let Some(block_end) = find_matching(program, pc, end, "for", "endfor") else {
-                    return Flow::Exception(runtime.unterminated_block("E170", "Missing :endfor"));
+                let block_end = match find_matching(program, pc, end, "for", "endfor") {
+                    Some(block_end) => block_end,
+                    None => {
+                        // Missing `:endfor` (`do_cmdline` epilogue): the
+                        // loop binds only the first element and the body
+                        // runs once; the error reports only when a
+                        // getline-ended input finishes.
+                        if let Some(first) = values.into_iter().next() {
+                            if let Err(flow) =
+                                assign_target(runtime, access, scope, target, first, false)
+                            {
+                                return flow;
+                            }
+                            match run_program(
+                                runtime,
+                                access,
+                                scope,
+                                lua,
+                                program,
+                                pc + 1,
+                                end,
+                            ) {
+                                Flow::Normal | Flow::Continue | Flow::Break => {}
+                                flow => {
+                                    display_error_message(runtime, access, &flow);
+                                    return flow;
+                                }
+                            }
+                        }
+                        if instruction.cmdline {
+                            return Flow::Normal;
+                        }
+                        return Flow::Exception(
+                            runtime.unterminated_block("E170", "Missing :endfor"),
+                        );
+                    }
                 };
                 let mut back_edges: usize = 0;
                 for value in values {
@@ -2594,12 +3054,32 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
             }
             "try" => {
                 let Some(block) = find_try(program, pc, end) else {
+                    // Upstream reports the missing `:endtry` only when a
+                    // getline-ended input finishes (ex_docmd.c:763-769):
+                    // the `:try` body runs first, so a failure inside — an
+                    // unresolvable name hiding the closer inside its dead
+                    // tail — surfaces instead of E600, while a cmdline
+                    // string that simply ends discards the open `:try`
+                    // silently.
+                    runtime.try_depth += 1;
+                    let flow =
+                        run_program(runtime, access, scope, lua, program, pc + 1, end);
+                    runtime.try_depth -= 1;
+                    if !matches!(flow, Flow::Normal) {
+                        display_error_message(runtime, access, &flow);
+                        return flow;
+                    }
+                    if instruction.cmdline {
+                        return Flow::Normal;
+                    }
                     return Flow::Exception(runtime.unterminated_block("E600", "Missing :endtry"));
                 };
                 runtime.try_depth += 1;
                 let mut pending =
                     run_program(runtime, access, scope, lua, program, pc + 1, block.try_end);
-                if let Flow::Exception(exception) = &pending {
+                if let Flow::Exception(exception) = &pending
+                    && exception.catchable
+                {
                     let message = exception.message();
                     let throwpoint = exception.throwpoint.clone();
                     for catch in &block.catches {
@@ -2835,14 +3315,24 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 .modifiers
                 .iter()
                 .any(|modifier| modifier.kind == ModifierKind::Silent && modifier.bang);
-            if silent_bang && matches!(flow, Flow::Exception(_) | Flow::NotImplemented(_)) {
+            // `emsg_silent` (ex_docmd.c:2373-2379): an emsg-level error
+            // under `:silent!` never sets `did_emsg` — nothing is printed
+            // and the rest of the cmdline still runs. A `:throw` exception
+            // is not an emsg and escapes loudly either way.
+            if silent_bang
+                && (matches!(
+                    &flow,
+                    Flow::Exception(exception)
+                        if matches!(exception.kind, VimExceptionKind::Error(_))
+                ) || matches!(&flow, Flow::NotImplemented(_)))
+            {
                 pc += 1;
                 continue;
             }
-            if display_error_message(runtime, access, &flow) {
-                pc += 1;
-                continue;
-            }
+            display_error_message(runtime, access, &flow);
+            // `did_emsg` aborts the whole do_cmdline (ex_docmd.c:745-753):
+            // `nvim_command`, `:` lines and sourced scripts alike stop at
+            // the error; only `:silent!` or `:catch` resumes past it.
             return flow;
         }
         pc += 1;
@@ -2927,7 +3417,7 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
                 let source = render_command(&command);
                 let raw = std::mem::take(&mut remaining);
                 raw[end.min(raw.len())..].clone_into(&mut remaining);
-                if remaining.starts_with('|') {
+                if remaining.starts_with('|') || remaining.starts_with('\n') {
                     remaining = remaining[1..].to_owned();
                 }
                 program.push(Instruction {
@@ -2937,6 +3427,7 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
                     raw,
                     line: instruction.line,
                     retried: false,
+                    cmdline: instruction.cmdline,
                 });
             }
             Ok(None) => break,
@@ -2957,6 +3448,7 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
                     raw,
                     line: instruction.line,
                     retried: true,
+                    cmdline: instruction.cmdline,
                 });
                 break;
             }
@@ -2967,6 +3459,26 @@ fn run_deferred_line<F: FileIO, E: ExEditorAccess>(
     }
     let end = program.len();
     run_program(runtime, access, scope, lua, &program, 0, end)
+}
+
+/// Whether the flow is an error whose message `:silent!` consumed — it
+/// still aborts the cmdline, it just neither prints nor reports an error
+/// at the boundary (upstream `emsg_silent`).
+fn is_silent_exception(flow: &Flow) -> bool {
+    matches!(flow, Flow::Exception(exception) if exception.silent)
+}
+
+/// Whether the text's leading modifier stack contains `:silent!` — the
+/// modifiers parse even when the command they qualify cannot resolve, and
+/// `emsg_silent` applies to that resolution error just the same
+/// (ex_docmd.c:2373-2379).
+fn source_silent_bang(source: &str) -> bool {
+    let mut cursor = 0_usize;
+    parse_modifiers(source, &mut cursor).is_ok_and(|modifiers| {
+        modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Silent && modifier.bang)
+    })
 }
 
 /// Holds `:noautocmd` suppression for one command: every event is ignored on
@@ -3046,8 +3558,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "lua" => command_lua(runtime, access, scope, lua, command),
         "luado" => command_luado(runtime, access, scope, lua, command),
         "luafile" => command_luafile(runtime, access, scope, lua, command),
-        "let" => command_let(runtime, access, scope, lua, &command.args, false),
-        "const" => command_let(runtime, access, scope, lua, &command.args, true),
+        "let" => command_let(runtime, access, scope, lua, command, false),
+        "const" => command_let(runtime, access, scope, lua, command, true),
         "unlet" => command_unlet(runtime, access, scope, &command.args, command.bang),
         "delfunction" => command_delfunction(runtime, command),
         "set" => command_set(
@@ -3097,6 +3609,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
                 // `:throw` produces the value verbatim, with no `Vim(...)`
                 // prefix (`get_exception_string`'s ET_USER branch).
                 command: None,
+                silent: false,
+                catchable: true,
             }),
             Err(flow) => flow,
         },
@@ -4407,7 +4921,15 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
     );
     let function = runtime
         .functions
-        .begin_call(name, sid, args, first_line, last_line, scope)
+        .begin_call(
+            name,
+            sid,
+            args,
+            first_line,
+            last_line,
+            scope,
+            runtime.next_frame_order(),
+        )
         .map_err(|error| userfunc_error_flow(runtime, error))?;
     if let Some(receiver) = receiver {
         scope
@@ -4427,9 +4949,13 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
             .scripts
             .script_name(sid)
             .map_or_else(|| format!("<SNR>{sid}"), std::borrow::ToOwned::to_owned);
-        runtime
-            .scripts
-            .push_alias_source(sid, function.context.seq, function.context.lnum, name);
+        runtime.scripts.push_alias_source(
+            sid,
+            function.context.seq,
+            function.context.lnum,
+            name,
+            runtime.next_frame_order(),
+        );
     }
     if switched_script {
         runtime.scripts.load_script_scope(sid, scope);
@@ -4521,9 +5047,16 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let text = runtime
         .scripts
         .read_script(path)
-        .map_err(|error| ExecError::Io {
-            path: path.to_path_buf(),
-            message: error.to_string(),
+        // `E484: Can't open file {path}` — upstream reports the bare
+        // path, not the OS error (`do_source`'s `EMSG2`, ex_cmds2.c).
+        .map_err(|error| {
+            let _ = error;
+            ExecError::Vim(
+                runtime.exception(
+                    "E484",
+                    format!("Can't open file {}", path.display()),
+                ),
+            )
         })?;
     let lines = join_source_lines(runtime, access, &text, cfg!(windows))?;
     let name = runtime
@@ -4534,7 +5067,7 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
         .to_string();
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
-    let sid = runtime.scripts.push_source(name);
+    let sid = runtime.scripts.push_source(name, runtime.next_frame_order());
     let lines = expand_script_lines(&runtime.scripts, lines, sid);
     runtime.scripts.load_script_scope(sid, scope);
     if load_once {
@@ -4658,9 +5191,10 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
-    args: &str,
+    command: &ExCommand,
     constant: bool,
 ) -> Flow {
+    let args = &command.args;
     if !constant && access.with_ex_editor(|editor| list_scoped_variables(editor, scope, args)) {
         return Flow::Normal;
     }
@@ -4671,19 +5205,80 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
             format!("Undefined variable: {}", args.trim()),
         );
     };
-    let value = if let Some((header, body)) = expression.split_once('\n') {
-        if !header.trim_start().starts_with("<<") {
-            return error_flow(runtime, "E15", "Invalid expression");
+    // The heredoc form is `=<<` at the start of the expression (vars.c:972):
+    // a newline elsewhere — inside a string literal, or inside `()`/`[]`/`{}`
+    // where the evaluator itself reports E15 — is not a heredoc marker.
+    let trimmed = expression.trim_start();
+    let value = if trimmed.starts_with("<<") {
+        // `heredoc_get` (eval/vars.c:759-813): optional `trim`/`eval`
+        // modifier words, then the marker word.
+        let header_end = trimmed.find('\n').unwrap_or(trimmed.len());
+        let mut words = trimmed[2..header_end].trim_start_matches([' ', '\t']);
+        let mut trim = false;
+        loop {
+            let end = words
+                .find(|character: char| character.is_ascii_whitespace())
+                .unwrap_or(words.len());
+            match &words[..end] {
+                "trim" => trim = true,
+                "eval" => {}
+                _ => break,
+            }
+            words = words[end..].trim_start_matches([' ', '\t']);
         }
-        let items = if body.is_empty() {
+        let marker_end = words
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(words.len());
+        let marker = &words[..marker_end];
+        if marker.is_empty() || marker.starts_with('"') {
+            return error_flow(runtime, "E172", "Missing marker".to_owned());
+        }
+        if marker.as_bytes()[0].is_ascii_lowercase() {
+            return error_flow(
+                runtime,
+                "E221",
+                "Marker cannot start with lower case letter".to_owned(),
+            );
+        }
+        let Some(body) = trimmed.get(header_end + 1..) else {
+            return error_flow(runtime, "E991", "Cannot use =<< here".to_owned());
+        };
+        // A cmdline-string heredoc still carries its terminator as the last
+        // line; a sourced line was already normalized by `join_logical_lines`
+        // (terminator consumed, `trim` indent applied).
+        let mut lines: Vec<&str> = if body.is_empty() {
             Vec::new()
         } else {
-            body.strip_suffix('\n')
-                .unwrap_or(body)
-                .split('\n')
-                .map(|line| Typval::String(OxStr::from(line.as_bytes())))
-                .collect()
+            body.strip_suffix('\n').unwrap_or(body).split('\n').collect()
         };
+        // Terminator (eval/vars.c:853-857): the bare marker, or under
+        // `trim` the marker preceded by exactly the command chunk's own
+        // whitespace — any other indent is body text, not the marker.
+        let indented_marker = format!("{}{}", command.cmdline_ws, marker);
+        if let Some(last) = lines.last().copied()
+            && (last == marker || (trim && last == indented_marker))
+        {
+            lines.pop();
+        }
+        let mut text_indent = None::<&str>;
+        let mut items = Vec::new();
+        for line in lines {
+            if trim && text_indent.is_none() && !line.is_empty() {
+                text_indent = Some(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()]);
+            }
+            let content = match text_indent {
+                Some(indent) => {
+                    let matching = line
+                        .bytes()
+                        .zip(indent.bytes())
+                        .take_while(|(left, right)| left == right)
+                        .count();
+                    &line[matching..]
+                }
+                None => line,
+            };
+            items.push(Typval::String(OxStr::from(content.as_bytes())));
+        }
         Typval::list(items)
     } else {
         match eval_text(
@@ -4990,32 +5585,44 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     name: &str,
     args: &str,
 ) -> Flow {
+    let mut pieces = Vec::new();
     if let Ok(value) = eval_text(runtime, access, scope, lua, args) {
-        access.with_ex_editor(|editor| {
-            push_echo_command_message(editor, name, typval_to_display(&value, false));
-        });
-        return Flow::Normal;
-    }
-    let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
-        Ok(expressions) => expressions,
-        Err(error) => return eval_error_flow(runtime, error),
-    };
-    let mut pieces = Vec::with_capacity(expressions.len());
-    for expression in expressions {
-        let value = match eval_text(
-            runtime,
-            access,
-            scope,
-            lua,
-            &args[expression.span.start..expression.span.end],
-        ) {
-            Ok(value) => value,
-            Err(flow) => return flow,
-        };
         pieces.push(typval_to_display(&value, false));
+    } else {
+        let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
+            Ok(expressions) => expressions,
+            Err(error) => return eval_error_flow(runtime, error),
+        };
+        pieces.reserve(expressions.len());
+        for expression in expressions {
+            let value = match eval_text(
+                runtime,
+                access,
+                scope,
+                lua,
+                &args[expression.span.start..expression.span.end],
+            ) {
+                Ok(value) => value,
+                Err(flow) => return flow,
+            };
+            pieces.push(typval_to_display(&value, false));
+        }
     }
     let separator = if name == "echon" { "" } else { " " };
     let text = pieces.join(separator);
+    if name == "echoerr" {
+        // `ex_execute`'s CMD_echoerr arm `emsg_multiline`s the joined
+        // text (eval.c:6329-6337): the value carries no `E..:` code, so
+        // `v:exception` reads `Vim(echoerr):{text}`.
+        return Flow::Exception(VimException {
+            kind: VimExceptionKind::Error(String::new()),
+            value: Box::new(Typval::String(OxStr(text.into_bytes()))),
+            throwpoint: runtime.throwpoint(),
+            command: Some("echoerr".to_owned()),
+            silent: false,
+            catchable: true,
+        });
+    }
     access.with_ex_editor(|editor| {
         push_echo_command_message(editor, name, text);
     });
@@ -5747,14 +6354,15 @@ fn command_execute<F: FileIO, E: ExEditorAccess>(
         }
     }
     let line = pieces.join(" ");
-    let logical = vec![LogicalLine {
-        text: line,
-        first_line: runtime.scripts.current_line(),
-    }];
-    let program = parse_program(
+    // `:execute` runs as one command (upstream `do_cmdline` over the joined
+    // string): throwpoints point at its invocation line, not the split
+    // offsets inside the string.
+    let first_line = runtime.scripts.current_line();
+    let program = parse_cmdline_program(
         &runtime.user_commands,
         access.with_ex_editor(|editor| editor.current_buffer()),
-        &logical,
+        &line,
+        first_line,
     );
     run_program(runtime, access, scope, lua, &program, 0, program.len())
 }
@@ -5922,7 +6530,7 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
             {
                 break error_flow(runtime, "E523", error.to_string());
             }
-            let flow = drain_typeahead(runtime, access, scope, lua, &machine);
+            let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
             if !matches!(flow, Flow::Normal) {
                 break flow;
             }
@@ -5944,7 +6552,7 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
                 {
                     break error_flow(runtime, "E523", error.to_string());
                 }
-                let flow = drain_typeahead(runtime, access, scope, lua, &machine);
+                let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
                 if !matches!(flow, Flow::Normal) {
                     break flow;
                 }
@@ -6075,14 +6683,11 @@ fn command_global<F: FileIO, E: ExEditorAccess>(
                 .with_ex_editor(|editor| cleanup_global_marks(editor, buffer, namespace, &marked));
             return error_flow(runtime, "E16", error.to_string());
         }
-        let logical = vec![LogicalLine {
-            text: nested.to_owned(),
-            first_line: runtime.scripts.current_line(),
-        }];
-        let program = parse_program(
+        let program = parse_cmdline_program(
             &runtime.user_commands,
             access.with_ex_editor(|editor| editor.current_buffer()),
-            &logical,
+            nested,
+            runtime.scripts.current_line(),
         );
         let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
         if !matches!(flow, Flow::Normal) {
@@ -13479,14 +14084,11 @@ fn command_argdo<F: FileIO, E: ExEditorAccess>(
     if start > count {
         return Flow::Normal;
     }
-    let logical = vec![LogicalLine {
-        text: nested.to_owned(),
-        first_line: runtime.scripts.current_line(),
-    }];
-    let program = parse_program(
+    let program = parse_cmdline_program(
         &runtime.user_commands,
         access.with_ex_editor(|editor| editor.current_buffer()),
-        &logical,
+        nested,
+        runtime.scripts.current_line(),
     );
     for entry in start..=end.min(count) {
         let index = entry - 1;
@@ -13558,14 +14160,11 @@ fn command_windo<F: FileIO, E: ExEditorAccess>(
         }
         Err(message) => return error_flow(runtime, "E16", message),
     };
-    let logical = vec![LogicalLine {
-        text: nested.to_owned(),
-        first_line: runtime.scripts.current_line(),
-    }];
-    let program = parse_program(
+    let program = parse_cmdline_program(
         &runtime.user_commands,
         access.with_ex_editor(|editor| editor.current_buffer()),
-        &logical,
+        nested,
+        runtime.scripts.current_line(),
     );
     for &window in windows
         .iter()
@@ -14998,14 +15597,11 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
         );
         let (action_flow, delete) = match &action.kind {
             AutocmdKind::ExString(source) => {
-                let logical = vec![LogicalLine {
-                    text: source.clone(),
-                    first_line: runtime.scripts.current_line(),
-                }];
-                let program = parse_program(
+                let program = parse_cmdline_program(
                     &runtime.user_commands,
                     access.with_ex_editor(|editor| editor.current_buffer()),
-                    &logical,
+                    source,
+                    runtime.scripts.current_line(),
                 );
                 let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
                 (flow, false)
@@ -15050,6 +15646,13 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
             // 0 nothing displays and the break preserves throw-unwind
             // parity for API callers.
             if display_error_message(runtime, access, &action_flow) {
+                // An uncaught `:throw` displays E605 *and* still aborts
+                // (`bufwrite.c:1861-1866`); other displayed errors are
+                // swallowed and the remaining autocmds run.
+                if matches!(&action_flow, Flow::Exception(exception) if matches!(exception.kind, VimExceptionKind::Throw)) {
+                    flow = action_flow;
+                    break;
+                }
                 continue;
             }
             flow = action_flow;
@@ -16365,14 +16968,11 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
                 .map_or(String::new(), |value| value.to_string()),
         );
     let first_line = runtime.scripts.current_line();
-    let logical = vec![LogicalLine {
-        text: expanded,
-        first_line,
-    }];
-    let program = parse_program(
+    let program = parse_cmdline_program(
         &runtime.user_commands,
         access.with_ex_editor(|editor| editor.current_buffer()),
-        &logical,
+        &expanded,
+        first_line,
     );
     let sid = definition.script_context.sid;
     let switched = !definition.keepscript && sid != 0 && runtime.scripts.current_sid() != Some(sid);
@@ -16381,7 +16981,13 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
         let name = format!("command {name}");
         runtime
             .scripts
-            .push_alias_source(sid, runtime.scripts.current_seq(), 0, name);
+            .push_alias_source(
+                sid,
+                runtime.scripts.current_seq(),
+                0,
+                name,
+                runtime.next_frame_order(),
+            );
         if switched {
             runtime.scripts.load_script_scope(sid, scope);
         }
@@ -18540,7 +19146,13 @@ fn address_domain_bounds(editor: &Editor, addr_type: AddrType) -> (usize, usize)
 /// port has neither a buffer load state ordered by number nor a quickfix
 /// list, so there is no limit to compare against.
 fn check_address_domain(editor: &Editor, command: &ExCommand) -> Result<(), String> {
-    if !effective_flags(&command.command).contains(CommandFlags::RANGE) {
+    // `invalid_range` bounds only `eap->argt & EX_RANGE` (ex_docmd.c:3761):
+    // a bare `:{lnum}` has no command entry — `argt` is zero — so `:3` in a
+    // one-line buffer clamps instead of erroring (`ex_range_without_command`
+    // calls `invalid_range` and finds no flags to check).
+    if matches!(command.command, ResolvedCommand::RangeOnly)
+        || !effective_flags(&command.command).contains(CommandFlags::RANGE)
+    {
         return Ok(());
     }
     if command.range.is_none() {
@@ -18695,49 +19307,64 @@ struct IfBranch {
     end: usize,
 }
 
-fn find_if(program: &[Instruction], open: usize, limit: usize) -> Option<IfBlock> {
+/// `:if`-body marker scan: the depth-0 `elseif`/`else` line positions and
+/// the depth-0 `endif` position. `terminated == None` means the program
+/// ended inside the block — upstream still picks and runs a branch from
+/// the markers before reporting the missing closer.
+fn if_markers(
+    program: &[Instruction],
+    open: usize,
+    limit: usize,
+) -> (Vec<usize>, Option<usize>) {
     let mut depth = 0usize;
     let mut markers = Vec::new();
     let mut index = open + 1;
     while index < limit {
         match program[index].name() {
             "if" => depth += 1,
-            "endif" if depth == 0 => {
-                let mut branches = Vec::new();
-                let mut condition =
-                    Some(skipwhite_trim(&program[open].command.as_ref()?.args).to_owned());
-                let mut start = open + 1;
-                for marker in markers {
-                    branches.push(IfBranch {
-                        condition,
-                        start,
-                        end: marker,
-                    });
-                    condition = match program[marker].name() {
-                        "elseif" => {
-                            Some(skipwhite_trim(&program[marker].command.as_ref()?.args).to_owned())
-                        }
-                        _ => None,
-                    };
-                    start = marker + 1;
-                }
-                branches.push(IfBranch {
-                    condition,
-                    start,
-                    end: index,
-                });
-                return Some(IfBlock {
-                    branches,
-                    end: index,
-                });
-            }
+            "endif" if depth == 0 => return (markers, Some(index)),
             "endif" => depth = depth.saturating_sub(1),
             "elseif" | "else" if depth == 0 => markers.push(index),
             _ => {}
         }
         index += 1;
     }
-    None
+    (markers, None)
+}
+
+/// Builds the branch table over `[open + 1, close)` from a marker scan.
+/// `close` is the `endif` position when the block terminated, else the
+/// program end.
+fn if_block(
+    program: &[Instruction],
+    open: usize,
+    markers: Vec<usize>,
+    close: usize,
+) -> Option<IfBlock> {
+    let mut branches = Vec::new();
+    let mut condition = Some(skipwhite_trim(&program[open].command.as_ref()?.args).to_owned());
+    let mut start = open + 1;
+    for marker in markers {
+        branches.push(IfBranch {
+            condition,
+            start,
+            end: marker,
+        });
+        condition = match program[marker].name() {
+            "elseif" => Some(skipwhite_trim(&program[marker].command.as_ref()?.args).to_owned()),
+            _ => None,
+        };
+        start = marker + 1;
+    }
+    branches.push(IfBranch {
+        condition,
+        start,
+        end: close,
+    });
+    Some(IfBlock {
+        branches,
+        end: close,
+    })
 }
 
 struct TryBlock {

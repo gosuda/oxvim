@@ -532,7 +532,7 @@ fn call_feedkeys_builtin<F: FileIO, E: ExEditorAccess>(
     })?;
     if execute {
         let machine = std::rc::Rc::new(std::cell::RefCell::new(ModeMachine::default()));
-        let flow = drain_typeahead(runtime, access, scope, lua, &machine);
+        let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
         if !matches!(flow, Flow::Normal) {
             return Err(flow_to_eval_error(flow, "feedkeys"));
         }

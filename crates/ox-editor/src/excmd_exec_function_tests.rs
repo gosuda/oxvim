@@ -617,7 +617,7 @@ fn evaluator_error_inside_user_function_enters_caller_catch_frame() {
     );
     assert_eq!(
         global_string(exec.scope(), "throwpoint").as_deref(),
-        Some("function BrokenBuiltin[1]..script <test>[1]")
+        Some("<test>[7]..function BrokenBuiltin, line 1")
     );
 }
 
@@ -642,7 +642,7 @@ fn public_function_entry_points_preserve_user_throw() {
         };
         assert_eq!(exception.kind, VimExceptionKind::Throw);
         assert_eq!(exception.message(), "wtf");
-        assert_eq!(exception.throwpoint, "function Foo[1]..script <test>[1]");
+        assert_eq!(exception.throwpoint, "function Foo, line 1");
     }
 }
 
@@ -772,11 +772,11 @@ fn recursion_exceeds_maxfuncdepth_e132() {
     let mut scope = Scope::new();
     for _ in 0..MAX_FUNC_DEPTH {
         funcs
-            .begin_call("Recurse", 0, vec![], 1, 1, &mut scope)
+            .begin_call("Recurse", 0, vec![], 1, 1, &mut scope, 0)
             .unwrap();
     }
     let err = funcs
-        .begin_call("Recurse", 0, vec![], 1, 1, &mut scope)
+        .begin_call("Recurse", 0, vec![], 1, 1, &mut scope, 0)
         .unwrap_err();
     assert_eq!(err.code, "E132");
 }
@@ -3499,10 +3499,11 @@ fn getchar_returns_full_multibyte_modified_character() {
 }
 
 /// Sourcing is not `:try`: upstream leaves `trylevel` alone in `do_source`,
-/// so an error inside a sourced script displays and continues both the
-/// script and the caller instead of unwinding to the top.
+/// so an error inside a sourced script displays and `did_emsg` aborts the
+/// rest of the file — verified against the reference binary, where the
+/// line after an uncaught `call` error never executes.
 #[test]
-fn sourced_script_error_continues_script_and_caller() {
+fn sourced_script_error_displays_and_aborts() {
     let io = MemoryFileIO::new();
     io.insert(
         "/inner.vim",
@@ -3510,7 +3511,11 @@ fn sourced_script_error_continues_script_and_caller() {
     );
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(io);
-    exec.source_file(&editor, "/inner.vim".as_ref()).unwrap();
-    assert_eq!(global_number(exec.scope(), "inner_after"), Some(1));
+    let error = exec.source_file(&editor, "/inner.vim".as_ref()).unwrap_err();
+    assert!(
+        error.to_string().contains("NoSuchFunc123"),
+        "got {error}"
+    );
+    assert_eq!(global_number(exec.scope(), "inner_after"), None);
     assert!(exec.did_emsg());
 }

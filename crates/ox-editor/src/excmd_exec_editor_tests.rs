@@ -9351,21 +9351,26 @@ fn comclear_wipes_global_and_buffer_local_tables() {
     assert!(error.to_string().contains("E492"), "{error}");
 }
 
-/// Upstream `cause_errthrow` (`ex_eval.c:189`): at `trylevel == 0` an
-/// uncaught error displays and sets `did_emsg`, but the next command still
-/// runs. The core script runner keeps `try_depth == 0` for startup paths.
+/// Upstream `emsg()` displays the error and `did_emsg` ends the
+/// `do_cmdline` loop (`ex_docmd.c:745-753`): nothing after the failing
+/// command runs — verified against the reference binary, where the line
+/// after an uncaught `call` error never executes. The core script runner
+/// keeps `try_depth == 0` for startup paths.
 #[test]
-fn depth_zero_script_error_displays_and_continues() {
+fn depth_zero_script_error_displays_and_aborts() {
     let (editor, mut executor) = setup();
-    let outcome = executor
+    let error = executor
         .execute_script_core(
             &editor,
             "starter.vim",
             "call NoSuchFunc123()\nlet g:after = 1\n",
         )
-        .unwrap();
-    assert_eq!(outcome, ExecOutcome::Completed);
-    assert!(global_flag(&executor, "after"));
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("NoSuchFunc123"),
+        "got {error}"
+    );
+    assert!(!global_flag(&executor, "after"));
     assert!(executor.did_emsg());
 }
 

@@ -250,6 +250,12 @@ pub struct ExCommand {
     pub register: Option<char>,
     /// Uninterpreted argument tail after count/register extraction.
     pub args: String,
+    /// Leading whitespace of the command-line chunk this command was read
+    /// from — `*eap->cmdlinep`'s own whitespace prefix, the text just past
+    /// the previous `|`/`\n` separator including whitespace before `:`s and
+    /// modifiers (eval/vars.c:772-776). `=<< trim` requires the terminator
+    /// line to carry exactly this indent.
+    pub cmdline_ws: String,
     /// Byte range occupied by this command in the original input.
     pub span: std::ops::Range<usize>,
 }
@@ -303,8 +309,25 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         let mut cursor = 0;
         while cursor < input.len() {
             cursor = skip_space_and_colons(input, cursor);
-            if cursor >= input.len() || input.as_bytes()[cursor] == b'"' {
+            if cursor >= input.len() {
                 break;
+            }
+            // `"` at command position is a comment that ends at the newline
+            // (ex_docmd.c:2505-2511); a bare `\n` is an empty command that
+            // `do_one_cmd` steps over (ex_docmd.c:2513-2516).
+            match input.as_bytes()[cursor] {
+                b'"' => match input[cursor..].find('\n') {
+                    Some(relative) => {
+                        cursor += relative + 1;
+                        continue;
+                    }
+                    None => break,
+                },
+                b'\n' => {
+                    cursor += 1;
+                    continue;
+                }
+                _ => {}
             }
             if commands.len() == MAX_COMMANDS {
                 return Err(error(ErrorCode::E488, cursor, "too many commands"));
@@ -312,8 +335,13 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             let (command, next) = self.parse_one(input, cursor)?;
             commands.push(command);
             cursor = next;
-            if cursor < input.len() && input.as_bytes()[cursor] == b'|' {
-                cursor += 1;
+            match input.as_bytes().get(cursor) {
+                // A comment quote `separate_nextcmd` found in an argument is
+                // written over with NUL, so nothing after it is reachable
+                // (ex_docmd.c:4170-4178).
+                Some(b'"') => break,
+                Some(b'|' | b'\n') => cursor += 1,
+                _ => {}
             }
         }
         Ok(commands)
@@ -376,6 +404,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                     count: None,
                     register: None,
                     args: String::new(),
+                    cmdline_ws: chunk_ws(input, start).to_owned(),
                     span: start..cursor,
                 },
                 cursor,
@@ -416,6 +445,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                 range,
                 bang,
                 usefilter,
+                cmdline_ws: chunk_ws(input, start).to_owned(),
                 count,
                 register,
                 args,
@@ -459,7 +489,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             usefilter = true;
             cursor += 1;
         }
-        let end = command_end(input, cursor, flags, usefilter, command.name());
+        let end = command_end(input, cursor, flags, usefilter, &command);
         // `ea.arg = skipwhite(p)` (`ex_docmd.c`): space and tab only, so a CR
         // or a newline that ends the argument stays in it.
         let args_start = skip_ascii_space(input, cursor).min(end);
@@ -479,6 +509,12 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         };
 
         let mut args = input[args_start..args_end].to_owned();
+        // The shell-family scan removes each `\` that continues the line
+        // (`STRMOVE`, ex_docmd.c:2312-2318), leaving a real newline inside
+        // the argument that the handler's nested cmdline splits on.
+        if shell_arg_family(command.name(), flags, usefilter) {
+            args = args.replace("\\\n", "\n");
+        }
         let register = if flags.contains(CommandFlags::REGSTR) {
             take_register(&mut args)
         } else {
@@ -593,7 +629,15 @@ fn is_one_letter_command(bytes: &[u8], start: usize) -> bool {
         || (second == b'r' && at(2) != b'e')
 }
 
-fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifier>, ParseError> {
+/// Parses the modifier stack (`:silent!`, `:verbose`, counts, …) at
+/// `*cursor`, advancing it to the first byte after the last modifier.
+/// Exposed so a host can inspect modifiers on a line whose command itself
+/// fails to resolve (e.g. `silent!` still suppresses that resolution error).
+///
+/// # Errors
+///
+/// Returns an error when a modifier is malformed.
+pub fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifier>, ParseError> {
     let mut modifiers = Vec::new();
     loop {
         let saved = *cursor;
@@ -1112,52 +1156,167 @@ fn parse_pattern(
     Ok((input[pattern_start..cursor].to_owned(), cursor))
 }
 
+/// The argument-scan family that ends at a newline (`ex_docmd.c:2295-2324`):
+/// `eap->usefilter`, plus the non-`TRLBAR` shell commands whose `CMD_*` entry
+/// takes the whole line verbatim.
+fn shell_arg_family(name: &str, flags: CommandFlags, usefilter: bool) -> bool {
+    usefilter
+        || (!flags.contains(CommandFlags::TRLBAR)
+            && matches!(name, "!" | "terminal" | "global" | "vglobal"))
+}
+
+/// Whitespace prefix of `*eap->cmdlinep` for a command parsed at `before`:
+/// the text just past the previous `|`/`\n` separator — or the start of the
+/// input — through the first non-blank byte (eval/vars.c:772-776). A `|` or
+/// `\n` earlier than the separator cannot precede a parsed command: anything
+/// that swallows it (`:normal`, user commands, quoted arguments) also
+/// swallows the text this command was read from, so the last separator
+/// before `before` is always the real chunk boundary.
+fn chunk_ws(input: &str, before: usize) -> &str {
+    let chunk_start = input[..before]
+        .rfind(['|', '\n'])
+        .map_or(0, |pos| pos + 1);
+    let indent_len = input[chunk_start..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    &input[chunk_start..chunk_start + indent_len]
+}
+
 fn command_end(
     input: &str,
     args_start: usize,
     flags: CommandFlags,
     usefilter: bool,
-    name: &str,
+    command: &ResolvedCommand,
 ) -> usize {
-    if matches!(name, "append" | "change" | "insert") {
-        return input.len();
+    let name = command.name();
+    // `do_one_cmd` ends a shell-family argument at a newline (`ex_docmd.c`
+    // 2295-2324): `:read !cmd`, `:write !cmd`, `:!`, `:terminal`, `:global`
+    // and `:vglobal`. A backslash-newline inside is a line continuation that
+    // survives the scan.
+    if shell_arg_family(name, flags, usefilter) {
+        return newline_command_end(input, args_start, true);
     }
-    // ":read !cmd" and ":write !cmd" own the rest of the line: upstream skips
-    // separate_nextcmd for them (ex_docmd.c:2291-2313), so a "|" inside the
-    // shell command is not a command separator.
-    if usefilter {
-        return input.len();
+    // `separate_nextcmd` scans a `TRLBAR` argument for `|`/comment/newline
+    // (ex_docmd.c:4130-4178). The substitute family shares the scan so a
+    // separator after its flags still splits the command.
+    if flags.contains(CommandFlags::TRLBAR)
+        || matches!(name, "substitute" | "smagic" | "snomagic")
+    {
+        return trlbar_command_end(input, args_start, flags, name);
     }
+    // `cmd_has_expr_args` (ex_docmd.c:1464-1473): `do_one_cmd` bounds the
+    // argument with a `skip_expr` loop, so the command ends at the first
+    // `|` or `\n` the expression scan cannot consume.
+    if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {
+        return expression_command_end(input, args_start, NewlineEnd::AnyDepth);
+    }
+    // Handlers that evaluate their own argument and then split the tail with
+    // `check_nextcmd`: a newline separates only at the expression's top
+    // level — inside `()`/`[]`/`{}` it stays in the argument.
     if matches!(
         name,
-        "execute"
-            | "let"
+        "let"
+            | "const"
             | "call"
-            | "echo"
-            | "echon"
-            | "echomsg"
-            | "echoerr"
             | "for"
             | "if"
             | "elseif"
             | "while"
             | "return"
             | "throw"
+            | "eval"
+            | "catch"
+            | "cexpr"
+            | "cgetexpr"
+            | "lexpr"
+            | "lgetexpr"
+            | "caddexpr"
+            | "laddexpr"
     ) {
-        return expression_command_end(input, args_start);
+        return expression_command_end(input, args_start, NewlineEnd::Toplevel);
     }
-    // Every other non-`TRLBAR` command owns the whole remainder. The one
-    // handler-owned exception is `wincmd`: `ex_wincmd` (ex_docmd.c:6523-6549)
-    // consumes the window-command key itself and then splits the tail with
-    // `check_nextcmd` (ex_docmd.c:4630-4637), so the command ends after its
-    // key form instead of after the whole line.
+    // `ex_wincmd` (ex_docmd.c:6523-6549) consumes the window-command key
+    // itself and then splits the tail with `check_nextcmd`
+    // (ex_docmd.c:4630-4637), so the command ends after its key form instead
+    // of after the whole line.
     if name == "wincmd" {
         return wincmd_command_end(input, args_start);
     }
-    let is_substitute = name == "substitute";
-    if !flags.contains(CommandFlags::TRLBAR) && !is_substitute {
+    // Commands whose argument is the whole remainder of the cmdline: script
+    // source a language handler evaluates, a `:command`/`:autocmd` body that
+    // keeps following lines as its definition, `:normal` keys, a nested
+    // cmdline the handler re-executes (`:windo let a\nlet b` runs both per
+    // window), and user commands (`:Mc a\nlet x` puts the newline in
+    // `<args>`). A newline is content here, never a separator.
+    if matches!(command, ResolvedCommand::User(_))
+        || matches!(
+            name,
+            "normal"
+                | "command"
+                | "autocmd"
+                | "debug"
+                | "lua"
+                | "luado"
+                | "mzscheme"
+                | "perl"
+                | "perldo"
+                | "python"
+                | "python3"
+                | "pythonx"
+                | "pyx"
+                | "pyxdo"
+                | "ruby"
+                | "rubydo"
+                | "tcl"
+                | "tcldo"
+                | "argdo"
+                | "bufdo"
+                | "tabdo"
+                | "windo"
+                | "confirm"
+                | "browse"
+                | "unsilent"
+                | "filter"
+        )
+    {
         return input.len();
     }
+    // Every other non-`TRLBAR` handler parses its own argument and then
+    // splits the tail with `check_nextcmd`, so the command ends at the
+    // first newline (verified against `nvim_command`: `:edit`,
+    // `:delfunction`, `:syntax` and friends all resume after `\n`).
+    newline_command_end(input, args_start, false)
+}
+
+/// Ends a command at its first newline separator. `continuation` marks the
+/// shell-family scan where a backslash-newline pair is a line continuation
+/// inside the argument rather than a separator (ex_docmd.c:2312-2318).
+fn newline_command_end(input: &str, args_start: usize, continuation: bool) -> usize {
+    let bytes = input.as_bytes();
+    let mut cursor = args_start;
+    while let Some(&byte) = bytes.get(cursor) {
+        if byte == b'\n'
+            && !(continuation && cursor > args_start && bytes[cursor - 1] == b'\\')
+        {
+            return cursor;
+        }
+        cursor += 1;
+    }
+    input.len()
+}
+
+/// The `separate_nextcmd` scan for a `TRLBAR` argument: the command ends at
+/// `|` (except :append/:change/:insert), a `"` comment (except `EX_NOTRLCOM`),
+/// or a newline (ex_docmd.c:4130-4178).
+fn trlbar_command_end(
+    input: &str,
+    args_start: usize,
+    flags: CommandFlags,
+    name: &str,
+) -> usize {
+    let bar_breaks = !matches!(name, "append" | "change" | "insert");
     let bytes = input.as_bytes();
     let mut escaped = false;
     let mut cursor = args_start;
@@ -1179,13 +1338,18 @@ fn command_end(
             cursor += 1;
             continue;
         }
-        if byte == b'|' {
+        if byte == b'|' && bar_breaks {
             return cursor;
         }
         if byte == b'"'
             && !flags.contains(CommandFlags::NOTRLCOM)
             && !is_comment_quote_exception(bytes, args_start, cursor, flags, name)
         {
+            return cursor;
+        }
+        // `separate_nextcmd` ends a TRLBAR argument at a newline too
+        // (ex_docmd.c:4170-4178).
+        if byte == b'\n' {
             return cursor;
         }
         cursor += 1;
@@ -1226,13 +1390,27 @@ fn wincmd_command_end(input: &str, args_start: usize) -> usize {
         cursor += usize::from(bytes.get(cursor).is_some());
     }
     cursor = skip_ascii_space(input, cursor);
-    if bytes.get(cursor) == Some(&b'|') {
+    // `check_nextcmd` accepts `|` or `\n` as the separator (ex_docmd.c:4648).
+    if matches!(bytes.get(cursor), Some(b'|' | b'\n')) {
         return cursor;
     }
     input.len()
 }
 
-fn expression_command_end(input: &str, start: usize) -> usize {
+/// Where a newline ends an expression-scanned argument. Mirrors the two ways
+/// upstream's `do_one_cmd` bounds the text a command sees (`ex_docmd.c`):
+/// the `skip_expr` loop used by `cmd_has_expr_args` aborts wherever the
+/// expression parser stops — including inside `()`, `[]`, `{}` — while the
+/// `let`/`if`/... handlers evaluate the argument themselves and then run
+/// `check_nextcmd`, so a newline inside nested forms stays in the argument
+/// for the evaluator to reject (E15 "Invalid expression").
+#[derive(Clone, Copy)]
+enum NewlineEnd {
+    AnyDepth,
+    Toplevel,
+}
+
+fn expression_command_end(input: &str, start: usize, newline: NewlineEnd) -> usize {
     let bytes = input.as_bytes();
     let mut cursor = start;
     let mut quote = None;
@@ -1264,9 +1442,87 @@ fn expression_command_end(input: &str, start: usize) -> usize {
             {
                 return cursor;
             }
+            b'=' if matches!(newline, NewlineEnd::Toplevel)
+                && nesting == 0
+                && !matches!(
+                    cursor.checked_sub(1).and_then(|prev| bytes.get(prev)),
+                    Some(b'=' | b'+' | b'-' | b'*' | b'/' | b'%' | b'.')
+                )
+                && bytes.get(cursor + 1) == Some(&b'<')
+                && bytes.get(cursor + 2) == Some(&b'<') =>
+            {
+                return heredoc_command_end(input, cursor + 3, start);
+            }
+            b'\n' if matches!(newline, NewlineEnd::AnyDepth) || nesting == 0 => {
+                return cursor;
+            }
             _ => {}
         }
         cursor += 1;
+    }
+    input.len()
+}
+
+/// The command boundary for `let`/`const` heredocs (`=<<`).
+///
+/// `ex_let` hands the text after `<<` to `heredoc_get` (eval/vars.c:739-912),
+/// which reads body lines out of the cmdline string itself until the
+/// terminator line — so the command's argument runs through the terminator,
+/// not to the first newline. `after_shift` is the index just past `<<` and
+/// `args_start` the argument's start (used to find the command line's own
+/// indentation, which `trim` allows on the terminator line, vars.c:853-857).
+fn heredoc_command_end(input: &str, after_shift: usize, args_start: usize) -> usize {
+    let header_end = input[after_shift..]
+        .find('\n')
+        .map_or(input.len(), |rel| after_shift + rel);
+    // Words after `<<`: optional `trim`/`eval` modifiers, then the marker.
+    let mut words = input[after_shift..header_end].trim_start_matches([' ', '\t']);
+    let mut trim = false;
+    loop {
+        let end = words
+            .find(|character: char| character.is_ascii_whitespace())
+            .unwrap_or(words.len());
+        match &words[..end] {
+            "trim" => trim = true,
+            "eval" => {}
+            _ => break,
+        }
+        words = words[end..].trim_start_matches([' ', '\t']);
+    }
+    let marker_end = words
+        .find(|character: char| character.is_ascii_whitespace())
+        .unwrap_or(words.len());
+    let marker = &words[..marker_end];
+    // A missing or invalid marker fails inside `heredoc_get` before any body
+    // line is consumed: the command owns the rest of the string and the
+    // handler reports E172/E221/E991.
+    if marker.is_empty()
+        || marker.starts_with('"')
+        || marker.as_bytes()[0].is_ascii_lowercase()
+    {
+        return input.len();
+    }
+    // `trim` allows the terminator to repeat the whitespace prefix of
+    // `*eap->cmdlinep` — the command chunk's own indent, which for a command
+    // after `|` is the whitespace that follows the bar (eval/vars.c:853-857).
+    let indent = chunk_ws(input, args_start);
+    let mut body = header_end + 1;
+    while body < input.len() {
+        let line_end = input[body..]
+            .find('\n')
+            .map_or(input.len(), |rel| body + rel);
+        let line = &input[body..line_end];
+        let marker_line = if trim {
+            line.strip_prefix(indent).unwrap_or(line)
+        } else {
+            line
+        };
+        if marker_line == marker {
+            // The argument ends at the newline terminating the marker line
+            // (or at end of input when the marker is last).
+            return line_end;
+        }
+        body = line_end + 1;
     }
     input.len()
 }

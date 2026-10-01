@@ -697,7 +697,22 @@ fn terminal_cursor(grid: &ComposedGrid, state: &TuiState) -> Option<(usize, usiz
     (row < height).then_some((rect.y + 1 + row, rect.x + 1 + column))
 }
 
+/// Maximum encoded key bytes batched into one `nvim_input` request — upstream
+/// `KEY_BUFFER_SIZE` (tui/input.h). A paste, resize, or mouse event flushes
+/// pending keys first so event order is preserved, matching `tinput_flush`.
+const KEY_BUFFER_SIZE: usize = 0x1000;
+
+fn flush_key_buffer(client: &mut Client, keys: &mut String) -> Result<(), TuiError> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    client.input(OxStr::from(keys.as_str()))?;
+    keys.clear();
+    Ok(())
+}
+
 fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
+    let mut keys = String::new();
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
         match event::read().map_err(TuiError::Input)? {
             Event::Key(key) => {
@@ -709,11 +724,15 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 }
                 state.chrome.keypress();
                 if let Some(input) = encode_key(key) {
-                    client.input(OxStr::from(input.as_str()))?;
+                    if keys.len() + input.len() > KEY_BUFFER_SIZE {
+                        flush_key_buffer(client, &mut keys)?;
+                    }
+                    keys.push_str(&input);
                 }
             }
             Event::Paste(data) => {
                 state.chrome.keypress();
+                flush_key_buffer(client, &mut keys)?;
                 match client.paste(OxStr::from(data.as_str())) {
                     // A refused paste (`'nomodifiable'`, a cancelled
                     // `vim.paste`, ...) is a remote rejection the server
@@ -723,7 +742,10 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                     Err(error) => return Err(TuiError::Client(error)),
                 }
             }
-            Event::Resize(columns, rows) => client.try_resize(columns, rows)?,
+            Event::Resize(columns, rows) => {
+                flush_key_buffer(client, &mut keys)?;
+                client.try_resize(columns, rows)?;
+            }
             Event::Mouse(mouse) => {
                 let dimensions = state
                     .screen
@@ -739,13 +761,14 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 });
                 if !hit_chrome {
                     let (button, action, modifier) = encode_mouse(mouse);
+                    flush_key_buffer(client, &mut keys)?;
                     client.input_mouse(&button, &action, &modifier, mouse.row, mouse.column)?;
                 }
             }
             _ => {}
         }
     }
-    Ok(())
+    flush_key_buffer(client, &mut keys)
 }
 
 /// Spawn an embed command, restoring and diagnosing process-edge failures in `run`.

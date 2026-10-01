@@ -16,7 +16,7 @@ pub use expand::{CmdlineContext, CmdlineSpecial, ExpansionPart, expand_with, sca
 pub use parser::{
     Address, AddressBase, CommandModifier, ErrorCode, ExCommand, ModifierKind, ParseError, Parser,
     PreviewMagic, PreviewPattern, Range, RangeKind, RangeSeparator, effective_addr_type,
-    effective_flags, parse_preview_pattern,
+    effective_flags, parse_modifiers, parse_preview_pattern,
 };
 
 impl ExCommand {

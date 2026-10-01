@@ -614,6 +614,16 @@ pub struct SourceFrame {
     pub definition_line: usize,
     /// One-based physical line currently executing.
     pub current_line: usize,
+    /// Position on the merged execution stack (`estack_T` in
+    /// `runtime_defs.h`): one counter shared with function-call frames, so
+    /// the throwpoint renderer interleaves script and function entries in
+    /// push order.
+    pub order: u64,
+    /// Whether this is a context-switch frame (`push_alias_source`) rather
+    /// than a real `:source`. Alias frames observe the *defining* script's
+    /// scope for `s:`/`<SNR>`; upstream they are not `estack` entries and
+    /// never appear in `v:throwpoint`.
+    pub alias: bool,
 }
 
 /// Registry entry for one sourced script.
@@ -1018,7 +1028,7 @@ impl<F: FileIO> ScriptCtx<F> {
     /// sourcing. Named contexts that are not files — `<command line>` and
     /// friends — are not looked up, matching `do_source_str`, which never
     /// consults the registry.
-    pub fn push_source(&mut self, name: String) -> Sid {
+    pub fn push_source(&mut self, name: String, order: u64) -> Sid {
         let sid = self
             .reusable_sid(&name)
             .unwrap_or_else(|| self.allocate_sid(&name));
@@ -1029,6 +1039,8 @@ impl<F: FileIO> ScriptCtx<F> {
             name,
             definition_line: 0,
             current_line: 0,
+            order,
+            alias: false,
         });
         sid
     }
@@ -1043,13 +1055,22 @@ impl<F: FileIO> ScriptCtx<F> {
     /// `current_context()` all observe that script while it executes. A
     /// user command passes the caller's `seq` to keep `sc_seq` unchanged,
     /// while a function call passes the function's own `seq`.
-    pub fn push_alias_source(&mut self, sid: Sid, seq: u64, lnum: usize, name: String) {
+    pub fn push_alias_source(
+        &mut self,
+        sid: Sid,
+        seq: u64,
+        lnum: usize,
+        name: String,
+        order: u64,
+    ) {
         self.source_stack.push(SourceFrame {
             sid,
             seq,
             name,
             definition_line: lnum,
             current_line: 0,
+            order,
+            alias: true,
         });
     }
 
@@ -1515,14 +1536,11 @@ impl<F: FileIO> ScriptCtx<F> {
         Ok((joined, index, found_marker))
     }
 
-    /// Renders the current source stack into an upstream-style throwpoint
-    /// string: `function F[3]..script /path[12]`; innermost last.
+    /// The raw source stack for `estack_sfile`-style rendering
+    /// (`ExRuntime::throwpoint` merges it with the call stack).
     #[must_use]
-    pub fn throwpoint_tail(&self) -> String {
-        match self.source_stack.last() {
-            Some(frame) => format!("script {}[{}]", frame.name, frame.current_line),
-            None => "command line".to_owned(),
-        }
+    pub fn source_stack(&self) -> &[SourceFrame] {
+        &self.source_stack
     }
 }
 
