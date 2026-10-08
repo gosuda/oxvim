@@ -15,6 +15,10 @@ const MAX_GROUP_ID: u64 = 20_000;
 /// numeric id always observe the change and each emitted id is
 /// defined exactly once — `hl_attr_define` never redefines a live id.
 const SLOT_MASK: u64 = 0xFFFF_FFFF;
+/// Live slots below this count never reclaim an occupied-but-unbound
+/// slot: composite churn needs sustained pressure before `intern`
+/// evicts, and callers holding a fresh id to bind keep it.
+const RECLAIM_CAP: usize = 2048;
 
 /// RGB or terminal highlight attributes.
 #[expect(
@@ -226,7 +230,18 @@ pub struct HlState {
     free: Vec<u64>,
     /// Reuse generation per slot, forming each id's high bits.
     generations: Vec<u64>,
+    /// `intern` epoch when each slot last took an attribute set, for
+    /// LRU eviction of unbound slots under `RECLAIM_CAP` pressure.
+    interned_at: Vec<u64>,
+    /// Monotonic intern counter stamping `interned_at`.
+    epoch: u64,
     ids: BTreeMap<Highlight, u64>,
+    /// Last id each retired attribute set held, keyed for resurrection:
+    /// re-interning a previously seen set reclaims its original id (same
+    /// number, identical attrs) instead of minting a fresh generation —
+    /// this keeps emitted ids bounded by distinct attr sets, like
+    /// upstream `attr_entry` dedup, instead of growing per vacate cycle.
+    retired: BTreeMap<Highlight, u64>,
     groups: BTreeMap<OxStr, u64>,
     /// Group name to stable group id (`syn_check_group` registry).
     group_ids: BTreeMap<OxStr, u64>,
@@ -262,7 +277,10 @@ impl HlState {
             refcounts: vec![0],
             free: Vec::new(),
             generations: vec![0],
+            interned_at: vec![0],
+            epoch: 0,
             ids,
+            retired: BTreeMap::new(),
             groups: BTreeMap::new(),
             group_ids: BTreeMap::new(),
             group_defs: BTreeMap::new(),
@@ -299,25 +317,67 @@ impl HlState {
 
     /// Interns an attribute set, returning its stable id and an event only once.
     ///
-    /// Reuses a vacated slot when one is available: the reuse bumps the
-    /// slot's generation, so the minted id is numerically new and its
-    /// `hl_attr_define` defines it for the first time — consumers can
-    /// never confuse it with the vacated id a cell may still hold.
+    /// Id claim order: a live dedup hit, resurrection of the set's
+    /// retired id (same number, identical attrs — UI tables and cells
+    /// holding it stay consistent), reuse of a vacated slot under a
+    /// fresh generation, eviction of an occupied-but-unbound composite
+    /// slot, then append. Fresh generations make each minted id
+    /// numerically new, so cell diffs keyed on the numeric id always
+    /// observe changes and `hl_attr_define` never redefines a live id.
     ///
     /// # Errors
     ///
     /// Returns [`HlError::IdExhausted`] when no identifier remains in the
     /// signed range supported by the protocol.
     pub fn intern(&mut self, highlight: Highlight) -> Result<(u64, Option<HlEvent>), HlError> {
+        self.epoch = self.epoch.saturating_add(1);
         if let Some(id) = self.ids.get(&highlight) {
             return Ok((*id, None));
         }
-        let id = if let Some(index) = self.free.pop() {
-            let index = usize::try_from(index).map_err(|_| HlError::IdExhausted)?;
+        // Resurrect a retired id: the set's last numeric id is claimed
+        // back when its slot is vacant or held only by an unbound
+        // composite, re-emitted with the identical attrs it always
+        // meant — cells and UI tables holding it stay consistent.
+        if let Some(&id) = self.retired.get(&highlight) {
+            let slot = usize::try_from(id & SLOT_MASK).map_err(|_| HlError::IdExhausted)?;
+            if slot < self.definitions.len() {
+                if self.occupied.get(slot).copied() == Some(true)
+                    && self.refcounts.get(slot).copied() == Some(0)
+                {
+                    self.evict(slot);
+                }
+                if self.occupied.get(slot).copied() == Some(false) {
+                    self.free.retain(|&free| free != slot as u64);
+                    self.occupied[slot] = true;
+                    self.refcounts[slot] = 0;
+                    self.generations[slot] = id >> 32;
+                    self.interned_at[slot] = self.epoch;
+                    self.definitions[slot] = highlight.clone();
+                    self.retired.remove(&highlight);
+                    let event = define_event(id, &highlight);
+                    self.ids.insert(highlight, id);
+                    return Ok((id, Some(event)));
+                }
+            }
+        }
+        let index = self
+            .free
+            .pop()
+            .map(|index| usize::try_from(index).map_err(|_| HlError::IdExhausted))
+            .transpose()?
+            .or_else(|| self.first_reclaimable())
+            .map(|index| {
+                if self.occupied[index] {
+                    self.evict(index);
+                }
+                index
+            });
+        let id = if let Some(index) = index {
             self.definitions[index] = highlight.clone();
             self.occupied[index] = true;
             self.refcounts[index] = 0;
             self.generations[index] = self.generations[index].saturating_add(1);
+            self.interned_at[index] = self.epoch;
             self.slot_id(index)
         } else {
             let index = self.definitions.len();
@@ -327,6 +387,7 @@ impl HlState {
             self.occupied.push(true);
             self.refcounts.push(0);
             self.generations.push(0);
+            self.interned_at.push(self.epoch);
             id
         };
         let event = define_event(id, &highlight);
@@ -448,11 +509,54 @@ impl HlState {
         if *count > 0 {
             return;
         }
-        if self.ids.get(&self.definitions[index]) == Some(&id) {
-            self.ids.remove(&self.definitions[index]);
+        let retired_set = self.definitions[index].clone();
+        if self.ids.get(&retired_set) == Some(&id) {
+            // `redefine` can leave a second live slot holding this set;
+            // move its dedup entry there instead of dropping it.
+            if let Some(other) = (0..self.definitions.len()).find(|&other| {
+                other != index && self.occupied[other] && self.definitions[other] == retired_set
+            }) {
+                self.ids.insert(retired_set.clone(), self.slot_id(other));
+            } else {
+                self.ids.remove(&retired_set);
+            }
         }
+        self.retired.insert(retired_set, id);
         self.occupied[index] = false;
         self.free.push(index as u64);
+    }
+
+    /// Oldest occupied slot no name binding references, excluding the
+    /// pinned default — the slots composite churn accumulates. Only
+    /// used under `RECLAIM_CAP` pressure: evicting the least recently
+    /// interned keeps a caller's fresh unbound id safe to bind, and
+    /// cells holding an evicted id's old generation resolve to nothing
+    /// here but stay defined in UI attr tables, whose contents the
+    /// numeric generation never changes.
+    fn first_reclaimable(&self) -> Option<usize> {
+        if self.definitions.len() < RECLAIM_CAP {
+            return None;
+        }
+        (1..self.definitions.len())
+            .filter(|&index| self.occupied[index] && self.refcounts[index] == 0)
+            .min_by_key(|&index| self.interned_at[index])
+    }
+
+    /// Retires an occupied, unbound slot so `intern` can claim it.
+    fn evict(&mut self, index: usize) {
+        let retired_set = self.definitions[index].clone();
+        let id = self.slot_id(index);
+        if self.ids.get(&retired_set) == Some(&id) {
+            if let Some(other) = (0..self.definitions.len()).find(|&other| {
+                other != index && self.occupied[other] && self.definitions[other] == retired_set
+            }) {
+                self.ids.insert(retired_set.clone(), self.slot_id(other));
+            } else {
+                self.ids.remove(&retired_set);
+            }
+        }
+        self.retired.insert(retired_set, id);
+        self.occupied[index] = false;
     }
 
     /// Defines a named group, interning the highlight and binding the name.
@@ -909,6 +1013,65 @@ mod tests {
         // Vacating `other` must not remove `ids[hl1] -> victim`.
         let (deduped, _) = state.intern(fg_highlight(1)).unwrap();
         assert_eq!(deduped, victim);
+    }
+
+    #[test]
+    fn churned_attr_set_resurrects_its_original_id() {
+        // Retired ids are claimed back for the identical set: emitted
+        // ids stay bounded by distinct sets, so UI attr tables can't
+        // grow per vacate cycle.
+        let mut state = HlState::new();
+        let (a, _) = state.intern(fg_highlight(1)).unwrap();
+        let (b, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", a).unwrap();
+        state.set_group("G", b).unwrap();
+        let (resurrected, event) = state.intern(fg_highlight(1)).unwrap();
+        assert_eq!(resurrected, a);
+        assert!(event.is_some());
+        state.set_group("G", a).unwrap();
+        let (again, _) = state.intern(fg_highlight(2)).unwrap();
+        assert_eq!(again, b);
+    }
+
+    #[test]
+    fn unbound_composite_churn_stays_bounded() {
+        // Interns that never get bound (compositor composites) used to
+        // pin their slots forever; unbound slots are evictable once no
+        // plainly vacant slot remains.
+        let mut state = HlState::new();
+        for i in 0..6000 {
+            state.intern(fg_highlight(i)).unwrap();
+        }
+        let live = state.iter().count();
+        assert!(
+            live <= RECLAIM_CAP + 2,
+            "unbound composite churn must not grow the table: {live} live slots"
+        );
+    }
+
+    #[test]
+    fn vacating_the_dedup_slot_keeps_a_live_duplicate() {
+        // Two live slots can share a set after `redefine`; vacating the
+        // dedup-mapped one must transfer the entry to the survivor or
+        // the next intern duplicates a live definition.
+        let mut state = HlState::new();
+        let (first, _) = state.intern(fg_highlight(1)).unwrap();
+        let (second, _) = state.intern(fg_highlight(2)).unwrap();
+        // Both slots now hold `hl1`; `ids[hl1]` kept `first` via
+        // `or_insert`. Bind and rebind `first` to vacate it…
+        state.redefine(second, fg_highlight(1)).unwrap();
+        state.set_group("G", first).unwrap();
+        let (fresh, _) = state.intern(fg_highlight(3)).unwrap();
+        state.set_group("G", fresh).unwrap();
+        // `first` is resurrected from `retired` (same set came back),
+        // and `second` — still live — must not be duplicated either.
+        let (back, _) = state.intern(fg_highlight(1)).unwrap();
+        assert!(back == first || back == second, "{back}");
+        let live = state
+            .iter()
+            .filter(|(_, h)| h.rgb.foreground == Some(1))
+            .count();
+        assert_eq!(live, 1, "intern duplicated a live definition");
     }
 
     #[test]
