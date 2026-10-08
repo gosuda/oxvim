@@ -1292,10 +1292,24 @@ impl ModeMachine {
                     return Ok(());
                 }
                 let line = ctx.line(editor, target)?;
-                // The clamped byte column can land inside a multi-byte
+                // `ins_up`/`ins_down` keep `w_curswant`: the column a
+                // short line clamped to must not become the new want —
+                // moving back onto a longer line restores the original
+                // column (move.c `nv_up`/`nv_down` semantics).
+                let want = editor.window(ctx.window).ok().map_or(
+                    i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX),
+                    |state| {
+                        if state.set_curswant {
+                            i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX)
+                        } else {
+                            state.curswant
+                        }
+                    },
+                );
+                // The wanted byte column can land inside a multi-byte
                 // scalar; snap down to a boundary so the next insert does
                 // not splice bytes into a character.
-                let mut col = ctx.cursor.col.min(line.len());
+                let mut col = usize::try_from(want).unwrap_or(0).min(line.len());
                 while col > 0 && col < line.len() && line[col] & 0xC0 == 0x80 {
                     col -= 1;
                 }
@@ -1306,6 +1320,10 @@ impl ModeMachine {
                         col,
                     },
                 )?;
+                if let Ok(state) = editor.window_mut(ctx.window) {
+                    state.curswant = want;
+                    state.set_curswant = false;
+                }
             }
             NamedKey::Home => {
                 editor.set_window_cursor(
@@ -1325,6 +1343,12 @@ impl ModeMachine {
                         col: line.len(),
                     },
                 )?;
+                // `ins_end` leaves `w_curswant` at MAXCOL like `$`, so
+                // vertical moves after it keep landing at end of line.
+                if let Ok(state) = editor.window_mut(ctx.window) {
+                    state.curswant = i64::MAX;
+                    state.set_curswant = false;
+                }
             }
             // `i_<Del>` edits without moving the cursor, so it does
             // not start a new undo block — return before `insert_moved`
@@ -1354,7 +1378,26 @@ impl ModeMachine {
                 };
                 if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1)
                 {
-                    editor.set_window_cursor(ctx.window, motion.target)?;
+                    let mut target = motion.target;
+                    // `ins_s_right` (`fwd_word`): the insert cursor may
+                    // rest one past the line, so a `w` that lands inside
+                    // the buffer's last word advances to end of line —
+                    // Normal `w` clamps onto the final byte instead. A
+                    // landing that starts the last word (e.g. a one-char
+                    // final word) still lands on it.
+                    if key == NamedKey::CtrlRight
+                        && let Some(last) = lines.last()
+                        && target.lnum == lines.len()
+                        && target.col + 1 == last.len()
+                    {
+                        let word_start = target.col == 0
+                            || crate::motion::classify(last[target.col - 1], false)
+                                != crate::motion::classify(last[target.col], false);
+                        if !word_start || target == ctx.cursor {
+                            target.col = last.len();
+                        }
+                    }
+                    editor.set_window_cursor(ctx.window, target)?;
                 }
             }
             _ => return Ok(()),

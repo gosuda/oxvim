@@ -4850,6 +4850,55 @@ fn insert_named_keys_move_cursor() {
     assert_eq!(window_cursor(&editor), position(2, 3));
 }
 
+/// `i_<Up>`/`i_<Down>` keep `w_curswant`: the column a short line
+/// clamps to must not become the wanted column — moving back onto a
+/// longer line restores the original column (`ins_up`/`ins_down`).
+#[test]
+fn insert_arrows_keep_curswant_across_short_lines() {
+    let (mut editor, _, mut machine) = named_editor("abcdef\nab\nabcdef", position(1, 5));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 5));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 5));
+    // A horizontal move re-seeds the want: after `i_<End>` the next
+    // vertical move keeps the end column, not the stale one.
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 6));
+}
+
+/// `i_<C-Right>` is `ins_s_right` (`fwd_word`): on the final word the
+/// insert cursor lands past the last byte at end of line — insert mode
+/// accepts a cursor one past the line, unlike Normal's `w` clamp.
+#[test]
+fn insert_ctrl_right_advances_past_final_word() {
+    let (mut editor, _, mut machine) = named_editor("foo bar", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 7));
+
+    // A one-char final word still lands on its byte first; the next
+    // press, unable to move forward, advances to end of line.
+    let (mut editor, _, mut machine) = named_editor("foo x", position(1, 0));
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 5));
+}
+
 /// `i_<Del>` deletes the character under the cursor and is a no-op at
 /// end of line (no join, unlike `i_<BS>` at column zero).
 #[test]

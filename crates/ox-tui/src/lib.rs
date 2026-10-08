@@ -767,7 +767,15 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                     }
                     continue;
                 }
-                if is_terminal_string_intro(key) {
+                // A ctrlstring introducer is followed by its payload in
+                // the same terminal write, so the next event is already
+                // buffered; a user's `Alt-P`/`Alt-]`/`Alt-_` chord
+                // arrives alone. Peek before consuming — otherwise the
+                // chord swallows every key until a terminator that
+                // never comes.
+                if is_terminal_string_intro(key)
+                    && event::poll(INPUT_POLL).map_err(TuiError::Input)?
+                {
                     state.consume_terminal_string = true;
                     continue;
                 }
@@ -2770,5 +2778,22 @@ mod tests {
             KeyCode::Char('x'),
             KeyModifiers::NONE
         )));
+    }
+
+    /// A bare `Alt-P`/`Alt-]`/`Alt-_` chord (no payload buffered after
+    /// it) must still encode as a keypress — only an introducer with
+    /// bytes already queued behind it starts a consume.
+    #[test]
+    fn alt_intro_chord_encodes_as_key() {
+        for code in [
+            KeyCode::Char('P'),
+            KeyCode::Char(']'),
+            KeyCode::Char('_'),
+        ] {
+            assert!(matches!(
+                encode_key(KeyEvent::new(code, KeyModifiers::ALT)),
+                Some(ref encoded) if encoded.starts_with("<A-")
+            ));
+        }
     }
 }
