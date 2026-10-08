@@ -1135,6 +1135,7 @@ impl ModeMachine {
             NamedKey::Home => state.cursor_byte = 0,
             NamedKey::End => state.cursor_byte = state.text.len(),
             NamedKey::Del if state.cursor_byte < state.text.len() => {
+                state.history_index = None;
                 let next =
                     crate::motion::next_char_boundary(state.text.as_bytes(), state.cursor_byte);
                 state.text.drain(state.cursor_byte..next);
@@ -1203,11 +1204,18 @@ impl ModeMachine {
                     return Ok(());
                 }
                 let line = ctx.line(editor, target)?;
+                // The clamped byte column can land inside a multi-byte
+                // scalar; snap down to a boundary so the next insert does
+                // not splice bytes into a character.
+                let mut col = ctx.cursor.col.min(line.len());
+                while col > 0 && line[col] & 0xC0 == 0x80 {
+                    col -= 1;
+                }
                 editor.set_window_cursor(
                     ctx.window,
                     Position {
                         lnum: target,
-                        col: ctx.cursor.col.min(line.len()),
+                        col,
                     },
                 )?;
             }
@@ -3363,6 +3371,7 @@ impl ModeMachine {
     ) -> Result<Option<Mode>, ModeError> {
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
+            state.history_index = None;
             state.text.insert(state.cursor_byte, key);
             state.cursor_byte += key.len_utf8();
             self.update_incsearch_preview(editor, state)?;
@@ -3395,6 +3404,7 @@ impl ModeMachine {
             }
             '\u{8}' | '\u{7f}' => {
                 if state.cursor_byte > 0 {
+                    state.history_index = None;
                     let previous =
                         crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte);
                     state.text.drain(previous..state.cursor_byte);
@@ -3435,6 +3445,7 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             ch if !ch.is_control() => {
+                state.history_index = None;
                 state.text.insert(state.cursor_byte, ch);
                 state.cursor_byte += ch.len_utf8();
                 self.update_incsearch_preview(editor, state)?;

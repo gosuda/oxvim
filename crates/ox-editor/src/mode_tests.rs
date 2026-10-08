@@ -4910,3 +4910,43 @@ fn cmdline_home_end_del_edit() {
     };
     assert_eq!(state.cursor_byte, 2);
 }
+
+/// `i_<Down>` onto a shorter multibyte line must not leave the cursor
+/// inside a character: a byte column clamped into the middle of a
+/// scalar corrupts the next insert.
+#[test]
+fn insert_down_snaps_column_to_char_boundary() {
+    let (mut editor, buffer, mut machine) = named_editor("abcd\naéx", position(1, 2));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    // Byte 2 sits inside `é` (bytes 1..3); the cursor snaps down to 1.
+    assert_eq!(window_cursor(&editor), position(2, 1));
+    machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "abcd\naZéx");
+}
+
+/// Editing a recalled history entry discards the walk
+/// (`ex_getln.c` resets `hisidx` when the line changes): a later
+/// `<Up>` matches against the edited text, not the stale prefix, and
+/// `<Down>` no longer restores the discarded input.
+#[test]
+fn cmdline_edit_after_recall_restarts_history_walk() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["e one".to_owned(), "e two".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":e ", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => state.text.clone(),
+        _ => panic!("expected cmdline mode"),
+    };
+    assert_eq!(text_of(&machine), "e twox");
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text_of(&machine), "e twox");
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), "e twox");
+}
