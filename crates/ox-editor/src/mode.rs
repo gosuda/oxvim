@@ -1310,15 +1310,21 @@ impl ModeMachine {
         // (`insert.c:640-653`).
         if self.pending_ctrl_bslash {
             self.pending_ctrl_bslash = false;
-            let ctx = cursor_context(editor)?;
-            insert::insert_char(
-                editor,
-                ctx.buffer,
-                ctx.window,
-                ctx.cursor,
-                '\u{1c}',
-                self.timestamp,
-            )?;
+            if matches!(self.mode, Mode::Replace(_)) {
+                // Replace overwrites with the literal byte, like
+                // `replace_insert`'s own `Literal` arm.
+                self.replace_scalar(editor, '\u{1c}')?;
+            } else {
+                let ctx = cursor_context(editor)?;
+                insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    '\u{1c}',
+                    self.timestamp,
+                )?;
+            }
         }
         // A partial `i_CTRL-V` numeric literal emits its charcode before
         // the named key runs, like the nondigit path in `insert_pending`;

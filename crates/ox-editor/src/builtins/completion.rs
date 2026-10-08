@@ -1913,6 +1913,14 @@ impl CompletionSession {
                     return Ok(CompletionOutcome::Handled);
                 }
                 CTRL_Y => {
+                    // `ins_compl_use_match(K_CTRL_Y)` is true: accept
+                    // uses `compl_shown_match`, so a selection the
+                    // arrows moved without inserting is what gets
+                    // written, not the last cycled match.
+                    if self.active && self.selected > 0 {
+                        let index = usize::try_from(self.selected).unwrap_or(0);
+                        self.show_match(editor, buffer, window, index, timestamp)?;
+                    }
                     self.stop_keep();
                     return Ok(CompletionOutcome::Handled);
                 }

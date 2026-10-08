@@ -5049,6 +5049,45 @@ fn ctrl_bslash_named_key_inserts_literal_then_moves() {
     assert!(matches!(machine.mode(), Mode::Insert(_)));
 }
 
+/// `r_CTRL-\` + named key in Replace mode overwrites with the literal
+/// byte through `replace_scalar`, like `replace_insert`'s `Literal`
+/// arm — the byte must not *insert* ahead of the covered character.
+#[test]
+fn ctrl_bslash_named_key_overwrites_in_replace() {
+    let (mut editor, buffer, mut machine) = named_editor("abc\ndef", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "R", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "abc\n\u{1c}ef");
+    assert_eq!(window_cursor(&editor).lnum, 1);
+    assert!(matches!(machine.mode(), Mode::Replace(_)));
+}
+
+/// `i_<C-Y>` accepts `compl_shown_match`: a selection the arrows moved
+/// without inserting is written on accept
+/// (`ins_compl_use_match(K_CTRL_Y)` is true).
+#[test]
+fn insert_ctrl_y_accepts_arrow_selected_completion() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    machine
+        .feed_keys(&mut editor, "\u{19}", &mut eval)
+        .unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "foobar foobat\nfoobatx");
+    assert!(!machine.completion.is_active());
+}
+
 /// `i_<Up>`/`i_<Down>` with the completion menu visible walk the
 /// selection without inserting (`ins_compl_use_match` returns false
 /// for them) — the cursor and the last-inserted match stay put.
