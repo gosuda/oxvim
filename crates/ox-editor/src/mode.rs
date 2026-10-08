@@ -1226,6 +1226,29 @@ impl ModeMachine {
     /// linewise keeping the column, `i_<Home>`/`i_<End>` move to the
     /// line edges, `i_<Del>` deletes the character under the cursor.
     fn insert_named(&mut self, editor: &mut Editor, key: NamedKey) -> Result<(), ModeError> {
+        // A partial `i_CTRL-V` numeric literal emits its charcode before
+        // the named key runs, like the nondigit path in `insert_pending`;
+        // the key then dispatches normally.
+        if matches!(self.insert_literal, Some(InsertLiteral::Digits { .. })) {
+            let Some(InsertLiteral::Digits { radix, digits, .. }) = self.insert_literal.take()
+            else {
+                unreachable!()
+            };
+            let ctx = cursor_context(editor)?;
+            if let Some(ch) = u32::from_str_radix(&digits, radix)
+                .ok()
+                .and_then(char::from_u32)
+            {
+                insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    ch,
+                    self.timestamp,
+                )?;
+            }
+        }
         let ctx = cursor_context(editor)?;
         // A pending `i_CTRL-V`/`i_CTRL-Q`/`i_CTRL-R` consumes the named
         // key itself: upstream inserts its keycode notation literally

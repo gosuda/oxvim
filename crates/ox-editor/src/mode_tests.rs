@@ -5016,3 +5016,17 @@ fn insert_pending_literal_and_register_take_named_key() {
         .unwrap();
     assert_eq!(text, "<Up><Down>");
 }
+
+/// A partial `i_CTRL-V` numeric literal emits its charcode before the
+/// named key dispatches — `i_CTRL-V65<Up>` inserts `A`, then moves.
+#[test]
+fn insert_named_key_flushes_digit_literal_first() {
+    let (mut editor, buffer, mut machine) = named_editor("xy\nzz", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\x1665", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "xy\nAzz");
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
