@@ -401,6 +401,44 @@ pub fn backspace(
     Ok(after)
 }
 
+/// `i_<Del>` (`ins_del`, `edit.c`): deletes the character under the
+/// cursor; unlike `i_<BS>` at column zero there is no line join at end
+/// of line — the key is a no-op there.
+///
+/// # Errors
+///
+/// Returns the buffer edit's [`EditorError`].
+pub fn delete_forward(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    window: WinHandle,
+    cursor: Position,
+    timestamp: i64,
+) -> Result<Position, EditorError> {
+    let mut line = line(editor, buffer, cursor.lnum)?;
+    if cursor.col >= line.len() {
+        return Ok(cursor);
+    }
+    let mut end = (cursor.col + 1).min(line.len());
+    while end < line.len()
+        && !std::str::from_utf8(&line).map_or(true, |text| text.is_char_boundary(end))
+    {
+        end += 1;
+    }
+    line.drain(cursor.col..end);
+    editor.replace_buffer_lines(crate::LineReplaceRequest {
+        buffer,
+        start: cursor.lnum,
+        end: cursor.lnum,
+        lines: &[line],
+        cursor_before: cursor,
+        cursor_after: cursor,
+        timestamp,
+    })?;
+    editor.set_window_cursor(window, cursor)?;
+    Ok(cursor)
+}
+
 /// `i_CTRL-W`: deletes the word before the cursor (`ins_bs` with
 /// `BACKSPACE_WORD`): trailing whitespace first, then the run of same-class
 /// characters. At column zero it joins with the previous line when

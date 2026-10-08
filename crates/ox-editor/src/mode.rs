@@ -132,6 +132,12 @@ pub struct CmdlineState {
     /// The currently placed `'incsearch'` highlight extmark, if a preview
     /// match is showing (`incsearch_state_T.did_incsearch`, `ex_getln.c:121`).
     pub preview_mark: Option<ExtmarkId>,
+    /// History navigation position while this command line is open
+    /// (`hisidx` relative): `None` while `text` is the user's own input.
+    pub history_index: Option<usize>,
+    /// The user's in-progress command-line text, saved on the first
+    /// `<Up>` and restored when `<Down>` walks past the newest entry.
+    pub history_saved: String,
 }
 /// State retained between an operator and its motion or text object.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +212,31 @@ pub enum Step {
     Left,
     /// Move the insertion or editing cursor one character right.
     Right,
+    /// Execute one decoded named special key.
+    Named(NamedKey),
+}
+
+/// A named special key decoded from a `K_SPECIAL` triple — the upstream
+/// keycodes (`termcodes.h` names) that dispatch per mode, not plain
+/// characters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamedKey {
+    /// `K_UP`: cursor up.
+    Up,
+    /// `K_DOWN`: cursor down.
+    Down,
+    /// `K_HOME`: start of line or edit field.
+    Home,
+    /// `K_END`: end of line or edit field.
+    End,
+    /// `K_DEL`: delete the character under the cursor.
+    Del,
+    /// `K_INS`: enter Insert from Normal/Visual.
+    Ins,
+    /// `KE_C_LEFT`: word left.
+    CtrlLeft,
+    /// `KE_C_RIGHT`: word right.
+    CtrlRight,
 }
 
 /// Failures produced by modal input execution.
@@ -801,7 +832,10 @@ impl ModeMachine {
                 {
                     Ok(Step::Key('\u{1b}'))
                 }
-                Key::Special(_, _) => Ok(Step::ProcessEvents),
+                Key::Special(second, third) => match Self::named_key(second, third) {
+                    Some(named) => Ok(Step::Named(named)),
+                    None => Ok(Step::ProcessEvents),
+                },
             };
         }
     }
@@ -962,6 +996,7 @@ impl ModeMachine {
             Step::Idle | Step::ProcessEvents => Ok(()),
             Step::Key(key) => self.execute_key(editor, key, eval),
             Step::Left | Step::Right => self.move_horizontal(editor, step == Step::Right, eval),
+            Step::Named(key) => self.named(editor, key, eval),
         }
     }
 
@@ -1001,6 +1036,214 @@ impl ModeMachine {
             return Ok(());
         }
         self.execute_key(editor, if forward { 'l' } else { 'h' }, eval)
+    }
+
+    /// The special keys dispatched as real behavior, named by upstream's
+    /// `K_SPECIAL` triples (`termcodes.h`): `k`+`u`/`d`/`h` are
+    /// `K_UP`/`K_DOWN`/`K_HOME`, `@`+`7` is `K_END`, `k`+`D` and
+    /// `KS_EXTRA`+80 are `K_DEL`/`kDel`, `k`+`I` is `K_INS`, and
+    /// `KS_EXTRA`+85/86 are `KE_C_LEFT`/`KE_C_RIGHT`.
+    fn named_key(second: u8, third: u8) -> Option<NamedKey> {
+        Some(match (second, third) {
+            (b'k', b'u') => NamedKey::Up,
+            (b'k', b'd') => NamedKey::Down,
+            (b'k', b'h') => NamedKey::Home,
+            (b'@', b'7') => NamedKey::End,
+            (b'k', b'D') | (KS_EXTRA, 80) => NamedKey::Del,
+            (b'k', b'I') => NamedKey::Ins,
+            (KS_EXTRA, 85) => NamedKey::CtrlLeft,
+            (KS_EXTRA, 86) => NamedKey::CtrlRight,
+            _ => return None,
+        })
+    }
+
+    /// Dispatches a decoded special key with the mode's own behavior —
+    /// upstream's per-mode keycode tables (`nv_cmds`, `ins_special`,
+    /// `ex_getln.c`), where the same keycode moves the cursor in Normal,
+    /// walks history in Cmdline, and edits in Insert.
+    fn named(
+        &mut self,
+        editor: &mut Editor,
+        key: NamedKey,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), ModeError> {
+        // Only the command-line handler needs its variant state: take
+        // the mode like `execute_key` does, so `state` and `self` can
+        // borrow at once. Other handlers dispatch through
+        // `execute_key`, which must see the real mode in place.
+        if let Mode::Cmdline(_) = self.mode {
+            let mut mode = std::mem::take(&mut self.mode);
+            let Mode::Cmdline(state) = &mut mode else {
+                unreachable!();
+            };
+            let result = self.cmdline_named(editor, state, key);
+            self.mode = mode;
+            return result;
+        }
+        if matches!(self.mode, Mode::Insert(_) | Mode::Replace(_)) {
+            return self.insert_named(editor, key);
+        }
+        self.motion_named(
+            editor,
+            key,
+            matches!(self.mode, Mode::OperatorPending(_)),
+            eval,
+        )
+    }
+
+    /// `nv_cmds` keycodes (`normal.c`): arrows and their Control word
+    /// variants are motions wherever motions are legal; `<Del>` and
+    /// `<Insert>` carry command meanings in Normal and Visual only.
+    /// Translating to the equivalent builtin key bypasses mappings —
+    /// upstream dispatches keycodes, not the `k` mapping a user may
+    /// have bound.
+    fn motion_named(
+        &mut self,
+        editor: &mut Editor,
+        key: NamedKey,
+        operator_pending: bool,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), ModeError> {
+        let char = match key {
+            NamedKey::Up => 'k',
+            NamedKey::Down => 'j',
+            NamedKey::Home => '0',
+            NamedKey::End => '$',
+            NamedKey::CtrlLeft => 'b',
+            NamedKey::CtrlRight => 'w',
+            NamedKey::Del | NamedKey::Ins if operator_pending => return Ok(()),
+            NamedKey::Del => 'x',
+            NamedKey::Ins => 'i',
+        };
+        self.execute_key(editor, char, eval)
+    }
+
+    /// `ex_getln.c` special keys on the command line: `<Up>`/`<Down>`
+    /// walk history, `<Home>`/`<End>` move the text cursor, `<Del>`
+    /// deletes the character under it.
+    fn cmdline_named(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+        key: NamedKey,
+    ) -> Result<(), ModeError> {
+        match key {
+            NamedKey::Up | NamedKey::Down => {
+                self.cmdline_history_nav(state, key == NamedKey::Up);
+                self.update_incsearch_preview(editor, state)?;
+            }
+            NamedKey::Home => state.cursor_byte = 0,
+            NamedKey::End => state.cursor_byte = state.text.len(),
+            NamedKey::Del if state.cursor_byte < state.text.len() => {
+                let next =
+                    crate::motion::next_char_boundary(state.text.as_bytes(), state.cursor_byte);
+                state.text.drain(state.cursor_byte..next);
+                self.update_incsearch_preview(editor, state)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// `c_<Up>`/`c_<Down>` (`ex_getln.c`): walk the Ex command history
+    /// for an entry whose beginning matches the current text. `<Down>`
+    /// past the newest match returns to the text the user had typed
+    /// (the scratch input saved on the first `<Up>`).
+    fn cmdline_history_nav(&mut self, state: &mut CmdlineState, up: bool) {
+        if state.kind != CmdlineKind::Ex || (state.history_index.is_none() && !up) {
+            return;
+        }
+        // `lookfor` is the text the user was editing when the walk
+        // started (`ex_getln.c`): it persists for the whole walk, so
+        // repeated `<Up>` keeps matching the same prefix instead of
+        // the just-recalled entry.
+        let lookfor = match state.history_index {
+            Some(_) => state.history_saved.clone(),
+            None => state.text.clone(),
+        };
+        let history = &self.cmdline_history;
+        let start = state.history_index.unwrap_or(history.len());
+        let found = if up {
+            (0..start).rev().find(|&index| history[index].starts_with(&lookfor))
+        } else {
+            (start + 1..history.len()).find(|&index| history[index].starts_with(&lookfor))
+        };
+        match found {
+            Some(index) => {
+                if state.history_index.is_none() {
+                    state.history_saved.clone_from(&lookfor);
+                }
+                state.history_index = Some(index);
+                state.text.clone_from(&history[index]);
+            }
+            None => {
+                if !up {
+                    state.history_index = None;
+                    state.text = std::mem::take(&mut state.history_saved);
+                }
+            }
+        }
+        state.cursor_byte = state.text.len();
+    }
+
+    /// `ins_special` cursor keys (`edit.c`): `i_<Up>`/`i_<Down>` move
+    /// linewise keeping the column, `i_<Home>`/`i_<End>` move to the
+    /// line edges, `i_<Del>` deletes the character under the cursor.
+    fn insert_named(&mut self, editor: &mut Editor, key: NamedKey) -> Result<(), ModeError> {
+        let ctx = cursor_context(editor)?;
+        match key {
+            NamedKey::Up | NamedKey::Down => {
+                let target = if key == NamedKey::Up {
+                    ctx.cursor.lnum.wrapping_sub(1)
+                } else {
+                    ctx.cursor.lnum + 1
+                };
+                let lines = editor.buffer(ctx.buffer)?.text()?.line_count();
+                if target < 1 || target > lines {
+                    return Ok(());
+                }
+                let line = ctx.line(editor, target)?;
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: target,
+                        col: ctx.cursor.col.min(line.len()),
+                    },
+                )?;
+            }
+            NamedKey::Home => {
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: ctx.cursor.lnum,
+                        col: 0,
+                    },
+                )?;
+            }
+            NamedKey::End => {
+                let line = ctx.line(editor, ctx.cursor.lnum)?;
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: ctx.cursor.lnum,
+                        col: line.len(),
+                    },
+                )?;
+            }
+            NamedKey::Del => {
+                insert::delete_forward(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    self.timestamp,
+                )?;
+            }
+            _ => return Ok(()),
+        }
+        self.insert_moved = true;
+        self.completion.reset();
+        Ok(())
     }
 
     /// Runs one check/execute iteration, returning whether work was ready.
@@ -1378,6 +1621,8 @@ impl ModeMachine {
                     preview_start: ctx.cursor,
                     preview_topline: topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
                 })))
             }
             ':' => {
@@ -1403,6 +1648,8 @@ impl ModeMachine {
                     preview_start,
                     preview_topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
                 })))
             }
             'n' | 'N' => {
@@ -2240,6 +2487,8 @@ impl ModeMachine {
                     preview_start: ctx.cursor,
                     preview_topline: topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
                 })))
             }
             'J' => {
