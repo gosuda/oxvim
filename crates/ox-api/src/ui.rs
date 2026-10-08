@@ -2274,12 +2274,13 @@ fn reproject_hl_links(
             .map_err(|error| ApiError::exception(error.to_string()))?;
     }
     // The reverse index `HlState::set_group_def` maintains keys each
-    // link by its resolved target, so this BFS stays proportional to
-    // the links that actually reach the changed group instead of
-    // scanning every definition. A link resolves its target in its own
-    // namespace unless `link_global` resolves it in namespace 0, so a
-    // namespace-0 change must consider `link_global` dependents in
-    // every namespace.
+    // link by its resolved target, so this BFS walks only links whose
+    // chains reach the changed group instead of scanning every
+    // definition. A link resolves its target in its own namespace
+    // unless `link_global` resolves it in namespace 0, so a
+    // namespace-0 change also queries `link_global` dependents in
+    // every namespace — O(namespaces) lookups per reached node,
+    // namespaces being few.
     let mut queue = vec![(ns_id, gid)];
     let mut seen = std::collections::BTreeSet::new();
     while let Some((current_ns, current_gid)) = queue.pop() {
@@ -2294,9 +2295,6 @@ fn reproject_hl_links(
             .unwrap_or_default();
         if current_ns == 0 {
             for (link_ns, ns) in &state.hl_namespaces {
-                if *link_ns == 0 {
-                    continue;
-                }
                 candidates.extend(
                     ns.link_dependents(current_gid, true)
                         .map(|name| (*link_ns, name.clone())),

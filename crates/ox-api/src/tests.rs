@@ -9844,3 +9844,54 @@ fn set_hl_retargeted_link_leaves_its_old_chain_untouched() {
     });
     assert_eq!(painted, Some(Some(0x00_aabb)));
 }
+
+#[test]
+fn set_hl_rebind_twice_mints_distinct_ids_for_the_cell_diff() {
+    // Two `nvim_set_hl` calls between redraws must leave the group's
+    // bound id numerically different from its first binding — the emit
+    // diff keys on the numeric id, so reusing the same number would
+    // let cells skip a repaint the protocol demands.
+    let session = session();
+    let set = |fg: i64| {
+        crate::ui::nvim_set_hl(
+            &session,
+            0,
+            OxStr::from("G"),
+            dict(&[("fg", Object::Integer(fg))]),
+        )
+        .unwrap();
+    };
+    let id_of = |session: &crate::ApiSession| {
+        session.with_state(|state| state.hl_namespaces[&0].group_id(&OxStr::from("G")))
+    };
+    set(0x00_0001);
+    let first = id_of(&session);
+    set(0x00_0002);
+    set(0x00_0003);
+    let third = id_of(&session);
+    assert!(first.is_some() && third.is_some() && first != third);
+}
+
+#[test]
+fn set_hl_namespace_zero_link_global_reprojects() {
+    // A `link_global` def living in namespace 0 resolves in namespace 0
+    // too; its target change must reproject it like any other ns's
+    // global links.
+    let session = session();
+    let set = |name: &str, entries: &[(&str, Object)]| {
+        crate::ui::nvim_set_hl(&session, 0, OxStr::from(name), dict(entries)).unwrap();
+    };
+    set("GT", &[("fg", Object::Integer(0x00_0011))]);
+    set(
+        "GL",
+        &[("link_global", Object::String(OxStr::from("GT")))],
+    );
+    set("GT", &[("fg", Object::Integer(0x00_ccdd))]);
+    let painted = session.with_state(|state| {
+        state.hl_namespaces[&0]
+            .group_id(&OxStr::from("GL"))
+            .and_then(|id| state.hl_namespaces[&0].get(id))
+            .map(|highlight| highlight.rgb.foreground)
+    });
+    assert_eq!(painted, Some(Some(0x00_ccdd)));
+}
