@@ -1201,6 +1201,15 @@ impl ModeMachine {
         state: &mut CmdlineState,
         key: NamedKey,
     ) -> Result<(), ModeError> {
+        // A pending `c_CTRL-\` completes first: a named key is never
+        // `CTRL-N`/`CTRL-G`, so upstream's arm takes the `vungetc`
+        // path (`command_line_handle_ctrl_bsl`, `ex_getln.c:1045-1051`)
+        // — the backslash byte enters the line literally, then the key
+        // runs normally.
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            self.cmdline_insert_ctrl_bslash(editor, state)?;
+        }
         match key {
             NamedKey::Up | NamedKey::Down => {
                 self.cmdline_history_nav(state, key == NamedKey::Up);
@@ -1253,6 +1262,21 @@ impl ModeMachine {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The `vungetc` resolution of a non-chord `c_CTRL-\` second key:
+    /// upstream reprocesses the backslash as an ordinary character, so
+    /// `\x1c` enters the command line literally (`put_on_cmdline`,
+    /// `ex_getln.c:2346-2354`) before the key is handled.
+    fn cmdline_insert_ctrl_bslash(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+    ) -> Result<(), ModeError> {
+        state.history_index = None;
+        state.text.insert(state.cursor_byte, '\u{1c}');
+        state.cursor_byte += 1;
+        self.update_incsearch_preview(editor, state)
     }
 
     /// `c_<Up>`/`c_<Down>` (`ex_getln.c`): walk the Ex command history
@@ -3688,21 +3712,27 @@ impl ModeMachine {
             self.update_incsearch_preview(editor, state)?;
             return Ok(None);
         }
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            if key == '\u{0e}' || key == '\u{7}' {
+                // `c_CTRL-\_CTRL-N`/`CTRL-G`: leave the command line
+                // for Normal mode (`command_line_handle_ctrl_bsl`,
+                // `ex_getln.c:1045-1096`).
+                Self::restore_incsearch_view(editor, state)?;
+                return Ok(Some(Mode::default()));
+            }
+            // Any other second key is pushed back upstream (`vungetc`):
+            // the `\x1c` byte inserts literally, then the key falls
+            // through to the FULL pipeline — it can arm a new pending
+            // or dispatch normally, but is never swallowed.
+            self.cmdline_insert_ctrl_bslash(editor, state)?;
+        }
         if key == '\u{16}' {
             self.pending_cmdline_literal = true;
             return Ok(None);
         }
         if key == '\u{1c}' {
             self.pending_ctrl_bslash = true;
-            return Ok(None);
-        }
-        if self.pending_ctrl_bslash {
-            self.pending_ctrl_bslash = false;
-            if key == '\u{0e}' {
-                // `c_CTRL-\_CTRL-N`: leave the command line for Normal mode.
-                Self::restore_incsearch_view(editor, state)?;
-                return Ok(Some(Mode::default()));
-            }
             return Ok(None);
         }
         match key {

@@ -5066,6 +5066,47 @@ fn ctrl_bslash_named_key_overwrites_in_replace() {
     assert!(matches!(machine.mode(), Mode::Replace(_)));
 }
 
+/// `c_CTRL-\` + named key resolves the arm: the `\x1c` byte enters the
+/// line literally (`vungetc` path, `ex_getln.c:1045-1051`), then the
+/// key runs — and the arm is cleared so the NEXT char types normally
+/// instead of being swallowed as a chord partner.
+#[test]
+fn cmdline_ctrl_bslash_named_key_inserts_literal_then_runs() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["edit file".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "\u{1c}", &mut eval)
+        .unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => state.text.clone(),
+        _ => panic!("expected cmdline mode"),
+    };
+    // `\x1c` inserted; `<Up>` then walked with it in the lookfor — no
+    // history entry starts with `\x1c`, so the line stays as typed.
+    assert_eq!(text_of(&machine), "\u{1c}".to_owned());
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(text_of(&machine), "\u{1c}x".to_owned());
+}
+
+/// `c_CTRL-\` + an ordinary character also takes the `vungetc` path:
+/// the byte inserts literally and the character is typed, not
+/// swallowed as a would-be chord partner.
+#[test]
+fn cmdline_ctrl_bslash_char_inserts_literal_then_types() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, ":\u{1c}x", &mut eval)
+        .unwrap();
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode")
+    };
+    assert_eq!(state.text, "\u{1c}x");
+}
+
 /// `i_<C-Y>` accepts `compl_shown_match`: a selection the arrows moved
 /// without inserting is written on accept
 /// (`ins_compl_use_match(K_CTRL_Y)` is true).
@@ -5085,6 +5126,31 @@ fn insert_ctrl_y_accepts_arrow_selected_completion() {
     let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
         .unwrap();
     assert_eq!(text, "foobar foobat\nfoobatx");
+    assert!(!machine.completion.is_active());
+}
+
+/// `i_<C-Y>` on the original-text entry (`selected == 0`) applies that
+/// entry too: accepting restores the typed leader instead of keeping
+/// the last-inserted candidate — `compl_shown_match` can be the
+/// original.
+#[test]
+fn insert_ctrl_y_restores_leader_when_selection_is_original() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    // Selection on the original entry: the inserted "obar" tail stays
+    // until accept (`ins_compl_use_match(K_UP)` is false).
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    machine
+        .feed_keys(&mut editor, "\u{19}", &mut eval)
+        .unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "foobar foobat\nfox");
     assert!(!machine.completion.is_active());
 }
 

@@ -1916,8 +1916,10 @@ impl CompletionSession {
                     // `ins_compl_use_match(K_CTRL_Y)` is true: accept
                     // uses `compl_shown_match`, so a selection the
                     // arrows moved without inserting is what gets
-                    // written, not the last cycled match.
-                    if self.active && self.selected > 0 {
+                    // written, not the last cycled match. Index 0 is
+                    // the original-text entry: accepting it restores
+                    // the typed leader, like `CTRL-E` does.
+                    if self.active && self.selected >= 0 {
                         let index = usize::try_from(self.selected).unwrap_or(0);
                         self.show_match(editor, buffer, window, index, timestamp)?;
                     }

@@ -1668,6 +1668,20 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 fn encode_key(key: KeyEvent) -> Option<String> {
+    // Crossterm folds the raw control bytes 0x1c..=0x1f into
+    // Ctrl-digit events — a terminal cannot send a distinct `Ctrl-4`,
+    // it sends the `Ctrl-\` byte — so upstream's byte-level decode
+    // sees `\x1c` and arms `c_CTRL-\`/`i_CTRL-\`. Re-encode the byte
+    // itself instead of a `<C-4>` name that decodes to literal `4`.
+    if let KeyCode::Char(digit @ '4'..='7') = key.code
+        && key.modifiers == KeyModifiers::CONTROL
+    {
+        return Some(
+            char::from_u32(0x18 + u32::from(digit) - u32::from('0'))
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
     let key_name = match key.code {
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -2753,6 +2767,32 @@ mod tests {
         assert_eq!(
             encode_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)),
             Some(",".to_owned())
+        );
+    }
+
+    /// Crossterm folds the control bytes 0x1c..=0x1f into Ctrl-digit
+    /// events: a real `Ctrl-\` press arrives as `Char('4') + CONTROL`.
+    /// Re-encode the byte itself so `c_CTRL-\`/`i_CTRL-\` arm — a
+    /// terminal cannot send a distinct `Ctrl-4`, and `<C-4>` notation
+    /// would decode to a literal `4`.
+    #[test]
+    fn encode_key_reencodes_ctrl_digit_folds_as_control_bytes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (digit, byte) in [('4', '\u{1c}'), ('5', '\u{1d}'), ('6', '\u{1e}'), ('7', '\u{1f}')] {
+            assert_eq!(
+                encode_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::CONTROL)),
+                Some(byte.to_string())
+            );
+        }
+        // Only the bare CONTROL fold is translated: with ALT or SHIFT
+        // present the name form still applies.
+        assert_eq!(
+            encode_key(KeyEvent::new(
+                KeyCode::Char('4'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some("<C-A-4>".to_owned())
         );
     }
 
