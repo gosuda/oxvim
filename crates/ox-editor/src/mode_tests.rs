@@ -4876,6 +4876,77 @@ fn insert_arrows_keep_curswant_across_short_lines() {
     assert_eq!(window_cursor(&editor), position(3, 6));
 }
 
+/// `w_curswant` counts display cells, not bytes (`coladvance`): moving
+/// off a tab-prefixed line keeps the screen column on plain lines, and
+/// the short-line clamp still restores it on the way back.
+#[test]
+fn insert_arrows_keep_curswant_in_virtual_columns() {
+    let (mut editor, _, mut machine) = named_editor("\tX\nabcdefghij\nzz", position(1, 1));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 8));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(2, 8));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
+
+/// A pending operand (`r`/`f`/`t` target, text-object selector) reads
+/// a character: a named key aborts the pending command like upstream's
+/// operand readers (`nv_replace`/`nv_csearch`), not a motion letter.
+#[test]
+fn named_key_aborts_pending_operand() {
+    let (mut editor, buffer, mut machine) = named_editor("foo bar", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "r", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "foo bar");
+    machine.feed_keys(&mut editor, "f", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(1, 0));
+    machine.feed_keys(&mut editor, "di", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(text(&editor), "foo bar");
+}
+
+/// `<Del>` with a pending count edits the count, not the buffer
+/// (`normal_get_command_count`): `12<Del>` leaves `1`, so `w` moves
+/// one word.
+#[test]
+fn named_del_edits_pending_count() {
+    let (mut editor, _, mut machine) = named_editor("foo bar baz", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "12", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    machine.feed_keys(&mut editor, "w", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(1, 4));
+}
+
+/// `i_<Ins>` toggles between insert and replace (`ins_insert`): once
+/// pressed, typed text overwrites; pressed again it inserts.
+#[test]
+fn insert_ins_toggles_replace_mode() {
+    let (mut editor, buffer, mut machine) = named_editor("abc", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'I');
+    machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "Zbc");
+    feed_special(&mut editor, &mut machine, b'k', b'I');
+    machine.feed_keys(&mut editor, "Q", &mut eval).unwrap();
+    assert_eq!(text(&editor), "ZQbc");
+}
+
 /// `i_<C-Right>` is `ins_s_right` (`fwd_word`): on the final word the
 /// insert cursor lands past the last byte at end of line — insert mode
 /// accepts a cursor one past the line, unlike Normal's `w` clamp.
@@ -4960,21 +5031,22 @@ fn cmdline_home_end_del_edit() {
     assert_eq!(state.cursor_byte, 2);
 }
 
-/// `i_<Down>` onto a shorter multibyte line must not leave the cursor
-/// inside a character: a byte column clamped into the middle of a
-/// scalar corrupts the next insert.
+/// `i_<Down>` lands on the character covering the wanted virtual
+/// column (`coladvance`): the landing is always a cluster head, never
+/// inside a multibyte scalar.
 #[test]
 fn insert_down_snaps_column_to_char_boundary() {
     let (mut editor, buffer, mut machine) = named_editor("abcd\naéx", position(1, 2));
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'd');
-    // Byte 2 sits inside `é` (bytes 1..3); the cursor snaps down to 1.
-    assert_eq!(window_cursor(&editor), position(2, 1));
+    // Virtual column 2 on `aéx` is `x` (`a`=cell 0, `é`=cell 1, `x`=cell
+    // 2): the cursor lands on byte 3, not inside `é` (bytes 1..3).
+    assert_eq!(window_cursor(&editor), position(2, 3));
     machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
     let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
         .unwrap();
-    assert_eq!(text, "abcd\naZéx");
+    assert_eq!(text, "abcd\naéZx");
 }
 
 /// Editing a recalled history entry discards the walk

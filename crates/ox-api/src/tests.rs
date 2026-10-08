@@ -9765,6 +9765,10 @@ fn set_hl_link_global_reprojects_across_namespaces() {
         )]),
     )
     .unwrap();
+    // Make ns 7 the active namespace before the global target changes:
+    // re-projecting `hl_namespaces[7]` must also refresh the active
+    // `state.highlights` clone, or the redraw path keeps stale attrs.
+    crate::ui::nvim_set_hl_ns(&session, 7).unwrap();
     crate::ui::nvim_set_hl(
         &session,
         0,
@@ -9782,4 +9786,17 @@ fn set_hl_link_global_reprojects_across_namespaces() {
         })
     });
     assert_eq!(far, Some(Some(0x00ee_ff00)));
+    let active = session.with_state(|state| {
+        state
+            .highlights
+            .group_id(&OxStr::from("FarLink"))
+            .and_then(|id| {
+                state
+                    .highlights
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, highlight)| highlight.rgb.foreground)
+            })
+    });
+    assert_eq!(active, Some(Some(0x00ee_ff00)));
 }

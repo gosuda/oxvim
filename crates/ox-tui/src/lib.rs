@@ -41,6 +41,13 @@ use thiserror::Error;
 const LOOP_SLICE: Duration = Duration::from_millis(16);
 // The level-triggered terminal backend treats a zero timeout as no poll.
 const INPUT_POLL: Duration = Duration::from_millis(1);
+
+/// Longest gap between events a consumed terminal string may span: the
+/// payload bytes of one terminal write arrive together, so an event this
+/// long after the previous consumed byte is user input, not a slow drip.
+/// Bounds the lossage when the lookahead below reads a keystroke that
+/// followed an `Alt-P`/`Alt-]`/`Alt-_` chord too quickly as a payload.
+const TERMINAL_STRING_GAP: Duration = Duration::from_millis(20);
 const NOTIFICATION_FADE_MS: u64 = 150;
 
 /// Motion policy selected from `OXVIM_TUI_MOTION`.
@@ -94,15 +101,16 @@ pub struct TuiState {
     highlight_groups: BTreeMap<HighlightGroup, HighlightStyle>,
     current_time: TimeMs,
     notification_started: Option<TimeMs>,
-    /// Inside a terminal string sequence (DCS `ESC P`, OSC `ESC ]`,
-    /// APC `ESC _`): crossterm has no string event, so the introducer
+    /// `Some(last)` while a terminal string (DCS `ESC P`, OSC `ESC ]`,
+    /// APC `ESC _`) is being consumed — `last` is when the previous
+    /// payload event arrived, so a gap past `TERMINAL_STRING_GAP` ends
+    /// the consume. Crossterm has no string event, so the introducer
     /// arrives as an Alt-modified key and the payload would otherwise
     /// leak in as keystrokes. Upstream's termkey driver frames these
     /// as ctrlstrings consumed wholesale until `BEL`, `ST`, or
-    /// `ESC \` (`nvim/tui/termkey/driver-csi.c:847`); the flag
-    /// persists across poll batches because an unterminated string
-    /// keeps swallowing input indefinitely.
-    consume_terminal_string: bool,
+    /// `ESC \` (`nvim/tui/termkey/driver-csi.c:847`); the state
+    /// persists across poll batches so a split payload stays framed.
+    consume_terminal_string: Option<std::time::Instant>,
 }
 
 impl Default for TuiState {
@@ -125,7 +133,7 @@ impl TuiState {
             highlight_groups: BTreeMap::new(),
             current_time: TimeMs(0),
             notification_started: None,
-            consume_terminal_string: false,
+            consume_terminal_string: None,
         }
     }
 
@@ -753,7 +761,27 @@ fn is_terminal_string_terminator(key: event::KeyEvent) -> bool {
 fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
     let mut keys = String::new();
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
-        match event::read().map_err(TuiError::Input)? {
+        let event = event::read().map_err(TuiError::Input)?;
+        if let Some(last) = state.consume_terminal_string {
+            if last.elapsed() > TERMINAL_STRING_GAP {
+                // Past the payload gap: this is user input — end the
+                // consume and let it be handled normally below.
+                state.consume_terminal_string = None;
+            } else if let Event::Key(key) = event {
+                if key.kind != event::KeyEventKind::Release
+                    && is_terminal_string_terminator(key)
+                {
+                    state.consume_terminal_string = None;
+                } else {
+                    state.consume_terminal_string = Some(std::time::Instant::now());
+                }
+                continue;
+            } else {
+                state.consume_terminal_string = Some(std::time::Instant::now());
+                continue;
+            }
+        }
+        match event {
             Event::Key(key) => {
                 // Windows reports key releases as distinct events; the editor
                 // protocol has presses only, so a release must not re-encode
@@ -761,22 +789,17 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 if key.kind == event::KeyEventKind::Release {
                     continue;
                 }
-                if state.consume_terminal_string {
-                    if is_terminal_string_terminator(key) {
-                        state.consume_terminal_string = false;
-                    }
-                    continue;
-                }
                 // A ctrlstring introducer is followed by its payload in
                 // the same terminal write, so the next event is already
                 // buffered; a user's `Alt-P`/`Alt-]`/`Alt-_` chord
                 // arrives alone. Peek before consuming — otherwise the
-                // chord swallows every key until a terminator that
-                // never comes.
+                // chord swallows keys until a terminator that never
+                // comes. `TERMINAL_STRING_GAP` still bounds how much a
+                // wrong peek can eat.
                 if is_terminal_string_intro(key)
                     && event::poll(INPUT_POLL).map_err(TuiError::Input)?
                 {
-                    state.consume_terminal_string = true;
+                    state.consume_terminal_string = Some(std::time::Instant::now());
                     continue;
                 }
                 state.chrome.keypress();
@@ -788,9 +811,6 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 }
             }
             Event::Paste(data) => {
-                if state.consume_terminal_string {
-                    continue;
-                }
                 state.chrome.keypress();
                 flush_key_buffer(client, &mut keys)?;
                 match client.paste(OxStr::from(data.as_str())) {
@@ -807,9 +827,6 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 client.try_resize(columns, rows)?;
             }
             Event::Mouse(mouse) => {
-                if state.consume_terminal_string {
-                    continue;
-                }
                 let dimensions = state
                     .screen
                     .composed_grid()

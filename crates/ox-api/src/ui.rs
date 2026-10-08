@@ -2225,9 +2225,11 @@ pub fn nvim_set_hl(
             .map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group_def(gid, def.clone());
         let _ = ns;
-        reproject_hl_links(state, ns_id, gid, &name, &def)?;
-        if ns_id == state.current_hl_ns {
-            activate_hl(state, ns_id);
+        let touched = reproject_hl_links(state, ns_id, gid, &name, &def)?;
+        // `link_global` re-projection can rewrite bindings in the active
+        // namespace even when the edited namespace is another one.
+        if touched.contains(&state.current_hl_ns) {
+            activate_hl(state, state.current_hl_ns);
         }
         Ok(())
     })?;
@@ -2259,7 +2261,8 @@ fn reproject_hl_links(
     gid: u64,
     name: &OxStr,
     def: &HlDef,
-) -> Result<(), ApiError> {
+) -> Result<std::collections::BTreeSet<i64>, ApiError> {
+    let mut touched = std::collections::BTreeSet::from([ns_id]);
     if def.link.is_some() {
         let effective = resolve_link_def(def, &state.hl_namespaces, ns_id);
         let self_protocol = project_protocol_hl(&effective);
@@ -2310,9 +2313,10 @@ fn reproject_hl_links(
             // A link that itself is the target of further links changes
             // what they resolve to as well.
             queue.push(link_gid);
+            touched.insert(link_ns);
         }
     }
-    Ok(())
+    Ok(touched)
 }
 
 #[expect(

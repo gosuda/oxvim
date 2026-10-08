@@ -5,7 +5,7 @@ use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
-use crate::builtins::position::{cursor_vcol, display_len, vcol_to_byte};
+use crate::builtins::position::{cursor_vcol, display_len, getvcol, vcol_to_byte};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{FindDirection, FindMotion, Motion, resolve, resolve_find};
@@ -1083,11 +1083,76 @@ impl ModeMachine {
         if matches!(self.mode, Mode::Insert(_) | Mode::Replace(_)) {
             return self.insert_named(editor, key);
         }
+        // A pending operand (`r`/`f`/`t` target, register, recording,
+        // `@` playback, `i`/`a` text object) reads a character: a named
+        // key has none to give — upstream's operand readers reject
+        // special keys and abort the pending command (`nv_replace`,
+        // `nv_csearch`, `op_reg_index`). Visual keeps its selection;
+        // operator-pending aborts back to Normal.
+        let operand_abort = match &self.mode {
+            Mode::Normal(state) => Self::operand_prefix(&state.prefix),
+            Mode::Visual(state) => Self::operand_prefix(&state.prefix),
+            Mode::OperatorPending(state) => Self::operand_prefix(&state.prefix),
+            _ => false,
+        };
+        if operand_abort {
+            beep_flush(editor);
+            match &mut self.mode {
+                Mode::Normal(state) => *state = NormalState::default(),
+                Mode::Visual(state) => state.prefix.clear(),
+                Mode::OperatorPending(_) => self.mode = Mode::default(),
+                _ => {}
+            }
+            return Ok(());
+        }
+        // A pending count is what `<Del>` edits: `normal_get_command_count`
+        // removes its last digit instead of deleting a character.
+        if key == NamedKey::Del {
+            let edited = match &mut self.mode {
+                Mode::Normal(state) if state.count != 0 => {
+                    state.count /= 10;
+                    true
+                }
+                Mode::Visual(state) if state.count != 0 => {
+                    state.count /= 10;
+                    true
+                }
+                Mode::OperatorPending(state) if state.motion_count != 0 => {
+                    state.motion_count /= 10;
+                    true
+                }
+                _ => false,
+            };
+            if edited {
+                return Ok(());
+            }
+        }
         self.motion_named(
             editor,
             key,
             matches!(self.mode, Mode::OperatorPending(_)),
             eval,
+        )
+    }
+
+    /// Whether `prefix` reads its next character as a command operand —
+    /// the `f`/`t` target, `r` replacement, register, recording, or `@`
+    /// playback character in Normal; the same plus `i`/`a` text-object
+    /// selectors in Visual and operator-pending.
+    fn operand_prefix(prefix: &str) -> bool {
+        matches!(
+            prefix,
+            "register"
+                | "record"
+                | "exec"
+                | "r"
+                | "r\u{16}"
+                | "f"
+                | "F"
+                | "t"
+                | "T"
+                | "i"
+                | "a"
         )
     }
 
@@ -1295,24 +1360,53 @@ impl ModeMachine {
                 // `ins_up`/`ins_down` keep `w_curswant`: the column a
                 // short line clamped to must not become the new want —
                 // moving back onto a longer line restores the original
-                // column (move.c `nv_up`/`nv_down` semantics).
-                let want = editor.window(ctx.window).ok().map_or(
+                // column (move.c `nv_up`/`nv_down` semantics). The want
+                // is a virtual (display) column like everywhere else it
+                // is used — tabs and wide characters occupy cells, not
+                // bytes — so both the seed and the landing translate
+                // through the `*vcol*` helpers.
+                let tabstop = match editor.options().get_buffer(ctx.buffer, "tabstop") {
+                    Ok(OptionValue::Number(value)) if *value > 0 => {
+                        usize::try_from(*value).unwrap_or(8)
+                    }
+                    _ => 8,
+                };
+                // The insert position sits before the byte at `col`, so
+                // seed from the covering character's first cell (a tab's
+                // last cell would overshoot); at end of line `getvcol`
+                // yields the display length, which is the insert EOL.
+                let (cur_vcol, _) = getvcol(
+                    &ctx.line(editor, ctx.cursor.lnum)?,
                     i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX),
+                    tabstop,
+                );
+                let cur_vcol = cur_vcol.saturating_add(usize::try_from(
+                    editor.window(ctx.window).map_or(0, |state| state.coladd.max(0)),
+                )
+                .unwrap_or(usize::MAX));
+                let want = editor.window(ctx.window).ok().map_or(
+                    i64::try_from(cur_vcol).unwrap_or(i64::MAX),
                     |state| {
                         if state.set_curswant {
-                            i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX)
+                            i64::try_from(cur_vcol).unwrap_or(i64::MAX)
                         } else {
                             state.curswant
                         }
                     },
                 );
-                // The wanted byte column can land inside a multi-byte
-                // scalar; snap down to a boundary so the next insert does
-                // not splice bytes into a character.
-                let mut col = usize::try_from(want).unwrap_or(0).min(line.len());
-                while col > 0 && col < line.len() && line[col] & 0xC0 == 0x80 {
-                    col -= 1;
-                }
+                // The insert cursor may rest one past the line, so a
+                // want at or past the line's display length lands on its
+                // end; inside it, `vcol_to_byte` snaps to the head of
+                // the covering cluster (the multi-byte snap is folded
+                // into the same translation).
+                let col = if want == i64::MAX
+                    || usize::try_from(want).unwrap_or(usize::MAX)
+                        >= display_len(&line, tabstop)
+                {
+                    line.len()
+                } else {
+                    vcol_to_byte(&line, usize::try_from(want).unwrap_or(0), tabstop)
+                };
                 editor.set_window_cursor(
                     ctx.window,
                     Position {
@@ -1400,7 +1494,16 @@ impl ModeMachine {
                     editor.set_window_cursor(ctx.window, target)?;
                 }
             }
-            _ => return Ok(()),
+            // `i_<Ins>` toggles between insert and replace mode
+            // (`ins_insert`, `insert.c`): it is a mode change, not a
+            // cursor move or an edit.
+            NamedKey::Ins => {
+                self.mode = match std::mem::take(&mut self.mode) {
+                    Mode::Insert(_) => Mode::Replace(ReplaceState),
+                    _ => Mode::Insert(InsertState),
+                };
+                return Ok(());
+            }
         }
         self.insert_moved = true;
         self.completion.reset();
