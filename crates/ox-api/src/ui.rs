@@ -2246,17 +2246,16 @@ pub fn nvim_set_hl(
             let effective = resolve_link_def(&linked_def, &state.hl_namespaces, ns_id);
             let linked_protocol = project_protocol_hl(&effective);
             let ns = state.hl_namespaces.entry(ns_id).or_default();
-            if let Some(current_id) = ns.group_id(&linked_name) {
-                let _ = ns
-                    .redefine(current_id, linked_protocol)
-                    .map_err(|error| ApiError::exception(error.to_string()))?;
-            } else {
-                let (new_id, _) = ns
-                    .intern(linked_protocol)
-                    .map_err(|error| ApiError::exception(error.to_string()))?;
-                ns.set_group(linked_name, new_id)
-                    .map_err(|error| ApiError::exception(error.to_string()))?;
-            }
+            // Rebind the name, never redefine the id: linked groups created
+            // before their targets project the same empty `Highlight`, and
+            // `intern` dedups them onto one shared definition slot (possibly
+            // the default id) — mutating that slot would repaint every name
+            // bound to it.
+            let (linked_id, _) = ns
+                .intern(linked_protocol)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            ns.set_group(linked_name, linked_id)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
         }
         if ns_id == state.current_hl_ns {
             activate_hl(state, ns_id);

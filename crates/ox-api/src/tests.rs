@@ -9638,6 +9638,17 @@ fn set_hl_link_reprojects_when_target_is_defined_later() {
         dict(&[("link", Object::String(OxStr::from("Target")))]),
     )
     .unwrap();
+    // A second link to a different target: both project the same empty
+    // `Highlight` before the targets exist, so `intern` dedups them onto one
+    // shared definition slot. Resolving one must not redefine that slot for
+    // the other.
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("LinkedTwo"),
+        dict(&[("link", Object::String(OxStr::from("TargetTwo")))]),
+    )
+    .unwrap();
     crate::ui::nvim_set_hl(
         &session,
         0,
@@ -9645,6 +9656,26 @@ fn set_hl_link_reprojects_when_target_is_defined_later() {
         dict(&[("fg", Object::Integer(0x0011_2233))]),
     )
     .unwrap();
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("TargetTwo"),
+        dict(&[("fg", Object::Integer(0x00aa_bbcc))]),
+    )
+    .unwrap();
+    let resolved_two = session.with_state(|state| {
+        state
+            .highlights
+            .group_id(&OxStr::from("LinkedTwo"))
+            .and_then(|id| {
+                state
+                    .highlights
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, highlight)| highlight.rgb.foreground)
+            })
+    });
+    assert_eq!(resolved_two, Some(Some(0x00aa_bbcc)));
     let resolved = session.with_state(|state| {
         state
             .highlights
