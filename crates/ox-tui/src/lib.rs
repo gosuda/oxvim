@@ -94,6 +94,15 @@ pub struct TuiState {
     highlight_groups: BTreeMap<HighlightGroup, HighlightStyle>,
     current_time: TimeMs,
     notification_started: Option<TimeMs>,
+    /// Inside a terminal string sequence (DCS `ESC P`, OSC `ESC ]`,
+    /// APC `ESC _`): crossterm has no string event, so the introducer
+    /// arrives as an Alt-modified key and the payload would otherwise
+    /// leak in as keystrokes. Upstream's termkey driver frames these
+    /// as ctrlstrings consumed wholesale until `BEL`, `ST`, or
+    /// `ESC \` (`nvim/tui/termkey/driver-csi.c:847`); the flag
+    /// persists across poll batches because an unterminated string
+    /// keeps swallowing input indefinitely.
+    consume_terminal_string: bool,
 }
 
 impl Default for TuiState {
@@ -116,6 +125,7 @@ impl TuiState {
             highlight_groups: BTreeMap::new(),
             current_time: TimeMs(0),
             notification_started: None,
+            consume_terminal_string: false,
         }
     }
 
@@ -711,6 +721,35 @@ fn flush_key_buffer(client: &mut Client, keys: &mut String) -> Result<(), TuiErr
     Ok(())
 }
 
+/// Whether a decoded key begins a terminal string sequence. Crossterm
+/// has no string events, so the `ESC`-prefixed introducers arrive as
+/// Alt-modified characters (`ESC P` → Alt-P, `ESC ]` → Alt-], `ESC _`
+/// → Alt-_) and the raw C1 introducers as their control characters
+/// (`0x90`/`0x9d`/`0x9f`). `SOS`/`PM` are deliberately not framed:
+/// upstream's driver does not consume them either
+/// (`nvim/tui/termkey/driver-csi.c:877`).
+fn is_terminal_string_intro(key: event::KeyEvent) -> bool {
+    if key.modifiers.contains(event::KeyModifiers::ALT) {
+        return matches!(key.code, event::KeyCode::Char('P' | ']' | '_'));
+    }
+    matches!(
+        key.code,
+        event::KeyCode::Char('\u{90}' | '\u{9d}' | '\u{9f}')
+    )
+}
+
+/// Whether a decoded key terminates a terminal string sequence:
+/// `BEL` arrives as `Ctrl-G`, two-byte `ST` (`ESC \\`) as `Alt-\\`,
+/// and the C1 `ST` as its control character.
+fn is_terminal_string_terminator(key: event::KeyEvent) -> bool {
+    match key.code {
+        event::KeyCode::Char('g') => key.modifiers.contains(event::KeyModifiers::CONTROL),
+        event::KeyCode::Char('\\') => key.modifiers.contains(event::KeyModifiers::ALT),
+        event::KeyCode::Char('\u{9c}') => true,
+        _ => false,
+    }
+}
+
 fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
     let mut keys = String::new();
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
@@ -722,6 +761,16 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 if key.kind == event::KeyEventKind::Release {
                     continue;
                 }
+                if state.consume_terminal_string {
+                    if is_terminal_string_terminator(key) {
+                        state.consume_terminal_string = false;
+                    }
+                    continue;
+                }
+                if is_terminal_string_intro(key) {
+                    state.consume_terminal_string = true;
+                    continue;
+                }
                 state.chrome.keypress();
                 if let Some(input) = encode_key(key) {
                     if keys.len() + input.len() > KEY_BUFFER_SIZE {
@@ -731,6 +780,9 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 }
             }
             Event::Paste(data) => {
+                if state.consume_terminal_string {
+                    continue;
+                }
                 state.chrome.keypress();
                 flush_key_buffer(client, &mut keys)?;
                 match client.paste(OxStr::from(data.as_str())) {
@@ -747,6 +799,9 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 client.try_resize(columns, rows)?;
             }
             Event::Mouse(mouse) => {
+                if state.consume_terminal_string {
+                    continue;
+                }
                 let dimensions = state
                     .screen
                     .composed_grid()
@@ -2658,5 +2713,62 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)),
             Some(",".to_owned())
         );
+    }
+
+    /// Terminal string sequences arrive through crossterm as an
+    /// Alt-modified key (their `ESC` prefix) — the introducer must
+    /// start a consume so the payload cannot leak into `nvim_input`
+    /// as keystrokes, like upstream's ctrlstring framing
+    /// (`nvim/tui/termkey/driver-csi.c:847`).
+    #[test]
+    fn terminal_string_intros_and_terminators() {
+        for code in [
+            KeyCode::Char('P'),
+            KeyCode::Char(']'),
+            KeyCode::Char('_'),
+        ] {
+            assert!(is_terminal_string_intro(KeyEvent::new(
+                code,
+                KeyModifiers::ALT
+            )));
+        }
+        for code in [
+            KeyCode::Char('\u{90}'),
+            KeyCode::Char('\u{9d}'),
+            KeyCode::Char('\u{9f}'),
+        ] {
+            assert!(is_terminal_string_intro(KeyEvent::new(
+                code,
+                KeyModifiers::NONE
+            )));
+        }
+
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::ALT
+        )));
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('\u{9c}'),
+            KeyModifiers::NONE
+        )));
+
+        // `SOS`/`PM` are not framed upstream, so they stay ordinary
+        // keys; a payload character is likewise ordinary.
+        assert!(!is_terminal_string_intro(KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_terminal_string_intro(KeyEvent::new(
+            KeyCode::Char('^'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        )));
     }
 }
