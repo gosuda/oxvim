@@ -2227,6 +2227,37 @@ pub fn nvim_set_hl(
         ns.set_group(name.clone(), protocol_id)
             .map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group_def(gid, def);
+        let linked: Vec<(OxStr, HlDef)> = ns
+            .iter_group_defs()
+            .filter(|(_, _, def)| def.link.is_some())
+            .map(|(name, _, def)| (name.clone(), def.clone()))
+            .collect();
+        let _ = ns;
+        // `hl_group_set`/`hl_attr_define` consumers resolve a group name to
+        // the attributes that name paints with; upstream resolves links at
+        // lookup (`synIDattr` follows the chain), so each definition change
+        // re-projects the effective attributes of every linked group in the
+        // namespace. Without this, a link set before its target — e.g.
+        // `default link IncSearch CurSearch` during `init_highlight` —
+        // keeps projecting the empty attributes the missing target
+        // resolved to, and extmark/incsearch highlights paint as plain
+        // text.
+        for (linked_name, linked_def) in linked {
+            let effective = resolve_link_def(&linked_def, &state.hl_namespaces, ns_id);
+            let linked_protocol = project_protocol_hl(&effective);
+            let ns = state.hl_namespaces.entry(ns_id).or_default();
+            if let Some(current_id) = ns.group_id(&linked_name) {
+                let _ = ns
+                    .redefine(current_id, linked_protocol)
+                    .map_err(|error| ApiError::exception(error.to_string()))?;
+            } else {
+                let (new_id, _) = ns
+                    .intern(linked_protocol)
+                    .map_err(|error| ApiError::exception(error.to_string()))?;
+                ns.set_group(linked_name, new_id)
+                    .map_err(|error| ApiError::exception(error.to_string()))?;
+            }
+        }
         if ns_id == state.current_hl_ns {
             activate_hl(state, ns_id);
         }

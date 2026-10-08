@@ -5046,3 +5046,21 @@ fn insert_ctrl_r_linewise_register_preserves_current_line() {
         String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "alpha bravo\nalpha bravo\nfifteen");
 }
+
+/// `'/pattern'` keystrokes run `'incsearch'` preview: the cursor jumps to
+/// the match and a transient `IncSearch` extmark marks the span.
+#[test]
+fn search_cmdline_typing_sets_incsearch_preview_mark() {
+    let (mut editor, _buffer, mut machine) =
+        named_editor("line 00\nNEEDLE far below\ntail", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "/NEEDL", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(2, 0));
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode, got {:?}", machine.mode());
+    };
+    assert!(
+        state.preview_mark.is_some(),
+        "incsearch preview mark not set for /NEEDL"
+    );
+}

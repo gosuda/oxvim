@@ -9621,3 +9621,63 @@ fn extmark_hl_group_round_trips_string_and_array_source_order() {
         ]))
     );
 }
+
+#[test]
+fn set_hl_link_reprojects_when_target_is_defined_later() {
+    // `highlight.c` resolves links at lookup (`synIDattr` follows the
+    // chain): `default link IncSearch CurSearch` runs during
+    // `init_highlight` BEFORE `CurSearch` is defined, and UI consumers
+    // must still paint the linked name with the target's attributes —
+    // otherwise extmark/incsearch highlights render as plain text.
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("Linked"),
+        dict(&[("link", Object::String(OxStr::from("Target")))]),
+    )
+    .unwrap();
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("Target"),
+        dict(&[("fg", Object::Integer(0x0011_2233))]),
+    )
+    .unwrap();
+    let resolved = session.with_state(|state| {
+        state
+            .highlights
+            .group_id(&OxStr::from("Linked"))
+            .and_then(|id| {
+                state
+                    .highlights
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, highlight)| highlight.rgb.foreground)
+            })
+    });
+    assert_eq!(resolved, Some(Some(0x0011_2233)));
+    // Redefining the target re-projects the link's painted attributes
+    // (lookup-time resolution, not a define-time snapshot).
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("Target"),
+        dict(&[("fg", Object::Integer(0x0044_5566))]),
+    )
+    .unwrap();
+    let repainted = session.with_state(|state| {
+        state
+            .highlights
+            .group_id(&OxStr::from("Linked"))
+            .and_then(|id| {
+                state
+                    .highlights
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, highlight)| highlight.rgb.foreground)
+            })
+    });
+    assert_eq!(repainted, Some(Some(0x0044_5566)));
+}
