@@ -2213,39 +2213,43 @@ pub fn nvim_set_hl(
             return Ok(());
         }
         let protocol = project_protocol_hl(&def);
-        let protocol_id = if let Some(current_id) = ns.group_id(&name) {
-            let _ = ns
-                .redefine(current_id, protocol)
-                .map_err(|error| ApiError::exception(error.to_string()))?;
-            current_id
-        } else {
-            let (new_id, _) = ns
-                .intern(protocol)
-                .map_err(|error| ApiError::exception(error.to_string()))?;
-            new_id
-        };
+        // Intern + rebind rather than `redefine` the group's current
+        // attribute id: `intern` dedups identical `Highlight`s onto one
+        // shared definition slot, so mutating that slot would repaint
+        // every name bound to it (e.g. redefining a group that shares
+        // its link target's colors would recolor the target too).
+        let (protocol_id, _) = ns
+            .intern(protocol)
+            .map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group(name.clone(), protocol_id)
             .map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group_def(gid, def);
-        let linked: Vec<(OxStr, HlDef)> = ns
-            .iter_group_defs()
-            .filter(|(_, _, def)| def.link.is_some())
-            .map(|(name, _, def)| (name.clone(), def.clone()))
-            .collect();
-        let _ = ns;
         // `hl_group_set`/`hl_attr_define` consumers resolve a group name to
         // the attributes that name paints with; upstream resolves links at
         // lookup (`synIDattr` follows the chain), so each definition change
-        // re-projects the effective attributes of every linked group in the
-        // namespace. Without this, a link set before its target — e.g.
+        // re-projects the effective attributes of every linked group that
+        // can reach it. Without this, a link set before its target — e.g.
         // `default link IncSearch CurSearch` during `init_highlight` —
         // keeps projecting the empty attributes the missing target
         // resolved to, and extmark/incsearch highlights paint as plain
-        // text.
-        for (linked_name, linked_def) in linked {
-            let effective = resolve_link_def(&linked_def, &state.hl_namespaces, ns_id);
+        // text. Links in the edited namespace resolve their target there,
+        // and `link_global` links in any namespace resolve theirs in
+        // namespace 0, so a global-namespace change must rescan links in
+        // every namespace.
+        let linked: Vec<(i64, OxStr, HlDef)> = state
+            .hl_namespaces
+            .iter()
+            .filter(|(link_ns, _)| ns_id == 0 || **link_ns == ns_id)
+            .flat_map(|(link_ns, ns)| {
+                ns.iter_group_defs()
+                    .filter(|(_, _, def)| def.link.is_some())
+                    .map(move |(name, _, def)| (*link_ns, name.clone(), def.clone()))
+            })
+            .collect();
+        for (link_ns, linked_name, linked_def) in linked {
+            let effective = resolve_link_def(&linked_def, &state.hl_namespaces, link_ns);
             let linked_protocol = project_protocol_hl(&effective);
-            let ns = state.hl_namespaces.entry(ns_id).or_default();
+            let ns = state.hl_namespaces.entry(link_ns).or_default();
             // Rebind the name, never redefine the id: linked groups created
             // before their targets project the same empty `Highlight`, and
             // `intern` dedups them onto one shared definition slot (possibly

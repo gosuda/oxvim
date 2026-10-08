@@ -9711,4 +9711,75 @@ fn set_hl_link_reprojects_when_target_is_defined_later() {
             })
     });
     assert_eq!(repainted, Some(Some(0x0044_5566)));
+    // `Linked` and `Target` now project identical attributes, so `intern`
+    // dedups them onto one shared definition slot. Giving `Linked` its own
+    // colors must rebind the name — mutating that slot in place would
+    // recolor `Target` even though its definition did not change.
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("Linked"),
+        dict(&[("fg", Object::Integer(0x0077_8899))]),
+    )
+    .unwrap();
+    let (linked_own, target_kept) = session.with_state(|state| {
+        let paint = |name: &str| {
+            state
+                .highlights
+                .group_id(&OxStr::from(name))
+                .and_then(|id| {
+                    state
+                        .highlights
+                        .iter()
+                        .find(|(candidate, _)| *candidate == id)
+                        .map(|(_, highlight)| highlight.rgb.foreground)
+                })
+        };
+        (paint("Linked"), paint("Target"))
+    });
+    assert_eq!(linked_own, Some(Some(0x0077_8899)));
+    assert_eq!(target_kept, Some(Some(0x0044_5566)));
+}
+
+#[test]
+fn set_hl_link_global_reprojects_across_namespaces() {
+    // A `link_global` link resolves its target in namespace 0 no matter
+    // which namespace the link lives in, so a global-target change must
+    // re-project links in every namespace — not just the edited one.
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("GlobalTarget"),
+        dict(&[("fg", Object::Integer(0x00dd_ccbb))]),
+    )
+    .unwrap();
+    crate::ui::nvim_set_hl(
+        &session,
+        7,
+        OxStr::from("FarLink"),
+        dict(&[(
+            "link_global",
+            Object::String(OxStr::from("GlobalTarget")),
+        )]),
+    )
+    .unwrap();
+    crate::ui::nvim_set_hl(
+        &session,
+        0,
+        OxStr::from("GlobalTarget"),
+        dict(&[("fg", Object::Integer(0x00ee_ff00))]),
+    )
+    .unwrap();
+    let far = session.with_state(|state| {
+        state.hl_namespaces.get(&7).and_then(|ns| {
+            ns.group_id(&OxStr::from("FarLink")).and_then(|id| {
+                ns.iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map(|(_, highlight)| highlight.rgb.foreground)
+            })
+        })
+    });
+    assert_eq!(far, Some(Some(0x00ee_ff00)));
 }
