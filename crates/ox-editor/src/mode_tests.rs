@@ -4987,3 +4987,32 @@ fn insert_ctrl_arrows_are_word_motions() {
     feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
     assert_eq!(window_cursor(&editor), position(1, 4));
 }
+
+/// `i_<Down>` onto an empty line must not panic — the clamped byte
+/// column equals `line.len()`, which is out of bounds for indexing.
+#[test]
+fn insert_down_onto_empty_line_does_not_panic() {
+    let (mut editor, _, mut machine) = named_editor("abcd\n\nx", position(1, 3));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 0));
+}
+
+/// `i_CTRL-V` and `i_CTRL-R` consume the next named key itself:
+/// upstream inserts the keycode notation literally.
+#[test]
+fn insert_pending_literal_and_register_take_named_key() {
+    let (mut editor, buffer, mut machine) = named_editor("", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\x16", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "<Up>");
+    machine.feed_keys(&mut editor, "\x12", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "<Up><Down>");
+}

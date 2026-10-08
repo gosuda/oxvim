@@ -1227,6 +1227,36 @@ impl ModeMachine {
     /// line edges, `i_<Del>` deletes the character under the cursor.
     fn insert_named(&mut self, editor: &mut Editor, key: NamedKey) -> Result<(), ModeError> {
         let ctx = cursor_context(editor)?;
+        // A pending `i_CTRL-V`/`i_CTRL-Q`/`i_CTRL-R` consumes the named
+        // key itself: upstream inserts its keycode notation literally
+        // (verified — `i_<C-V><Up>` and `i_<C-R><Up>` both put `<Up>`
+        // into the buffer).
+        if self.insert_literal.is_some() || self.pending_insert_ctrl_r {
+            self.insert_literal = None;
+            self.pending_insert_ctrl_r = false;
+            let notation = match key {
+                NamedKey::Up => "<Up>",
+                NamedKey::Down => "<Down>",
+                NamedKey::Home => "<Home>",
+                NamedKey::End => "<End>",
+                NamedKey::Del => "<Del>",
+                NamedKey::Ins => "<Ins>",
+                NamedKey::CtrlLeft => "<C-Left>",
+                NamedKey::CtrlRight => "<C-Right>",
+            };
+            let mut cursor = ctx.cursor;
+            for ch in notation.chars() {
+                cursor = insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    cursor,
+                    ch,
+                    self.timestamp,
+                )?;
+            }
+            return Ok(());
+        }
         match key {
             NamedKey::Up | NamedKey::Down => {
                 let target = if key == NamedKey::Up {
@@ -1243,7 +1273,7 @@ impl ModeMachine {
                 // scalar; snap down to a boundary so the next insert does
                 // not splice bytes into a character.
                 let mut col = ctx.cursor.col.min(line.len());
-                while col > 0 && line[col] & 0xC0 == 0x80 {
+                while col > 0 && col < line.len() && line[col] & 0xC0 == 0x80 {
                     col -= 1;
                 }
                 editor.set_window_cursor(
@@ -1273,6 +1303,9 @@ impl ModeMachine {
                     },
                 )?;
             }
+            // `i_<Del>` edits without moving the cursor, so it does
+            // not start a new undo block — return before `insert_moved`
+            // is set.
             NamedKey::Del => {
                 insert::delete_forward(
                     editor,
@@ -1281,6 +1314,7 @@ impl ModeMachine {
                     ctx.cursor,
                     self.timestamp,
                 )?;
+                return Ok(());
             }
             // `i_<C-Left>`/`i_<C-Right>` are the `ins_s_left`/`ins_s_right`
             // word motions (`edit.c`) — a `b`/`w` target on the whole
