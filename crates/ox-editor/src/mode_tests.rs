@@ -5031,6 +5031,51 @@ fn cmdline_home_end_del_edit() {
     assert_eq!(state.cursor_byte, 2);
 }
 
+/// `i_<C-\>` followed by a named key completes the chord: the
+/// backslash byte inserts literally, then the key runs normally
+/// (`insert.c:640-653` — a named key is never the `CTRL-N` exit).
+#[test]
+fn ctrl_bslash_named_key_inserts_literal_then_moves() {
+    let (mut editor, buffer, mut machine) = named_editor("ab\ncd", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "ab\n\u{1c}cd");
+    // The named key still dispatched: the cursor moved up a line.
+    assert_eq!(window_cursor(&editor).lnum, 1);
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+}
+
+/// `i_<Up>`/`i_<Down>` with the completion menu visible walk the
+/// selection without inserting (`ins_compl_use_match` returns false
+/// for them) — the cursor and the last-inserted match stay put.
+#[test]
+fn insert_arrows_select_completion_without_inserting() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    assert!(machine.completion.pum().is_some());
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    assert_eq!(window_cursor(&editor), position(2, 6));
+    // `pum.selected` excludes the original-text entry (`self.selected - 1`).
+    assert_eq!(machine.completion.pum().map(|pum| pum.selected), Some(1));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    assert_eq!(machine.completion.pum().map(|pum| pum.selected), Some(0));
+}
+
 /// `i_<Down>` lands on the character covering the wanted virtual
 /// column (`coladvance`): the landing is always a cluster head, never
 /// inside a multibyte scalar.
@@ -5047,6 +5092,28 @@ fn insert_down_snaps_column_to_char_boundary() {
     let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
         .unwrap();
     assert_eq!(text, "abcd\naéZx");
+}
+
+/// `lookfor` truncates at the cursor when the walk starts
+/// (`ex_getln.c` takes `cmdbuff` through `cmdpos`): `<Up>` from a
+/// mid-line cursor matches history on the prefix, and `<Down>` past
+/// the newest entry still restores the full typed line.
+#[test]
+fn cmdline_up_matches_prefix_through_cursor_only() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["edit file".to_owned(), "edit target".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":edit typo", &mut eval).unwrap();
+    // `c_<C-Left>` lands before `typo` — cursor at byte 5.
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    assert_eq!(text_of(&machine), ("edit target".to_owned(), 11));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), ("edit typo".to_owned(), 9));
 }
 
 /// Editing a recalled history entry discards the walk

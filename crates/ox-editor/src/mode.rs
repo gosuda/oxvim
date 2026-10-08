@@ -138,6 +138,9 @@ pub struct CmdlineState {
     /// The user's in-progress command-line text, saved on the first
     /// `<Up>` and restored when `<Down>` walks past the newest entry.
     pub history_saved: String,
+    /// `lookfor` (`ex_getln.c`): the text through the cursor when the
+    /// history walk started — it persists for the whole walk.
+    pub history_lookfor: String,
 }
 /// State retained between an operator and its motion or text object.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1254,14 +1257,16 @@ impl ModeMachine {
         if state.kind != CmdlineKind::Ex || (state.history_index.is_none() && !up) {
             return;
         }
-        // `lookfor` is the text the user was editing when the walk
-        // started (`ex_getln.c`): it persists for the whole walk, so
-        // repeated `<Up>` keeps matching the same prefix instead of
-        // the just-recalled entry.
-        let lookfor = match state.history_index {
-            Some(_) => state.history_saved.clone(),
-            None => state.text.clone(),
-        };
+        // `lookfor` is the text through the cursor when the walk
+        // started (`ex_getln.c` truncates `ccline.cmdbuff` at
+        // `ccline.cmdpos`): it persists for the whole walk, so repeated
+        // `<Up>` keeps matching the same prefix instead of the
+        // just-recalled entry. `history_saved` keeps the FULL line so
+        // `<Down>` past the newest entry restores it.
+        if state.history_index.is_none() {
+            state.history_lookfor = state.text[..state.cursor_byte].to_string();
+        }
+        let lookfor = state.history_lookfor.clone();
         let history = &self.cmdline_history;
         let start = state.history_index.unwrap_or(history.len());
         let found = if up {
@@ -1272,11 +1277,13 @@ impl ModeMachine {
         match found {
             Some(index) => {
                 if state.history_index.is_none() {
-                    state.history_saved.clone_from(&lookfor);
+                    state.history_saved.clone_from(&state.text);
                 }
                 state.history_index = Some(index);
                 state.text.clone_from(&history[index]);
             }
+            // Upstream also frees `lookfor` when the walk ends; the
+            // next `<Up>` re-derives it from the then-current text.
             None => {
                 if !up {
                     state.history_index = None;
@@ -1291,6 +1298,22 @@ impl ModeMachine {
     /// linewise keeping the column, `i_<Home>`/`i_<End>` move to the
     /// line edges, `i_<Del>` deletes the character under the cursor.
     fn insert_named(&mut self, editor: &mut Editor, key: NamedKey) -> Result<(), ModeError> {
+        // A pending `i_CTRL-\` completes first: a named key is never
+        // `CTRL-N`, so upstream's arm takes the `vungetc` path — the
+        // backslash byte inserts literally, then the key runs normally
+        // (`insert.c:640-653`).
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            let ctx = cursor_context(editor)?;
+            insert::insert_char(
+                editor,
+                ctx.buffer,
+                ctx.window,
+                ctx.cursor,
+                '\u{1c}',
+                self.timestamp,
+            )?;
+        }
         // A partial `i_CTRL-V` numeric literal emits its charcode before
         // the named key runs, like the nondigit path in `insert_pending`;
         // the key then dispatches normally.
@@ -1343,6 +1366,13 @@ impl ModeMachine {
                     self.timestamp,
                 )?;
             }
+            return Ok(());
+        }
+        // `ins_compl_pum_key`: with the completion menu visible the
+        // arrows move its selection without inserting (`ins_compl_use_match`
+        // returns false for `K_UP`/`K_DOWN`), not the buffer cursor.
+        if matches!(key, NamedKey::Up | NamedKey::Down) && self.completion.pum().is_some() {
+            self.completion.arrow(editor, key == NamedKey::Up);
             return Ok(());
         }
         match key {
@@ -1887,6 +1917,7 @@ impl ModeMachine {
                     preview_mark: None,
                     history_index: None,
                     history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             ':' => {
@@ -1914,6 +1945,7 @@ impl ModeMachine {
                     preview_mark: None,
                     history_index: None,
                     history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             'n' | 'N' => {
@@ -2753,6 +2785,7 @@ impl ModeMachine {
                     preview_mark: None,
                     history_index: None,
                     history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             'J' => {

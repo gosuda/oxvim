@@ -777,8 +777,15 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 }
                 continue;
             } else {
-                state.consume_terminal_string = Some(std::time::Instant::now());
-                continue;
+                // A resize is not string payload — forward it even
+                // mid-consume, and without refreshing the timestamp:
+                // a string long enough to span it ends on its own
+                // terminator, and a resize arriving during an
+                // abandoned consume still benefits from the gap.
+                if !matches!(event, Event::Resize(..)) {
+                    state.consume_terminal_string = Some(std::time::Instant::now());
+                    continue;
+                }
             }
         }
         match event {

@@ -2016,6 +2016,36 @@ impl CompletionSession {
         self.cycle(editor, buffer, window, direction, timestamp)
     }
 
+    /// `ins_complete(K_UP/K_DOWN)` with the menu visible
+    /// (`ins_compl_pum_key`, `insexpand.c:5685-5702`): the arrow keys move
+    /// the selection but `ins_compl_use_match` returns false for them, so
+    /// nothing is inserted — only the highlight walks.
+    pub fn arrow(&mut self, editor: &Editor, backward: bool) {
+        if !self.active || self.matches.is_empty() {
+            return;
+        }
+        let len = self.matches.len();
+        let direction = if backward {
+            Direction::Backward
+        } else {
+            Direction::Forward
+        };
+        let next = match (self.selected, direction) {
+            (-1, Direction::Forward) => usize::from(len > 1),
+            (-1, Direction::Backward) => len - 1,
+            (index, dir) => {
+                let index = usize::try_from(index.max(0)).unwrap_or(0).min(len - 1);
+                match dir {
+                    Direction::Forward => (index + 1) % len,
+                    Direction::Backward => (index + len - 1) % len,
+                }
+            }
+        };
+        self.selected = i64::try_from(next).unwrap_or(i64::MAX);
+        self.update_status();
+        self.refresh_pum(editor);
+    }
+
     /// One `ins_compl_next` step (`insexpand.c:5431-5560`): move to the
     /// neighboring entry of the cyclic list and show it
     /// (`ins_compl_make_cyclic`, `insexpand.c:1351-1369`).
