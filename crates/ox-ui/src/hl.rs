@@ -1,6 +1,6 @@
 //! Stable highlight identifiers and protocol emission.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
@@ -210,12 +210,27 @@ pub enum HlError {
 #[derive(Clone, Debug)]
 pub struct HlState {
     definitions: Vec<Highlight>,
+    /// Whether each definition slot holds live attributes; vacated
+    /// slots keep their last entry until `intern` reuses them.
+    occupied: Vec<bool>,
+    /// Name bindings referencing each slot. A slot whose count returns
+    /// to zero after having been bound is vacated into `free`.
+    refcounts: Vec<u32>,
+    /// Definition slots `intern` may reuse, in vacate order.
+    free: Vec<u64>,
     ids: BTreeMap<Highlight, u64>,
     groups: BTreeMap<OxStr, u64>,
     /// Group name to stable group id (`syn_check_group` registry).
     group_ids: BTreeMap<OxStr, u64>,
     /// Group id to the last explicitly-set canonical definition.
     group_defs: BTreeMap<u64, HlDef>,
+    /// Link target to the group names linking at it, split by
+    /// resolution scope: `local_dependents` lists links resolved in
+    /// this namespace, `global_dependents` lists `link_global` links
+    /// resolved against namespace 0.
+    local_dependents: BTreeMap<u64, BTreeSet<OxStr>>,
+    /// `link_global` dependents of each namespace-0 group id.
+    global_dependents: BTreeMap<u64, BTreeSet<OxStr>>,
     /// Next group id; group ids are one-based and stable per name.
     next_group_id: u64,
 }
@@ -235,10 +250,15 @@ impl HlState {
         ids.insert(default.clone(), 0);
         Self {
             definitions: vec![default],
+            occupied: vec![true],
+            refcounts: vec![0],
+            free: Vec::new(),
             ids,
             groups: BTreeMap::new(),
             group_ids: BTreeMap::new(),
             group_defs: BTreeMap::new(),
+            local_dependents: BTreeMap::new(),
+            global_dependents: BTreeMap::new(),
             next_group_id: 1,
         }
     }
@@ -270,6 +290,10 @@ impl HlState {
 
     /// Interns an attribute set, returning its stable id and an event only once.
     ///
+    /// Reuses a vacated slot when one is available: republishing an id
+    /// emits a fresh `hl_attr_define`, matching [`HlState::redefine`]'s
+    /// contract that references paint whatever the table holds now.
+    ///
     /// # Errors
     ///
     /// Returns [`HlError::IdExhausted`] when no identifier remains in the
@@ -278,10 +302,21 @@ impl HlState {
         if let Some(id) = self.ids.get(&highlight) {
             return Ok((*id, None));
         }
-        let id = u64::try_from(self.definitions.len()).map_err(|_| HlError::IdExhausted)?;
-        i64::try_from(id).map_err(|_| HlError::IdExhausted)?;
+        let id = if let Some(id) = self.free.pop() {
+            let index = usize::try_from(id).map_err(|_| HlError::IdExhausted)?;
+            self.definitions[index] = highlight.clone();
+            self.occupied[index] = true;
+            self.refcounts[index] = 0;
+            id
+        } else {
+            let id = u64::try_from(self.definitions.len()).map_err(|_| HlError::IdExhausted)?;
+            i64::try_from(id).map_err(|_| HlError::IdExhausted)?;
+            self.definitions.push(highlight.clone());
+            self.occupied.push(true);
+            self.refcounts.push(0);
+            id
+        };
         let event = define_event(id, &highlight);
-        self.definitions.push(highlight.clone());
         self.ids.insert(highlight, id);
         Ok((id, Some(event)))
     }
@@ -294,10 +329,10 @@ impl HlState {
     /// highlight.
     pub fn redefine(&mut self, id: u64, highlight: Highlight) -> Result<Option<HlEvent>, HlError> {
         let index = usize::try_from(id).map_err(|_| HlError::UnknownId(id))?;
-        let existing = self
-            .definitions
-            .get_mut(index)
-            .ok_or(HlError::UnknownId(id))?;
+        if self.occupied.get(index).copied() != Some(true) {
+            return Err(HlError::UnknownId(id));
+        }
+        let existing = &mut self.definitions[index];
         if *existing == highlight {
             return Ok(None);
         }
@@ -322,17 +357,18 @@ impl HlState {
         name: impl Into<OxStr>,
         id: u64,
     ) -> Result<Option<HlEvent>, HlError> {
-        if usize::try_from(id)
-            .ok()
-            .is_none_or(|index| index >= self.definitions.len())
-        {
+        let index = usize::try_from(id).map_err(|_| HlError::UnknownId(id))?;
+        if self.occupied.get(index).copied() != Some(true) {
             return Err(HlError::UnknownId(id));
         }
         let name = name.into();
         if self.groups.get(&name) == Some(&id) {
             return Ok(None);
         }
-        self.groups.insert(name.clone(), id);
+        if let Some(vacated) = self.groups.insert(name.clone(), id) {
+            self.release_binding(vacated);
+        }
+        self.refcounts[index] = self.refcounts[index].saturating_add(1);
         Ok(Some(HlEvent {
             name: "hl_group_set",
             args: vec![
@@ -345,9 +381,10 @@ impl HlState {
     /// Returns a definition by id.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&Highlight> {
-        usize::try_from(id)
-            .ok()
-            .and_then(|index| self.definitions.get(index))
+        usize::try_from(id).ok().and_then(|index| {
+            (self.occupied.get(index).copied() == Some(true))
+                .then(|| &self.definitions[index])
+        })
     }
 
     /// Iterates definitions in identifier order.
@@ -355,6 +392,7 @@ impl HlState {
         self.definitions
             .iter()
             .enumerate()
+            .filter(|(index, _)| self.occupied.get(*index).copied() == Some(true))
             .filter_map(|(id, highlight)| u64::try_from(id).ok().map(|id| (id, highlight)))
     }
 
@@ -366,11 +404,34 @@ impl HlState {
     /// Emits every current definition, including the default group.
     #[must_use]
     pub fn definitions(&self) -> Vec<HlEvent> {
-        self.definitions
-            .iter()
-            .enumerate()
-            .map(|(id, highlight)| define_event(u64::try_from(id).unwrap_or(u64::MAX), highlight))
+        self.iter()
+            .map(|(id, highlight)| define_event(id, highlight))
             .collect()
+    }
+
+    /// Drops one name binding's reference to `id`; when the last binding
+    /// leaves a non-default slot, vacates it for `intern` to reuse. Grid
+    /// cells can hold a vacated id until their next write — `get` then
+    /// yields nothing and they repaint plain rather than showing another
+    /// group's colors, matching [`HlState::redefine`]'s "references paint
+    /// whatever the table holds now" contract.
+    fn release_binding(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let Ok(index) = usize::try_from(id) else {
+            return;
+        };
+        let Some(count) = self.refcounts.get_mut(index) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        self.ids.remove(&self.definitions[index]);
+        self.occupied[index] = false;
+        self.free.push(id);
     }
 
     /// Defines a named group, interning the highlight and binding the name.
@@ -457,9 +518,46 @@ impl HlState {
         self.group_defs.get(&id)
     }
 
-    /// Stores the canonical definition for a group id.
-    pub fn set_group_def(&mut self, id: u64, definition: HlDef) {
+    /// Stores the canonical definition for a group id, keeping the
+    /// reverse link index in sync: the group's name leaves the index
+    /// slot of its previous target and joins its new target's slot.
+    pub fn set_group_def(&mut self, id: u64, name: &OxStr, definition: HlDef) {
+        if let Some(old) = self.group_defs.get(&id)
+            && let Some(target) = old.link
+        {
+            let map = if old.link_global {
+                &mut self.global_dependents
+            } else {
+                &mut self.local_dependents
+            };
+            if let Some(linkers) = map.get_mut(&target) {
+                linkers.remove(name);
+                if linkers.is_empty() {
+                    map.remove(&target);
+                }
+            }
+        }
+        if let Some(target) = definition.link {
+            let map = if definition.link_global {
+                &mut self.global_dependents
+            } else {
+                &mut self.local_dependents
+            };
+            map.entry(target).or_default().insert(name.clone());
+        }
         self.group_defs.insert(id, definition);
+    }
+
+    /// Group names whose definitions link to `target`; `global` selects
+    /// `link_global` links (resolved against namespace 0) from local
+    /// links resolved in this namespace.
+    pub fn link_dependents(&self, target: u64, global: bool) -> impl Iterator<Item = &OxStr> {
+        let map = if global {
+            &self.global_dependents
+        } else {
+            &self.local_dependents
+        };
+        map.get(&target).into_iter().flatten()
     }
 
     /// Iterates explicitly-set group definitions in name order.
@@ -664,6 +762,16 @@ fn push_flag(entries: &mut Vec<(OxStr, Object)>, name: &'static str, enabled: bo
 mod tests {
     use super::*;
 
+    fn fg_highlight(fg: u32) -> Highlight {
+        Highlight {
+            rgb: HlAttrs {
+                foreground: Some(fg),
+                ..HlAttrs::default()
+            },
+            ..Highlight::default()
+        }
+    }
+
     #[test]
     fn group_boundary_rejects_past_max_hl_id() {
         let mut state = HlState::new();
@@ -692,5 +800,116 @@ mod tests {
             state.check_group(&OxStr::from("Over")),
             Err(HlError::TooManyGroups)
         );
+    }
+
+    #[test]
+    fn rebinding_a_group_vacates_its_old_attr_slot_for_reuse() {
+        let mut state = HlState::new();
+        let (first, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", first).unwrap();
+        let (second, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", second).unwrap();
+        // The slot `G` vacated reports nothing until interned again.
+        assert_eq!(state.get(first), None);
+        let (reused, event) = state.intern(fg_highlight(3)).unwrap();
+        assert_eq!(reused, first);
+        // Republishing an id re-emits `hl_attr_define`, matching
+        // `redefine`'s contract for references that cached the slot.
+        assert!(event.is_some());
+        assert_eq!(
+            state.get(reused).map(|highlight| highlight.rgb.foreground),
+            Some(Some(3))
+        );
+    }
+
+    #[test]
+    fn shared_attr_survives_partial_rebind() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("A", id).unwrap();
+        state.set_group("B", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("A", other).unwrap();
+        // `B` still binds the slot, so it is not a reuse candidate.
+        assert!(state.get(id).is_some());
+        let (fresh, _) = state.intern(fg_highlight(3)).unwrap();
+        assert_ne!(fresh, id);
+    }
+
+    #[test]
+    fn default_slot_is_never_vacated() {
+        let mut state = HlState::new();
+        state.set_group("G", 0).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", other).unwrap();
+        assert!(state.get(0).is_some());
+    }
+
+    #[test]
+    fn vacated_slot_rejects_bind_and_redefine() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", other).unwrap();
+        assert_eq!(state.set_group("H", id), Err(HlError::UnknownId(id)));
+        assert_eq!(
+            state.redefine(id, fg_highlight(3)),
+            Err(HlError::UnknownId(id))
+        );
+    }
+
+    #[test]
+    fn rebinding_to_the_same_id_keeps_the_slot_bound() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", id).unwrap();
+        state.set_group("G", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        assert_ne!(other, id);
+        assert!(state.get(id).is_some());
+    }
+
+    #[test]
+    fn link_dependents_track_retargets_and_scope() {
+        let mut state = HlState::new();
+        let a = state.check_group(&OxStr::from("A")).unwrap();
+        let t = state.check_group(&OxStr::from("T")).unwrap();
+        let u = state.check_group(&OxStr::from("U")).unwrap();
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(t),
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 1);
+        // Retargeting removes the stale index entry.
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(u),
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 0);
+        assert_eq!(state.link_dependents(u, false).count(), 1);
+        // `link_global` dependents index separately from local links.
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(t),
+                link_global: true,
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 0);
+        assert_eq!(state.link_dependents(t, true).count(), 1);
+        // Clearing the link drops the index entry entirely.
+        state.set_group_def(a, &OxStr::from("A"), HlDef::default());
+        assert_eq!(state.link_dependents(t, true).count(), 0);
     }
 }

@@ -2223,7 +2223,7 @@ pub fn nvim_set_hl(
             .map_err(|error| ApiError::exception(error.to_string()))?;
         ns.set_group(name.clone(), protocol_id)
             .map_err(|error| ApiError::exception(error.to_string()))?;
-        ns.set_group_def(gid, def.clone());
+        ns.set_group_def(gid, &name, def.clone());
         let _ = ns;
         let touched = reproject_hl_links(state, ns_id, gid, &name, &def)?;
         // `link_global` re-projection can rewrite bindings in the active
@@ -2273,31 +2273,44 @@ fn reproject_hl_links(
         ns.set_group(name.clone(), self_id)
             .map_err(|error| ApiError::exception(error.to_string()))?;
     }
-    // The map indexes each link by its target so the BFS only walks
-    // chains that reach the changed group. Definitions are fetched per
-    // dependent during the walk — cloning every linked `HlDef` up front
-    // would allocate once per link per call.
-    let mut dependents: BTreeMap<u64, Vec<(i64, u64, OxStr)>> = BTreeMap::new();
-    for (link_ns, ns) in &state.hl_namespaces {
-        if ns_id != 0 && *link_ns != ns_id {
-            continue;
-        }
-        for (name, link_gid, def) in ns.iter_group_defs() {
-            if let Some(target) = def.link {
-                dependents
-                    .entry(target)
-                    .or_default()
-                    .push((*link_ns, link_gid, name.clone()));
+    // The reverse index `HlState::set_group_def` maintains keys each
+    // link by its resolved target, so this BFS stays proportional to
+    // the links that actually reach the changed group instead of
+    // scanning every definition. A link resolves its target in its own
+    // namespace unless `link_global` resolves it in namespace 0, so a
+    // namespace-0 change must consider `link_global` dependents in
+    // every namespace.
+    let mut queue = vec![(ns_id, gid)];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((current_ns, current_gid)) = queue.pop() {
+        let mut candidates: Vec<(i64, OxStr)> = state
+            .hl_namespaces
+            .get(&current_ns)
+            .map(|ns| {
+                ns.link_dependents(current_gid, false)
+                    .map(|name| (current_ns, name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if current_ns == 0 {
+            for (link_ns, ns) in &state.hl_namespaces {
+                if *link_ns == 0 {
+                    continue;
+                }
+                candidates.extend(
+                    ns.link_dependents(current_gid, true)
+                        .map(|name| (*link_ns, name.clone())),
+                );
             }
         }
-    }
-    let mut queue = vec![gid];
-    let mut seen = std::collections::BTreeSet::new();
-    while let Some(current) = queue.pop() {
-        let Some(next) = dependents.get(&current) else {
-            continue;
-        };
-        for (link_ns, link_gid, linked_name) in next.clone() {
+        for (link_ns, linked_name) in candidates {
+            let Some(link_gid) = state
+                .hl_namespaces
+                .get(&link_ns)
+                .and_then(|ns| ns.group_by_name(&linked_name))
+            else {
+                continue;
+            };
             if !seen.insert((link_ns, link_gid)) {
                 continue;
             }
@@ -2323,7 +2336,7 @@ fn reproject_hl_links(
                 .map_err(|error| ApiError::exception(error.to_string()))?;
             // A link that itself is the target of further links changes
             // what they resolve to as well.
-            queue.push(link_gid);
+            queue.push((link_ns, link_gid));
             touched.insert(link_ns);
         }
     }

@@ -9800,3 +9800,47 @@ fn set_hl_link_global_reprojects_across_namespaces() {
     });
     assert_eq!(active, Some(Some(0x00ee_ff00)));
 }
+
+#[test]
+fn set_hl_attr_churn_keeps_the_intern_table_bounded() {
+    // Repeated `nvim_set_hl` on one group interns a fresh attribute set
+    // per call; superseded slots are vacated when their last binding
+    // rebinds, so the table tracks live references rather than the
+    // cumulative number of calls.
+    let session = session();
+    for i in 0..300 {
+        crate::ui::nvim_set_hl(
+            &session,
+            0,
+            OxStr::from("Churn"),
+            dict(&[("fg", Object::Integer(0x100 + i))]),
+        )
+        .unwrap();
+    }
+    let live = session.with_state(|state| state.hl_namespaces[&0].iter().count());
+    assert!(live <= 3, "attr table kept superseded slots: {live}");
+}
+
+#[test]
+fn set_hl_retargeted_link_leaves_its_old_chain_untouched() {
+    // After `A` retargets away from `B`, changing `B`'s chain must not
+    // re-project `A`: a stale reverse-index entry would rebind `A` to
+    // the chain's new resolved attributes.
+    let session = session();
+    let set = |name: &str, entries: &[(&str, Object)]| {
+        crate::ui::nvim_set_hl(&session, 0, OxStr::from(name), dict(entries)).unwrap();
+    };
+    set("T", &[("fg", Object::Integer(0x00_0011))]);
+    set("C", &[("fg", Object::Integer(0x00_aabb))]);
+    set("B", &[("link", Object::String(OxStr::from("T")))]);
+    set("A", &[("link", Object::String(OxStr::from("B")))]);
+    set("A", &[("link", Object::String(OxStr::from("C")))]);
+    set("T", &[("fg", Object::Integer(0x00_ff00))]);
+    let painted = session.with_state(|state| {
+        state.hl_namespaces[&0]
+            .group_id(&OxStr::from("A"))
+            .and_then(|id| state.hl_namespaces[&0].get(id))
+            .map(|highlight| highlight.rgb.foreground)
+    });
+    assert_eq!(painted, Some(Some(0x00_aabb)));
+}
