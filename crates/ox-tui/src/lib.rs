@@ -41,6 +41,18 @@ use thiserror::Error;
 const LOOP_SLICE: Duration = Duration::from_millis(16);
 // The level-triggered terminal backend treats a zero timeout as no poll.
 const INPUT_POLL: Duration = Duration::from_millis(1);
+/// How long to wait for payload after a ctrlstring introducer before
+/// treating the key as a human Alt chord. Covers relay-chunked writes
+/// (tmux/ssh) that a single `INPUT_POLL` slice can miss while staying
+/// below perceptible chord latency.
+const TERMINAL_STRING_PEEK: Duration = Duration::from_millis(10);
+
+/// Longest gap between events a consumed terminal string may span: the
+/// payload bytes of one terminal write arrive together, so an event this
+/// long after the previous consumed byte is user input, not a slow drip.
+/// Bounds the lossage when the lookahead below reads a keystroke that
+/// followed an `Alt-P`/`Alt-]`/`Alt-_` chord too quickly as a payload.
+const TERMINAL_STRING_GAP: Duration = Duration::from_millis(20);
 const NOTIFICATION_FADE_MS: u64 = 150;
 
 /// Motion policy selected from `OXVIM_TUI_MOTION`.
@@ -94,6 +106,16 @@ pub struct TuiState {
     highlight_groups: BTreeMap<HighlightGroup, HighlightStyle>,
     current_time: TimeMs,
     notification_started: Option<TimeMs>,
+    /// `Some(last)` while a terminal string (DCS `ESC P`, OSC `ESC ]`,
+    /// APC `ESC _`) is being consumed — `last` is when the previous
+    /// payload event arrived, so a gap past `TERMINAL_STRING_GAP` ends
+    /// the consume. Crossterm has no string event, so the introducer
+    /// arrives as an Alt-modified key and the payload would otherwise
+    /// leak in as keystrokes. Upstream's termkey driver frames these
+    /// as ctrlstrings consumed wholesale until `BEL`, `ST`, or
+    /// `ESC \` (`nvim/tui/termkey/driver-csi.c:847`); the state
+    /// persists across poll batches so a split payload stays framed.
+    consume_terminal_string: Option<std::time::Instant>,
 }
 
 impl Default for TuiState {
@@ -116,6 +138,7 @@ impl TuiState {
             highlight_groups: BTreeMap::new(),
             current_time: TimeMs(0),
             notification_started: None,
+            consume_terminal_string: None,
         }
     }
 
@@ -711,15 +734,88 @@ fn flush_key_buffer(client: &mut Client, keys: &mut String) -> Result<(), TuiErr
     Ok(())
 }
 
+/// Whether a decoded key begins a terminal string sequence. Crossterm
+/// has no string events, so the `ESC`-prefixed introducers arrive as
+/// Alt-modified characters (`ESC P` → Alt-P, `ESC ]` → Alt-], `ESC _`
+/// → Alt-_) and the raw C1 introducers as their control characters
+/// (`0x90`/`0x9d`/`0x9f`). `SOS`/`PM` are deliberately not framed:
+/// upstream's driver does not consume them either
+/// (`nvim/tui/termkey/driver-csi.c:877`).
+fn is_terminal_string_intro(key: event::KeyEvent) -> bool {
+    if key.modifiers.contains(event::KeyModifiers::ALT) {
+        return matches!(key.code, event::KeyCode::Char('P' | ']' | '_'));
+    }
+    matches!(
+        key.code,
+        event::KeyCode::Char('\u{90}' | '\u{9d}' | '\u{9f}')
+    )
+}
+
+/// Whether a decoded key terminates a terminal string sequence:
+/// `BEL` arrives as `Ctrl-G`, two-byte `ST` (`ESC \\`) as `Alt-\\`,
+/// and the C1 `ST` as its control character.
+fn is_terminal_string_terminator(key: event::KeyEvent) -> bool {
+    match key.code {
+        event::KeyCode::Char('g') => key.modifiers.contains(event::KeyModifiers::CONTROL),
+        event::KeyCode::Char('\\') => key.modifiers.contains(event::KeyModifiers::ALT),
+        event::KeyCode::Char('\u{9c}') => true,
+        _ => false,
+    }
+}
+
 fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<(), TuiError> {
     let mut keys = String::new();
     while event::poll(INPUT_POLL).map_err(TuiError::Input)? {
-        match event::read().map_err(TuiError::Input)? {
+        let event = event::read().map_err(TuiError::Input)?;
+        if let Some(last) = state.consume_terminal_string {
+            if last.elapsed() > TERMINAL_STRING_GAP {
+                // Past the payload gap: this is user input — end the
+                // consume and let it be handled normally below.
+                state.consume_terminal_string = None;
+            } else if let Event::Key(key) = event {
+                if key.kind != event::KeyEventKind::Release
+                    && is_terminal_string_terminator(key)
+                {
+                    state.consume_terminal_string = None;
+                } else {
+                    state.consume_terminal_string = Some(std::time::Instant::now());
+                }
+                continue;
+            } else {
+                // A resize is not string payload — forward it even
+                // mid-consume, and keep the consume armed: a
+                // `try_resize` slower than `TERMINAL_STRING_GAP` must
+                // not expire the string and let trailing payload bytes
+                // fall through as keystrokes.
+                state.consume_terminal_string = Some(std::time::Instant::now());
+                if !matches!(event, Event::Resize(..)) {
+                    continue;
+                }
+            }
+        }
+        match event {
             Event::Key(key) => {
                 // Windows reports key releases as distinct events; the editor
                 // protocol has presses only, so a release must not re-encode
                 // as another press.
                 if key.kind == event::KeyEventKind::Release {
+                    continue;
+                }
+                // A ctrlstring introducer is followed by its payload in
+                // the same terminal write, but a relay (tmux, ssh) can
+                // chunk the write and park the first payload byte a few
+                // milliseconds behind the introducer. Peek for up to
+                // `TERMINAL_STRING_PEEK` before deciding this was a
+                // human `Alt-P`/`Alt-]`/`Alt-_` chord — too short and a
+                // split string's payload lands as editor input; too
+                // long and a real chord stalls. `poll` returns as soon
+                // as an event is buffered, so a real string pays only
+                // its actual relay latency. `TERMINAL_STRING_GAP` still
+                // bounds how much a wrong peek can eat.
+                if is_terminal_string_intro(key)
+                    && event::poll(TERMINAL_STRING_PEEK).map_err(TuiError::Input)?
+                {
+                    state.consume_terminal_string = Some(std::time::Instant::now());
                     continue;
                 }
                 state.chrome.keypress();
@@ -1572,6 +1668,20 @@ fn duration_millis(duration: Duration) -> u64 {
 }
 
 fn encode_key(key: KeyEvent) -> Option<String> {
+    // Crossterm folds the raw control bytes 0x1c..=0x1f into
+    // Ctrl-digit events — a terminal cannot send a distinct `Ctrl-4`,
+    // it sends the `Ctrl-\` byte — so upstream's byte-level decode
+    // sees `\x1c` and arms `c_CTRL-\`/`i_CTRL-\`. Re-encode the byte
+    // itself instead of a `<C-4>` name that decodes to literal `4`.
+    if let KeyCode::Char(digit @ '4'..='7') = key.code
+        && key.modifiers == KeyModifiers::CONTROL
+    {
+        return Some(
+            char::from_u32(0x18 + u32::from(digit) - u32::from('0'))
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
     let key_name = match key.code {
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
@@ -2658,5 +2768,105 @@ mod tests {
             encode_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)),
             Some(",".to_owned())
         );
+    }
+
+    /// Crossterm folds the control bytes 0x1c..=0x1f into Ctrl-digit
+    /// events: a real `Ctrl-\` press arrives as `Char('4') + CONTROL`.
+    /// Re-encode the byte itself so `c_CTRL-\`/`i_CTRL-\` arm — a
+    /// terminal cannot send a distinct `Ctrl-4`, and `<C-4>` notation
+    /// would decode to a literal `4`.
+    #[test]
+    fn encode_key_reencodes_ctrl_digit_folds_as_control_bytes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for (digit, byte) in [('4', '\u{1c}'), ('5', '\u{1d}'), ('6', '\u{1e}'), ('7', '\u{1f}')] {
+            assert_eq!(
+                encode_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::CONTROL)),
+                Some(byte.to_string())
+            );
+        }
+        // Only the bare CONTROL fold is translated: with ALT or SHIFT
+        // present the name form still applies.
+        assert_eq!(
+            encode_key(KeyEvent::new(
+                KeyCode::Char('4'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            )),
+            Some("<C-A-4>".to_owned())
+        );
+    }
+
+    /// Terminal string sequences arrive through crossterm as an
+    /// Alt-modified key (their `ESC` prefix) — the introducer must
+    /// start a consume so the payload cannot leak into `nvim_input`
+    /// as keystrokes, like upstream's ctrlstring framing
+    /// (`nvim/tui/termkey/driver-csi.c:847`).
+    #[test]
+    fn terminal_string_intros_and_terminators() {
+        for code in [
+            KeyCode::Char('P'),
+            KeyCode::Char(']'),
+            KeyCode::Char('_'),
+        ] {
+            assert!(is_terminal_string_intro(KeyEvent::new(
+                code,
+                KeyModifiers::ALT
+            )));
+        }
+        for code in [
+            KeyCode::Char('\u{90}'),
+            KeyCode::Char('\u{9d}'),
+            KeyCode::Char('\u{9f}'),
+        ] {
+            assert!(is_terminal_string_intro(KeyEvent::new(
+                code,
+                KeyModifiers::NONE
+            )));
+        }
+
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('\\'),
+            KeyModifiers::ALT
+        )));
+        assert!(is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('\u{9c}'),
+            KeyModifiers::NONE
+        )));
+
+        // `SOS`/`PM` are not framed upstream, so they stay ordinary
+        // keys; a payload character is likewise ordinary.
+        assert!(!is_terminal_string_intro(KeyEvent::new(
+            KeyCode::Char('X'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_terminal_string_intro(KeyEvent::new(
+            KeyCode::Char('^'),
+            KeyModifiers::ALT
+        )));
+        assert!(!is_terminal_string_terminator(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    /// A bare `Alt-P`/`Alt-]`/`Alt-_` chord (no payload buffered after
+    /// it) must still encode as a keypress — only an introducer with
+    /// bytes already queued behind it starts a consume.
+    #[test]
+    fn alt_intro_chord_encodes_as_key() {
+        for code in [
+            KeyCode::Char('P'),
+            KeyCode::Char(']'),
+            KeyCode::Char('_'),
+        ] {
+            assert!(matches!(
+                encode_key(KeyEvent::new(code, KeyModifiers::ALT)),
+                Some(ref encoded) if encoded.starts_with("<A-")
+            ));
+        }
     }
 }

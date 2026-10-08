@@ -4744,3 +4744,634 @@ fn ctrl_w_less_reaches_wincmd_through_the_typeahead() {
         before - 1
     );
 }
+
+/// Builds the `run` helper's editor without feeding keys — for tests
+/// that drive `K_SPECIAL` triples through the typeahead.
+fn named_editor(text: &str, cursor: Position) -> (Editor, ox_types::BufHandle, ModeMachine) {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(Buffer::from_bytes(text.as_bytes()).unwrap(), true)
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, cursor).unwrap();
+    (editor, buffer, ModeMachine::default())
+}
+
+/// Feeds one `K_SPECIAL` triple through the typeahead — the same
+/// `nvim_input` decode path a terminal key event takes.
+fn feed_special(editor: &mut Editor, machine: &mut ModeMachine, second: u8, third: u8) {
+    editor
+        .typeahead_mut()
+        .append(&Keys::special(second, third).unwrap(), TypeaheadFlags::default());
+    let mut eval = NullExprEval;
+    machine.run_once(editor, &mut eval).unwrap();
+}
+
+fn window_cursor(editor: &Editor) -> Position {
+    editor
+        .window(editor.current_window().unwrap())
+        .unwrap()
+        .cursor
+}
+
+/// `<Up>`/`<Down>`/`<Home>`/`<End>` are keycodes dispatched as motions
+/// (`nv_cmds` `KAUP`/`KADOWN`/`KAHOME`/`KAEND`), not swallowed keys:
+/// a terminal's arrow presses must move the cursor.
+#[test]
+fn normal_named_keys_are_motions() {
+    let (mut editor, _, mut machine) = named_editor("one\ntwo\nthree", position(2, 1));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 1));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 1));
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'h');
+    assert_eq!(window_cursor(&editor), position(2, 0));
+}
+
+/// `<Del>` in Normal deletes the character under the cursor like `x`,
+/// and `<Insert>` enters Insert like `i`.
+#[test]
+fn normal_del_and_insert_dispatch() {
+    let (mut editor, buffer, mut machine) = named_editor("abc", position(1, 0));
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "bc");
+
+    feed_special(&mut editor, &mut machine, b'k', b'I');
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+}
+
+/// `KE_C_LEFT`/`KE_C_RIGHT` are word motions (`b`/`w`).
+#[test]
+fn normal_ctrl_arrows_are_word_motions() {
+    let (mut editor, _, mut machine) = named_editor("foo bar", position(1, 0));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(window_cursor(&editor), position(1, 0));
+}
+
+/// `<Del>` in operator-pending has no motion — `d<Del>` must not
+/// delete anything (a char-translation to `x` would cancel or corrupt
+/// the pending operator).
+#[test]
+fn operator_pending_del_is_noop() {
+    let (mut editor, buffer, mut machine) = named_editor("foo bar", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "d", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    machine.feed_keys(&mut editor, "w", &mut eval).unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "bar");
+}
+
+/// Insert-mode arrows move the insertion cursor (`ins_special`):
+/// `i_<Up>`/i_<Down>` linewise, `i_<Home>`/`i_<End>` to the line edges.
+#[test]
+fn insert_named_keys_move_cursor() {
+    let (mut editor, _, mut machine) = named_editor("one\ntwo\nthree", position(3, 2));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'h');
+    assert_eq!(window_cursor(&editor), position(2, 0));
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    assert_eq!(window_cursor(&editor), position(2, 3));
+}
+
+/// `i_<Up>`/`i_<Down>` keep `w_curswant`: the column a short line
+/// clamps to must not become the wanted column — moving back onto a
+/// longer line restores the original column (`ins_up`/`ins_down`).
+#[test]
+fn insert_arrows_keep_curswant_across_short_lines() {
+    let (mut editor, _, mut machine) = named_editor("abcdef\nab\nabcdef", position(1, 5));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 5));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 5));
+    // A horizontal move re-seeds the want: after `i_<End>` the next
+    // vertical move keeps the end column, not the stale one.
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    assert_eq!(window_cursor(&editor), position(2, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 6));
+}
+
+/// `w_curswant` counts display cells, not bytes (`coladvance`): moving
+/// off a tab-prefixed line keeps the screen column on plain lines, and
+/// the short-line clamp still restores it on the way back.
+#[test]
+fn insert_arrows_keep_curswant_in_virtual_columns() {
+    let (mut editor, _, mut machine) = named_editor("\tX\nabcdefghij\nzz", position(1, 1));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 8));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(3, 2));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(2, 8));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
+
+/// A pending operand (`r`/`f`/`t` target, text-object selector) reads
+/// a character: a named key aborts the pending command like upstream's
+/// operand readers (`nv_replace`/`nv_csearch`), not a motion letter.
+#[test]
+fn named_key_aborts_pending_operand() {
+    let (mut editor, buffer, mut machine) = named_editor("foo bar", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "r", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "foo bar");
+    machine.feed_keys(&mut editor, "f", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(1, 0));
+    machine.feed_keys(&mut editor, "di", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(text(&editor), "foo bar");
+}
+
+/// `<Del>` with a pending count edits the count, not the buffer
+/// (`normal_get_command_count`): `12<Del>` leaves `1`, so `w` moves
+/// one word.
+#[test]
+fn named_del_edits_pending_count() {
+    let (mut editor, _, mut machine) = named_editor("foo bar baz", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "12", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    machine.feed_keys(&mut editor, "w", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(1, 4));
+}
+
+/// `i_<Ins>` toggles between insert and replace (`ins_insert`): once
+/// pressed, typed text overwrites; pressed again it inserts.
+#[test]
+fn insert_ins_toggles_replace_mode() {
+    let (mut editor, buffer, mut machine) = named_editor("abc", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'I');
+    machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "Zbc");
+    feed_special(&mut editor, &mut machine, b'k', b'I');
+    machine.feed_keys(&mut editor, "Q", &mut eval).unwrap();
+    assert_eq!(text(&editor), "ZQbc");
+}
+
+/// `i_<C-Right>` is `ins_s_right` (`fwd_word`): on the final word the
+/// insert cursor lands past the last byte at end of line — insert mode
+/// accepts a cursor one past the line, unlike Normal's `w` clamp.
+#[test]
+fn insert_ctrl_right_advances_past_final_word() {
+    let (mut editor, _, mut machine) = named_editor("foo bar", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 7));
+
+    // A one-char final word still lands on its byte first; the next
+    // press, unable to move forward, advances to end of line.
+    let (mut editor, _, mut machine) = named_editor("foo x", position(1, 0));
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 5));
+}
+
+/// `i_<Del>` deletes the character under the cursor and is a no-op at
+/// end of line (no join, unlike `i_<BS>` at column zero).
+#[test]
+fn insert_del_deletes_forward() {
+    let (mut editor, buffer, mut machine) = named_editor("abc\ndef", position(1, 1));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "ac\ndef");
+}
+
+/// `c_<Up>` recalls the newest Ex history entry whose beginning matches
+/// the text typed so far; `<Down>` steps back toward the saved input.
+#[test]
+fn cmdline_up_down_walk_matching_history() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec![
+        "e /tmp/alpha".to_owned(),
+        "e /tmp/beta".to_owned(),
+        "e /tmp/alt".to_owned(),
+    ]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":e /tmp/al", &mut eval).unwrap();
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text_of(&machine), ("e /tmp/alt".to_owned(), 10));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text_of(&machine), ("e /tmp/alpha".to_owned(), 12));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), ("e /tmp/alt".to_owned(), 10));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), ("e /tmp/al".to_owned(), 9));
+}
+
+/// `c_<Home>`/`c_<End>`/`c_<Del>` edit the command-line text and cursor.
+#[test]
+fn cmdline_home_end_del_edit() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":wqa", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'h');
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    let (text, cursor) = match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    assert_eq!((text.as_str(), cursor), ("qa", 0));
+    feed_special(&mut editor, &mut machine, b'@', b'7');
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode")
+    };
+    assert_eq!(state.cursor_byte, 2);
+}
+
+/// `i_<C-\>` followed by a named key completes the chord: the
+/// backslash byte inserts literally, then the key runs normally
+/// (`insert.c:640-653` — a named key is never the `CTRL-N` exit).
+#[test]
+fn ctrl_bslash_named_key_inserts_literal_then_moves() {
+    let (mut editor, buffer, mut machine) = named_editor("ab\ncd", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "ab\n\u{1c}cd");
+    // The named key still dispatched: the cursor moved up a line.
+    assert_eq!(window_cursor(&editor).lnum, 1);
+    assert!(matches!(machine.mode(), Mode::Insert(_)));
+}
+
+/// `r_CTRL-\` + named key in Replace mode overwrites with the literal
+/// byte through `replace_scalar`, like `replace_insert`'s `Literal`
+/// arm — the byte must not *insert* ahead of the covered character.
+#[test]
+fn ctrl_bslash_named_key_overwrites_in_replace() {
+    let (mut editor, buffer, mut machine) = named_editor("abc\ndef", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "R", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "abc\n\u{1c}ef");
+    assert_eq!(window_cursor(&editor).lnum, 1);
+    assert!(matches!(machine.mode(), Mode::Replace(_)));
+}
+
+/// `c_CTRL-\` + named key resolves the arm: the `\x1c` byte enters the
+/// line literally (`vungetc` path, `ex_getln.c:1045-1051`), then the
+/// key runs — and the arm is cleared so the NEXT char types normally
+/// instead of being swallowed as a chord partner.
+#[test]
+fn cmdline_ctrl_bslash_named_key_inserts_literal_then_runs() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["edit file".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "\u{1c}", &mut eval)
+        .unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => state.text.clone(),
+        _ => panic!("expected cmdline mode"),
+    };
+    // `\x1c` inserted; `<Up>` then walked with it in the lookfor — no
+    // history entry starts with `\x1c`, so the line stays as typed.
+    assert_eq!(text_of(&machine), "\u{1c}".to_owned());
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    assert_eq!(text_of(&machine), "\u{1c}x".to_owned());
+}
+
+/// `c_CTRL-\` + an ordinary character also takes the `vungetc` path:
+/// the byte inserts literally and the character is typed, not
+/// swallowed as a would-be chord partner.
+#[test]
+fn cmdline_ctrl_bslash_char_inserts_literal_then_types() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, ":\u{1c}x", &mut eval)
+        .unwrap();
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode")
+    };
+    assert_eq!(state.text, "\u{1c}x");
+}
+
+/// `i_<C-Y>` accepts `compl_shown_match`: a selection the arrows moved
+/// without inserting is written on accept
+/// (`ins_compl_use_match(K_CTRL_Y)` is true).
+#[test]
+fn insert_ctrl_y_accepts_arrow_selected_completion() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    machine
+        .feed_keys(&mut editor, "\u{19}", &mut eval)
+        .unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "foobar foobat\nfoobatx");
+    assert!(!machine.completion.is_active());
+}
+
+/// `i_<C-Y>` on the original-text entry (`selected == 0`) applies that
+/// entry too: accepting restores the typed leader instead of keeping
+/// the last-inserted candidate — `compl_shown_match` can be the
+/// original.
+#[test]
+fn insert_ctrl_y_restores_leader_when_selection_is_original() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    // Selection on the original entry: the inserted "obar" tail stays
+    // until accept (`ins_compl_use_match(K_UP)` is false).
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    machine
+        .feed_keys(&mut editor, "\u{19}", &mut eval)
+        .unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "foobar foobat\nfox");
+    assert!(!machine.completion.is_active());
+}
+
+/// `i_<Up>`/`i_<Down>` with the completion menu visible walk the
+/// selection without inserting (`ins_compl_use_match` returns false
+/// for them) — the cursor and the last-inserted match stay put.
+#[test]
+fn insert_arrows_select_completion_without_inserting() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("foobar foobat\nx", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
+        .unwrap();
+    assert!(machine.completion.pum().is_some());
+    let text = |editor: &Editor| {
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap()
+    };
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    assert_eq!(window_cursor(&editor), position(2, 6));
+    // `pum.selected` excludes the original-text entry (`self.selected - 1`).
+    assert_eq!(machine.completion.pum().map(|pum| pum.selected), Some(1));
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text(&editor), "foobar foobat\nfoobarx");
+    assert_eq!(machine.completion.pum().map(|pum| pum.selected), Some(0));
+}
+
+/// `i_<Down>` lands on the character covering the wanted virtual
+/// column (`coladvance`): the landing is always a cluster head, never
+/// inside a multibyte scalar.
+#[test]
+fn insert_down_snaps_column_to_char_boundary() {
+    let (mut editor, buffer, mut machine) = named_editor("abcd\naéx", position(1, 2));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    // Virtual column 2 on `aéx` is `x` (`a`=cell 0, `é`=cell 1, `x`=cell
+    // 2): the cursor lands on byte 3, not inside `é` (bytes 1..3).
+    assert_eq!(window_cursor(&editor), position(2, 3));
+    machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "abcd\naéZx");
+}
+
+/// An operand aborted by a named key clears the pending count with the
+/// prefix — `3vf<Up>` must not leave `count = 3` for the next motion.
+#[test]
+fn visual_operand_abort_clears_count() {
+    let (mut editor, _, mut machine) = named_editor("abcde", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "3vf", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    {
+        let Mode::Visual(state) = machine.mode() else {
+            panic!("expected visual mode")
+        };
+        assert_eq!(state.count, 0);
+    }
+    machine.feed_keys(&mut editor, "l", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
+
+/// `lookfor` truncates at the cursor when the walk starts
+/// (`ex_getln.c` takes `cmdbuff` through `cmdpos`): `<Up>` from a
+/// mid-line cursor matches history on the prefix, and `<Down>` past
+/// the newest entry still restores the full typed line.
+#[test]
+fn cmdline_up_matches_prefix_through_cursor_only() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["edit file".to_owned(), "edit target".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":edit typo", &mut eval).unwrap();
+    // `c_<C-Left>` lands before `typo` — cursor at byte 5.
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    assert_eq!(text_of(&machine), ("edit target".to_owned(), 11));
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), ("edit typo".to_owned(), 9));
+}
+
+/// Editing a recalled history entry discards the walk
+/// (`ex_getln.c` resets `hisidx` when the line changes): a later
+/// `<Up>` matches against the edited text, not the stale prefix, and
+/// `<Down>` no longer restores the discarded input.
+#[test]
+fn cmdline_edit_after_recall_restarts_history_walk() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    machine.set_cmdline_history(vec!["e one".to_owned(), "e two".to_owned()]);
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":e ", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
+    let text_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => state.text.clone(),
+        _ => panic!("expected cmdline mode"),
+    };
+    assert_eq!(text_of(&machine), "e twox");
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    assert_eq!(text_of(&machine), "e twox");
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(text_of(&machine), "e twox");
+}
+
+/// `c_<Del>` at the end of the command line deletes the character
+/// before the cursor; `<C-Left>`/`<C-Right>` are WORD motions.
+#[test]
+fn cmdline_del_at_end_and_ctrl_arrows() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, ":e foo bar", &mut eval)
+        .unwrap();
+    let state_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    assert_eq!(state_of(&machine), ("e foo ba".to_owned(), 8));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(state_of(&machine).1, 6);
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(state_of(&machine).1, 2);
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(state_of(&machine).1, 6);
+}
+
+/// `i_<C-Left>`/`i_<C-Right>` are word motions across the buffer.
+#[test]
+fn insert_ctrl_arrows_are_word_motions() {
+    let (mut editor, _, mut machine) = named_editor("foo bar\nbaz qux", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(2, 0));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+}
+
+/// `i_<Down>` onto an empty line must not panic — the clamped byte
+/// column equals `line.len()`, which is out of bounds for indexing.
+#[test]
+fn insert_down_onto_empty_line_does_not_panic() {
+    let (mut editor, _, mut machine) = named_editor("abcd\n\nx", position(1, 3));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    assert_eq!(window_cursor(&editor), position(2, 0));
+}
+
+/// `i_CTRL-V` and `i_CTRL-R` consume the next named key itself:
+/// upstream inserts the keycode notation literally.
+#[test]
+fn insert_pending_literal_and_register_take_named_key() {
+    let (mut editor, buffer, mut machine) = named_editor("", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\x16", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "<Up>");
+    machine.feed_keys(&mut editor, "\x12", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'd');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "<Up><Down>");
+}
+
+/// A partial `i_CTRL-V` numeric literal emits its charcode before the
+/// named key dispatches — `i_CTRL-V65<Up>` inserts `A`, then moves.
+#[test]
+fn insert_named_key_flushes_digit_literal_first() {
+    let (mut editor, buffer, mut machine) = named_editor("xy\nzz", position(2, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i\x1665", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+        .unwrap();
+    assert_eq!(text, "xy\nAzz");
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
+
+/// `i_CTRL-R` on a linewise register inserts the register like typed
+/// text — each line plus a newline — preserving the current line's
+/// contents (reference UI verified; previously the line was replaced
+/// and its text destroyed).
+#[test]
+fn insert_ctrl_r_linewise_register_preserves_current_line() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("alpha bravo\nfifteen", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\"ayy", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "G0i\x12a", &mut eval).unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    assert_eq!(text, "alpha bravo\nalpha bravo\nfifteen");
+}
+
+/// `'/pattern'` keystrokes run `'incsearch'` preview: the cursor jumps to
+/// the match and a transient `IncSearch` extmark marks the span.
+#[test]
+fn search_cmdline_typing_sets_incsearch_preview_mark() {
+    let (mut editor, _buffer, mut machine) =
+        named_editor("line 00\nNEEDLE far below\ntail", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "/NEEDL", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(2, 0));
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode, got {:?}", machine.mode());
+    };
+    assert!(
+        state.preview_mark.is_some(),
+        "incsearch preview mark not set for /NEEDL"
+    );
+}

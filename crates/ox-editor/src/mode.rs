@@ -5,7 +5,7 @@ use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
-use crate::builtins::position::{cursor_vcol, display_len, vcol_to_byte};
+use crate::builtins::position::{cursor_vcol, display_len, getvcol, vcol_to_byte};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{FindDirection, FindMotion, Motion, resolve, resolve_find};
@@ -132,6 +132,15 @@ pub struct CmdlineState {
     /// The currently placed `'incsearch'` highlight extmark, if a preview
     /// match is showing (`incsearch_state_T.did_incsearch`, `ex_getln.c:121`).
     pub preview_mark: Option<ExtmarkId>,
+    /// History navigation position while this command line is open
+    /// (`hisidx` relative): `None` while `text` is the user's own input.
+    pub history_index: Option<usize>,
+    /// The user's in-progress command-line text, saved on the first
+    /// `<Up>` and restored when `<Down>` walks past the newest entry.
+    pub history_saved: String,
+    /// `lookfor` (`ex_getln.c`): the text through the cursor when the
+    /// history walk started — it persists for the whole walk.
+    pub history_lookfor: String,
 }
 /// State retained between an operator and its motion or text object.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -206,6 +215,31 @@ pub enum Step {
     Left,
     /// Move the insertion or editing cursor one character right.
     Right,
+    /// Execute one decoded named special key.
+    Named(NamedKey),
+}
+
+/// A named special key decoded from a `K_SPECIAL` triple — the upstream
+/// keycodes (`termcodes.h` names) that dispatch per mode, not plain
+/// characters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamedKey {
+    /// `K_UP`: cursor up.
+    Up,
+    /// `K_DOWN`: cursor down.
+    Down,
+    /// `K_HOME`: start of line or edit field.
+    Home,
+    /// `K_END`: end of line or edit field.
+    End,
+    /// `K_DEL`: delete the character under the cursor.
+    Del,
+    /// `K_INS`: enter Insert from Normal/Visual.
+    Ins,
+    /// `KE_C_LEFT`: word left.
+    CtrlLeft,
+    /// `KE_C_RIGHT`: word right.
+    CtrlRight,
 }
 
 /// Failures produced by modal input execution.
@@ -801,7 +835,10 @@ impl ModeMachine {
                 {
                     Ok(Step::Key('\u{1b}'))
                 }
-                Key::Special(_, _) => Ok(Step::ProcessEvents),
+                Key::Special(second, third) => match Self::named_key(second, third) {
+                    Some(named) => Ok(Step::Named(named)),
+                    None => Ok(Step::ProcessEvents),
+                },
             };
         }
     }
@@ -962,6 +999,7 @@ impl ModeMachine {
             Step::Idle | Step::ProcessEvents => Ok(()),
             Step::Key(key) => self.execute_key(editor, key, eval),
             Step::Left | Step::Right => self.move_horizontal(editor, step == Step::Right, eval),
+            Step::Named(key) => self.named(editor, key, eval),
         }
     }
 
@@ -1001,6 +1039,541 @@ impl ModeMachine {
             return Ok(());
         }
         self.execute_key(editor, if forward { 'l' } else { 'h' }, eval)
+    }
+
+    /// The special keys dispatched as real behavior, named by upstream's
+    /// `K_SPECIAL` triples (`termcodes.h`): `k`+`u`/`d`/`h` are
+    /// `K_UP`/`K_DOWN`/`K_HOME`, `@`+`7` is `K_END`, `k`+`D` and
+    /// `KS_EXTRA`+80 are `K_DEL`/`kDel`, `k`+`I` is `K_INS`, and
+    /// `KS_EXTRA`+85/86 are `KE_C_LEFT`/`KE_C_RIGHT`.
+    fn named_key(second: u8, third: u8) -> Option<NamedKey> {
+        Some(match (second, third) {
+            (b'k', b'u') => NamedKey::Up,
+            (b'k', b'd') => NamedKey::Down,
+            (b'k', b'h') => NamedKey::Home,
+            (b'@', b'7') => NamedKey::End,
+            (b'k', b'D') | (KS_EXTRA, 80) => NamedKey::Del,
+            (b'k', b'I') => NamedKey::Ins,
+            (KS_EXTRA, 85) => NamedKey::CtrlLeft,
+            (KS_EXTRA, 86) => NamedKey::CtrlRight,
+            _ => return None,
+        })
+    }
+
+    /// Dispatches a decoded special key with the mode's own behavior —
+    /// upstream's per-mode keycode tables (`nv_cmds`, `ins_special`,
+    /// `ex_getln.c`), where the same keycode moves the cursor in Normal,
+    /// walks history in Cmdline, and edits in Insert.
+    fn named(
+        &mut self,
+        editor: &mut Editor,
+        key: NamedKey,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), ModeError> {
+        // Only the command-line handler needs its variant state: take
+        // the mode like `execute_key` does, so `state` and `self` can
+        // borrow at once. Other handlers dispatch through
+        // `execute_key`, which must see the real mode in place.
+        if let Mode::Cmdline(_) = self.mode {
+            let mut mode = std::mem::take(&mut self.mode);
+            let Mode::Cmdline(state) = &mut mode else {
+                unreachable!();
+            };
+            let result = self.cmdline_named(editor, state, key);
+            self.mode = mode;
+            return result;
+        }
+        if matches!(self.mode, Mode::Insert(_) | Mode::Replace(_)) {
+            return self.insert_named(editor, key);
+        }
+        // A pending operand (`r`/`f`/`t` target, register, recording,
+        // `@` playback, `i`/`a` text object) reads a character: a named
+        // key has none to give — upstream's operand readers reject
+        // special keys and abort the pending command (`nv_replace`,
+        // `nv_csearch`, `op_reg_index`). Visual keeps its selection;
+        // operator-pending aborts back to Normal.
+        let operand_abort = match &self.mode {
+            Mode::Normal(state) => Self::operand_prefix(&state.prefix),
+            Mode::Visual(state) => Self::operand_prefix(&state.prefix),
+            Mode::OperatorPending(state) => Self::operand_prefix(&state.prefix),
+            _ => false,
+        };
+        if operand_abort {
+            beep_flush(editor);
+            match &mut self.mode {
+                Mode::Normal(state) => *state = NormalState::default(),
+                // An aborted operand cancels its pending count too —
+                // otherwise `3vf<Up>` leaves `count` at 3 for the next
+                // visual motion (upstream `clearopbeep` resets both).
+                Mode::Visual(state) => {
+                    state.prefix.clear();
+                    state.count = 0;
+                }
+                Mode::OperatorPending(_) => self.mode = Mode::default(),
+                _ => {}
+            }
+            return Ok(());
+        }
+        // A pending count is what `<Del>` edits: `normal_get_command_count`
+        // removes its last digit instead of deleting a character.
+        if key == NamedKey::Del {
+            let edited = match &mut self.mode {
+                Mode::Normal(state) if state.count != 0 => {
+                    state.count /= 10;
+                    true
+                }
+                Mode::Visual(state) if state.count != 0 => {
+                    state.count /= 10;
+                    true
+                }
+                Mode::OperatorPending(state) if state.motion_count != 0 => {
+                    state.motion_count /= 10;
+                    true
+                }
+                _ => false,
+            };
+            if edited {
+                return Ok(());
+            }
+        }
+        self.motion_named(
+            editor,
+            key,
+            matches!(self.mode, Mode::OperatorPending(_)),
+            eval,
+        )
+    }
+
+    /// Whether `prefix` reads its next character as a command operand —
+    /// the `f`/`t` target, `r` replacement, register, recording, or `@`
+    /// playback character in Normal; the same plus `i`/`a` text-object
+    /// selectors in Visual and operator-pending.
+    fn operand_prefix(prefix: &str) -> bool {
+        matches!(
+            prefix,
+            "register"
+                | "record"
+                | "exec"
+                | "r"
+                | "r\u{16}"
+                | "f"
+                | "F"
+                | "t"
+                | "T"
+                | "i"
+                | "a"
+        )
+    }
+
+    /// `nv_cmds` keycodes (`normal.c`): arrows and their Control word
+    /// variants are motions wherever motions are legal; `<Del>` and
+    /// `<Insert>` carry command meanings in Normal and Visual only.
+    /// Translating to the equivalent builtin key bypasses mappings —
+    /// upstream dispatches keycodes, not the `k` mapping a user may
+    /// have bound.
+    fn motion_named(
+        &mut self,
+        editor: &mut Editor,
+        key: NamedKey,
+        operator_pending: bool,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), ModeError> {
+        let char = match key {
+            NamedKey::Up => 'k',
+            NamedKey::Down => 'j',
+            NamedKey::Home => '0',
+            NamedKey::End => '$',
+            NamedKey::CtrlLeft => 'b',
+            NamedKey::CtrlRight => 'w',
+            NamedKey::Del | NamedKey::Ins if operator_pending => return Ok(()),
+            NamedKey::Del => 'x',
+            NamedKey::Ins => 'i',
+        };
+        self.execute_key(editor, char, eval)
+    }
+
+    /// `ex_getln.c` special keys on the command line: `<Up>`/`<Down>`
+    /// walk history, `<Home>`/`<End>` move the text cursor, `<Del>`
+    /// deletes the character under it.
+    fn cmdline_named(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+        key: NamedKey,
+    ) -> Result<(), ModeError> {
+        // A pending `c_CTRL-\` completes first: a named key is never
+        // `CTRL-N`/`CTRL-G`, so upstream's arm takes the `vungetc`
+        // path (`command_line_handle_ctrl_bsl`, `ex_getln.c:1045-1051`)
+        // — the backslash byte enters the line literally, then the key
+        // runs normally.
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            self.cmdline_insert_ctrl_bslash(editor, state)?;
+        }
+        match key {
+            NamedKey::Up | NamedKey::Down => {
+                self.cmdline_history_nav(state, key == NamedKey::Up);
+                self.update_incsearch_preview(editor, state)?;
+            }
+            NamedKey::Home => state.cursor_byte = 0,
+            NamedKey::End => state.cursor_byte = state.text.len(),
+            NamedKey::Del if state.cursor_byte < state.text.len() => {
+                state.history_index = None;
+                let next =
+                    crate::motion::next_char_boundary(state.text.as_bytes(), state.cursor_byte);
+                state.text.drain(state.cursor_byte..next);
+                self.update_incsearch_preview(editor, state)?;
+            }
+            // `c_<Del>` at the end of the line deletes the character
+            // before the cursor (`ex_getln.c`) — verified against
+            // upstream, which turns `:abc<End><Del>` into `:ab`.
+            NamedKey::Del if state.cursor_byte > 0 => {
+                state.history_index = None;
+                let previous =
+                    crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte);
+                state.text.drain(previous..state.cursor_byte);
+                state.cursor_byte = previous;
+                self.update_incsearch_preview(editor, state)?;
+            }
+            // `c_<C-Left>`/`c_<C-Right>` move a WORD (space run) at a
+            // time on the command line (`ex_getln.c`).
+            NamedKey::CtrlLeft => {
+                let bytes = state.text.as_bytes();
+                let mut at = state.cursor_byte;
+                while at > 0 && bytes[at - 1] == b' ' {
+                    at -= 1;
+                }
+                while at > 0 && bytes[at - 1] != b' ' {
+                    at -= 1;
+                }
+                state.cursor_byte = at;
+            }
+            NamedKey::CtrlRight => {
+                let bytes = state.text.as_bytes();
+                let mut at = state.cursor_byte;
+                while at < bytes.len() && bytes[at] != b' ' {
+                    at += 1;
+                }
+                while at < bytes.len() && bytes[at] == b' ' {
+                    at += 1;
+                }
+                state.cursor_byte = at;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The `vungetc` resolution of a non-chord `c_CTRL-\` second key:
+    /// upstream reprocesses the backslash as an ordinary character, so
+    /// `\x1c` enters the command line literally (`put_on_cmdline`,
+    /// `ex_getln.c:2346-2354`) before the key is handled.
+    fn cmdline_insert_ctrl_bslash(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+    ) -> Result<(), ModeError> {
+        state.history_index = None;
+        state.text.insert(state.cursor_byte, '\u{1c}');
+        state.cursor_byte += 1;
+        self.update_incsearch_preview(editor, state)
+    }
+
+    /// `c_<Up>`/`c_<Down>` (`ex_getln.c`): walk the Ex command history
+    /// for an entry whose beginning matches the current text. `<Down>`
+    /// past the newest match returns to the text the user had typed
+    /// (the scratch input saved on the first `<Up>`).
+    fn cmdline_history_nav(&mut self, state: &mut CmdlineState, up: bool) {
+        if state.kind != CmdlineKind::Ex || (state.history_index.is_none() && !up) {
+            return;
+        }
+        // `lookfor` is the text through the cursor when the walk
+        // started (`ex_getln.c` truncates `ccline.cmdbuff` at
+        // `ccline.cmdpos`): it persists for the whole walk, so repeated
+        // `<Up>` keeps matching the same prefix instead of the
+        // just-recalled entry. `history_saved` keeps the FULL line so
+        // `<Down>` past the newest entry restores it.
+        if state.history_index.is_none() {
+            state.history_lookfor = state.text[..state.cursor_byte].to_string();
+        }
+        let lookfor = state.history_lookfor.clone();
+        let history = &self.cmdline_history;
+        let start = state.history_index.unwrap_or(history.len());
+        let found = if up {
+            (0..start).rev().find(|&index| history[index].starts_with(&lookfor))
+        } else {
+            (start + 1..history.len()).find(|&index| history[index].starts_with(&lookfor))
+        };
+        match found {
+            Some(index) => {
+                if state.history_index.is_none() {
+                    state.history_saved.clone_from(&state.text);
+                }
+                state.history_index = Some(index);
+                state.text.clone_from(&history[index]);
+            }
+            // Upstream also frees `lookfor` when the walk ends; the
+            // next `<Up>` re-derives it from the then-current text.
+            None => {
+                if !up {
+                    state.history_index = None;
+                    state.text = std::mem::take(&mut state.history_saved);
+                }
+            }
+        }
+        state.cursor_byte = state.text.len();
+    }
+
+    /// `ins_special` cursor keys (`edit.c`): `i_<Up>`/`i_<Down>` move
+    /// linewise keeping the column, `i_<Home>`/`i_<End>` move to the
+    /// line edges, `i_<Del>` deletes the character under the cursor.
+    fn insert_named(&mut self, editor: &mut Editor, key: NamedKey) -> Result<(), ModeError> {
+        // A pending `i_CTRL-\` completes first: a named key is never
+        // `CTRL-N`, so upstream's arm takes the `vungetc` path — the
+        // backslash byte inserts literally, then the key runs normally
+        // (`insert.c:640-653`).
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            if matches!(self.mode, Mode::Replace(_)) {
+                // Replace overwrites with the literal byte, like
+                // `replace_insert`'s own `Literal` arm.
+                self.replace_scalar(editor, '\u{1c}')?;
+            } else {
+                let ctx = cursor_context(editor)?;
+                insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    '\u{1c}',
+                    self.timestamp,
+                )?;
+            }
+        }
+        // A partial `i_CTRL-V` numeric literal emits its charcode before
+        // the named key runs, like the nondigit path in `insert_pending`;
+        // the key then dispatches normally.
+        if matches!(self.insert_literal, Some(InsertLiteral::Digits { .. })) {
+            let Some(InsertLiteral::Digits { radix, digits, .. }) = self.insert_literal.take()
+            else {
+                unreachable!()
+            };
+            let ctx = cursor_context(editor)?;
+            if let Some(ch) = u32::from_str_radix(&digits, radix)
+                .ok()
+                .and_then(char::from_u32)
+            {
+                insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    ch,
+                    self.timestamp,
+                )?;
+            }
+        }
+        let ctx = cursor_context(editor)?;
+        // A pending `i_CTRL-V`/`i_CTRL-Q`/`i_CTRL-R` consumes the named
+        // key itself: upstream inserts its keycode notation literally
+        // (verified — `i_<C-V><Up>` and `i_<C-R><Up>` both put `<Up>`
+        // into the buffer).
+        if self.insert_literal.is_some() || self.pending_insert_ctrl_r {
+            self.insert_literal = None;
+            self.pending_insert_ctrl_r = false;
+            let notation = match key {
+                NamedKey::Up => "<Up>",
+                NamedKey::Down => "<Down>",
+                NamedKey::Home => "<Home>",
+                NamedKey::End => "<End>",
+                NamedKey::Del => "<Del>",
+                NamedKey::Ins => "<Ins>",
+                NamedKey::CtrlLeft => "<C-Left>",
+                NamedKey::CtrlRight => "<C-Right>",
+            };
+            let mut cursor = ctx.cursor;
+            for ch in notation.chars() {
+                cursor = insert::insert_char(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    cursor,
+                    ch,
+                    self.timestamp,
+                )?;
+            }
+            return Ok(());
+        }
+        // `ins_compl_pum_key`: with the completion menu visible the
+        // arrows move its selection without inserting (`ins_compl_use_match`
+        // returns false for `K_UP`/`K_DOWN`), not the buffer cursor.
+        if matches!(key, NamedKey::Up | NamedKey::Down) && self.completion.pum().is_some() {
+            self.completion.arrow(editor, key == NamedKey::Up);
+            return Ok(());
+        }
+        match key {
+            NamedKey::Up | NamedKey::Down => {
+                let target = if key == NamedKey::Up {
+                    ctx.cursor.lnum.wrapping_sub(1)
+                } else {
+                    ctx.cursor.lnum + 1
+                };
+                let lines = editor.buffer(ctx.buffer)?.text()?.line_count();
+                if target < 1 || target > lines {
+                    return Ok(());
+                }
+                let line = ctx.line(editor, target)?;
+                // `ins_up`/`ins_down` keep `w_curswant`: the column a
+                // short line clamped to must not become the new want —
+                // moving back onto a longer line restores the original
+                // column (move.c `nv_up`/`nv_down` semantics). The want
+                // is a virtual (display) column like everywhere else it
+                // is used — tabs and wide characters occupy cells, not
+                // bytes — so both the seed and the landing translate
+                // through the `*vcol*` helpers.
+                let tabstop = match editor.options().get_buffer(ctx.buffer, "tabstop") {
+                    Ok(OptionValue::Number(value)) if *value > 0 => {
+                        usize::try_from(*value).unwrap_or(8)
+                    }
+                    _ => 8,
+                };
+                // The insert position sits before the byte at `col`, so
+                // seed from the covering character's first cell (a tab's
+                // last cell would overshoot); at end of line `getvcol`
+                // yields the display length, which is the insert EOL.
+                let (cur_vcol, _) = getvcol(
+                    &ctx.line(editor, ctx.cursor.lnum)?,
+                    i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX),
+                    tabstop,
+                );
+                let cur_vcol = cur_vcol.saturating_add(usize::try_from(
+                    editor.window(ctx.window).map_or(0, |state| state.coladd.max(0)),
+                )
+                .unwrap_or(usize::MAX));
+                let want = editor.window(ctx.window).ok().map_or(
+                    i64::try_from(cur_vcol).unwrap_or(i64::MAX),
+                    |state| {
+                        if state.set_curswant {
+                            i64::try_from(cur_vcol).unwrap_or(i64::MAX)
+                        } else {
+                            state.curswant
+                        }
+                    },
+                );
+                // The insert cursor may rest one past the line, so a
+                // want at or past the line's display length lands on its
+                // end; inside it, `vcol_to_byte` snaps to the head of
+                // the covering cluster (the multi-byte snap is folded
+                // into the same translation).
+                let col = if want == i64::MAX
+                    || usize::try_from(want).unwrap_or(usize::MAX)
+                        >= display_len(&line, tabstop)
+                {
+                    line.len()
+                } else {
+                    vcol_to_byte(&line, usize::try_from(want).unwrap_or(0), tabstop)
+                };
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: target,
+                        col,
+                    },
+                )?;
+                if let Ok(state) = editor.window_mut(ctx.window) {
+                    state.curswant = want;
+                    state.set_curswant = false;
+                }
+            }
+            NamedKey::Home => {
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: ctx.cursor.lnum,
+                        col: 0,
+                    },
+                )?;
+            }
+            NamedKey::End => {
+                let line = ctx.line(editor, ctx.cursor.lnum)?;
+                editor.set_window_cursor(
+                    ctx.window,
+                    Position {
+                        lnum: ctx.cursor.lnum,
+                        col: line.len(),
+                    },
+                )?;
+                // `ins_end` leaves `w_curswant` at MAXCOL like `$`, so
+                // vertical moves after it keep landing at end of line.
+                if let Ok(state) = editor.window_mut(ctx.window) {
+                    state.curswant = i64::MAX;
+                    state.set_curswant = false;
+                }
+            }
+            // `i_<Del>` edits without moving the cursor, so it does
+            // not start a new undo block — return before `insert_moved`
+            // is set.
+            NamedKey::Del => {
+                insert::delete_forward(
+                    editor,
+                    ctx.buffer,
+                    ctx.window,
+                    ctx.cursor,
+                    self.timestamp,
+                )?;
+                return Ok(());
+            }
+            // `i_<C-Left>`/`i_<C-Right>` are the `ins_s_left`/`ins_s_right`
+            // word motions (`edit.c`) — a `b`/`w` target on the whole
+            // buffer, not a charwise step.
+            NamedKey::CtrlLeft | NamedKey::CtrlRight => {
+                let count = editor.buffer(ctx.buffer)?.text()?.line_count();
+                let lines = (1..=count)
+                    .map(|n| ctx.line(editor, n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let command = if key == NamedKey::CtrlLeft {
+                    "b"
+                } else {
+                    "w"
+                };
+                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1)
+                {
+                    let mut target = motion.target;
+                    // `ins_s_right` (`fwd_word`): the insert cursor may
+                    // rest one past the line, so a `w` that lands inside
+                    // the buffer's last word advances to end of line —
+                    // Normal `w` clamps onto the final byte instead. A
+                    // landing that starts the last word (e.g. a one-char
+                    // final word) still lands on it.
+                    if key == NamedKey::CtrlRight
+                        && let Some(last) = lines.last()
+                        && target.lnum == lines.len()
+                        && target.col + 1 == last.len()
+                    {
+                        let word_start = target.col == 0
+                            || crate::motion::classify(last[target.col - 1], false)
+                                != crate::motion::classify(last[target.col], false);
+                        if !word_start || target == ctx.cursor {
+                            target.col = last.len();
+                        }
+                    }
+                    editor.set_window_cursor(ctx.window, target)?;
+                }
+            }
+            // `i_<Ins>` toggles between insert and replace mode
+            // (`ins_insert`, `insert.c`): it is a mode change, not a
+            // cursor move or an edit.
+            NamedKey::Ins => {
+                self.mode = match std::mem::take(&mut self.mode) {
+                    Mode::Insert(_) => Mode::Replace(ReplaceState),
+                    _ => Mode::Insert(InsertState),
+                };
+                return Ok(());
+            }
+        }
+        self.insert_moved = true;
+        self.completion.reset();
+        Ok(())
     }
 
     /// Runs one check/execute iteration, returning whether work was ready.
@@ -1378,6 +1951,9 @@ impl ModeMachine {
                     preview_start: ctx.cursor,
                     preview_topline: topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             ':' => {
@@ -1403,6 +1979,9 @@ impl ModeMachine {
                     preview_start,
                     preview_topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             'n' | 'N' => {
@@ -2240,6 +2819,9 @@ impl ModeMachine {
                     preview_start: ctx.cursor,
                     preview_topline: topline,
                     preview_mark: None,
+                    history_index: None,
+                    history_saved: String::new(),
+                    history_lookfor: String::new(),
                 })))
             }
             'J' => {
@@ -2929,23 +3511,33 @@ impl ModeMachine {
             return Ok(None);
         };
         match kind {
+            // `insert_reg` (edit.c): a linewise register is inserted like
+            // typed text — each line followed by a newline — at the cursor,
+            // preserving the current line's contents. Verified against the
+            // reference UI: `i_CTRL-R` on a `yy` register splits the line
+            // instead of replacing it.
             RegisterKind::LineWise => {
-                let mut replacement = lines;
-                replacement.push(Vec::new());
-                let after = Position {
-                    lnum: ctx.cursor.lnum + replacement.len() - 1,
-                    col: 0,
-                };
-                editor.replace_buffer_lines(crate::LineReplaceRequest {
-                    buffer: ctx.buffer,
-                    start: ctx.cursor.lnum,
-                    end: ctx.cursor.lnum,
-                    lines: &replacement,
-                    cursor_before: ctx.cursor,
-                    cursor_after: after,
-                    timestamp: self.timestamp,
-                })?;
-                editor.set_window_cursor(ctx.window, after)?;
+                let mut cursor = ctx.cursor;
+                for line in &lines {
+                    for ch in String::from_utf8_lossy(line).chars() {
+                        cursor = insert::insert_char(
+                            editor,
+                            ctx.buffer,
+                            ctx.window,
+                            cursor,
+                            ch,
+                            self.timestamp,
+                        )?;
+                    }
+                    cursor = insert::newline(
+                        editor,
+                        ctx.buffer,
+                        ctx.window,
+                        cursor,
+                        self.timestamp,
+                        eval,
+                    )?;
+                }
             }
             RegisterKind::CharacterWise | RegisterKind::BlockWise { .. } => {
                 let mut cursor = ctx.cursor;
@@ -3114,10 +3706,26 @@ impl ModeMachine {
     ) -> Result<Option<Mode>, ModeError> {
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
+            state.history_index = None;
             state.text.insert(state.cursor_byte, key);
             state.cursor_byte += key.len_utf8();
             self.update_incsearch_preview(editor, state)?;
             return Ok(None);
+        }
+        if self.pending_ctrl_bslash {
+            self.pending_ctrl_bslash = false;
+            if key == '\u{0e}' || key == '\u{7}' {
+                // `c_CTRL-\_CTRL-N`/`CTRL-G`: leave the command line
+                // for Normal mode (`command_line_handle_ctrl_bsl`,
+                // `ex_getln.c:1045-1096`).
+                Self::restore_incsearch_view(editor, state)?;
+                return Ok(Some(Mode::default()));
+            }
+            // Any other second key is pushed back upstream (`vungetc`):
+            // the `\x1c` byte inserts literally, then the key falls
+            // through to the FULL pipeline — it can arm a new pending
+            // or dispatch normally, but is never swallowed.
+            self.cmdline_insert_ctrl_bslash(editor, state)?;
         }
         if key == '\u{16}' {
             self.pending_cmdline_literal = true;
@@ -3125,15 +3733,6 @@ impl ModeMachine {
         }
         if key == '\u{1c}' {
             self.pending_ctrl_bslash = true;
-            return Ok(None);
-        }
-        if self.pending_ctrl_bslash {
-            self.pending_ctrl_bslash = false;
-            if key == '\u{0e}' {
-                // `c_CTRL-\_CTRL-N`: leave the command line for Normal mode.
-                Self::restore_incsearch_view(editor, state)?;
-                return Ok(Some(Mode::default()));
-            }
             return Ok(None);
         }
         match key {
@@ -3146,6 +3745,7 @@ impl ModeMachine {
             }
             '\u{8}' | '\u{7f}' => {
                 if state.cursor_byte > 0 {
+                    state.history_index = None;
                     let previous =
                         crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte);
                     state.text.drain(previous..state.cursor_byte);
@@ -3186,6 +3786,7 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             ch if !ch.is_control() => {
+                state.history_index = None;
                 state.text.insert(state.cursor_byte, ch);
                 state.cursor_byte += ch.len_utf8();
                 self.update_incsearch_preview(editor, state)?;
