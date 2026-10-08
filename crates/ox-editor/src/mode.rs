@@ -1102,7 +1102,13 @@ impl ModeMachine {
             beep_flush(editor);
             match &mut self.mode {
                 Mode::Normal(state) => *state = NormalState::default(),
-                Mode::Visual(state) => state.prefix.clear(),
+                // An aborted operand cancels its pending count too —
+                // otherwise `3vf<Up>` leaves `count` at 3 for the next
+                // visual motion (upstream `clearopbeep` resets both).
+                Mode::Visual(state) => {
+                    state.prefix.clear();
+                    state.count = 0;
+                }
                 Mode::OperatorPending(_) => self.mode = Mode::default(),
                 _ => {}
             }

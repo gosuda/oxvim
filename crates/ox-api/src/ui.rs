@@ -2273,7 +2273,11 @@ fn reproject_hl_links(
         ns.set_group(name.clone(), self_id)
             .map_err(|error| ApiError::exception(error.to_string()))?;
     }
-    let mut dependents: BTreeMap<u64, Vec<(i64, u64, OxStr, HlDef)>> = BTreeMap::new();
+    // The map indexes each link by its target so the BFS only walks
+    // chains that reach the changed group. Definitions are fetched per
+    // dependent during the walk — cloning every linked `HlDef` up front
+    // would allocate once per link per call.
+    let mut dependents: BTreeMap<u64, Vec<(i64, u64, OxStr)>> = BTreeMap::new();
     for (link_ns, ns) in &state.hl_namespaces {
         if ns_id != 0 && *link_ns != ns_id {
             continue;
@@ -2283,7 +2287,7 @@ fn reproject_hl_links(
                 dependents
                     .entry(target)
                     .or_default()
-                    .push((*link_ns, link_gid, name.clone(), def.clone()));
+                    .push((*link_ns, link_gid, name.clone()));
             }
         }
     }
@@ -2293,11 +2297,18 @@ fn reproject_hl_links(
         let Some(next) = dependents.get(&current) else {
             continue;
         };
-        for (link_ns, link_gid, linked_name, linked_def) in next.clone() {
+        for (link_ns, link_gid, linked_name) in next.clone() {
             if !seen.insert((link_ns, link_gid)) {
                 continue;
             }
-            let effective = resolve_link_def(&linked_def, &state.hl_namespaces, link_ns);
+            let Some(linked_def) = state
+                .hl_namespaces
+                .get(&link_ns)
+                .and_then(|ns| ns.group_def(link_gid))
+            else {
+                continue;
+            };
+            let effective = resolve_link_def(linked_def, &state.hl_namespaces, link_ns);
             let linked_protocol = project_protocol_hl(&effective);
             let ns = state.hl_namespaces.entry(link_ns).or_default();
             // Rebind the name, never redefine the id: linked groups

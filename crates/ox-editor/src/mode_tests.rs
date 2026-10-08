@@ -5094,6 +5094,24 @@ fn insert_down_snaps_column_to_char_boundary() {
     assert_eq!(text, "abcd\naéZx");
 }
 
+/// An operand aborted by a named key clears the pending count with the
+/// prefix — `3vf<Up>` must not leave `count = 3` for the next motion.
+#[test]
+fn visual_operand_abort_clears_count() {
+    let (mut editor, _, mut machine) = named_editor("abcde", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "3vf", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    {
+        let Mode::Visual(state) = machine.mode() else {
+            panic!("expected visual mode")
+        };
+        assert_eq!(state.count, 0);
+    }
+    machine.feed_keys(&mut editor, "l", &mut eval).unwrap();
+    assert_eq!(window_cursor(&editor), position(1, 1));
+}
+
 /// `lookfor` truncates at the cursor when the walk starts
 /// (`ex_getln.c` takes `cmdbuff` through `cmdpos`): `<Up>` from a
 /// mid-line cursor matches history on the prefix, and `<Down>` past

@@ -41,6 +41,11 @@ use thiserror::Error;
 const LOOP_SLICE: Duration = Duration::from_millis(16);
 // The level-triggered terminal backend treats a zero timeout as no poll.
 const INPUT_POLL: Duration = Duration::from_millis(1);
+/// How long to wait for payload after a ctrlstring introducer before
+/// treating the key as a human Alt chord. Covers relay-chunked writes
+/// (tmux/ssh) that a single `INPUT_POLL` slice can miss while staying
+/// below perceptible chord latency.
+const TERMINAL_STRING_PEEK: Duration = Duration::from_millis(10);
 
 /// Longest gap between events a consumed terminal string may span: the
 /// payload bytes of one terminal write arrive together, so an event this
@@ -797,14 +802,18 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                     continue;
                 }
                 // A ctrlstring introducer is followed by its payload in
-                // the same terminal write, so the next event is already
-                // buffered; a user's `Alt-P`/`Alt-]`/`Alt-_` chord
-                // arrives alone. Peek before consuming — otherwise the
-                // chord swallows keys until a terminator that never
-                // comes. `TERMINAL_STRING_GAP` still bounds how much a
-                // wrong peek can eat.
+                // the same terminal write, but a relay (tmux, ssh) can
+                // chunk the write and park the first payload byte a few
+                // milliseconds behind the introducer. Peek for up to
+                // `TERMINAL_STRING_PEEK` before deciding this was a
+                // human `Alt-P`/`Alt-]`/`Alt-_` chord — too short and a
+                // split string's payload lands as editor input; too
+                // long and a real chord stalls. `poll` returns as soon
+                // as an event is buffered, so a real string pays only
+                // its actual relay latency. `TERMINAL_STRING_GAP` still
+                // bounds how much a wrong peek can eat.
                 if is_terminal_string_intro(key)
-                    && event::poll(INPUT_POLL).map_err(TuiError::Input)?
+                    && event::poll(TERMINAL_STRING_PEEK).map_err(TuiError::Input)?
                 {
                     state.consume_terminal_string = Some(std::time::Instant::now());
                     continue;
