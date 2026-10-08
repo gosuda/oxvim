@@ -4950,3 +4950,40 @@ fn cmdline_edit_after_recall_restarts_history_walk() {
     feed_special(&mut editor, &mut machine, b'k', b'd');
     assert_eq!(text_of(&machine), "e twox");
 }
+
+/// `c_<Del>` at the end of the command line deletes the character
+/// before the cursor; `<C-Left>`/`<C-Right>` are WORD motions.
+#[test]
+fn cmdline_del_at_end_and_ctrl_arrows() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    let mut eval = NullExprEval;
+    machine
+        .feed_keys(&mut editor, ":e foo bar", &mut eval)
+        .unwrap();
+    let state_of = |machine: &ModeMachine| match machine.mode() {
+        Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
+        _ => panic!("expected cmdline mode"),
+    };
+    feed_special(&mut editor, &mut machine, b'k', b'D');
+    assert_eq!(state_of(&machine), ("e foo ba".to_owned(), 8));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(state_of(&machine).1, 6);
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(state_of(&machine).1, 2);
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(state_of(&machine).1, 6);
+}
+
+/// `i_<C-Left>`/`i_<C-Right>` are word motions across the buffer.
+#[test]
+fn insert_ctrl_arrows_are_word_motions() {
+    let (mut editor, _, mut machine) = named_editor("foo bar\nbaz qux", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 86);
+    assert_eq!(window_cursor(&editor), position(2, 0));
+    feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
+    assert_eq!(window_cursor(&editor), position(1, 4));
+}

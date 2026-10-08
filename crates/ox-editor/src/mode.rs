@@ -1141,6 +1141,41 @@ impl ModeMachine {
                 state.text.drain(state.cursor_byte..next);
                 self.update_incsearch_preview(editor, state)?;
             }
+            // `c_<Del>` at the end of the line deletes the character
+            // before the cursor (`ex_getln.c`) — verified against
+            // upstream, which turns `:abc<End><Del>` into `:ab`.
+            NamedKey::Del if state.cursor_byte > 0 => {
+                state.history_index = None;
+                let previous =
+                    crate::motion::prev_char_boundary(state.text.as_bytes(), state.cursor_byte);
+                state.text.drain(previous..state.cursor_byte);
+                state.cursor_byte = previous;
+                self.update_incsearch_preview(editor, state)?;
+            }
+            // `c_<C-Left>`/`c_<C-Right>` move a WORD (space run) at a
+            // time on the command line (`ex_getln.c`).
+            NamedKey::CtrlLeft => {
+                let bytes = state.text.as_bytes();
+                let mut at = state.cursor_byte;
+                while at > 0 && bytes[at - 1] == b' ' {
+                    at -= 1;
+                }
+                while at > 0 && bytes[at - 1] != b' ' {
+                    at -= 1;
+                }
+                state.cursor_byte = at;
+            }
+            NamedKey::CtrlRight => {
+                let bytes = state.text.as_bytes();
+                let mut at = state.cursor_byte;
+                while at < bytes.len() && bytes[at] != b' ' {
+                    at += 1;
+                }
+                while at < bytes.len() && bytes[at] == b' ' {
+                    at += 1;
+                }
+                state.cursor_byte = at;
+            }
             _ => {}
         }
         Ok(())
@@ -1246,6 +1281,24 @@ impl ModeMachine {
                     ctx.cursor,
                     self.timestamp,
                 )?;
+            }
+            // `i_<C-Left>`/`i_<C-Right>` are the `ins_s_left`/`ins_s_right`
+            // word motions (`edit.c`) — a `b`/`w` target on the whole
+            // buffer, not a charwise step.
+            NamedKey::CtrlLeft | NamedKey::CtrlRight => {
+                let count = editor.buffer(ctx.buffer)?.text()?.line_count();
+                let lines = (1..=count)
+                    .map(|n| ctx.line(editor, n))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let command = if key == NamedKey::CtrlLeft {
+                    "b"
+                } else {
+                    "w"
+                };
+                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1)
+                {
+                    editor.set_window_cursor(ctx.window, motion.target)?;
+                }
             }
             _ => return Ok(()),
         }

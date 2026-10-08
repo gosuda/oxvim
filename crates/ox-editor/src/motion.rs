@@ -355,7 +355,7 @@ fn vertical_motion(
 
 /// Word motions (`w`, `W`, `e`, `E`, `b`, `B`, `ge`, `gE`); the `e`-shaped
 /// variants are inclusive.
-fn word_motion(lines: &[Vec<u8>], start: Position, command: &str, count: usize) -> Option<Motion> {
+pub(crate) fn word_motion(lines: &[Vec<u8>], start: Position, command: &str, count: usize) -> Option<Motion> {
     let (big, end, backward) = match command {
         "w" => (false, false, false),
         "W" => (true, false, false),
