@@ -5030,3 +5030,19 @@ fn insert_named_key_flushes_digit_literal_first() {
     assert_eq!(text, "xy\nAzz");
     assert_eq!(window_cursor(&editor), position(1, 1));
 }
+
+/// `i_CTRL-R` on a linewise register inserts the register like typed
+/// text — each line plus a newline — preserving the current line's
+/// contents (reference UI verified; previously the line was replaced
+/// and its text destroyed).
+#[test]
+fn insert_ctrl_r_linewise_register_preserves_current_line() {
+    let (mut editor, buffer, mut machine) =
+        named_editor("alpha bravo\nfifteen", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\"ayy", &mut eval).unwrap();
+    machine.feed_keys(&mut editor, "G0i\x12a", &mut eval).unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
+    assert_eq!(text, "alpha bravo\nalpha bravo\nfifteen");
+}

@@ -3296,23 +3296,33 @@ impl ModeMachine {
             return Ok(None);
         };
         match kind {
+            // `insert_reg` (edit.c): a linewise register is inserted like
+            // typed text — each line followed by a newline — at the cursor,
+            // preserving the current line's contents. Verified against the
+            // reference UI: `i_CTRL-R` on a `yy` register splits the line
+            // instead of replacing it.
             RegisterKind::LineWise => {
-                let mut replacement = lines;
-                replacement.push(Vec::new());
-                let after = Position {
-                    lnum: ctx.cursor.lnum + replacement.len() - 1,
-                    col: 0,
-                };
-                editor.replace_buffer_lines(crate::LineReplaceRequest {
-                    buffer: ctx.buffer,
-                    start: ctx.cursor.lnum,
-                    end: ctx.cursor.lnum,
-                    lines: &replacement,
-                    cursor_before: ctx.cursor,
-                    cursor_after: after,
-                    timestamp: self.timestamp,
-                })?;
-                editor.set_window_cursor(ctx.window, after)?;
+                let mut cursor = ctx.cursor;
+                for line in &lines {
+                    for ch in String::from_utf8_lossy(line).chars() {
+                        cursor = insert::insert_char(
+                            editor,
+                            ctx.buffer,
+                            ctx.window,
+                            cursor,
+                            ch,
+                            self.timestamp,
+                        )?;
+                    }
+                    cursor = insert::newline(
+                        editor,
+                        ctx.buffer,
+                        ctx.window,
+                        cursor,
+                        self.timestamp,
+                        eval,
+                    )?;
+                }
             }
             RegisterKind::CharacterWise | RegisterKind::BlockWise { .. } => {
                 let mut cursor = ctx.cursor;
