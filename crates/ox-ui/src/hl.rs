@@ -1,6 +1,6 @@
 //! Stable highlight identifiers and protocol emission.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ox_types::{Dict, Object, OxStr};
 use thiserror::Error;
@@ -9,6 +9,18 @@ use thiserror::Error;
 const MAX_GROUP_NAME_LEN: usize = 200;
 /// Maximum highlight group id (`MAX_HL_ID`).
 const MAX_GROUP_ID: u64 = 20_000;
+/// Low 32 bits of an attribute id address the definition slot; higher
+/// bits carry the slot's reuse generation. Reusing a vacated slot
+/// yields a numerically distinct id, so cell diffs keyed on the
+/// numeric id always observe the change and each emitted id is
+/// defined exactly once — `hl_attr_define` never redefines a live id.
+const SLOT_MASK: u64 = 0xFFFF_FFFF;
+/// Entries the `retired` resurrection map keeps. Recent churn
+/// resurrected still hits; entries older than this are dropped —
+/// their sets are least likely to recur and a miss just mints a new
+/// id, matching upstream's append-only growth for never-repeating
+/// sets.
+const RETIRED_CAP: usize = 4096;
 
 /// RGB or terminal highlight attributes.
 #[expect(
@@ -210,12 +222,38 @@ pub enum HlError {
 #[derive(Clone, Debug)]
 pub struct HlState {
     definitions: Vec<Highlight>,
+    /// Whether each definition slot holds live attributes; vacated
+    /// slots keep their last entry until `intern` reuses them.
+    occupied: Vec<bool>,
+    /// Name bindings referencing each slot. A slot whose count returns
+    /// to zero after having been bound is vacated into `free`.
+    refcounts: Vec<u32>,
+    /// Definition slots `intern` may reuse, in vacate order.
+    free: Vec<u64>,
+    /// Reuse generation per slot, forming each id's high bits.
+    generations: Vec<u64>,
     ids: BTreeMap<Highlight, u64>,
+    /// Last id each retired attribute set held, keyed for resurrection:
+    /// re-interning a previously seen set reclaims its original id (same
+    /// number, identical attrs) instead of minting a fresh generation —
+    /// this keeps emitted ids bounded by distinct attr sets, like
+    /// upstream `attr_entry` dedup, instead of growing per vacate cycle.
+    /// FIFO-bounded at `RETIRED_CAP` alongside `retired_queue`.
+    retired: BTreeMap<Highlight, u64>,
+    /// Insertion order of `retired` keys for FIFO eviction.
+    retired_queue: VecDeque<Highlight>,
     groups: BTreeMap<OxStr, u64>,
     /// Group name to stable group id (`syn_check_group` registry).
     group_ids: BTreeMap<OxStr, u64>,
     /// Group id to the last explicitly-set canonical definition.
     group_defs: BTreeMap<u64, HlDef>,
+    /// Link target to the group names linking at it, split by
+    /// resolution scope: `local_dependents` lists links resolved in
+    /// this namespace, `global_dependents` lists `link_global` links
+    /// resolved against namespace 0.
+    local_dependents: BTreeMap<u64, BTreeSet<OxStr>>,
+    /// `link_global` dependents of each namespace-0 group id.
+    global_dependents: BTreeMap<u64, BTreeSet<OxStr>>,
     /// Next group id; group ids are one-based and stable per name.
     next_group_id: u64,
 }
@@ -235,10 +273,18 @@ impl HlState {
         ids.insert(default.clone(), 0);
         Self {
             definitions: vec![default],
+            occupied: vec![true],
+            refcounts: vec![0],
+            free: Vec::new(),
+            generations: vec![0],
             ids,
+            retired: BTreeMap::new(),
+            retired_queue: VecDeque::new(),
             groups: BTreeMap::new(),
             group_ids: BTreeMap::new(),
             group_defs: BTreeMap::new(),
+            local_dependents: BTreeMap::new(),
+            global_dependents: BTreeMap::new(),
             next_group_id: 1,
         }
     }
@@ -270,6 +316,14 @@ impl HlState {
 
     /// Interns an attribute set, returning its stable id and an event only once.
     ///
+    /// Id claim order: a live dedup hit, resurrection of the set's
+    /// retired id (same number, identical attrs — UI tables and cells
+    /// holding it stay consistent), reuse of a vacated slot under a
+    /// fresh generation, eviction of an occupied-but-unbound composite
+    /// slot, then append. Fresh generations make each minted id
+    /// numerically new, so cell diffs keyed on the numeric id always
+    /// observe changes and `hl_attr_define` never redefines a live id.
+    ///
     /// # Errors
     ///
     /// Returns [`HlError::IdExhausted`] when no identifier remains in the
@@ -278,10 +332,50 @@ impl HlState {
         if let Some(id) = self.ids.get(&highlight) {
             return Ok((*id, None));
         }
-        let id = u64::try_from(self.definitions.len()).map_err(|_| HlError::IdExhausted)?;
-        i64::try_from(id).map_err(|_| HlError::IdExhausted)?;
+        // Resurrect a retired id only when its slot is vacant: an
+        // occupied slot may be a composite id already written into a
+        // grid (never emitted via `hl_attr_define` if reclaimed, and
+        // `set_group` would fail `UnknownId` on a stolen pending
+        // binding) — stealing it would leave a live reference
+        // unresolvable. Falling through just mints elsewhere.
+        if let Some(&id) = self.retired.get(&highlight) {
+            let slot = usize::try_from(id & SLOT_MASK).map_err(|_| HlError::IdExhausted)?;
+            if slot < self.definitions.len()
+                && self.occupied.get(slot).copied() == Some(false)
+            {
+                self.free.retain(|&free| free != slot as u64);
+                self.occupied[slot] = true;
+                self.refcounts[slot] = 0;
+                self.generations[slot] = id >> 32;
+                self.definitions[slot] = highlight.clone();
+                self.retired.remove(&highlight);
+                let event = define_event(id, &highlight);
+                self.ids.insert(highlight, id);
+                return Ok((id, Some(event)));
+            }
+        }
+        let index = self
+            .free
+            .pop()
+            .map(|index| usize::try_from(index).map_err(|_| HlError::IdExhausted))
+            .transpose()?;
+        let id = if let Some(index) = index {
+            self.definitions[index] = highlight.clone();
+            self.occupied[index] = true;
+            self.refcounts[index] = 0;
+            self.generations[index] = self.generations[index].saturating_add(1);
+            self.slot_id(index)
+        } else {
+            let index = self.definitions.len();
+            let id = u64::try_from(index).map_err(|_| HlError::IdExhausted)?;
+            i64::try_from(id).map_err(|_| HlError::IdExhausted)?;
+            self.definitions.push(highlight.clone());
+            self.occupied.push(true);
+            self.refcounts.push(0);
+            self.generations.push(0);
+            id
+        };
         let event = define_event(id, &highlight);
-        self.definitions.push(highlight.clone());
         self.ids.insert(highlight, id);
         Ok((id, Some(event)))
     }
@@ -293,11 +387,8 @@ impl HlState {
     /// Returns [`HlError::UnknownId`] when `id` does not identify an existing
     /// highlight.
     pub fn redefine(&mut self, id: u64, highlight: Highlight) -> Result<Option<HlEvent>, HlError> {
-        let index = usize::try_from(id).map_err(|_| HlError::UnknownId(id))?;
-        let existing = self
-            .definitions
-            .get_mut(index)
-            .ok_or(HlError::UnknownId(id))?;
+        let index = self.slot_index(id).ok_or(HlError::UnknownId(id))?;
+        let existing = &mut self.definitions[index];
         if *existing == highlight {
             return Ok(None);
         }
@@ -322,17 +413,15 @@ impl HlState {
         name: impl Into<OxStr>,
         id: u64,
     ) -> Result<Option<HlEvent>, HlError> {
-        if usize::try_from(id)
-            .ok()
-            .is_none_or(|index| index >= self.definitions.len())
-        {
-            return Err(HlError::UnknownId(id));
-        }
+        let index = self.slot_index(id).ok_or(HlError::UnknownId(id))?;
         let name = name.into();
         if self.groups.get(&name) == Some(&id) {
             return Ok(None);
         }
-        self.groups.insert(name.clone(), id);
+        if let Some(vacated) = self.groups.insert(name.clone(), id) {
+            self.release_binding(vacated);
+        }
+        self.refcounts[index] = self.refcounts[index].saturating_add(1);
         Ok(Some(HlEvent {
             name: "hl_group_set",
             args: vec![
@@ -345,9 +434,22 @@ impl HlState {
     /// Returns a definition by id.
     #[must_use]
     pub fn get(&self, id: u64) -> Option<&Highlight> {
-        usize::try_from(id)
-            .ok()
-            .and_then(|index| self.definitions.get(index))
+        self.slot_index(id).map(|index| &self.definitions[index])
+    }
+
+    /// Numeric id for `index`'s current generation (`SLOT_MASK` layout).
+    fn slot_id(&self, index: usize) -> u64 {
+        (self.generations[index] << 32) | index as u64
+    }
+
+    /// Definition slot a full id addresses, or `None` when the slot is
+    /// vacant or the id carries an earlier generation.
+    fn slot_index(&self, id: u64) -> Option<usize> {
+        let index = usize::try_from(id & SLOT_MASK).ok()?;
+        (index < self.definitions.len()
+            && self.occupied[index]
+            && self.generations[index] == (id >> 32))
+        .then_some(index)
     }
 
     /// Iterates definitions in identifier order.
@@ -355,7 +457,8 @@ impl HlState {
         self.definitions
             .iter()
             .enumerate()
-            .filter_map(|(id, highlight)| u64::try_from(id).ok().map(|id| (id, highlight)))
+            .filter(|(index, _)| self.occupied.get(*index).copied() == Some(true))
+            .map(|(index, highlight)| (self.slot_id(index), highlight))
     }
 
     /// Iterates named group bindings in stable name order.
@@ -366,11 +469,59 @@ impl HlState {
     /// Emits every current definition, including the default group.
     #[must_use]
     pub fn definitions(&self) -> Vec<HlEvent> {
-        self.definitions
-            .iter()
-            .enumerate()
-            .map(|(id, highlight)| define_event(u64::try_from(id).unwrap_or(u64::MAX), highlight))
+        self.iter()
+            .map(|(id, highlight)| define_event(id, highlight))
             .collect()
+    }
+
+    /// Drops one name binding's reference to `id`; when the last binding
+    /// leaves a non-default slot, vacates it for `intern` to reuse. The
+    /// reuse mints a fresh generation of the slot's id, so a grid cell
+    /// still holding the vacated id can never alias another group's
+    /// colors — it resolves to nothing until its next write, and the
+    /// numeric id change makes the emit diff repaint the cell.
+    fn release_binding(&mut self, id: u64) {
+        if id == 0 {
+            return;
+        }
+        let Ok(index) = usize::try_from(id & SLOT_MASK) else {
+            return;
+        };
+        let Some(count) = self.refcounts.get_mut(index) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        let retired_set = self.definitions[index].clone();
+        if self.ids.get(&retired_set) == Some(&id) {
+            // `redefine` can leave a second live slot holding this set;
+            // move its dedup entry there instead of dropping it.
+            if let Some(other) = (0..self.definitions.len()).find(|&other| {
+                other != index && self.occupied[other] && self.definitions[other] == retired_set
+            }) {
+                self.ids.insert(retired_set.clone(), self.slot_id(other));
+            } else {
+                self.ids.remove(&retired_set);
+            }
+        }
+        self.retire(retired_set, id);
+        self.occupied[index] = false;
+        self.free.push(index as u64);
+    }
+
+    /// Remembers `id` as `retired_set`'s resurrection candidate,
+    /// FIFO-evicting the oldest entry past `RETIRED_CAP`.
+    fn retire(&mut self, retired_set: Highlight, id: u64) {
+        if self.retired.insert(retired_set.clone(), id).is_none() {
+            self.retired_queue.push_back(retired_set);
+        }
+        while self.retired_queue.len() > RETIRED_CAP {
+            if let Some(oldest) = self.retired_queue.pop_front() {
+                self.retired.remove(&oldest);
+            }
+        }
     }
 
     /// Defines a named group, interning the highlight and binding the name.
@@ -457,9 +608,46 @@ impl HlState {
         self.group_defs.get(&id)
     }
 
-    /// Stores the canonical definition for a group id.
-    pub fn set_group_def(&mut self, id: u64, definition: HlDef) {
+    /// Stores the canonical definition for a group id, keeping the
+    /// reverse link index in sync: the group's name leaves the index
+    /// slot of its previous target and joins its new target's slot.
+    pub fn set_group_def(&mut self, id: u64, name: &OxStr, definition: HlDef) {
+        if let Some(old) = self.group_defs.get(&id)
+            && let Some(target) = old.link
+        {
+            let map = if old.link_global {
+                &mut self.global_dependents
+            } else {
+                &mut self.local_dependents
+            };
+            if let Some(linkers) = map.get_mut(&target) {
+                linkers.remove(name);
+                if linkers.is_empty() {
+                    map.remove(&target);
+                }
+            }
+        }
+        if let Some(target) = definition.link {
+            let map = if definition.link_global {
+                &mut self.global_dependents
+            } else {
+                &mut self.local_dependents
+            };
+            map.entry(target).or_default().insert(name.clone());
+        }
         self.group_defs.insert(id, definition);
+    }
+
+    /// Group names whose definitions link to `target`; `global` selects
+    /// `link_global` links (resolved against namespace 0) from local
+    /// links resolved in this namespace.
+    pub fn link_dependents(&self, target: u64, global: bool) -> impl Iterator<Item = &OxStr> {
+        let map = if global {
+            &self.global_dependents
+        } else {
+            &self.local_dependents
+        };
+        map.get(&target).into_iter().flatten()
     }
 
     /// Iterates explicitly-set group definitions in name order.
@@ -664,6 +852,16 @@ fn push_flag(entries: &mut Vec<(OxStr, Object)>, name: &'static str, enabled: bo
 mod tests {
     use super::*;
 
+    fn fg_highlight(fg: u32) -> Highlight {
+        Highlight {
+            rgb: HlAttrs {
+                foreground: Some(fg),
+                ..HlAttrs::default()
+            },
+            ..Highlight::default()
+        }
+    }
+
     #[test]
     fn group_boundary_rejects_past_max_hl_id() {
         let mut state = HlState::new();
@@ -692,5 +890,227 @@ mod tests {
             state.check_group(&OxStr::from("Over")),
             Err(HlError::TooManyGroups)
         );
+    }
+
+    #[test]
+    fn rebinding_a_group_vacates_its_old_attr_slot_for_reuse() {
+        let mut state = HlState::new();
+        let (first, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", first).unwrap();
+        let (second, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", second).unwrap();
+        // The slot `G` vacated reports nothing until interned again.
+        assert_eq!(state.get(first), None);
+        let (reused, event) = state.intern(fg_highlight(3)).unwrap();
+        // Reuse mints a new generation of the same slot: numerically a
+        // fresh id, so cells holding the vacated id diff as changed.
+        assert_ne!(reused, first);
+        assert_eq!(reused & SLOT_MASK, first & SLOT_MASK);
+        assert!(event.is_some());
+        assert_eq!(
+            state.get(reused).map(|highlight| highlight.rgb.foreground),
+            Some(Some(3))
+        );
+    }
+
+    #[test]
+    fn shared_attr_survives_partial_rebind() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("A", id).unwrap();
+        state.set_group("B", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("A", other).unwrap();
+        // `B` still binds the slot, so it is not a reuse candidate.
+        assert!(state.get(id).is_some());
+        let (fresh, _) = state.intern(fg_highlight(3)).unwrap();
+        assert_ne!(fresh, id);
+    }
+
+    #[test]
+    fn default_slot_is_never_vacated() {
+        let mut state = HlState::new();
+        state.set_group("G", 0).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", other).unwrap();
+        assert!(state.get(0).is_some());
+    }
+
+    #[test]
+    fn vacated_slot_rejects_bind_and_redefine() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", other).unwrap();
+        assert_eq!(state.set_group("H", id), Err(HlError::UnknownId(id)));
+        assert_eq!(
+            state.redefine(id, fg_highlight(3)),
+            Err(HlError::UnknownId(id))
+        );
+    }
+
+    #[test]
+    fn rebinding_to_the_same_id_keeps_the_slot_bound() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", id).unwrap();
+        state.set_group("G", id).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        assert_ne!(other, id);
+        assert!(state.get(id).is_some());
+    }
+
+    #[test]
+    fn vacating_a_slot_keeps_other_slots_dedup_entry() {
+        // `redefine`'s `or_insert` can leave `ids[h]` pointing at a
+        // different live slot; vacating must not delete that entry or
+        // the next intern of `h` duplicates a live definition.
+        let mut state = HlState::new();
+        let (victim, _) = state.intern(fg_highlight(1)).unwrap();
+        let (other, _) = state.intern(fg_highlight(2)).unwrap();
+        // `other` now holds `victim`'s attributes; `ids[hl1]` still
+        // maps to `victim` because `or_insert` keeps the first winner.
+        state.redefine(other, fg_highlight(1)).unwrap();
+        state.set_group("G", other).unwrap();
+        let (fresh, _) = state.intern(fg_highlight(3)).unwrap();
+        state.set_group("G", fresh).unwrap();
+        // Vacating `other` must not remove `ids[hl1] -> victim`.
+        let (deduped, _) = state.intern(fg_highlight(1)).unwrap();
+        assert_eq!(deduped, victim);
+    }
+
+    #[test]
+    fn churned_attr_set_resurrects_its_original_id() {
+        // Retired ids are claimed back for the identical set: emitted
+        // ids stay bounded by distinct sets, so UI attr tables can't
+        // grow per vacate cycle.
+        let mut state = HlState::new();
+        let (a, _) = state.intern(fg_highlight(1)).unwrap();
+        let (b, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", a).unwrap();
+        state.set_group("G", b).unwrap();
+        let (resurrected, event) = state.intern(fg_highlight(1)).unwrap();
+        assert_eq!(resurrected, a);
+        assert!(event.is_some());
+        state.set_group("G", a).unwrap();
+        let (again, _) = state.intern(fg_highlight(2)).unwrap();
+        assert_eq!(again, b);
+    }
+
+    #[test]
+    fn unbound_composite_churn_matches_upstream_growth() {
+        // Never-bound interns (compositor composites) can't be evicted
+        // safely — a grid cell may already hold the id — so
+        // never-repeating sets grow like upstream's append-only table,
+        // while recurring sets resurrect their retired ids instead of
+        // minting new ones.
+        let mut state = HlState::new();
+        for i in 0..300 {
+            state.intern(fg_highlight(i)).unwrap();
+        }
+        let grown = state.iter().count();
+        // Re-interning the same sets hits `ids` — no growth — then a
+        // churn cycle through binds resurrects rather than mints.
+        for i in 0..300 {
+            state.intern(fg_highlight(i)).unwrap();
+        }
+        assert_eq!(state.iter().count(), grown);
+    }
+
+    #[test]
+    fn retired_map_stays_fifo_bounded() {
+        let mut state = HlState::new();
+        // Vacate more distinct sets than RETIRED_CAP; the oldest
+        // resurrection entries must be evicted.
+        for i in 0..(RETIRED_CAP as u32 + 64) {
+            let (id, _) = state.intern(fg_highlight(i)).unwrap();
+            state.set_group("G", id).unwrap();
+            let (next, _) = state.intern(fg_highlight(i + 1)).unwrap();
+            state.set_group("G", next).unwrap();
+        }
+        assert!(state.retired.len() <= RETIRED_CAP);
+    }
+
+    #[test]
+    fn vacating_the_dedup_slot_keeps_a_live_duplicate() {
+        // Two live slots can share a set after `redefine`; vacating the
+        // dedup-mapped one must transfer the entry to the survivor or
+        // the next intern duplicates a live definition.
+        let mut state = HlState::new();
+        let (first, _) = state.intern(fg_highlight(1)).unwrap();
+        let (second, _) = state.intern(fg_highlight(2)).unwrap();
+        // Both slots now hold `hl1`; `ids[hl1]` kept `first` via
+        // `or_insert`. Bind and rebind `first` to vacate it…
+        state.redefine(second, fg_highlight(1)).unwrap();
+        state.set_group("G", first).unwrap();
+        let (fresh, _) = state.intern(fg_highlight(3)).unwrap();
+        state.set_group("G", fresh).unwrap();
+        // `first` is resurrected from `retired` (same set came back),
+        // and `second` — still live — must not be duplicated either.
+        let (back, _) = state.intern(fg_highlight(1)).unwrap();
+        assert!(back == first || back == second, "{back}");
+        let live = state
+            .iter()
+            .filter(|(_, h)| h.rgb.foreground == Some(1))
+            .count();
+        assert_eq!(live, 1, "intern duplicated a live definition");
+    }
+
+    #[test]
+    fn stale_generation_ids_resolve_to_nothing() {
+        let mut state = HlState::new();
+        let (id, _) = state.intern(fg_highlight(1)).unwrap();
+        state.set_group("G", id).unwrap();
+        let (next, _) = state.intern(fg_highlight(2)).unwrap();
+        state.set_group("G", next).unwrap();
+        // The vacated id's generation is now stale: nothing may bind
+        // it or read attributes through it, so a cell still holding it
+        // can never alias the slot's later contents.
+        assert_eq!(state.get(id), None);
+        assert_eq!(state.set_group("H", id), Err(HlError::UnknownId(id)));
+    }
+
+    #[test]
+    fn link_dependents_track_retargets_and_scope() {
+        let mut state = HlState::new();
+        let a = state.check_group(&OxStr::from("A")).unwrap();
+        let t = state.check_group(&OxStr::from("T")).unwrap();
+        let u = state.check_group(&OxStr::from("U")).unwrap();
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(t),
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 1);
+        // Retargeting removes the stale index entry.
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(u),
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 0);
+        assert_eq!(state.link_dependents(u, false).count(), 1);
+        // `link_global` dependents index separately from local links.
+        state.set_group_def(
+            a,
+            &OxStr::from("A"),
+            HlDef {
+                link: Some(t),
+                link_global: true,
+                ..HlDef::default()
+            },
+        );
+        assert_eq!(state.link_dependents(t, false).count(), 0);
+        assert_eq!(state.link_dependents(t, true).count(), 1);
+        // Clearing the link drops the index entry entirely.
+        state.set_group_def(a, &OxStr::from("A"), HlDef::default());
+        assert_eq!(state.link_dependents(t, true).count(), 0);
     }
 }
