@@ -1632,7 +1632,10 @@ fn mapping_notation_encodes_known_names_and_preserves_unknown_names() {
         Keys::parse_notation("<F2>", "\\", "\\"),
         Keys::from_encoded(vec![K_SPECIAL, b'k', b'2']).unwrap()
     );
-    assert_eq!(Keys::parse_notation("<Up>", "\\", "\\"), keys("<Up>"));
+    assert_eq!(
+        Keys::parse_notation("<Up>", "\\", "\\"),
+        Keys::from_encoded(vec![K_SPECIAL, b'k', b'u']).unwrap()
+    );
     assert_eq!(
         Keys::parse_notation("<M-x>", "\\", "\\"),
         Keys::from_encoded(vec![K_SPECIAL, 0xfc, 8, b'x']).unwrap()

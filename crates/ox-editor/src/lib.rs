@@ -111,7 +111,7 @@ pub use server::{ServerHost, prepare_server_address, server_address_new};
 pub use typeahead::{
     K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Key,
     KeyDecodeError, Keys, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Remap,
-    Typeahead, TypeaheadError, TypeaheadFlags,
+    Typeahead, TypeaheadError, TypeaheadFlags, special_key_pair,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, MAX_FUNC_DEPTH, UserFunc, UserFuncError, UserFuncFlags,

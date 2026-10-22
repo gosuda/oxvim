@@ -1691,7 +1691,16 @@ fn encode_key(key: KeyEvent) -> Option<String> {
             // the shifted glyph itself (`<` + Shift). Translate the
             // base-keycode form so `,` + Shift never arrives as a literal
             // comma — the same glyph a legacy terminal would have sent.
-            return Some(shifted_char(character, key.modifiers).to_string());
+            let shifted = shifted_char(character, key.modifiers);
+            // `<` opens keycode notation for `nvim_input`'s termcode pass —
+            // typed text must send the `<lt>` escape (the same quoting a
+            // remote UI applies) or input like `:nnoremap <Down> x` loses its
+            // characters to a decoded key.
+            return Some(if shifted == '<' {
+                "<lt>".to_string()
+            } else {
+                shifted.to_string()
+            });
         }
         KeyCode::Char(character) => character.to_string(),
         KeyCode::Enter => "CR".into(),
@@ -2757,16 +2766,29 @@ mod tests {
 
         let shifted =
             |character| encode_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::SHIFT));
-        assert_eq!(shifted(','), Some("<".to_owned()));
+        assert_eq!(shifted(','), Some("<lt>".to_owned()));
         assert_eq!(shifted('.'), Some(">".to_owned()));
         assert_eq!(shifted('='), Some("+".to_owned()));
         assert_eq!(shifted('a'), Some("A".to_owned()));
         assert_eq!(shifted('1'), Some("!".to_owned()));
 
-        assert_eq!(shifted('<'), Some("<".to_owned()));
+        assert_eq!(shifted('<'), Some("<lt>".to_owned()));
         assert_eq!(
             encode_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE)),
             Some(",".to_owned())
+        );
+    }
+
+    /// `nvim_input` runs termcode replacement, so typed `<` must escape as
+    /// `<lt>` — otherwise `:nnoremap <Down> x` typed into the command line
+    /// decodes `<Down>` into the keycode and drops the mapping's lhs.
+    #[test]
+    fn encode_key_escapes_typed_less_than_as_lt() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        assert_eq!(
+            encode_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::NONE)),
+            Some("<lt>".to_owned())
         );
     }
 

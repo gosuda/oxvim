@@ -184,6 +184,159 @@ pub const MOD_MASK_4CLICK: u8 = 0x60;
 /// Command ("super") key mask (keycodes.h:474).
 pub const MOD_MASK_CMD: u8 = 0x80;
 
+/// Encodes a named special key (`<Up>`, `<F1>`, `<BS>`, `<Tab>`, ...) as its
+/// core `(KS_xxx, KE_xxx)` pair; the third byte is a KE_* enum value when the
+/// key has no termcap name, otherwise a termcap byte (src/nvim/keycodes.h
+/// `TERMCAP2KEY`). Function keys F13-F63, the keypad set, the shifted/control
+/// cursor keys, and the extra xterm keys are all dedicated three-byte keys.
+/// This mirrors upstream's `key_names_table` merged with the
+/// `modifier_keys_table` dedicated shifted/control entries so both the
+/// notation parser and the termcode API read one canonical inventory.
+const SPECIAL_KEY_PAIRS: &[(&[u8], (u8, u8))] = &[
+    // Base cursor/navigation keys (termcap byte pairs).
+    (b"up", (b'k', b'u')),
+    (b"down", (b'k', b'd')),
+    (b"left", (b'k', b'l')),
+    (b"right", (b'k', b'r')),
+    (b"home", (b'k', b'h')),
+    (b"end", (b'@', b'7')),
+    (b"pageup", (b'k', b'P')),
+    (b"pagedown", (b'k', b'N')),
+    (b"del", (b'k', b'D')),
+    (b"delete", (b'k', b'D')),
+    (b"bs", (b'k', b'b')),
+    (b"backspace", (b'k', b'b')),
+    (b"tab", (KS_EXTRA, 54)),    // KE_TAB
+    (b"ignore", (KS_EXTRA, 53)), // KE_IGNORE
+    (b"nop", (KS_EXTRA, 97)),    // KE_NOP
+    (b"insert", (b'k', b'I')),
+    (b"ins", (b'k', b'I')),
+    (b"help", (b'%', b'1')),
+    (b"undo", (b'&', b'8')),
+    (b"find", (b'@', b'0')),
+    (b"select", (b'*', b'6')), // K_KSELECT
+    // Shifted/control cursor keys and shifted Tab (modifier_keys_table).
+    (b"s-tab", (b'k', b'B')),   // K_S_TAB
+    (b"s-up", (KS_EXTRA, 4)),   // KE_S_UP
+    (b"s-down", (KS_EXTRA, 5)), // KE_S_DOWN
+    (b"s-left", (b'#', b'4')),
+    (b"s-right", (b'%', b'i')),
+    (b"s-home", (b'#', b'2')),
+    (b"s-end", (b'*', b'7')),
+    (b"s-del", (b'*', b'4')),
+    (b"c-left", (KS_EXTRA, 85)),  // KE_C_LEFT
+    (b"c-right", (KS_EXTRA, 86)), // KE_C_RIGHT
+    (b"c-home", (KS_EXTRA, 87)),  // KE_C_HOME
+    (b"c-end", (KS_EXTRA, 88)),   // KE_C_END
+    // Keypad keys: k0-k9 and k-prefixed navigation/arithmetic.
+    (b"k0", (b'K', b'C')),
+    (b"k1", (b'K', b'D')),
+    (b"k2", (b'K', b'E')),
+    (b"k3", (b'K', b'F')),
+    (b"k4", (b'K', b'G')),
+    (b"k5", (b'K', b'H')),
+    (b"k6", (b'K', b'I')),
+    (b"k7", (b'K', b'J')),
+    (b"k8", (b'K', b'K')),
+    (b"k9", (b'K', b'L')),
+    (b"kup", (b'K', b'u')),
+    (b"kdown", (b'K', b'd')),
+    (b"kleft", (b'K', b'l')),
+    (b"kright", (b'K', b'r')),
+    (b"khome", (b'K', b'1')),
+    (b"kend", (b'K', b'4')),
+    (b"kpageup", (b'K', b'3')),
+    (b"kpagedown", (b'K', b'5')),
+    (b"korigin", (b'K', b'2')),
+    (b"kplus", (b'K', b'6')),
+    (b"kminus", (b'K', b'7')),
+    (b"kdivide", (b'K', b'8')),
+    (b"kmultiply", (b'K', b'9')),
+    (b"kenter", (b'K', b'A')),
+    (b"kpoint", (b'K', b'B')),
+    (b"kcomma", (b'K', b'M')),
+    (b"kequal", (b'K', b'N')),
+    (b"kinsert", (KS_EXTRA, 79)), // KE_KINS
+    (b"kdel", (KS_EXTRA, 80)),    // KE_KDEL
+    // Function keys F1-F12 (F13-F63 handled by the numeric run in
+    // `special_key_pair`).
+    (b"f1", (b'k', b'1')),
+    (b"f2", (b'k', b'2')),
+    (b"f3", (b'k', b'3')),
+    (b"f4", (b'k', b'4')),
+    (b"f5", (b'k', b'5')),
+    (b"f6", (b'k', b'6')),
+    (b"f7", (b'k', b'7')),
+    (b"f8", (b'k', b'8')),
+    (b"f9", (b'k', b'9')),
+    (b"f10", (b'k', b';')),
+    (b"f11", (b'F', b'1')),
+    (b"f12", (b'F', b'2')),
+    // Shifted function keys F1-F12.
+    (b"s-f1", (KS_EXTRA, 6)),
+    (b"s-f2", (KS_EXTRA, 7)),
+    (b"s-f3", (KS_EXTRA, 8)),
+    (b"s-f4", (KS_EXTRA, 9)),
+    (b"s-f5", (KS_EXTRA, 10)),
+    (b"s-f6", (KS_EXTRA, 11)),
+    (b"s-f7", (KS_EXTRA, 12)),
+    (b"s-f8", (KS_EXTRA, 13)),
+    (b"s-f9", (KS_EXTRA, 14)),
+    (b"s-f10", (KS_EXTRA, 15)),
+    (b"s-f11", (KS_EXTRA, 16)),
+    (b"s-f12", (KS_EXTRA, 17)),
+    // Extra vt100 xterm keys and shifted variants.
+    (b"xup", (KS_EXTRA, 65)),    // KE_XUP
+    (b"xdown", (KS_EXTRA, 66)),  // KE_XDOWN
+    (b"xleft", (KS_EXTRA, 67)),  // KE_XLEFT
+    (b"xright", (KS_EXTRA, 68)), // KE_XRIGHT
+    (b"xhome", (KS_EXTRA, 63)),  // KE_XHOME
+    (b"zhome", (KS_EXTRA, 64)),  // KE_ZHOME
+    (b"xend", (KS_EXTRA, 61)),   // KE_XEND
+    (b"zend", (KS_EXTRA, 62)),   // KE_ZEND
+    (b"xf1", (KS_EXTRA, 57)),
+    (b"xf2", (KS_EXTRA, 58)),
+    (b"xf3", (KS_EXTRA, 59)),
+    (b"xf4", (KS_EXTRA, 60)),
+    (b"s-xf1", (KS_EXTRA, 71)),
+    (b"s-xf2", (KS_EXTRA, 72)),
+    (b"s-xf3", (KS_EXTRA, 73)),
+    (b"s-xf4", (KS_EXTRA, 74)),
+];
+
+/// Resolves one lowercased `<Notation>` name to its `(second, third)` pair —
+/// the port's `get_special_key_code` over the merged table above.
+#[must_use]
+pub fn special_key_pair(name: &[u8]) -> Option<(u8, u8)> {
+    // Function keys F13-F63 are a numeric run with a computed third byte.
+    if let Some(digits) = name.strip_prefix(b"f")
+        && !digits.is_empty()
+        && digits.iter().all(u8::is_ascii_digit)
+    {
+        let n: u8 = std::str::from_utf8(digits).ok()?.parse().ok()?;
+        return function_key(n);
+    }
+    SPECIAL_KEY_PAIRS
+        .iter()
+        .find(|entry| entry.0 == name)
+        .map(|entry| entry.1)
+}
+
+/// Computes the `(second, third)` bytes for a function key F1-F63 following
+/// keycodes.h (`K_F1`..`K_F63` termcap byte runs).
+fn function_key(n: u8) -> Option<(u8, u8)> {
+    match n {
+        1..=10 => Some((b'k', *b"123456789;".get((n - 1) as usize)?)),
+        11..=12 => Some((b'F', n - 11 + b'1')),
+        13..=40 => Some((
+            b'F',
+            *b"3456789ABCDEFGHIJKLMNOPQRSTU".get((n - 13) as usize)?,
+        )),
+        41..=63 => Some((b'F', *b"VWXYZabcdefghijklmnopqr".get((n - 41) as usize)?)),
+        _ => None,
+    }
+}
+
 fn append_raw(output: &mut Vec<u8>, bytes: &[u8]) {
     for byte in bytes {
         match *byte {
@@ -192,6 +345,44 @@ fn append_raw(output: &mut Vec<u8>, bytes: &[u8]) {
             byte => output.push(byte),
         }
     }
+}
+
+/// The plain-byte names (`keycodes.c` emits a literal byte for these rather
+/// than a three-byte key).
+fn simple_name_byte(lower: &str) -> Option<u8> {
+    Some(match lower {
+        "lt" => b'<',
+        "bslash" => b'\\',
+        "bar" => b'|',
+        "space" => b' ',
+        "tab" => 0x09,
+        "cr" | "return" | "enter" => 0x0d,
+        "nl" | "newline" | "linefeed" | "lf" => 0x0a,
+        "esc" | "escape" => 0x1b,
+        "bs" | "backspace" => 0x08,
+        "del" | "delete" => 0x7f,
+        "nul" => 0x00,
+        _ => return None,
+    })
+}
+
+/// `simplify_key` (`keycodes.c:185-257`): the first (modifier, key) pair —
+/// scanned in modifier-key-table order — that owns a dedicated code resolves
+/// to that code's `(second, third)` bytes plus the modifier bit it consumed.
+fn simplified_key_pair(modifiers: u8, lower: &str) -> Option<((u8, u8), u8)> {
+    for (mask, prefix) in [
+        (MOD_MASK_SHIFT, "s-"),
+        (MOD_MASK_CTRL, "c-"),
+        (MOD_MASK_ALT, "a-"),
+        (MOD_MASK_ALT, "m-"),
+    ] {
+        if modifiers & mask != 0
+            && let Some(pair) = special_key_pair(format!("{prefix}{lower}").as_bytes())
+        {
+            return Some((pair, mask));
+        }
+    }
+    None
 }
 
 /// One `<...>` key name in final internal form.
@@ -262,20 +453,27 @@ fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u
 
     let lower = rest.to_ascii_lowercase();
     if raw.is_none() {
-        raw = match lower.as_str() {
-            "lt" => Some(b'<'),
-            "bslash" => Some(b'\\'),
-            "bar" => Some(b'|'),
-            "space" => Some(b' '),
-            "tab" => Some(0x09),
-            "cr" | "return" | "enter" => Some(0x0d),
-            "nl" | "newline" | "linefeed" | "lf" => Some(0x0a),
-            "esc" | "escape" => Some(0x1b),
-            "bs" | "backspace" => Some(0x08),
-            "del" | "delete" => Some(0x7f),
-            "nul" => Some(0x00),
-            _ => None,
-        };
+        raw = simple_name_byte(lower.as_str());
+    }
+
+    // `get_special_key_code` (`keycodes.c:664-678`): the name after the last
+    // modifier resolves through the key-names table (`Up`, `PageDown`,
+    // `F10`, ...). `simplify_key` (`keycodes.c:185-257`) then rewrites a
+    // (modifier, key) pair that has a dedicated code (`S-Tab`, `S-Down`,
+    // `C-Left`, `S-F1`, ...) to that code and clears the folded modifier;
+    // any leftover modifiers still prefix the key below.
+    let mut special = if raw.is_none() {
+        special_key_pair(lower.as_bytes())
+    } else {
+        None
+    };
+    if modifiers != 0
+        && (raw.is_some() || special.is_some())
+        && let Some((pair, mask)) = simplified_key_pair(modifiers, lower.as_str())
+    {
+        raw = None;
+        special = Some(pair);
+        modifiers &= !mask;
     }
 
     let mut output = Vec::new();
@@ -286,8 +484,8 @@ fn named_key_bytes(name: &str, leader: &str, local_leader: &str) -> Option<Vec<u
         append_raw(&mut output, &[raw]);
         return Some(output);
     }
-    if let [b'f', digit @ b'1'..=b'9'] = lower.as_bytes() {
-        output.extend_from_slice(&[K_SPECIAL, b'k', *digit]);
+    if let Some((second, third)) = special {
+        output.extend_from_slice(&[K_SPECIAL, second, third]);
         return Some(output);
     }
     if modifiers != 0 && rest.chars().count() == 1 {
