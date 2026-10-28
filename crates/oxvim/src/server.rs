@@ -447,6 +447,9 @@ pub(crate) fn build_embedded_core(
         Rc::new(LuaScheduler {
             queue: lua_work.clone(),
             session: session.clone(),
+            ex: ex.clone(),
+            nested_ex: nested_ex.clone(),
+            hostless_passes: Rc::new(Cell::new(0)),
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -6292,6 +6295,9 @@ fn nvim_cmd_args(params: &[Object]) -> Result<(&Dict, &Dict), ApiError> {
 struct LuaScheduler {
     queue: Rc<RefCell<VecDeque<Work>>>,
     session: Rc<ApiSession>,
+    ex: Rc<RefCell<ExExecutor>>,
+    nested_ex: Rc<RefCell<ExExecutor>>,
+    hostless_passes: Rc<Cell<usize>>,
 }
 
 impl Scheduler for LuaScheduler {
@@ -6305,7 +6311,47 @@ impl Scheduler for LuaScheduler {
     }
 
     fn pump_scheduled(&self) -> bool {
-        drain_lua_work_queue(&self.queue, &self.session)
+        let mut ran = drain_lua_work_queue(&self.queue, &self.session);
+        // Pump terminal-job output so `vim.wait()` observes it: upstream
+        // serves the main loop on every wait turn (`LOOP_PROCESS_EVENTS`,
+        // event/loop.c), while the server otherwise only flushes PTY output
+        // on transport ticks (`poll_background_work`). A scoped `jobstart`
+        // from Lua lands on whichever executor is free at the call: `ex`
+        // from an RPC chunk, `nested_ex` when an enclosing `:lua` holds
+        // `ex` (`dispatch_scoped_builtin`). Flush whichever slot yields a
+        // `try_borrow_mut`, skipping a slot an enclosing frame holds rather
+        // than `borrow_mut`-ing into a panic.
+        // Terminal bytes deliberately do not feed the return value: it tells
+        // `loop_poll` whether it may skip its timeout and block, and a job
+        // that keeps writing would otherwise turn `vim.wait` into a spin
+        // loop. Upstream processes the events and then blocks again
+        // (`LOOP_PROCESS_EVENTS`), so the flush reports nothing here.
+        for executor in [&self.ex, &self.nested_ex] {
+            if let Ok(mut guard) = executor.try_borrow_mut() {
+                if let Err(error) = guard.flush_pty_output(&*self.session) {
+                    report_server_error(&self.session, &error);
+                }
+            }
+        }
+        // Opportunistically deliver deferred job callbacks at the same
+        // borrow-free boundary. `deliver_deferred_job_events` no-ops while
+        // either executor is busy or the host is in user code (the
+        // pre-existing reentry guard); its unconditional owner borrows would
+        // panic under an enclosing `:lua`, so only offer an owner slot that
+        // is free right now. Each executor owns its deferred queue, so offer
+        // both with the other as the callback-host alternate.
+        let mut passes = self.hostless_passes.get();
+        for (owner, alternate) in [(&self.ex, &self.nested_ex), (&self.nested_ex, &self.ex)] {
+            if owner.try_borrow().is_err() {
+                continue;
+            }
+            match deliver_deferred_job_events(&self.session, owner, alternate, &mut passes) {
+                Ok(delivered) => ran |= delivered,
+                Err(error) => report_job_callback_error(&self.session, &error),
+            }
+        }
+        self.hostless_passes.set(passes);
+        ran
     }
 }
 
