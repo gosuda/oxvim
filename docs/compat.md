@@ -56,7 +56,7 @@ Known divergences are recorded in `tests/differential/SKIPS.md` and admitted onl
 ## Known gaps
 
 - Terminal channels connect and route data, but parsing terminal VT escape sequences into buffer cells is not implemented, so `:terminal` and the upstream Makefile's oldtest path produce no visible buffer text.
-- `:edit <name>` in headless mode did not finish within three minutes on this host, with about 1.4 million `vim.fn.fnamemodify` calls in fifteen seconds and `vim.filetype.match` never entered. The builtin bridge itself is no longer the cause: it dropped from 620 to 3 microseconds per call once the option and register mirrors were version-gated.
+- Five oldtest files still time out before running a test: `test_plugin_termdebug.vim`, `test_tabpage.vim`, `test_functions.vim`, `test_put.vim`, and `test_regexp_latin.vim`, which crashes instead.
 - Unsetting a local option value with `nil` is not yet supported in the editor options store.
 - Advanced `vim.uv` features (custom polling priorities, non-standard file descriptor redirection, and platform system metrics) return typed `Unsupported` errors.
 - Windows is untested; verification runs on Linux and POSIX-compliant systems.
@@ -68,7 +68,7 @@ Measured on 2026-10-28 against the release binary at `c4520b0` plus the fixes in
 | Suite | Files | Pass | Fail | Skip | Error |
 |---|---|---|---|---|---|
 | `just functional` (Busted) | 484 | 1830 | 4076 | 58 | 1 |
-| `just oldtest` (legacy Vimscript) | 236 | - | 2323 of 3593 executed | 685 | 40 blocked, 6 timed out |
+| `just oldtest` (legacy Vimscript) | 236 | - | 2368 of 3654 executed | 686 | 40 blocked, 5 timed out |
 
 Neither suite passes yet. `just apidiff`, `cargo build --workspace --release`, and
 `cargo nextest run --workspace` do pass, and the workspace suite covers 3635 tests.
