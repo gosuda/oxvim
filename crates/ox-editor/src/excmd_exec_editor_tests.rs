@@ -6063,6 +6063,27 @@ fn sleep_rejects_a_zero_count_with_e939() {
     executor.execute_line(&editor, "0read in.txt").unwrap();
 }
 
+/// `:sleep` pumps the event loop while waiting (`os_delay` with events):
+/// a job whose exit lands mid-sleep has its callback delivered before the
+/// script continues, instead of waiting for a later drain.
+#[test]
+fn sleep_delivers_job_callbacks_before_continuing() {
+    let _guard = crate::lock_process_state();
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "sleep",
+            "func! OnSleepExit(id, data, event)\nlet g:sleep_fired = 1\nendfunc\nlet g:sleep_fired = 0\nlet g:sleep_job = jobstart(['sh', '-c', 'exit 0'], {'on_exit': 'OnSleepExit'})\nsleep 200m\n",
+        )
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "sleep_fired"),
+        Some(ox_types::Typval::Number(1)),
+        "a job exit during :sleep must be delivered before the sleep ends"
+    );
+}
+
 /// `:scriptencoding` outside a sourced file is E167.
 #[test]
 fn scriptencoding_outside_a_script_raises_e167() {
@@ -10947,4 +10968,234 @@ fn helpclose_without_help_window_is_noop() {
     executor.execute_line(&editor, "helpclose").unwrap();
     assert_eq!(editor.editor().windows().len(), 1);
     assert_eq!(editor.editor().messages().len(), seen);
+}
+
+/// Reads a script-global string list for `:cdo` visit assertions.
+fn global_strings(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<String> {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::List(items)) => items
+            .borrow()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ox_types::Typval::String(text) => {
+                    Some(text.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected string list global {name}, got {other:?}"),
+    }
+}
+
+/// `:cdo` visits each valid entry in ordinal order (`ex_listdo`,
+/// ex_cmds2.c:556-690): unparseable lines are skipped, not counted, and an
+/// explicit range selects valid-entry ordinals (test_cdo.vim `XdoTests`).
+#[test]
+fn cdo_visits_each_valid_entry_in_range() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor.scripts().io().insert("qf3.txt", "three\n");
+    executor
+        .execute_line(
+            &editor,
+            "cgetexpr ['non-error 1', 'qf1.txt:1:1:one', 'non-error 2', 'qf2.txt:1:1:two', 'qf3.txt:1:1:three']",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(
+        global_strings(&executor, "seen"),
+        ["qf1.txt", "qf2.txt", "qf3.txt"]
+    );
+
+    executor.execute_line(&editor, "unlet g:seen").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "2,2cdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "seen"), ["qf2.txt"]);
+}
+
+/// `:cfdo` visits the first valid entry of each file once (`FORWARD_FILE`),
+/// and `:cdo` on an empty list is a silent no-op while an explicit
+/// out-of-range address is `E16` (ex_docmd.c `invalid_range`,
+/// `ADDR_QUICKFIX_VALID`).
+#[test]
+fn cfdo_visits_each_file_once_and_empty_cdo_stays_silent() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(
+            &editor,
+            "cgetexpr ['qf1.txt:1:1:one', 'qf1.txt:1:1:again', 'qf2.txt:1:1:two']",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cfdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "seen"), ["qf1.txt", "qf2.txt"]);
+
+    executor.execute_line(&editor, "call setqflist([])").unwrap();
+    executor.execute_line(&editor, "let g:empty = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cdo let g:empty = g:empty + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "empty"), Vec::<String>::new());
+    assert_vim_error(
+        executor.execute_line(&editor, "2cdo let g:empty = [expand('%')]"),
+        "E16",
+    );
+}
+
+/// `:cdo` leaving a modified buffer without `!` fails with `E37`
+/// (`can_abandon` via `buflist_getfile`; test_cdo.vim's unsaved-buffer
+/// check), while `!` overrides the guard and runs the nested command.
+#[test]
+fn cdo_abandoning_modified_buffer_without_bang_is_e37() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(&editor, "cgetexpr ['qf1.txt:1:1:one', 'qf2.txt:1:1:two']")
+        .unwrap();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "setlocal modified").unwrap();
+    assert_vim_error(
+        executor.execute_line(&editor, "2,2cdo call add([], 1)"),
+        "E37",
+    );
+    executor
+        .execute_line(&editor, "2,2cdo! let g:forced = expand('%')")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "forced"),
+        Some(ox_types::Typval::String("qf2.txt".into()))
+    );
+}
+
+/// `:silent!` records the suppressed code in `v:errmsg` without displaying
+/// it (message.c:826-828: "also when using `:silent! cmd`").
+#[test]
+fn silent_bang_records_errmsg_while_swallowing_the_error() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(&editor, "cgetexpr ['qf1.txt:1:1:one', 'qf2.txt:1:1:two']")
+        .unwrap();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "setlocal modified").unwrap();
+    let messages = editor.editor().messages().len();
+    executor
+        .execute_line(&editor, "silent! 2,2cdo call add([], 1)")
+        .unwrap();
+    assert_eq!(
+        editor.editor().messages().len(),
+        messages,
+        ":silent! must not display the swallowed error"
+    );
+    match executor.evaluate_expression(&editor, "v:errmsg") {
+        Ok(ox_types::Typval::String(text)) => assert!(
+            text.to_string_lossy().starts_with("E37"),
+            "v:errmsg must name the swallowed error, got {text:?}"
+        ),
+        other => panic!("expected v:errmsg string, got {other:?}"),
+    }
+}
+
+/// `++once` / `++nested` are definition flags, not pattern text
+/// (`arg_autocmd_flag_get`, autocmd.c:778-830): the pattern stores cleanly,
+/// the flags store on the options, and `++once` consumes itself on first
+/// fire while a repeated flag is `E983`.
+#[test]
+fn autocmd_once_flag_fires_once_and_stores_clean_pattern() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py ++once let g:hit = 1")
+        .unwrap();
+    let definitions = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].pattern, "*.py");
+    assert!(definitions[0].once);
+    assert!(!definitions[0].nested);
+    assert_eq!(
+        definitions[0].kind,
+        AutocmdKind::ExString("let g:hit = 1".to_owned())
+    );
+
+    executor.scripts().io().insert("once.py", "x");
+    executor.execute_line(&editor, "edit once.py").unwrap();
+    assert_eq!(
+        global_value(&executor, "hit"),
+        Some(ox_types::Typval::Number(1))
+    );
+    assert!(
+        editor.editor().autocmds().definitions().is_empty(),
+        "++once must be consumed by its first fire"
+    );
+    executor.execute_line(&editor, "unlet g:hit").unwrap();
+    executor.execute_line(&editor, "edit once.py").unwrap();
+    assert_eq!(global_value(&executor, "hit"), None);
+}
+
+/// `++nested` and the deprecated bare `nested` both set the nested flag, a
+/// repeated flag is `E983`, and flag-like command text stays a command.
+#[test]
+fn autocmd_nested_flag_parses_and_duplicates_are_e983() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py ++nested let g:n = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py nested let g:m = 1")
+        .unwrap();
+    let definitions = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    assert_eq!(definitions.len(), 2);
+    for definition in &definitions {
+        assert_eq!(definition.pattern, "*.py");
+        assert!(definition.nested, "nested flag must store");
+    }
+    assert_vim_error(
+        executor.execute_line(&editor, "autocmd BufEnter *.py ++once ++once let g:d = 1"),
+        "E983",
+    );
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.x nested_call()")
+        .unwrap();
+    let flagged = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    let trailing = flagged
+        .iter()
+        .find(|definition| definition.pattern == "*.x")
+        .expect("flag-like body must still register");
+    assert!(!trailing.nested);
+    assert_eq!(
+        trailing.kind,
+        AutocmdKind::ExString("nested_call()".to_owned())
+    );
 }

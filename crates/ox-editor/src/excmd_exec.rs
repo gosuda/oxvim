@@ -1359,6 +1359,15 @@ impl<F: FileIO> ExExecutor<F> {
         access: &E,
         event: JobEvent,
     ) -> Result<(), String> {
+        // Timer callbacks that keep failing are stopped after three strikes
+        // upstream (`eval.c:5106-5116`): capture the timer identity before
+        // the event moves into delivery, so a job event — matched by
+        // receiver identity, never by shape — cannot be misclassified.
+        let timer_id = self
+            .runtime
+            .jobs
+            .as_ref()
+            .and_then(|manager| manager.timer_id_for_event(&event));
         let name = match &event.callback {
             Typval::String(name) => name.clone(),
             Typval::Funcref(funcref) | Typval::Partial(funcref) => {
@@ -1383,7 +1392,14 @@ impl<F: FileIO> ExExecutor<F> {
             1,
             Some(event.receiver),
         )
-        .map_err(|flow| flow_to_eval_error(flow, &name.to_string_lossy()).to_string())?;
+        .map_err(|flow| {
+            if let Some(id) = timer_id
+                && let Some(manager) = self.runtime.jobs.as_mut()
+            {
+                manager.record_timer_error(id);
+            }
+            flow_to_eval_error(flow, &name.to_string_lossy()).to_string()
+        })?;
         Ok(())
     }
 
@@ -3370,8 +3386,31 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         if matches!(exception.kind, VimExceptionKind::Error(_))
                 ) || matches!(&flow, Flow::NotImplemented(_)))
             {
-                pc += 1;
-                continue;
+            // `emsg()` records `v:errmsg` before the `:silent!`
+            // early-return (message.c:826-828: "also when using
+            // `:silent! cmd`"); only the display is skipped. The text is
+            // built from the flow directly: the display helper bails at
+            // `try_depth != 0` (API callers run nested), but a swallowed
+            // error never propagates, so nothing later can record it.
+            let message = match &flow {
+                Flow::Exception(exception) => Some(exception.emsg_text()),
+                Flow::NotImplemented(name) => {
+                    Some(format!("E117: Unknown function: {name}"))
+                }
+                _ => None,
+            };
+            if let Some(message) = message {
+                let text = OxStr(message.into_bytes());
+                access.with_ex_editor(|editor| {
+                    editor.vvars_mut().insert(
+                        OxStr::from("errmsg"),
+                        Object::String(text.clone()),
+                    );
+                });
+                scope.replace_pair(ScopeKind::Vim, "errmsg", Typval::String(text));
+            }
+            pc += 1;
+            continue;
             }
             display_error_message(runtime, access, &flow);
             // `did_emsg` aborts the whole do_cmdline (ex_docmd.c:745-753):
@@ -3790,7 +3829,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "undojoin" => access.with_ex_editor(|editor| command_undojoin(runtime, editor)),
         "retab" => access.with_ex_editor(|editor| command_retab(runtime, editor, scope, command)),
         "hide" => access.with_ex_editor(|editor| command_hide(runtime, editor, command)),
-        "sleep" => access.with_ex_editor(|editor| command_sleep(runtime, editor, command)),
+        "sleep" => command_sleep(runtime, access, scope, lua, command),
         "scriptencoding" => command_scriptencoding(runtime, command),
         "scriptnames" => command_scriptnames(runtime, access, scope, lua, command),
         "argdelete" => access.with_ex_editor(|editor| command_argdelete(runtime, editor, command)),
@@ -6314,7 +6353,11 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
     let Some(open) = text.find('(') else {
         return error_flow(runtime, "E107", format!("Missing parentheses: {text}"));
     };
-    let Some(close) = text.rfind(')') else {
+    // `get_func_arguments` consumes one balanced call: the match for the
+    // opening paren ends the argument list, so `->Chained()` or `.member`
+    // after it is trailing (`E488`), not part of the last argument (which
+    // `rfind(')')` would swallow and misreport as an argument error).
+    let Some(close) = find_closing_paren(text, open) else {
         return error_flow(runtime, "E107", format!("Missing parentheses: {text}"));
     };
     let name = text[..open].trim();
@@ -12848,14 +12891,18 @@ fn window_by_number(windows: &[WinHandle], number: usize) -> Option<WinHandle> {
 /// The count defaults to 1 and anything other than `m` or an empty tail is
 /// `E475` reporting the *remaining* argument, not the whole one. A zero count
 /// is `E939` from the shared count parse, since `sleep` carries no `ZEROR`.
-fn command_sleep<F: FileIO>(
+fn command_sleep<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let amount = match (&command.range, command.count) {
         (_, Some(count)) => count,
-        (Some(_), None) => match resolve_range_raw(editor, command) {
+        (Some(_), None) => match access
+            .with_ex_editor(|editor| resolve_range_raw(editor, command))
+        {
             Ok((_, end)) => end as u64,
             Err(message) => return error_flow(runtime, "E16", message),
         },
@@ -12874,7 +12921,20 @@ fn command_sleep<F: FileIO>(
     // leaves every terminal buffer empty.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(milliseconds);
     loop {
-        pump_job_output(runtime, editor);
+        access.with_ex_editor(|editor| pump_job_output(runtime, editor));
+        // `os_delay` pumps the event loop, so timers and channel callbacks
+        // fire while the script waits. New completions are polled off the
+        // reactor and delivered exactly like the `jobwait` flush; a
+        // callback's own failure is consumed by the invoke path's re-defer
+        // contract and never aborts the sleep.
+        if let Some(manager) = runtime.jobs.as_mut()
+            && let Ok(mut events) = manager.poll()
+            && !events.is_empty()
+        {
+            let _ = crate::builtins::process::invoke_job_events(
+                runtime, access, scope, lua, &mut events,
+            );
+        }
         let now = std::time::Instant::now();
         if now >= deadline {
             break;
@@ -22007,6 +22067,38 @@ fn render_address(address: &Address) -> String {
 
 fn split_comma_args(source: &str) -> Vec<&str> {
     split_top_level(source, b',', true)
+}
+
+/// Offset of the `)` closing the call opened at `open`, skipping quoted
+/// strings with the same discipline as [`split_top_level`]. `None` when the
+/// parens never balance (`get_func_arguments` fails the whole `:defer`).
+fn find_closing_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(active) = quote {
+            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte == b'(' {
+            depth += 1;
+        } else if byte == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 fn split_top_level(source: &str, delimiter: u8, exact: bool) -> Vec<&str> {
