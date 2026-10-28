@@ -63,6 +63,16 @@ Criteria 1 to 3 are green. Criteria 4 and 5 are measured and still red.
 6. `:new`/`:split` aside, functional-suite failures need their own census: the harness aborts early on most
    files, and the group logs now carry per-test lines the counter can read.
 
+## Measurement traps met in this run
+
+- `$TEST_FILTER` is matched with `v:val =~ pattern`, so alternation is Vim's `\|`, not `|`.
+  A probe written `^Test_(a|b)$` selects nothing and reports success; every filter in this
+  campaign that produced a verdict used one anchored name or a character class.
+- A census binary copied outside `target/release` cannot find the runtime tree and reports
+  every file as blocked with zero tests. `tests/oldtest/run.sh` uses the in-tree binary.
+- `timeout -s TERM` does not stop a hung oxvim cleanly in the shared PTY; harness probes that
+  need a hard cap use `start_new_session` and a kill.
+
 ## Evidence
 
 All logs live under `.outline/evidence/` (gitignored): `gates/`, `oldtest-final/`, `functional-*.log`,
