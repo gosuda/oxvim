@@ -522,6 +522,18 @@ impl OptionStore {
     }
 
     /// Drops every local value owned by a closed window.
+    /// Drops every window-local overlay, so each option falls back to its
+    /// global value.
+    ///
+    /// `:new` and `:vnew` create their window through the same split path as
+    /// `:split`, but upstream initialises it with `win_init` rather than
+    /// `win_init_some`, so nothing is inherited from the window that was
+    /// current before the command.
+    pub fn reset_window(&mut self, window: WinHandle) {
+        self.windows.remove(&window);
+        self.version = self.version.wrapping_add(1);
+    }
+
     pub fn remove_window(&mut self, window: WinHandle) {
         self.windows.remove(&window);
         self.version = self.version.wrapping_add(1);

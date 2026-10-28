@@ -11206,6 +11206,10 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
                     created_window.set(None);
                     return Err(LoadSwitchError::Editor(error));
                 }
+                // `:split {file}` initialises its window with `win_init`, not
+                // `win_init_some`, so it inherits nothing from the window the
+                // command started in; only a bare `:split` copies options.
+                access.with_ex_editor(|editor| editor.options_mut().reset_window(created));
                 Ok(())
             },
             || {
@@ -11283,6 +11287,11 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             let _ = access.with_ex_editor(|editor| editor.wipe_buffer(new_buffer));
         }
         return error_flow(runtime, "E36", error.to_string());
+    }
+    // `:new`, `:vnew`, and `:split {file}` create their window with
+    // `win_init`, so nothing is inherited; only a bare `:split` copies.
+    if new_buffer != buffer {
+        access.with_ex_editor(|editor| editor.options_mut().reset_window(created));
     }
     if new_buffer == buffer
         && let Some(cursor) = origin_cursor
