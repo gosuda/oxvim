@@ -1,5 +1,6 @@
 //! Command-line introspection builtins (`eval/funcs.c` `f_getcmd*`,
-//! `f_setcmdpos`, `f_pumvisible`, `f_wildmenumode`).
+//! `f_setcmdpos`, `f_pumvisible`, `f_wildmenumode`) and command-line history
+//! builtins (`cmdhist.c` `f_histadd`, `f_histdel`, `f_histget`, `f_histnr`).
 //!
 //! These read the live command line owned by [`Mode::Cmdline`] state on the
 //! mode machine, or the [`PromptDialog`] backing `input()` (upstream's `@`
@@ -7,12 +8,21 @@
 //! `ExRuntime`, not on `Editor`, so every entry snapshots what it needs
 //! through a short `try_borrow` and drops it before touching the editor —
 //! user code must never execute under a machine borrow.
+//!
+//! The history banks themselves live on [`Editor`], beside registers and the
+//! quickfix stack — deliberately not on the mode machine, whose Ex recall
+//! list (`ModeMachine::cmdline_history`, `<Up>`/`<Down>` walk state) is a
+//! separate interactive mechanism the parent still owns.
 
-use ox_eval::{EvalError, builtin_spec};
+use ox_eval::{EvalError, RegexEngine, builtin_spec};
 use ox_types::{OxStr, Typval};
 
-use crate::excmd_exec::{EvalHost, ExEditorAccess};
+use super::input_string_arg;
+use crate::Editor;
+use crate::excmd_exec::{EvalHost, ExEditorAccess, VimRegex};
+use crate::history::HistoryKind;
 use crate::mode::{CmdlineKind, Mode};
+use crate::options::OptionValue;
 use crate::script::FileIO;
 use crate::search::SearchDirection;
 
@@ -36,6 +46,10 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "getcmdprompt" => Ok(Typval::String(OxStr::from(cmdline_prompt(host).as_str()))),
         "pumvisible" => Ok(Typval::Number(i64::from(completion_visible(host)))),
         "wildmenumode" => Ok(Typval::Number(0)),
+        "histadd" => call_histadd(host, args),
+        "histdel" => call_histdel(host, args),
+        "histget" => call_histget(host, args),
+        "histnr" => call_histnr(host, args),
         _ => unreachable!("cmdline builtin route and dispatcher disagree"),
     }
 }
@@ -300,6 +314,156 @@ fn floor_char_boundary(text: &str, byte: usize) -> usize {
     end
 }
 
+/// Resolves a history `kind` argument (`f_histadd`, `f_histdel`,
+/// `f_histget`, `f_histnr` via `get_histtype`, `cmdhist.c:270-289`). An
+/// empty name selects the live command line (`return_default == false`):
+/// the open `Mode::Cmdline` kind, `input()`'s `@` dialog, else the `NUL`
+/// fallback, which `hist_char2type` maps to search. Unknown names are
+/// `None` — never an error, the builtins answer miss values instead.
+fn history_kind<F: FileIO, E: ExEditorAccess>(
+    host: &EvalHost<'_, F, E>,
+    name: &str,
+) -> Option<HistoryKind> {
+    if name.is_empty() {
+        return Some(match cmdline_type(host) {
+            ":" => HistoryKind::Cmd,
+            "@" => HistoryKind::Input,
+            _ => HistoryKind::Search,
+        });
+    }
+    HistoryKind::from_name(name)
+}
+
+/// Table capacity from the `'history'` option (`p_hi`, `init_history`),
+/// falling back to upstream's 10000 default (`option.c`) when unset or
+/// non-numeric — the same fallback `shada.rs` uses. A zero option stores
+/// nothing, matching `hislen == 0`.
+fn history_capacity(editor: &Editor) -> usize {
+    match editor.options().get_global("history") {
+        Ok(OptionValue::Number(value)) => usize::try_from((*value).max(0)).unwrap_or(usize::MAX),
+        _ => 10_000,
+    }
+}
+
+/// `histadd({kind}, {item})` (`f_histadd`, `cmdhist.c:523-541`): 1 on
+/// success, 0 for an unknown kind or an empty item. Container arguments
+/// raise the port's usual `E73x` string-coercion errors, like every other
+/// editor-stateful builtin.
+fn call_histadd<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let kind_name = input_string_arg(&args[0])?;
+    let item = input_string_arg(&args[1])?;
+    let Some(kind) = history_kind(host, &kind_name.to_string_lossy()) else {
+        return Ok(Typval::Number(0));
+    };
+    if item.as_bytes().is_empty() {
+        return Ok(Typval::Number(0));
+    }
+    let text = item.to_string_lossy().into_owned();
+    host.access.with_ex_editor(|editor| {
+        let capacity = history_capacity(editor);
+        editor.history_mut().add(kind, &text, capacity);
+    });
+    Ok(Typval::Number(1))
+}
+
+/// `histdel({kind}[, {item}])` (`f_histdel`, `cmdhist.c:544-553`): with one
+/// argument clears the whole bank; a Number second argument deletes one
+/// indexed entry (`calc_hist_idx`); anything else is a magic regex and
+/// deletes every match (`del_history_entry`, always case-sensitive).
+/// Reports 1 when something was deleted, else 0 — including unknown kinds,
+/// misses, empty patterns, and patterns that fail to compile.
+fn call_histdel<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let kind_name = input_string_arg(&args[0])?;
+    let Some(kind) = history_kind(host, &kind_name.to_string_lossy()) else {
+        return Ok(Typval::Number(0));
+    };
+    if args.len() == 1 {
+        if host.access.with_ex_editor(|editor| {
+            if history_capacity(editor) == 0 {
+                return false;
+            }
+            editor.history_mut().clear(kind);
+            true
+        }) {
+            return Ok(Typval::Number(1));
+        }
+        return Ok(Typval::Number(0));
+    }
+    if let Typval::Number(index) = args[1] {
+        let deleted = host
+            .access
+            .with_ex_editor(|editor| editor.history_mut().delete_index(kind, index));
+        return Ok(Typval::Number(i64::from(deleted)));
+    }
+    let pattern = input_string_arg(&args[1])?.to_string_lossy().into_owned();
+    if pattern.is_empty() {
+        return Ok(Typval::Number(0));
+    }
+    let deleted = host.access.with_ex_editor(|editor| {
+        editor.history_mut().delete_pattern(kind, |text| {
+            history_pattern_matches(&pattern, text)
+        })
+    });
+    Ok(Typval::Number(i64::from(deleted)))
+}
+
+/// One `del_history_entry` trial (`cmdhist.c:429+`): magic, case-sensitive,
+/// unanchored (`vim_regcomp(str, RE_MAGIC + RE_STRING)` + `vim_regexec`).
+/// A pattern that fails to compile matches nothing — upstream's `regprog ==
+/// NULL` early `false`.
+fn history_pattern_matches(pattern: &str, text: &str) -> bool {
+    VimRegex
+        .is_match(&OxStr::from(text), &OxStr::from(pattern), false)
+        .unwrap_or(false)
+}
+
+/// `histget({kind}[, {index}])` (`f_histget`, `cmdhist.c:556-576`): the
+/// entry text, or `""` for any miss — unknown kind, empty bank, `0`, an
+/// unknown absolute hisnum, or an out-of-range relative index. Never an
+/// error on the value itself; a bad index *type* still raises through
+/// `tv_get_number`, exactly like upstream's `tv_get_number_chk`.
+fn call_histget<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let kind_name = input_string_arg(&args[0])?;
+    let Some(kind) = history_kind(host, &kind_name.to_string_lossy()) else {
+        return Ok(Typval::String(OxStr::from("")));
+    };
+    let index = if args.len() == 1 {
+        host.access
+            .with_ex_editor(|editor| editor.history().newest(kind))
+    } else {
+        tv_get_number(&args[1])?
+    };
+    let text = host
+        .access
+        .with_ex_editor(|editor| editor.history().get(kind, index).unwrap_or("").to_owned());
+    Ok(Typval::String(OxStr::from(text.as_str())))
+}
+
+/// `histnr({kind})` (`f_histnr`, `cmdhist.c:579-591`): the newest entry's
+/// hisnum, or -1 for an unknown kind or a bank with no numbered entry.
+fn call_histnr<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let kind_name = input_string_arg(&args[0])?;
+    let Some(kind) = history_kind(host, &kind_name.to_string_lossy()) else {
+        return Ok(Typval::Number(-1));
+    };
+    let number = host
+        .access
+        .with_ex_editor(|editor| editor.history().newest(kind));
+    Ok(Typval::Number(number))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{floor_char_boundary, number_prefix, tv_get_number};
@@ -324,5 +488,242 @@ mod tests {
         assert_eq!(floor_char_boundary(text, 1), 0);
         assert_eq!(text[..floor_char_boundary(text, 2)].chars().count(), 1);
         assert_eq!(text[..floor_char_boundary(text, 3)].chars().count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use ox_eval::ScopeKind;
+    use ox_types::Typval;
+
+    use crate::excmd_exec::ExEditorAccess as _;
+    use crate::{Editor, ExExecutor, ExecError, TestEditorAccess, VimExceptionKind};
+
+    fn error_code(err: &ExecError) -> String {
+        match err {
+            ExecError::Vim(exception) => match &exception.kind {
+                VimExceptionKind::Error(code) => code.clone(),
+                VimExceptionKind::Throw => "Throw".to_owned(),
+            },
+            other => panic!("expected Vim error, got {other:?}"),
+        }
+    }
+
+    fn fixture() -> (TestEditorAccess, ExExecutor<crate::script::RealFileIO>) {
+        (TestEditorAccess::new(Editor::new()), ExExecutor::new())
+    }
+
+    fn run(editor: &TestEditorAccess, exec: &mut ExExecutor<crate::script::RealFileIO>, script: &str) {
+        exec.execute_script(editor, "<test>", script).unwrap();
+    }
+
+    fn run_err(
+        editor: &TestEditorAccess,
+        exec: &mut ExExecutor<crate::script::RealFileIO>,
+        script: &str,
+    ) -> String {
+        error_code(&exec.execute_script(editor, "<test>", script).unwrap_err())
+    }
+
+    fn global(exec: &ExExecutor<crate::script::RealFileIO>, name: &str) -> Option<Typval> {
+        exec.scope()
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .ok()
+            .cloned()
+    }
+
+    fn global_number(exec: &ExExecutor<crate::script::RealFileIO>, name: &str) -> Option<i64> {
+        match global(exec, name)? {
+            Typval::Number(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn global_string(exec: &ExExecutor<crate::script::RealFileIO>, name: &str) -> Option<String> {
+        match global(exec, name)? {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// `f_histadd` + `f_histget` + `f_histnr` (`cmdhist.c:523-591`): adds
+    /// number from 1, a re-add moves to the newest slot with a fresh hisnum
+    /// (the old number is a miss), omitted index is the newest, and `0` is
+    /// always a miss.
+    #[test]
+    fn add_dedup_moves_to_newest_with_fresh_hisnum() {
+        let (editor, mut exec) = fixture();
+        run(
+            &editor,
+            &mut exec,
+            "let g:a1 = histadd('cmd', 'echo one') \
+             | let g:a2 = histadd('cmd', 'echo two') \
+             | let g:a3 = histadd('cmd', 'echo one')",
+        );
+        assert_eq!(global_number(&exec, "a1"), Some(1));
+        assert_eq!(global_number(&exec, "a2"), Some(1));
+        assert_eq!(global_number(&exec, "a3"), Some(1));
+        run(
+            &editor,
+            &mut exec,
+            "let g:newest = histget('cmd') \
+             | let g:prev = histget('cmd', -2) \
+             | let g:moved = histget('cmd', 1) \
+             | let g:second = histget('cmd', 2) \
+             | let g:third = histget('cmd', 3) \
+             | let g:zero = histget('cmd', 0) \
+             | let g:nr = histnr('cmd')",
+        );
+        assert_eq!(global_string(&exec, "newest"), Some("echo one".to_owned()));
+        assert_eq!(global_string(&exec, "prev"), Some("echo two".to_owned()));
+        assert_eq!(global_string(&exec, "moved"), Some(String::new()));
+        assert_eq!(global_string(&exec, "second"), Some("echo two".to_owned()));
+        assert_eq!(global_string(&exec, "third"), Some("echo one".to_owned()));
+        assert_eq!(global_string(&exec, "zero"), Some(String::new()));
+        assert_eq!(global_number(&exec, "nr"), Some(3));
+    }
+
+    /// All five banks, prefix/case/single-char kinds, and unknown-kind
+    /// misses: `""` for `histget`, `-1` for `histnr`, `0` for `histadd`.
+    #[test]
+    fn five_tables_share_kind_resolution() {
+        let (editor, mut exec) = fixture();
+        run(
+            &editor,
+            &mut exec,
+            "let g:kinds = [histadd(':', 'c1'), histadd('/', 's1'), \
+             histadd('=', 'e1'), histadd('@', 'i1'), histadd('>', 'd1')]",
+        );
+        run(
+            &editor,
+            &mut exec,
+            "let g:row = histget('c') . '|' . histget('s') . '|' . histget('e') \
+             . '|' . histget('i') . '|' . histget('d') \
+             | let g:nrs = histnr('CMD') . '|' . histnr('/') . '|' . histnr('?') \
+             | let g:bad_get = histget('bogus') \
+             | let g:bad_nr = histnr('bogus') \
+             | let g:bad_add = histadd('bogus', 'x') \
+             | let g:empty_item = histadd('c', '')",
+        );
+        assert_eq!(global_string(&exec, "row"), Some("c1|s1|e1|i1|d1".to_owned()));
+        assert_eq!(global_string(&exec, "nrs"), Some("1|1|1".to_owned()));
+        assert_eq!(global_string(&exec, "bad_get"), Some(String::new()));
+        assert_eq!(global_number(&exec, "bad_nr"), Some(-1));
+        assert_eq!(global_number(&exec, "bad_add"), Some(0));
+        assert_eq!(global_number(&exec, "empty_item"), Some(0));
+    }
+
+    /// `histdel` (`f_histdel`, `cmdhist.c:544-553`): index leg deletes one
+    /// entry by absolute (`2`) or relative (`-1`) index and reports misses
+    /// (`99`, `0`) as 0; the pattern leg deletes every regex match.
+    #[test]
+    fn delete_index_and_pattern_legs() {
+        let (editor, mut exec) = fixture();
+        run(
+            &editor,
+            &mut exec,
+            "call histdel('c') \
+             | call histadd('c', 'a') | call histadd('c', 'b') | call histadd('c', 'c') \
+             | let g:d1 = histdel('c', 2) \
+             | let g:row = histget('c', -1) . '|' . histget('c', -2) . '|' . histnr('c') \
+             | let g:miss = histdel('c', 99) \
+             | let g:zero = histdel('c', 0) \
+             | let g:nomatch = histdel('c', 'zzz') \
+             | let g:pat = histdel('c', 'a') \
+             | let g:left = histget('c')",
+        );
+        assert_eq!(global_number(&exec, "d1"), Some(1));
+        assert_eq!(global_string(&exec, "row"), Some("c|a|3".to_owned()));
+        assert_eq!(global_number(&exec, "miss"), Some(0));
+        assert_eq!(global_number(&exec, "zero"), Some(0));
+        assert_eq!(global_number(&exec, "nomatch"), Some(0));
+        assert_eq!(global_number(&exec, "pat"), Some(1));
+        assert_eq!(global_string(&exec, "left"), Some("c".to_owned()));
+    }
+
+    /// The clear leg resets the bank and its counter: the next add restarts
+    /// at hisnum 1 and `histnr` reads -1 while empty.
+    #[test]
+    fn delete_clear_resets_bank_and_counter() {
+        let (editor, mut exec) = fixture();
+        run(
+            &editor,
+            &mut exec,
+            "call histadd('c', 'x') \
+             | let g:cleared = histdel('c') \
+             | let g:nr = histnr('c') \
+             | let g:get = histget('c') \
+             | let g:re = histadd('c', 'fresh') \
+             | let g:nr2 = histnr('c')",
+        );
+        assert_eq!(global_number(&exec, "cleared"), Some(1));
+        assert_eq!(global_number(&exec, "nr"), Some(-1));
+        assert_eq!(global_string(&exec, "get"), Some(String::new()));
+        assert_eq!(global_number(&exec, "re"), Some(1));
+        assert_eq!(global_number(&exec, "nr2"), Some(1));
+    }
+
+    /// `del_history_idx` on the final entry leaves `histnr()` at 0 (not -1)
+    /// while `histget()` still misses; the counter is not reset.
+    #[test]
+    fn delete_final_entry_by_index_reports_zero_nr() {
+        let (editor, mut exec) = fixture();
+        run(
+            &editor,
+            &mut exec,
+            "call histdel('c') \
+             | let g:added = histadd('c', 'solo') \
+             | let g:del = histdel('c', 1) \
+             | let g:nr = histnr('c') \
+             | let g:get = histget('c') \
+             | let g:re = histadd('c', 'again') \
+             | let g:nr2 = histnr('c')",
+        );
+        assert_eq!(global_number(&exec, "added"), Some(1));
+        assert_eq!(global_number(&exec, "del"), Some(1));
+        assert_eq!(global_number(&exec, "nr"), Some(0));
+        assert_eq!(global_string(&exec, "get"), Some(String::new()));
+        assert_eq!(global_number(&exec, "re"), Some(1));
+        assert_eq!(global_number(&exec, "nr2"), Some(2));
+    }
+
+    /// Arity follows `eval.lua` (`E119`/`E118`), container values raise the
+    /// port's coercion errors, and an empty pattern or a pattern that fails
+    /// to compile deletes nothing.
+    #[test]
+    fn arity_and_type_errors_match_port_conventions() {
+        let (editor, mut exec) = fixture();
+        assert_eq!(run_err(&editor, &mut exec, "call histadd('c')"), "E119");
+        assert_eq!(run_err(&editor, &mut exec, "call histnr()"), "E119");
+        assert_eq!(run_err(&editor, &mut exec, "call histget('c', 1, 2)"), "E118");
+        assert_eq!(run_err(&editor, &mut exec, "call histadd([], 'x')"), "E730");
+        assert_eq!(run_err(&editor, &mut exec, "echo histget('c', [])"), "E730");
+        run(
+            &editor,
+            &mut exec,
+            "call histdel('c') | call histadd('c', 'kept')",
+        );
+        run(
+            &editor,
+            &mut exec,
+            "let g:empty_pat = histdel('c', '') \
+             | let g:bad_pat = histdel('c', '[z-a]') \
+             | let g:kept = histget('c')",
+        );
+        assert_eq!(global_number(&exec, "empty_pat"), Some(0));
+        assert_eq!(global_number(&exec, "bad_pat"), Some(0));
+        assert_eq!(global_string(&exec, "kept"), Some("kept".to_owned()));
+    }
+
+    /// The store lives on [`Editor`], not the mode machine: direct access
+    /// serves the builtins without touching `ModeMachine`.
+    #[test]
+    fn store_lives_on_editor_beside_registers() {
+        let (editor, mut exec) = fixture();
+        run(&editor, &mut exec, "call histadd('=', '2+2')");
+        let (entry, newest) = editor
+            .with_ex_editor(|state| (state.history().get(crate::history::HistoryKind::Expr, -1).map(str::to_owned), state.history().newest(crate::history::HistoryKind::Expr)));
+        assert_eq!(entry.as_deref(), Some("2+2"));
+        assert_eq!(newest, 1);
     }
 }

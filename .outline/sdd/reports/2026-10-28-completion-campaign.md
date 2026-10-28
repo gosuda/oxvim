@@ -103,6 +103,38 @@ scrollback, `job.rs` pumps pty output, and `editor.rs` projects rows into the bu
 output never reaches the buffer in headless mode. The next terminal slice is to trace that path from
 the pty read to the row projection, not to write a new emulator.
 
+## Parity fixes landed after the slice cut, 2026-10-28
+
+| Commit | Surface | What changed | Proof |
+|---|---|---|---|
+| 8746163 | `package.path` | Relative loader entries are kept, as the oracle keeps them; `cpath` is left alone | `require('test.functional.testnvim.exec_lua')` answers true in a harness-shaped tree; the 418 module-not-found failures disappear from the api and core group logs |
+| 3fa6889 | `:terminal` | Buffer gets `buftype=terminal` at attach; `:sleep` pumps the job reactor | `:terminal echo hello-from-terminal` + `:sleep 1` leaves the text and `[Process exited 0]`; with the pump reverted the new test fails on a blank buffer |
+| 5e8dbcc | `win_findbuf`, `getcmdwintype` | Both names answered E117 before | Same script on both binaries: `t=` and `ids=[1001]` |
+| 56f083b | normal-mode put | Count overflow answers E1240 before allocating | `test_put.vim` moves from a 300 s timeout, 0 executed, to 34 executed, 25 failed; both `assert_fails` cases pass |
+| 7c0a007 | `vim.v.exiting` | Reads `vim.NIL` until shutdown, as upstream does | `vim.wait(200, fn, 10)` runs 20 iterations, matching the oracle; it ran 3 before |
+| 8ebdd32 | Lua wait path | `loop_poll` flushes terminal jobs through the free executor slot | `crates/oxvim/tests/wait_pty_pump.rs`, 1 test, passes |
+
+`just apidiff` reports `schemas match`, and `oxvim --api-info` is
+byte-identical to the oracle's document (32701 bytes each).
+
+## Gaps the parallel wave opened, with owners
+
+- `vim.wait` cannot pump terminal output while both executor slots are busy,
+  which is the case for a whole `-l` script; that needs the job reactor to be
+  reachable without the executor borrow.
+- A `luafile`-hosted wait wakes about 4 times in 2 s where the oracle wakes
+  every interval; the `-l` path is correct, so the remaining difference is in
+  how the chunk is hosted.
+- `:syntax` has no engine: 15 oldtest files and 8 functional files need it,
+  plus `synID`/`synIDattr`/`synIDtrans`/`synstack`/`synconcealed`. Scope
+  assessment recorded; not attempted.
+- Confirmed absent from Neovim and correctly kept absent in oxvim after the
+  channel pass: `ch_status`, `chaninfo`, `term_start`, `term_getline`,
+  `term_getscrolled`. `termopen` exists upstream and is now implemented.
+- Builtin inventory against upstream `eval.lua`: 462 upstream names, 312
+  routed, 150 missing, 1 extra (`defer`). The table is in
+  `local://compat-builtin-gaps.md`.
+
 ## Evidence
 
 All logs live under `.outline/evidence/` (gitignored): `gates/`, `oldtest-final/`, `functional-*.log`,
