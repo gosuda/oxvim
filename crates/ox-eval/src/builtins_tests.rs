@@ -5095,3 +5095,193 @@ fn invalid_utf8_rides_composed_character_boundaries() {
         Typval::String(OxStr(vec![0xff]))
     );
 }
+
+// `msgpackparse()`/`msgpackdump()` (`eval/funcs.c:4421-4574`): the byte
+// model is a readfile-style stream — list items join with NL while an NL
+// inside an item reads as NUL — and maps honour `v:msgpack_types`.
+#[test]
+fn msgpack_round_trips_values_through_blob_and_list() {
+    // nil / bool / number / float / string.
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc0])]).unwrap(),
+        Typval::list(vec![Typval::Special(Special::Null)])
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc3])]).unwrap(),
+        Typval::list(vec![Typval::Bool(true)])
+    );
+    // A string dumps as BIN8 (`0xC4`), keys dump as STR.
+    assert_eq!(
+        call("msgpackdump", vec![texts(&["Test"])]).unwrap(),
+        Typval::list(vec![Typval::String(OxStr(vec![
+            0xc4, 0x04, b'T', b'e', b's', b't',
+        ]))])
+    );
+    // Blob form carries the raw packed bytes.
+    assert_eq!(
+        call(
+            "msgpackdump",
+            vec![texts(&["Test"]), text("B")]
+        )
+        .unwrap(),
+        Typval::Blob(vec![0xc4, 0x04, b'T', b'e', b's', b't'])
+    );
+    // Round trip through both forms.
+    for value in [
+        Typval::Special(Special::Null),
+        Typval::Bool(false),
+        Typval::Number(-300),
+        Typval::Float(0.125),
+        text("hi"),
+        Typval::list(vec![number(1), text("two")]),
+        Typval::dict(vec![(OxStr::from("a"), number(1))]),
+    ] {
+        let dumped = call("msgpackdump", vec![Typval::list(vec![value.clone()])]).unwrap();
+        assert_eq!(
+            call("msgpackparse", vec![dumped]).unwrap(),
+            Typval::list(vec![value]),
+            "list-form round trip"
+        );
+    }
+}
+
+#[test]
+fn msgpack_parse_honours_special_types_and_stream_joins() {
+    // `0xCF FF..FF` is `uint64::MAX`: beyond `i64`, so it decodes to the
+    // integer special dict whose `_TYPE is v:msgpack_types.integer`.
+    let parsed = call(
+        "msgpackparse",
+        vec![Typval::Blob(vec![0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])],
+    )
+    .unwrap();
+    let Typval::List(items) = parsed else {
+        panic!("parse must answer a List");
+    };
+    let [value] = items
+        .try_borrow()
+        .map(|data| data.items.clone())
+        .unwrap()
+        .try_into()
+        .map_err(|_| "single value")
+        .unwrap();
+    let Typval::Dict(entries) = value else {
+        panic!("uint64::MAX must decode to a special dict");
+    };
+    let data = entries.try_borrow().unwrap();
+    let get = |key: &str| {
+        data.entries
+            .iter()
+            .find(|entry| entry.key.as_bytes() == key.as_bytes())
+            .unwrap()
+            .value
+            .clone()
+    };
+    assert!(matches!(get("_TYPE"), Typval::List(_)));
+    assert_eq!(
+        get("_VAL"),
+        Typval::list(vec![number(1), number(3), number(0x7fff_ffff), number(0x7fff_ffff)])
+    );
+    drop(data);
+    // List items join with NL: `0xC4 0x01` + NL reads BIN8 len 1 over the
+    // joiner, i.e. `"\n"`.
+    assert_eq!(
+        call(
+            "msgpackparse",
+            vec![Typval::list(vec![Typval::String(OxStr(vec![0xc4, 0x01])), text("")])]
+        )
+        .unwrap(),
+        Typval::list(vec![text("\n")])
+    );
+    // A map with a duplicate string key is the generic-map special dict.
+    let parsed = call(
+        "msgpackparse",
+        vec![Typval::Blob(vec![0x82, 0xa1, b'a', 0xc4, 0x01, 0x0a, 0xa1, b'a', 0xc4, 0x01, 0x0b])],
+    )
+    .unwrap();
+    let dumped = call("msgpackdump", vec![parsed.clone()]).unwrap();
+    assert_eq!(call("msgpackparse", vec![dumped]).unwrap(), parsed);
+}
+
+#[test]
+fn msgpack_rejects_bad_arguments_with_upstream_codes() {
+    assert_eq!(call("msgpackparse", vec![]).unwrap_err().code, "E119");
+    assert_eq!(
+        call("msgpackparse", vec![text("x"), text("y")]).unwrap_err().code,
+        "E118"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![text("x")]).unwrap_err().code,
+        "E899"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![number(1)]).unwrap_err().code,
+        "E899"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc4])])
+            .unwrap_err()
+            .code,
+        "E475"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc1])])
+            .unwrap_err()
+            .code,
+        "E475"
+    );
+    assert_eq!(call("msgpackdump", vec![]).unwrap_err().code, "E119");
+    assert_eq!(
+        call("msgpackdump", vec![text("x")]).unwrap_err().code,
+        "E686"
+    );
+    // A Funcref cannot dump: `E5004` naming the top argument and `itself`.
+    let error = call("msgpackdump", vec![Typval::list(vec![funcref("tr")])]).unwrap_err();
+    assert_eq!(error.code, "E5004");
+    assert!(error.message.contains("itself"), "{}", error.message);
+    // A self-referencing list is `E5005` with the container path: three
+    // open levels render three positions, like upstream's
+    // `[[[todump]]]` shape.
+    let inner = Typval::list(vec![]);
+    let recursive = Typval::list(vec![Typval::list(vec![inner.clone()])]);
+    if let Typval::List(reference) = &inner {
+        reference
+            .borrow_mut()
+            .items
+            .push(recursive.clone());
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![recursive])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.contains("index 0, index 0, index 0"),
+        "{}",
+        error.message
+    );
+    // Shallower shapes render fewer levels: a directly self-referential
+    // list names one level, a two-level cycle two (oracle probes).
+    let direct = Typval::list(vec![]);
+    if let Typval::List(reference) = &direct {
+        reference
+            .borrow_mut()
+            .items
+            .push(Typval::List(reference.clone()));
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![direct])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.ends_with("in index 0"),
+        "{}",
+        error.message
+    );
+    let lower = Typval::list(vec![]);
+    let upper = Typval::list(vec![lower.clone()]);
+    if let Typval::List(reference) = &lower {
+        reference.borrow_mut().items.push(upper.clone());
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![upper])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.ends_with("in index 0, index 0"),
+        "{}",
+        error.message
+    );
+}

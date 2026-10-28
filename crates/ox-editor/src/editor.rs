@@ -696,6 +696,21 @@ impl Editor {
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
                 ("register".into(), Object::String(OxStr::from("\""))),
+                // `v:msgpack_types` (`eval.c` `set_internal_string_var`): the
+                // five marker lists that name the special msgpack maps, so
+                // `msgpackparse()` can build them and `msgpackdump()` can
+                // recognise them by list identity.
+                ("msgpack_types".into(), Object::Dict(Dict(vec![
+                    ("nil".into(), Object::Array(Vec::new())),
+                    ("boolean".into(), Object::Array(Vec::new())),
+                    ("integer".into(), Object::Array(Vec::new())),
+                    ("float".into(), Object::Array(Vec::new())),
+                    ("string".into(), Object::Array(Vec::new())),
+                    ("array".into(), Object::Array(Vec::new())),
+                    ("map".into(), Object::Array(Vec::new())),
+                    ("binary".into(), Object::Array(Vec::new())),
+                    ("ext".into(), Object::Array(Vec::new())),
+                ]))),
             ]),
             gvars_version: 1,
             vvars_version: 1,

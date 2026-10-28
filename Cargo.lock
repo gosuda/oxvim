@@ -602,6 +602,7 @@ dependencies = [
  "ox-regex",
  "ox-sys",
  "ox-types",
+ "rmpv",
  "serde_json",
  "sha2",
  "stacker",

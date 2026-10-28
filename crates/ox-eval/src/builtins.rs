@@ -17,7 +17,7 @@ use crate::eval::{
 };
 use crate::parser::Parser;
 use crate::path_builtins;
-use crate::scope::{Scope, env_os_string};
+use crate::scope::{Scope, ScopeKind, env_os_string};
 
 const MAX_CONTAINER_DEPTH: usize = 100;
 
@@ -287,6 +287,8 @@ impl<'a> Builtins<'a> {
             "max" => extremum(&args[0], true),
             "min" => extremum(&args[0], false),
             "mkdir" => path_builtins::mkdir(&args),
+            "msgpackdump" => msgpack_dump(&args[0], args.get(1), scope),
+            "msgpackparse" => msgpack_parse(&args[0], scope),
             "nr2char" => nr2char(&args),
             "or" => binary_number(&args, |left, right| left | right),
             "pow" => float_binary(&args, f64::powf),
@@ -1619,6 +1621,8 @@ pub fn is_builtin_implemented(name: &str) -> bool {
             | "max"
             | "min"
             | "mkdir"
+            | "msgpackdump"
+            | "msgpackparse"
             | "nr2char"
             | "or"
             | "pathshorten"
@@ -1871,7 +1875,10 @@ fn set_buffer_line(buffer: &mut dyn BufferHost, lnum: i64, text: &OxStr) -> Resu
 /// `abs('-12')` was 0 and `abs('0x10')` was 0 against the oracle's 12 and 16.
 /// The error codes are `num_errors` (`typval.c:4171-4181`), which gives a
 /// Funcref E703 and a Blob E974.
-fn number_arg(value: &Typval) -> Result<i64> {
+///
+/// Editor builtins with a numeric column or count (e.g. `shiftwidth()`)
+/// share this rather than restating the coercion table.
+pub fn number_arg(value: &Typval) -> Result<i64> {
     match value {
         Typval::Number(number) => Ok(*number),
         Typval::Bool(value) => Ok(i64::from(*value)),
@@ -5459,6 +5466,964 @@ fn non_overlapping_count(haystack: &[u8], needle: &[u8]) -> usize {
 }
 fn saturating_i64(value: usize) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+// ---------------------------------------------------------------------------
+// `msgpackparse()` / `msgpackdump()`
+// ---------------------------------------------------------------------------
+//
+// Upstream `eval/funcs.c:4421-4574` with the codec in `eval/encode.c` and
+// `eval/decode.c`. The framing comes from `rmpv` (already a workspace
+// dependency, also backing `ox-rpc`); only the Vimscript mapping is local:
+// - parse honours `v:msgpack_types`: maps whose keys are all non-empty
+//   strings become Dicts, every other map becomes a
+//   `{"_TYPE": v:msgpack_types.map, "_VAL": [[key, value], ...]}` special
+//   dict, `uint64` beyond `i64::MAX` becomes the integer special dict, and
+//   ext values become the ext special dict. Strings holding NUL decode as
+//   Blobs, matching `decode_string`.
+// - a List argument is a readfile-style stream: items join with NL while an
+//   NL inside an item reads as NUL (`encode_read_from_list`); the dump side
+//   splits packed bytes the same way (`encode_list_write`), so the two are
+//   exact inverses.
+
+/// `v:msgpack_types` member names in `eval/vars.c:240-251` order.
+const MSGPACK_TYPE_NAMES: [&[u8]; 8] = [
+    b"nil",
+    b"boolean",
+    b"integer",
+    b"float",
+    b"string",
+    b"array",
+    b"map",
+    b"ext",
+];
+
+/// Clone the eight `v:msgpack_types` lists, preserving identity so a parsed
+/// `_TYPE` answers `is` against the scope's lists (like upstream comparing
+/// against `eval_msgpack_type_lists`). A scope without the variable (only
+/// possible for hand-built scopes) gets fresh lists, which still round-trip.
+fn msgpack_type_lists(scope: &Scope) -> [ox_types::ListRef; 8] {
+    let indexed = scope
+        .get_scoped(ScopeKind::Vim, b"msgpack_types", 0)
+        .ok()
+        .and_then(|value| match value {
+            Typval::Dict(entries) => entries.try_borrow().ok(),
+            _ => None,
+        });
+    MSGPACK_TYPE_NAMES.map(|name| {
+        indexed
+            .as_ref()
+            .and_then(|entries| {
+                entries
+                    .entries
+                    .iter()
+                    .find(|entry| entry.key.as_bytes() == name)
+                    .and_then(|entry| match &entry.value {
+                        Typval::List(reference) => Some(reference.clone()),
+                        _ => None,
+                    })
+            })
+            .unwrap_or_else(|| match Typval::list(Vec::new()) {
+                Typval::List(reference) => reference,
+                _ => unreachable!("Typval::list builds a List"),
+            })
+    })
+}
+
+/// Build one msgpack special dict (`decode.c:create_special_dict`): the
+/// `_TYPE` list keeps its scope identity, `_VAL` carries the payload.
+fn msgpack_special_dict(types: &[ox_types::ListRef; 8], index: usize, value: Typval) -> Typval {
+    Typval::dict_with_entries(vec![
+        DictEntry::new(
+            OxStr::from("_TYPE"),
+            Typval::List(types[index].clone()),
+        ),
+        DictEntry::new(OxStr::from("_VAL"), value),
+    ])
+}
+
+/// `decode_string` (`eval/decode.c`): bytes with NUL become a Blob, anything
+/// else a String. `force_blob` is only set by the shada reader, never here.
+fn msgpack_decode_bytes(bytes: &[u8]) -> Typval {
+    if bytes.iter().any(|byte| *byte == 0) {
+        Typval::Blob(bytes.to_vec())
+    } else {
+        Typval::String(OxStr(bytes.to_vec()))
+    }
+}
+
+/// Split ext payload bytes readfile-style (`encode_list_write`): NL
+/// separates items, NUL inside an item reads back as NL. Empty input is the
+/// empty list.
+fn msgpack_split_bytes(data: &[u8]) -> Typval {
+    if data.is_empty() {
+        return Typval::list(Vec::new());
+    }
+    let mut items = Vec::new();
+    let mut start = 0;
+    for (index, byte) in data.iter().enumerate() {
+        if *byte == b'\n' {
+            items.push(msgpack_nl_item(&data[start..index]));
+            start = index + 1;
+        }
+    }
+    items.push(msgpack_nl_item(&data[start..]));
+    Typval::list(items)
+}
+
+fn msgpack_nl_item(piece: &[u8]) -> Typval {
+    Typval::String(OxStr(
+        piece
+            .iter()
+            .map(|byte| if *byte == 0 { b'\n' } else { *byte })
+            .collect(),
+    ))
+}
+
+/// Map one decoded `rmpv::Value` to a `Typval` with special-dict semantics.
+fn msgpack_value_to_typval(value: rmpv::Value, types: &[ox_types::ListRef; 8]) -> Typval {
+    match value {
+        rmpv::Value::Nil => Typval::Special(Special::Null),
+        rmpv::Value::Boolean(flag) => Typval::Bool(flag),
+        rmpv::Value::Integer(number) => match number.as_i64() {
+            Some(number) => Typval::Number(number),
+            None => {
+                // Only `uint64` beyond `i64::MAX` reaches here; negatives
+                // always fit. Layout mirrors `positive_integer_to_special_typval`
+                // (`eval/decode.c`).
+                let value = number.as_u64().unwrap_or(u64::MAX);
+                msgpack_special_dict(
+                    types,
+                    2,
+                    Typval::list(vec![
+                        Typval::Number(1),
+                        Typval::Number(i64::try_from((value >> 62) & 0x3).unwrap_or(i64::MAX)),
+                        Typval::Number(i64::try_from((value >> 31) & 0x7FFF_FFFF).unwrap_or(i64::MAX)),
+                        Typval::Number(i64::try_from(value & 0x7FFF_FFFF).unwrap_or(i64::MAX)),
+                    ]),
+                )
+            }
+        },
+        rmpv::Value::F32(number) => Typval::Float(f64::from(number)),
+        rmpv::Value::F64(number) => Typval::Float(number),
+        rmpv::Value::String(text) => msgpack_decode_bytes(text.as_bytes()),
+        rmpv::Value::Binary(data) => msgpack_decode_bytes(&data),
+        rmpv::Value::Array(items) => Typval::list(
+            items
+                .into_iter()
+                .map(|item| msgpack_value_to_typval(item, types))
+                .collect(),
+        ),
+        rmpv::Value::Map(pairs) => {
+            let mut decoded = Vec::with_capacity(pairs.len());
+            let mut regular = true;
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for (key, value) in pairs {
+                let key = msgpack_value_to_typval(key, types);
+                let value = msgpack_value_to_typval(value, types);
+                if regular {
+                    match &key {
+                        Typval::String(text)
+                            if !text.as_bytes().is_empty()
+                                && seen.insert(text.as_bytes().to_vec()) => {}
+                        _ => regular = false,
+                    }
+                }
+                decoded.push((key, value));
+            }
+            if regular {
+                // Every key decoded to a distinct non-empty String: a plain
+                // Dict, like upstream's all-string map branch.
+                Typval::dict(
+                    decoded
+                        .into_iter()
+                        .map(|(key, value)| match key {
+                            Typval::String(text) => (text, value),
+                            _ => unreachable!("regular map keys are Strings"),
+                        })
+                        .collect(),
+                )
+            } else {
+                // Duplicate, empty, or non-string keys: the generic map
+                // special dict holding `[key, value]` pairs.
+                msgpack_special_dict(
+                    types,
+                    6,
+                    Typval::list(
+                        decoded
+                            .into_iter()
+                            .map(|(key, value)| Typval::list(vec![key, value]))
+                            .collect(),
+                    ),
+                )
+            }
+        }
+        rmpv::Value::Ext(kind, data) => msgpack_special_dict(
+            types,
+            7,
+            Typval::list(vec![
+                Typval::Number(i64::from(kind)),
+                msgpack_split_bytes(&data),
+            ]),
+        ),
+    }
+}
+
+fn msgpack_parse_error(error: &rmpv::decode::Error) -> EvalError {
+    use std::io::ErrorKind;
+    // `emsg_mpack_error` (`eval/funcs.c:4454`): EOF is "Incomplete", depth
+    // overflow names itself, anything else "Failed to parse".
+    if error.kind() == ErrorKind::UnexpectedEof {
+        EvalError::new("E475", 0, "Invalid argument: Incomplete msgpack string")
+    } else if matches!(error, rmpv::decode::Error::DepthLimitExceeded) {
+        EvalError::new("E475", 0, "Invalid argument: object was too deep to unpack")
+    } else {
+        EvalError::new("E475", 0, "Invalid argument: Failed to parse msgpack string")
+    }
+}
+
+/// `f_msgpackparse` (`eval/funcs.c:4561`).
+fn msgpack_parse(value: &Typval, scope: &Scope) -> Result<Typval> {
+    let mut bytes = Vec::new();
+    match value {
+        Typval::Blob(data) => bytes.extend_from_slice(data),
+        Typval::List(reference) => {
+            for (index, item) in list_items(reference)?.iter().enumerate() {
+                let Typval::String(text) = item else {
+                    return Err(EvalError::new(
+                        "E475",
+                        0,
+                        "Invalid argument: List item is not a string",
+                    ));
+                };
+                if index > 0 {
+                    bytes.push(b'\n');
+                }
+                bytes.extend(
+                    text.as_bytes()
+                        .iter()
+                        .map(|byte| if *byte == b'\n' { 0 } else { *byte }),
+                );
+            }
+        }
+        _ => {
+            return Err(EvalError::new(
+                "E899",
+                0,
+                "Argument of msgpackparse() must be a List or Blob",
+            ));
+        }
+    }
+    if bytes.is_empty() {
+        return Ok(Typval::list(Vec::new()));
+    }
+    let types = msgpack_type_lists(scope);
+    let mut out = Vec::new();
+    let mut rest = bytes.as_slice();
+    while !rest.is_empty() {
+        // `rmpv` leniently decodes the reserved `0xC1` marker as nil while
+        // upstream's `mpack` rejects it (`MPACK_ERROR` → "Failed to parse").
+        // Nested `0xC1` markers stay lenient: only the exercised top-level
+        // shape is pinned here.
+        if rest.first() == Some(&0xc1) {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Failed to parse msgpack string",
+            ));
+        }
+        match rmpv::decode::read_value(&mut rest) {
+            Ok(value) => out.push(msgpack_value_to_typval(value, &types)),
+            Err(error) => return Err(msgpack_parse_error(&error)),
+        }
+    }
+    Ok(Typval::list(out))
+}
+
+/// One open container on the dump path, mirroring `MPConvStackVal`: lists
+/// and dicts render their position, and a pairs frame renders the special
+/// map position (`conv_error` in `eval/encode.c`).
+enum MsgpackDumpFrame {
+    List { id: usize, index: usize },
+    Dict { id: usize, key: Vec<u8> },
+    Pairs {
+        id: usize,
+        index: usize,
+        /// The current pair's key, cloned for error rendering.
+        first: Typval,
+        /// The previous pair's key, for the dict-key path that still
+        /// addresses the pair behind the one mid-encode.
+        prev_first: Option<Typval>,
+        /// Whether the pair key already encoded: past the key the frame
+        /// addresses the current pair, otherwise the previous one.
+        value_phase: bool,
+    },
+}
+
+/// Recursive msgpack encoder with upstream cycle paths. Containers compare
+/// by identity against the open stack (`TYPVAL_ENCODE_CHECK_SELF_REFERENCE`):
+/// re-entering an open container is `E5005`, a Funcref anywhere is `E5004`.
+struct MsgpackDumpEncoder<'a> {
+    types: &'a [ox_types::ListRef; 8],
+    /// The top-level argument name for this item, e.g.
+    /// `msgpackdump() argument, index 0` (`conv_error`'s `objname`).
+    objname: String,
+    stack: Vec<MsgpackDumpFrame>,
+}
+
+impl MsgpackDumpEncoder<'_> {
+    fn encode_value(&mut self, value: &Typval) -> Result<rmpv::Value> {
+        match value {
+            Typval::Number(number) => Ok(rmpv::Value::from(*number)),
+            Typval::Float(number) => Ok(rmpv::Value::F64(*number)),
+            Typval::String(text) => Ok(rmpv::Value::Binary(text.as_bytes().to_vec().into())),
+            Typval::Blob(data) => Ok(rmpv::Value::Binary(data.clone().into())),
+            Typval::Bool(flag) => Ok(rmpv::Value::Boolean(*flag)),
+            Typval::Special(Special::Null) => Ok(rmpv::Value::Nil),
+            // Upstream's encoder has no channel/job case; they answer
+            // `VAR_TYPE_NUMBER` from `type()`, so they pack as Numbers.
+            Typval::Channel(id) | Typval::Job(id) => {
+                Ok(rmpv::Value::from(i64::try_from(*id).unwrap_or(i64::MAX)))
+            }
+            Typval::Funcref(_) | Typval::Partial(_) => Err(self.dump_error(
+                "E5004",
+                "attempt to dump function reference",
+            )),
+            Typval::List(reference) => {
+                let id = Rc::as_ptr(reference) as usize;
+                if self.stack.iter().any(|frame| frame.id() == id) {
+                    return Err(self.dump_error(
+                        "E5005",
+                        "container references itself",
+                    ));
+                }
+                let items = list_items(reference)?;
+                self.stack.push(MsgpackDumpFrame::List { id, index: 0 });
+                let mut out = Vec::with_capacity(items.len());
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(MsgpackDumpFrame::List { index: slot, .. }) = self.stack.last_mut() {
+                        *slot = index;
+                    }
+                    let encoded = stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                        self.encode_value(item)
+                    });
+                    out.push(encoded?);
+                }
+                self.stack.pop();
+                Ok(rmpv::Value::Array(out))
+            }
+            Typval::Dict(reference) => self.encode_dict(reference),
+        }
+    }
+
+    fn encode_dict(&mut self, reference: &ox_types::DictRef) -> Result<rmpv::Value> {
+        if let Some((index, payload)) = self.special_payload(reference) {
+            return self.encode_special(index, &payload);
+        }
+        let id = Rc::as_ptr(reference) as usize;
+        if self.stack.iter().any(|frame| frame.id() == id) {
+            return Err(self.dump_error("E5005", "container references itself"));
+        }
+        let entries = cloned_entries(reference)?;
+        self.stack.push(MsgpackDumpFrame::Dict { id, key: Vec::new() });
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            if let Some(MsgpackDumpFrame::Dict { key, .. }) = self.stack.last_mut() {
+                *key = entry.key.as_bytes().to_vec();
+            }
+            let key = msgpack_dict_key(&entry.key);
+            let value = stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                self.encode_value(&entry.value)
+            })?;
+            out.push((key, value));
+        }
+        self.stack.pop();
+        Ok(rmpv::Value::Map(out))
+    }
+
+    /// Split out a `{"_TYPE": <canonical list>, "_VAL": ...}` special dict,
+    /// identified by list identity like upstream compares against
+    /// `eval_msgpack_type_lists`. Anything else (including a hand-built dict
+    /// whose `_TYPE` merely looks empty) encodes as a regular map.
+    fn special_payload(&self, reference: &ox_types::DictRef) -> Option<(usize, Typval)> {
+        let entries = reference.try_borrow().ok()?;
+        if entries.entries.len() != 2 {
+            return None;
+        }
+        let kind = entries.entries.iter().find_map(|entry| match &entry.value {
+            Typval::List(list) if entry.key.as_bytes() == b"_TYPE" => self
+                .types
+                .iter()
+                .position(|canonical| Rc::ptr_eq(canonical, list)),
+            _ => None,
+        })?;
+        let payload = entries
+            .entries
+            .iter()
+            .find(|entry| entry.key.as_bytes() == b"_VAL")
+            .map(|entry| entry.value.clone())?;
+        Some((kind, payload))
+    }
+
+    /// Encode one special dict by its `v:msgpack_types` index. Shapes that
+    /// fail the upstream checks fall back to a regular dict holding the
+    /// `_TYPE`/`_VAL` entries (`_convert_one_value_regular_dict`).
+    fn encode_special(&mut self, index: usize, payload: &Typval) -> Result<rmpv::Value> {
+        match index {
+            // `kMPNil`: the payload is ignored.
+            0 => Ok(rmpv::Value::Nil),
+            // `kMPBoolean`: a Number payload packs as a bool.
+            1 => match payload {
+                Typval::Number(number) => Ok(rmpv::Value::Boolean(*number != 0)),
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPInteger`: `[sign, highest, high, low]`, each a Number with
+            // the low three non-negative and the sign nonzero.
+            2 => match payload {
+                Typval::List(reference) => {
+                    let items = list_items(&reference).unwrap_or_default();
+                    let numbers: Option<Vec<i64>> = items
+                        .iter()
+                        .map(|item| match item {
+                            Typval::Number(number) => Some(*number),
+                            _ => None,
+                        })
+                        .collect();
+                    match numbers.as_deref() {
+                        Some([sign, highest, high, low])
+                            if *sign != 0 && *highest >= 0 && *high >= 0 && *low >= 0 =>
+                        {
+                            let magnitude = (u64::try_from(*highest).unwrap_or(0) << 62)
+                                | (u64::try_from(*high).unwrap_or(0) << 31)
+                                | (u64::try_from(*low).unwrap_or(0));
+                            if *sign > 0 {
+                                Ok(rmpv::Value::from(magnitude))
+                            } else {
+                                // `INT64_MIN` decodes through here: its
+                                // magnitude overflows `i64`, landing back on
+                                // `i64::MIN` exactly like upstream's wrap.
+                                Ok(rmpv::Value::from(
+                                    i64::try_from(magnitude)
+                                        .map(|value| value.wrapping_neg())
+                                        .unwrap_or(i64::MIN),
+                                ))
+                            }
+                        }
+                        _ => self.encode_regular_dict_fallback(index, payload),
+                    }
+                }
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPFloat`: a Float payload packs as `f64`.
+            3 => match payload {
+                Typval::Float(number) => Ok(rmpv::Value::F64(*number)),
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPString`: a List payload joins readfile-style into STR bytes.
+            4 => match payload {
+                Typval::List(reference) => {
+                    let items = list_items(&reference).unwrap_or_default();
+                    let mut parts = Vec::with_capacity(items.len());
+                    for item in &items {
+                        match item {
+                            Typval::String(text) => parts.push(text.clone()),
+                            _ => return self.encode_regular_dict_fallback(index, payload),
+                        }
+                    }
+                    match msgpack_join_list(&parts) {
+                        Some(bytes) => Ok(msgpack_string_value(&bytes)),
+                        None => self.encode_regular_dict_fallback(index, payload),
+                    }
+                }
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPArray`: a List payload packs as an array.
+            5 => match payload {
+                Typval::List(reference) => {
+                    let id = Rc::as_ptr(reference) as usize;
+                    if self.stack.iter().any(|frame| frame.id() == id) {
+                        return Err(self.dump_error("E5005", "container references itself"));
+                    }
+                    let items = list_items(reference).unwrap_or_default();
+                    self.stack.push(MsgpackDumpFrame::List { id, index: 0 });
+                    let mut out = Vec::with_capacity(items.len());
+                    for (item_index, item) in items.iter().enumerate() {
+                        if let Some(MsgpackDumpFrame::List { index: slot, .. }) =
+                            self.stack.last_mut()
+                        {
+                            *slot = item_index;
+                        }
+                        let encoded = stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                            self.encode_value(item)
+                        });
+                        out.push(encoded?);
+                    }
+                    self.stack.pop();
+                    Ok(rmpv::Value::Array(out))
+                }
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPMap`: a List of `[key, value]` pairs packs as a map. Pair
+            // keys and values that are Lists encode inside their own frame
+            // (like the binary's pairs loop), so a recursive pair renders
+            // `key ... at index ... from special map` with the pair position.
+            6 => match payload {
+                Typval::List(reference) => {
+                    let id = Rc::as_ptr(reference) as usize;
+                    if self.stack.iter().any(|frame| frame.id() == id) {
+                        return Err(self.dump_error("E5005", "container references itself"));
+                    }
+                    let items = list_items(reference).unwrap_or_default();
+                    let mut pairs = Vec::with_capacity(items.len());
+                    for item in &items {
+                        let pair = match item {
+                            Typval::List(pair) => list_items(pair).unwrap_or_default(),
+                            _ => return self.encode_regular_dict_fallback(index, payload),
+                        };
+                        if pair.len() != 2 {
+                            return self.encode_regular_dict_fallback(index, payload);
+                        }
+                        pairs.push(pair);
+                    }
+                    self.stack.push(MsgpackDumpFrame::Pairs {
+                        id,
+                        index: 0,
+                        first: Typval::Special(Special::Null),
+                        prev_first: None,
+                        value_phase: false,
+                    });
+                    let mut out = Vec::with_capacity(pairs.len());
+                    for (pair_index, pair) in pairs.iter().enumerate() {
+                        if let Some(MsgpackDumpFrame::Pairs {
+                            index,
+                            first,
+                            prev_first,
+                            value_phase,
+                            ..
+                        }) = self.stack.last_mut()
+                        {
+                            *index = pair_index;
+                            *prev_first = if pair_index == 0 {
+                                None
+                            } else {
+                                Some(first.clone())
+                            };
+                            *first = pair[0].clone();
+                            *value_phase = false;
+                        }
+                        let key = self.encode_pair_part(&pair[0])?;
+                        if let Some(MsgpackDumpFrame::Pairs { value_phase, .. }) =
+                            self.stack.last_mut()
+                        {
+                            // `conv_error` reads the pair past its key while
+                            // the value encodes.
+                            *value_phase = true;
+                        }
+                        let value = stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                            self.encode_pair_part(&pair[1])
+                        })?;
+                        out.push((key, value));
+                    }
+                    self.stack.pop();
+                    Ok(rmpv::Value::Map(out))
+                }
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            // `kMPExt`: `[number type, list payload]` packs as ext.
+            7 => match payload {
+                Typval::List(reference) => {
+                    let items = list_items(reference).unwrap_or_default();
+                    match items.as_slice() {
+                        [Typval::Number(kind), Typval::List(data)] => {
+                            let Ok(kind) = i8::try_from(*kind) else {
+                                return self.encode_regular_dict_fallback(index, payload);
+                            };
+                            let parts = list_items(data).unwrap_or_default();
+                            let mut bytes_parts = Vec::with_capacity(parts.len());
+                            for part in &parts {
+                                match part {
+                                    Typval::String(text) => bytes_parts.push(text.clone()),
+                                    _ => {
+                                        return self.encode_regular_dict_fallback(index, payload);
+                                    }
+                                }
+                            }
+                            match msgpack_join_list(&bytes_parts) {
+                                Some(bytes) => Ok(rmpv::Value::Ext(kind, bytes.into())),
+                                None => self.encode_regular_dict_fallback(index, payload),
+                            }
+                        }
+                        _ => self.encode_regular_dict_fallback(index, payload),
+                    }
+                }
+                _ => self.encode_regular_dict_fallback(index, payload),
+            },
+            _ => self.encode_regular_dict_fallback(index, payload),
+        }
+    }
+
+    /// Encode one special-map pair key or value. Lists encode inside their
+    /// own frame (pushed without a self check, but marked, so a nested
+    /// reference still fails); anything else encodes inline, so a recursive
+    /// dict fails through the re-entrant special check with no extra frame.
+    fn encode_pair_part(&mut self, value: &Typval) -> Result<rmpv::Value> {
+        match value {
+            Typval::List(reference) => {
+                let id = Rc::as_ptr(reference) as usize;
+                let items = list_items(reference)?;
+                self.stack.push(MsgpackDumpFrame::List { id, index: 0 });
+                let mut out = Vec::with_capacity(items.len());
+                for (item_index, item) in items.iter().enumerate() {
+                    if let Some(MsgpackDumpFrame::List { index: slot, .. }) = self.stack.last_mut()
+                    {
+                        *slot = item_index;
+                    }
+                    let encoded = stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+                        self.encode_value(item)
+                    });
+                    out.push(encoded?);
+                }
+                self.stack.pop();
+                Ok(rmpv::Value::Array(out))
+            }
+            _ => stacker::maybe_grow(32 * 1024, 1024 * 1024, || self.encode_value(value)),
+        }
+    }
+
+    /// Re-encode a rejected special dict as its plain `_TYPE`/`_VAL` map.
+    fn encode_regular_dict_fallback(
+        &mut self,
+        index: usize,
+        payload: &Typval,
+    ) -> Result<rmpv::Value> {
+        let fallback = Typval::dict(vec![
+            (
+                OxStr::from("_TYPE"),
+                Typval::List(self.types[index].clone()),
+            ),
+            (OxStr::from("_VAL"), payload.clone()),
+        ]);
+        match fallback {
+            Typval::Dict(reference) => self.encode_dict(&reference),
+            _ => unreachable!("Typval::dict builds a Dict"),
+        }
+    }
+
+    /// Format an encode failure (`conv_error` in `eval/encode.c`): `E5004`
+    /// reads `Error while dumping {obj}, {path}: ...` while `E5005` reads
+    /// `Unable to dump {obj}: ... in {path}`.
+    fn dump_error(&self, code: &'static str, reason: &str) -> EvalError {
+        let message = if code == "E5005" {
+            format!(
+                "Unable to dump {}: {reason} in {}",
+                self.objname,
+                self.dump_path()
+            )
+        } else {
+            format!(
+                "Error while dumping {}, {}: {reason}",
+                self.objname,
+                self.dump_path()
+            )
+        };
+        EvalError::new(code, 0, message)
+    }
+
+    /// Render the open-container path for `E5004`/`E5005` (`conv_error`):
+    /// `index {i}` per list level, `key {string()}` per dict level, and
+    /// `key {echo} at index {i} from special map` per pairs level. An empty
+    /// stack is `itself`.
+    fn dump_path(&self) -> String {
+        if self.stack.is_empty() {
+            return "itself".to_owned();
+        }
+        let mut parts = Vec::with_capacity(self.stack.len());
+        for (position, frame) in self.stack.iter().enumerate() {
+            match frame {
+                MsgpackDumpFrame::List { index, .. } => {
+                    parts.push(format!("index {index}"));
+                }
+                MsgpackDumpFrame::Dict { key, .. } => {
+                    parts.push(format!("key {}", msgpack_string_key(key)));
+                }
+                MsgpackDumpFrame::Pairs { .. } => {
+                    // While a dict pair key encodes, the frame still
+                    // addresses the previous pair (or nothing at all for the
+                    // first); a list key or value pushes its own frame, and
+                    // past the key the frame addresses the current pair.
+                    let peer = self.pairs_peer(position);
+                    match peer {
+                        None => {
+                            let MsgpackDumpFrame::Pairs { index, .. } = frame else {
+                                unreachable!("matched as Pairs");
+                            };
+                            parts.push(format!("index {index}"));
+                        }
+                        Some((peer_index, peer_first)) => parts.push(format!(
+                            "key {} at index {peer_index} from special map",
+                            msgpack_echo_value(peer_first)
+                        )),
+                    }
+                }
+            }
+        }
+        parts.join(", ")
+    }
+
+    /// The pair a pairs frame addresses for error rendering.
+    fn pairs_peer(&self, position: usize) -> Option<(usize, &Typval)> {
+        let MsgpackDumpFrame::Pairs {
+            index,
+            first,
+            prev_first,
+            value_phase,
+            ..
+        } = &self.stack[position]
+        else {
+            return None;
+        };
+        // A list pair key or value encodes inside its own frame, which sits
+        // directly above: the frame addresses the current pair then.
+        if matches!(
+            self.stack.get(position + 1),
+            Some(MsgpackDumpFrame::List { .. })
+        ) {
+            return Some((*index, first));
+        }
+        if *value_phase {
+            return Some((*index, first));
+        }
+        // A dict key encodes inline with no frame of its own; the frame
+        // still addresses the previous pair, or nothing for the first.
+        match prev_first {
+            Some(previous) => index.checked_sub(1).map(|at| (at, previous)),
+            None => None,
+        }
+    }
+}
+
+impl MsgpackDumpFrame {
+    fn id(&self) -> usize {
+        match self {
+            MsgpackDumpFrame::List { id, .. }
+            | MsgpackDumpFrame::Dict { id, .. }
+            | MsgpackDumpFrame::Pairs { id, .. } => *id,
+        }
+    }
+}
+
+/// Encode a regular-dict key as STR (`TYPVAL_ENCODE_CONV_STR_STRING`), falling
+/// back to BIN when the bytes are not UTF-8 (upstream writes raw bytes; no
+/// test covers that shape, and both decode back to the same String).
+fn msgpack_dict_key(key: &OxStr) -> rmpv::Value {
+    match std::str::from_utf8(key.as_bytes()) {
+        Ok(text) => rmpv::Value::String(text.to_owned().into()),
+        Err(_) => rmpv::Value::Binary(key.as_bytes().to_vec().into()),
+    }
+}
+
+/// Encode special-string bytes as STR, mirroring `mpack_str`; invalid UTF-8
+/// (unrepresentable in `rmpv::Utf8String`) falls back to BIN, which decodes
+/// to the same String.
+fn msgpack_string_value(bytes: &[u8]) -> rmpv::Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => rmpv::Value::String(text.to_owned().into()),
+        Err(_) => rmpv::Value::Binary(bytes.to_vec().into()),
+    }
+}
+
+/// Render one dict key the way `string()` quotes it (`conv_error` uses
+/// `encode_tv2string` for dict levels): `'d'` for strings.
+fn msgpack_string_key(key: &[u8]) -> String {
+    let mut out = String::from("'");
+    for byte in key {
+        out.push(char::from(*byte));
+        if *byte == b'\'' {
+            out.push('\'');
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Render one special-map pair key the way `:echo` prints it (`conv_error`
+/// uses `encode_tv2echo` for pair levels): strings raw, containers with
+/// `[...@N]`/`{...@N}` backrefs numbered from the first nested container.
+fn msgpack_echo_value(value: &Typval) -> String {
+    fn render(value: &Typval, nested: &mut Vec<usize>, out: &mut String) {
+        match value {
+            Typval::String(text) => {
+                out.push_str(&text.to_string_lossy());
+            }
+            Typval::Number(number) => out.push_str(&number.to_string()),
+            Typval::Float(number) => out.push_str(&float_as_string(*number).to_string_lossy()),
+            Typval::Bool(true) => out.push_str("v:true"),
+            Typval::Bool(false) => out.push_str("v:false"),
+            Typval::Special(Special::Null) => out.push_str("v:null"),
+            Typval::Channel(id) | Typval::Job(id) => out.push_str(&id.to_string()),
+            Typval::Funcref(function) => {
+                out.push_str(&format!("function('{}')", function.name.to_string_lossy()));
+            }
+            Typval::Partial(function) => {
+                out.push_str(&format!("function('{}')", function.name.to_string_lossy()));
+            }
+            Typval::Blob(data) => {
+                use std::fmt::Write as _;
+                out.push_str("0z");
+                for byte in data {
+                    let _ = write!(out, "{byte:02X}");
+                }
+            }
+            Typval::List(reference) => {
+                let id = Rc::as_ptr(reference) as usize;
+                if let Some(position) = nested.iter().position(|known| *known == id) {
+                    out.push_str(&format!("[...@{position}]"));
+                    return;
+                }
+                nested.push(id);
+                let items = reference
+                    .try_borrow()
+                    .map(|data| data.items.clone())
+                    .unwrap_or_default();
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    render(item, &mut *nested, &mut *out);
+                }
+                out.push(']');
+                nested.pop();
+            }
+            Typval::Dict(reference) => {
+                let id = Rc::as_ptr(reference) as usize;
+                if let Some(position) = nested.iter().position(|known| *known == id) {
+                    out.push_str(&format!("{{...@{position}}}"));
+                    return;
+                }
+                nested.push(id);
+                                let entries = reference
+                    .try_borrow()
+                    .map(|data| {
+                        data.entries
+                            .iter()
+                            .map(|entry| (entry.key.clone(), entry.value.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                out.push('{');
+                for (index, (key, item)) in entries.iter().enumerate() {
+                    if index > 0 {
+                        out.push_str(", ");
+                    }
+                    out.push_str(&msgpack_string_key(key.as_bytes()));
+                    out.push_str(": ");
+                    render(item, &mut *nested, &mut *out);
+                }
+                out.push('}');
+                nested.pop();
+            }
+        }
+    }
+    let mut out = String::new();
+    // The echoed root itself takes no backref number: the first nested
+    // container is `...@0`, matching the oracle's key renderings.
+    match value {
+        Typval::List(reference) => {
+            let items = reference
+                .try_borrow()
+                .map(|data| data.items.clone())
+                .unwrap_or_default();
+            let mut nested = Vec::new();
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                render(item, &mut nested, &mut out);
+            }
+            out.push(']');
+        }
+        Typval::Dict(reference) => {
+            let entries = reference
+                .try_borrow()
+                .map(|data| {
+                    data.entries
+                        .iter()
+                        .map(|entry| (entry.key.clone(), entry.value.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let mut nested = Vec::new();
+            out.push('{');
+            for (index, (key, item)) in entries.iter().enumerate() {
+                if index > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&msgpack_string_key(key.as_bytes()));
+                out.push_str(": ");
+                render(item, &mut nested, &mut out);
+            }
+            out.push('}');
+        }
+        _ => render(value, &mut Vec::new(), &mut out),
+    }
+    out
+}
+
+/// Join a special-string/ext payload list readfile-style
+/// (`encode_vim_list_to_buf`): items join with NL, an NL inside an item reads
+/// as NUL. Any non-String item (already filtered by callers into the regular
+/// fallback) is refused here.
+fn msgpack_join_list(parts: &[OxStr]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            out.push(b'\n');
+        }
+        out.extend(
+            part.as_bytes()
+                .iter()
+                .map(|byte| if *byte == b'\n' { 0 } else { *byte }),
+        );
+    }
+    Some(out)
+}
+
+/// `f_msgpackdump` (`eval/funcs.c:4422`): a List of values packs to a
+/// readfile-style List, or to a Blob when the second argument is `"B"`.
+fn msgpack_dump(value: &Typval, format: Option<&Typval>, scope: &Scope) -> Result<Typval> {
+    let Typval::List(reference) = value else {
+        return Err(EvalError::new(
+            "E686",
+            0,
+            "Argument of msgpackdump() must be a List",
+        ));
+    };
+    let items = list_items(reference)?;
+    let types = msgpack_type_lists(scope);
+    let mut packed = Vec::new();
+    let mut encoder = MsgpackDumpEncoder {
+        types: &types,
+        objname: String::new(),
+        stack: Vec::new(),
+    };
+    for (index, item) in items.iter().enumerate() {
+        encoder.objname = format!("msgpackdump() argument, index {index}");
+        let encoded =
+            stacker::maybe_grow(32 * 1024, 1024 * 1024, || encoder.encode_value(item))?;
+        rmpv::encode::write_value(&mut packed, &encoded).map_err(|_| {
+            encoder.dump_error("E5004", "attempt to dump function reference")
+        })?;
+    }
+    // Upstream compares the second argument for equality with `"B"`
+    // (`strequal(..., "B")`); anything else (including absent) is the List
+    // form, and a non-String second argument coerces the same way.
+    let blob = matches!(format, Some(Typval::String(text)) if text.as_bytes() == b"B");
+    if blob {
+        return Ok(Typval::Blob(packed));
+    }
+    Ok(msgpack_split_bytes(&packed))
 }
 fn set_pair(values: &mut Vec<(OxStr, Typval)>, key: &[u8], value: Typval) {
     if let Some((_, existing)) = values

@@ -1,10 +1,13 @@
 //! Ambient-environment builtins: working directory, system clock, standard
 //! paths, shell quoting, display width, highlight table, and event-loop state.
 
+use std::rc::Rc;
+
 use crate::excmd_exec::ExEditorAccess;
 use crate::mode::Mode;
 use crate::options::OptionValue;
 use crate::script::{FileIO, StdPath};
+use crate::userfunc::{WatchCallback, WatchTarget};
 use crate::visual::VisualKind;
 use crate::{DirectoryScope, Editor};
 use ox_eval::EvalError;
@@ -60,6 +63,17 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .access
             .with_ex_editor(|editor| call_strdisplaywidth_builtin(editor, args)),
         "strftime" => call_strftime_builtin(args),
+        "shiftwidth" => host
+            .access
+            .with_ex_editor(|editor| call_shiftwidth_builtin(editor, args)),
+        "haslocaldir" => host
+            .access
+            .with_ex_editor(|editor| call_haslocaldir_builtin(editor, args)),
+        "bufloaded" => host
+            .access
+            .with_ex_editor(|editor| call_bufloaded_builtin(editor, args)),
+        "dictwatcheradd" => call_dictwatcher_add_builtin(host, args),
+        "dictwatcherdel" => call_dictwatcher_del_builtin(host, args),
         _ => unreachable!("environment builtin route and dispatcher disagree"),
     }
 }
@@ -504,6 +518,348 @@ fn call_state_builtin<F: FileIO, E: ExEditorAccess>(
     Ok(Typval::String(OxStr::from(state.as_str())))
 }
 
+/// Enforces the `eval.lua` argument counts the way upstream's function table
+/// does before a builtin body runs.
+fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
+    let spec = ox_eval::builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
+    if count < spec.min_args {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
+    }
+    if spec.max_args.is_some_and(|maximum| count > maximum) {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Reads a buffer-scoped numeric option for the current buffer, falling back
+/// to the global baseline and then to `default` when neither exists.
+fn buffer_number_option(editor: &Editor, name: &str, default: i64) -> i64 {
+    let value = editor
+        .current_buffer()
+        .and_then(|buffer| editor.options().get_buffer(buffer, name).ok())
+        .or_else(|| editor.options().get_global_baseline(name).ok());
+    match value {
+        Some(OptionValue::Number(value)) => *value,
+        _ => default,
+    }
+}
+
+/// `f_shiftwidth` (`eval/funcs.c:6589`): the effective `'shiftwidth'` — the
+/// option itself unless it is zero, in which case `'tabstop'`. An optional
+/// column selects the indent step at that column; without `'vartabstop'`
+/// (unmodelled here) the column only matters through its coercion, and a
+/// negative column answers 0.
+fn call_shiftwidth_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("shiftwidth", args.len())?;
+    if let Some(column) = args.first() {
+        // `tv_get_number_chk` (`ox_eval::builtins::number_arg`): coerce or
+        // fail with the typed error, then bail out silently on a negative
+        // column with the preset 0. Strings never error (`'x'` is 0).
+        if ox_eval::builtins::number_arg(column)? < 0 {
+            return Ok(Typval::Number(0));
+        }
+    }
+    let shiftwidth = buffer_number_option(editor, "shiftwidth", 8);
+    if shiftwidth != 0 {
+        return Ok(Typval::Number(shiftwidth));
+    }
+    Ok(Typval::Number(buffer_number_option(editor, "tabstop", 8)))
+}
+
+/// `f_haslocaldir` (`eval/fs.c:1041`): whether the addressed scope object
+/// has a local working directory. Only window-local directories exist in
+/// this port (`:lcd`/`:tcd` both land on `DirectoryScope::Window`), so the
+/// tab, buffer, and global scopes answer 0; argument validation mirrors
+/// `getcwd_scope_args` exactly.
+fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("haslocaldir", args.len())?;
+    let mut selected = [0i64; 3];
+    for (index, argument) in args.iter().enumerate() {
+        // Upstream rejects anything but `VAR_NUMBER` with `E474`.
+        let Typval::Number(number) = argument else {
+            return Err(EvalError::new("E474", 0, "Invalid argument"));
+        };
+        if *number < -1 {
+            return Err(EvalError::new("E474", 0, "Invalid argument"));
+        }
+        selected[index] = *number;
+    }
+    // An argument may only be -1 when every preceding argument is -1.
+    let mut explicit = false;
+    for number in selected.iter().take(args.len()) {
+        explicit = explicit || *number >= 0;
+        if explicit && *number < 0 {
+            return Err(EvalError::new(
+                "E5001",
+                0,
+                "Argument cannot be -1 if preceding argument is >= 0.",
+            ));
+        }
+    }
+    let argc = args.len();
+    let (window_number, tab_number, buffer_number) = (selected[0], selected[1], selected[2]);
+    // Buffer scope requires the window and tab slots to be skipped; only a
+    // buffer target reaches the buffer branch.
+    if argc == 3 && buffer_number >= 0 {
+        if window_number >= 0 || tab_number >= 0 {
+            return Err(EvalError::new(
+                "E5006",
+                0,
+                "Window and tab scope must be -1 when using buffer scope",
+            ));
+        }
+        let buffer = if buffer_number == 0 {
+            editor.current_buffer()
+        } else {
+            ox_types::BufHandle::try_from(buffer_number)
+                .ok()
+                .filter(|buffer| editor.buffer(*buffer).is_ok())
+        };
+        if buffer.is_none() {
+            return Err(EvalError::new("E5007", 0, "Cannot find buffer number."));
+        }
+        // This port stores no buffer-local directories.
+        return Ok(Typval::Number(0));
+    }
+    // Without arguments the window scope is implied; `-1` skips one scope
+    // outward, exactly like `getcwd_scope_args`: no window argument (or a
+    // non-negative one) stays at the window, `-1` with no (or a
+    // non-negative) tab argument selects the tab, and `-1, -1` selects the
+    // global scope.
+    let window_scope = argc == 0 || window_number >= 0;
+    let tab = if argc >= 2 && tab_number > 0 {
+        let tabs = editor.tabpages();
+        let Some(tab) = usize::try_from(tab_number)
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| tabs.get(index).copied())
+        else {
+            return Err(EvalError::new("E5000", 0, "Cannot find tab number."));
+        };
+        Some(tab)
+    } else {
+        editor.current_tabpage()
+    };
+    if !window_scope {
+        // Tab scope (`haslocaldir(-1[, ...])`) or global scope
+        // (`haslocaldir(-1, -1[, ...])`): neither stores a directory here,
+        // but an explicit bad tab number above still reports `E5000`.
+        return Ok(Typval::Number(0));
+    }
+    let window = if window_number == 0 {
+        // `find_win_by_nr` answers `curwin`, which always exists upstream;
+        // without one there is no window-local directory to report.
+        let Some(window) = editor.current_window() else {
+            return Ok(Typval::Number(0));
+        };
+        Some(window)
+    } else {
+        let windows = tab.and_then(|tab| editor.tabpage_windows(tab).ok()).unwrap_or_default();
+        // A live handle wins over the ordinal, mirroring `find_win_by_nr`'s
+        // window-ID branch; otherwise the 1-based position in the tab.
+        ox_types::WinHandle::try_from(window_number)
+            .ok()
+            .filter(|handle| windows.contains(handle))
+            .or_else(|| {
+                usize::try_from(window_number)
+                    .ok()
+                    .and_then(|number| number.checked_sub(1))
+                    .and_then(|index| windows.get(index).copied())
+            })
+    };
+    let Some(window) = window else {
+        return Err(EvalError::new("E5002", 0, "Cannot find window number."));
+    };
+    Ok(Typval::Number(i64::from(
+        editor
+            .window_local_directory(window)
+            .ok()
+            .flatten()
+            .is_some(),
+    )))
+}
+
+/// `f_bufloaded` (`eval/buffer.c:498`): whether `find_buffer()` resolves the
+/// argument and the buffer text is resident. Unlike `bufexists()`, no
+/// argument spells the current buffer: `0`, `""`, and `"%"` all miss, and
+/// non-number/string values answer 0 without an error.
+fn call_bufloaded_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("bufloaded", args.len())?;
+    let buffer = match args.first() {
+        Some(Typval::Number(number)) if *number != 0 => ox_types::BufHandle::try_from(*number)
+            .ok()
+            .filter(|buffer| editor.buffer(*buffer).is_ok()),
+        Some(Typval::String(name)) if !name.as_bytes().is_empty() => {
+            editor.buffers().into_iter().find(|buffer| {
+                editor
+                    .buffer(*buffer)
+                    .is_ok_and(|state| state.name() == name)
+            })
+        }
+        _ => None,
+    };
+    let loaded = buffer.is_some_and(|buffer| {
+        editor
+            .buffer(buffer)
+            .is_ok_and(|state| state.residency.is_loaded())
+    });
+    Ok(Typval::Number(i64::from(loaded)))
+}
+
+/// Whether a callback name needs the digit-lead rejection: upstream's
+/// `callback_from_typval` answers `E921` for a `String` starting with a
+/// digit on both the add and the delete path, while an undefined name
+/// otherwise registers fine (resolution happens at fire time).
+fn dictwatcher_name_rejected(name: &OxStr) -> bool {
+    name.as_bytes().first().is_some_and(|byte| byte.is_ascii_digit())
+}
+
+/// Normalises a `dictwatcheradd()` callback: a `Funcref`/`Partial` value is
+/// stored whole, a name is stored as written (an undefined name still
+/// registers), and a null callback stores the never-firing
+/// [`WatchCallback::None`]. Anything else — including a digit-leading name
+/// — is `E921`.
+fn dictwatcher_add_callback(argument: &Typval) -> ox_eval::Result<WatchCallback> {
+    match argument {
+        Typval::Funcref(function) => Ok(WatchCallback::Funcref(function.clone())),
+        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone())),
+        Typval::String(name) if !dictwatcher_name_rejected(name) => {
+            Ok(WatchCallback::Name(name.clone()))
+        }
+        Typval::Special(_) => Ok(WatchCallback::None),
+        _ => Err(EvalError::new("E921", 0, "Invalid callback argument")),
+    }
+}
+
+/// Normalises a `dictwatcherdel()` callback: same shapes as the add path,
+/// except a non-string/non-function (null included) is the `E475`
+/// `funcref` refusal from the delete body's explicit type check.
+fn dictwatcher_del_callback(argument: &Typval) -> ox_eval::Result<WatchCallback> {
+    match argument {
+        Typval::Funcref(function) => Ok(WatchCallback::Funcref(function.clone())),
+        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone())),
+        Typval::String(name) if dictwatcher_name_rejected(name) => Err(EvalError::new(
+            "E921",
+            0,
+            "Invalid callback argument",
+        )),
+        Typval::String(name) => Ok(WatchCallback::Name(name.clone())),
+        _ => Err(EvalError::new("E475", 0, "Invalid argument: funcref")),
+    }
+}
+
+/// The watched `Dict` identity for `dictwatcheradd()`/`dictwatcherdel()`.
+/// Bare `g:`/`b:`/`w:`/`t:` snapshots carry no provenance in a bare
+/// `Typval`, so scope namespaces need the evaluator to record
+/// `WatchTarget::Scope` (reported to the route owner); every other dict
+/// keys by live identity.
+fn dictwatcher_target(argument: &Typval) -> ox_eval::Result<WatchTarget> {
+    match argument {
+        Typval::Dict(reference) => Ok(WatchTarget::Dict(Rc::as_ptr(reference) as usize)),
+        _ => Err(EvalError::new("E475", 0, "Invalid argument: dict")),
+    }
+}
+
+/// The add-path target: `v:_null_dict` is refused with `E46`, while the
+/// delete path lets the lookup miss instead (the `Couldn't find a watcher`
+/// error).
+fn dictwatcher_add_target(argument: &Typval) -> ox_eval::Result<WatchTarget> {
+    if argument.is_null_dict() {
+        return Err(EvalError::new(
+            "E46",
+            0,
+            "Cannot change read-only variable \"dictwatcheradd() argument\"",
+        ));
+    }
+    dictwatcher_target(argument)
+}
+
+/// Coerces a dictwatcher key pattern: upstream accepts `VAR_STRING` and
+/// `VAR_NUMBER` (`tv_get_string_chk`), refusing anything else. A null
+/// pattern adds no watcher and answers 0.
+fn dictwatcher_pattern(argument: &Typval) -> ox_eval::Result<Option<OxStr>> {
+    match argument {
+        Typval::String(pattern) => Ok(Some(pattern.clone())),
+        Typval::Number(number) => Ok(Some(OxStr::from(number.to_string().as_str()))),
+        Typval::Special(ox_types::Special::Null) => Ok(None),
+        _ => Err(EvalError::new("E475", 0, "Invalid argument: key")),
+    }
+}
+
+/// Validates `dictwatcheradd()` arguments without touching the registry so
+/// the checks stay unit-testable without an executor host.
+fn dictwatcher_add_args(
+    args: &[Typval],
+) -> ox_eval::Result<(WatchTarget, Option<OxStr>, WatchCallback)> {
+    check_arity("dictwatcheradd", args.len())?;
+    let target = dictwatcher_add_target(&args[0])?;
+    let pattern = dictwatcher_pattern(&args[1])?;
+    let callback = dictwatcher_add_callback(&args[2])?;
+    Ok((target, pattern, callback))
+}
+
+/// Validates `dictwatcherdel()` arguments without touching the registry.
+fn dictwatcher_del_args(
+    args: &[Typval],
+) -> ox_eval::Result<(WatchTarget, Option<OxStr>, WatchCallback)> {
+    check_arity("dictwatcherdel", args.len())?;
+    let target = dictwatcher_target(&args[0])?;
+    let pattern = dictwatcher_pattern(&args[1])?;
+    let callback = dictwatcher_del_callback(&args[2])?;
+    Ok((target, pattern, callback))
+}
+
+/// `f_dictwatcheradd` (`eval/funcs.c:965`).
+fn call_dictwatcher_add_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let (target, pattern, callback) = dictwatcher_add_args(args)?;
+    let Some(pattern) = pattern else {
+        return Ok(Typval::Number(0));
+    };
+    host.runtime
+        .functions
+        .dictwatcher_add(target, pattern, callback);
+    Ok(Typval::Number(0))
+}
+
+/// `f_dictwatcherdel` (`eval/funcs.c:1003`): removes the watcher only when
+/// dict, key, and callback all match, else the codeless
+/// `Couldn't find a watcher matching key and callback`.
+fn call_dictwatcher_del_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let (target, pattern, callback) = dictwatcher_del_args(args)?;
+    let removed = match pattern {
+        Some(pattern) => host.runtime.functions.dictwatcher_remove(
+            &target,
+            pattern.as_bytes(),
+            &callback,
+        ),
+        // A null pattern never matches an added watcher.
+        None => false,
+    };
+    if removed {
+        return Ok(Typval::Number(0));
+    }
+    Err(EvalError::new(
+        "",
+        0,
+        "Couldn't find a watcher matching key and callback",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use ox_eval::Scope;
@@ -735,5 +1091,308 @@ mod api_and_highlight_tests {
         assert_eq!(global_string(&exec, "none").as_deref(), Some(""));
         assert_eq!(global_string(&exec, "idle").as_deref(), Some(""));
         assert_eq!(global_string(&exec, "au").as_deref(), Some("oxS"));
+    }
+}
+
+#[cfg(test)]
+mod ambient_direct_tests {
+    use ox_types::Typval;
+
+    use crate::options::OptionValue;
+    use crate::{DirectoryScope, Editor, TestEditorAccess};
+
+    /// A fresh editor with one listed buffer shown in one tabpage, so
+    /// current-buffer/window lookups resolve the way they do in a live
+    /// session (`Editor::new()` starts with neither).
+    fn editor_with_window() -> (TestEditorAccess, ox_types::BufHandle) {
+        let editor = TestEditorAccess::new(Editor::new());
+        let buffer = editor
+            .editor_mut()
+            .create_buffer_with(ox_text::Buffer::new(), true)
+            .unwrap();
+        editor
+            .editor_mut()
+            .create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (editor, buffer)
+    }
+
+    fn eval_builtin(
+        editor: &Editor,
+        name: &str,
+        args: &[Typval],
+    ) -> ox_eval::Result<Typval> {
+        match name {
+            "shiftwidth" => super::call_shiftwidth_builtin(editor, args),
+            "haslocaldir" => super::call_haslocaldir_builtin(editor, args),
+            "bufloaded" => super::call_bufloaded_builtin(editor, args),
+            _ => unreachable!("covered builtin"),
+        }
+    }
+
+    fn number_arg(value: &Typval) -> i64 {
+        match value {
+            Typval::Number(value) => *value,
+            _ => panic!("expected a Number, got {value:?}"),
+        }
+    }
+
+    fn text(value: &str) -> Typval {
+        Typval::String(ox_types::OxStr::from(value))
+    }
+
+    // `shiftwidth()` (`eval/funcs.c:6589`): the buffer option, or `tabstop`
+    // when it is zero; the column form coerces, a negative column is 0.
+    #[test]
+    fn shiftwidth_reports_effective_indent_step() {
+        let (editor, buffer) = editor_with_window();
+        editor
+            .editor_mut()
+            .options_mut()
+            .set_buffer(buffer, "shiftwidth", OptionValue::Number(4))
+            .unwrap();
+        let editor_ref = editor.editor();
+        assert_eq!(
+            number_arg(&eval_builtin(&editor_ref, "shiftwidth", &[]).unwrap()),
+            4
+        );
+        assert_eq!(
+            number_arg(
+                &eval_builtin(&editor_ref, "shiftwidth", &[Typval::Number(3)]).unwrap()
+            ),
+            4
+        );
+        assert_eq!(
+            number_arg(
+                &eval_builtin(&editor_ref, "shiftwidth", &[Typval::Number(-1)]).unwrap()
+            ),
+            0
+        );
+        drop(editor_ref);
+        editor
+            .editor_mut()
+            .options_mut()
+            .set_buffer(buffer, "shiftwidth", OptionValue::Number(0))
+            .unwrap();
+        editor
+            .editor_mut()
+            .options_mut()
+            .set_buffer(buffer, "tabstop", OptionValue::Number(6))
+            .unwrap();
+        let editor_ref = editor.editor();
+        assert_eq!(
+            number_arg(&eval_builtin(&editor_ref, "shiftwidth", &[]).unwrap()),
+            6
+        );
+        assert_eq!(
+            number_arg(
+                &eval_builtin(&editor_ref, "shiftwidth", &[Typval::Number(100)]).unwrap()
+            ),
+            6
+        );
+        // A non-numeric column coerces silently: `'x'` is 0.
+        assert_eq!(
+            number_arg(&eval_builtin(&editor_ref, "shiftwidth", &[text("x")]).unwrap()),
+            6
+        );
+    }
+
+    // `haslocaldir()` (`eval/fs.c:1041`): 1 after a window-local directory
+    // is set, 0 without one, and upstream's validation errors for bad
+    // shapes. Tab/buffer/global scopes store nothing in this port.
+    #[test]
+    fn haslocaldir_tracks_window_directories_and_validates() {
+        let _guard = crate::lock_process_state();
+        let original = std::env::current_dir().unwrap();
+        let target =
+            std::env::temp_dir().join(format!("ox-editor-haslocaldir-{}", std::process::id()));
+        std::fs::create_dir_all(&target).unwrap();
+        let (editor, _buffer) = editor_with_window();
+        {
+            let editor_ref = editor.editor();
+            assert_eq!(
+                number_arg(&eval_builtin(&editor_ref, "haslocaldir", &[]).unwrap()),
+                0
+            );
+        }
+        {
+            let mut borrowed = editor.editor_mut();
+            crate::excmd_exec::change_directory(
+                &mut borrowed,
+                &target.to_string_lossy(),
+                DirectoryScope::Window,
+            )
+            .unwrap();
+        }
+        {
+            let editor_ref = editor.editor();
+            for args in [
+                vec![],
+                vec![Typval::Number(0)],
+                vec![Typval::Number(0), Typval::Number(0)],
+            ] {
+                assert_eq!(
+                    number_arg(&eval_builtin(&editor_ref, "haslocaldir", &args).unwrap()),
+                    1,
+                    "{args:?}"
+                );
+            }
+            for args in [
+                vec![Typval::Number(-1)],
+                vec![Typval::Number(-1), Typval::Number(0)],
+                vec![
+                    Typval::Number(-1),
+                    Typval::Number(-1),
+                ],
+            ] {
+                assert_eq!(
+                    number_arg(&eval_builtin(&editor_ref, "haslocaldir", &args).unwrap()),
+                    0,
+                    "{args:?}"
+                );
+            }
+        }
+        std::env::set_current_dir(&original).unwrap();
+        std::fs::remove_dir(&target).unwrap();
+        // Validation mirrors `getcwd_scope_args`.
+        let editor_ref = editor.editor();
+        for (args, code) in [
+            (vec![text("x")], "E474"),
+            (vec![Typval::Number(1), Typval::Number(-1)], "E5001"),
+            (
+                vec![
+                    Typval::Number(0),
+                    Typval::Number(0),
+                    Typval::Number(0),
+                ],
+                "E5006",
+            ),
+            (
+                vec![
+                    Typval::Number(-1),
+                    Typval::Number(-1),
+                    Typval::Number(99999),
+                ],
+                "E5007",
+            ),
+            (
+                vec![
+                    Typval::Number(0),
+                    Typval::Number(0),
+                    Typval::Number(0),
+                    Typval::Number(0),
+                ],
+                "E118",
+            ),
+            (vec![Typval::Number(-1), Typval::Number(99)], "E5000"),
+            (vec![Typval::Number(99)], "E5002"),
+        ] {
+            assert_eq!(
+                eval_builtin(&editor_ref, "haslocaldir", &args).unwrap_err().code,
+                code,
+                "{args:?}"
+            );
+        }
+    }
+
+    // `bufloaded()` (`eval/buffer.c:498`): the current buffer by number is
+    // loaded, a missing number — and `0`, `""`, and every non-number/string
+    // — is not.
+    #[test]
+    fn bufloaded_reports_resident_buffers() {
+        let (editor, _buffer) = editor_with_window();
+        let editor_ref = editor.editor();
+        let current = editor_ref.current_buffer().unwrap();
+        let current_number = Typval::Number(i64::from(current));
+        assert_eq!(
+            number_arg(&eval_builtin(&editor_ref, "bufloaded", &[current_number]).unwrap()),
+            1
+        );
+        for argument in [
+            Typval::Number(99999),
+            Typval::Number(0),
+            text(""),
+            text("%"),
+            Typval::Bool(true),
+            Typval::Special(ox_types::Special::Null),
+        ] {
+            assert_eq!(
+                number_arg(&eval_builtin(&editor_ref, "bufloaded", &[argument]).unwrap()),
+                0
+            );
+        }
+    }
+
+    // `dictwatcheradd()`/`dictwatcherdel()` argument validation
+    // (`eval/funcs.c:965,1003`): the registry round-trip lives in
+    // `userfunc` tests; here the builtin layer's target/pattern/callback
+    // checks and upstream error codes are pinned.
+    #[test]
+    fn dictwatcher_argument_validation_matches_upstream() {
+        let dict = || Typval::dict(vec![(ox_types::OxStr::from("k"), Typval::Number(1))]);
+        let name = || Typval::String(ox_types::OxStr::from("g:Changed"));
+        // Valid shapes parse.
+        let (target, pattern, callback) =
+            super::dictwatcher_add_args(&[dict(), text("watched"), name()]).unwrap();
+        assert!(matches!(target, crate::userfunc::WatchTarget::Dict(_)));
+        assert_eq!(pattern.unwrap().as_bytes(), b"watched");
+        assert!(matches!(callback, crate::userfunc::WatchCallback::Name(_)));
+        // A null pattern adds nothing but still validates.
+        assert!(
+            super::dictwatcher_add_args(&[
+                dict(),
+                Typval::Special(ox_types::Special::Null),
+                name(),
+            ])
+            .unwrap()
+            .1
+            .is_none()
+        );
+        // A null callback registers the never-firing variant.
+        assert!(matches!(
+            super::dictwatcher_add_args(&[
+                dict(),
+                text("x"),
+                Typval::Special(ox_types::Special::Null),
+            ])
+            .unwrap()
+            .2,
+            crate::userfunc::WatchCallback::None
+        ));
+        for (arguments, code) in [
+            // add path
+            (vec![dict(), text("x"), Typval::Number(42)], "E921"),
+            (vec![dict(), text("x"), text("123")], "E921"),
+            (vec![text("x"), text("x"), name()], "E475"),
+            (vec![Typval::null_dict(), text("x"), name()], "E46"),
+            (vec![dict(), Typval::Bool(true), name()], "E475"),
+        ] {
+            assert_eq!(
+                super::dictwatcher_add_args(&arguments).unwrap_err().code,
+                code,
+                "{arguments:?}"
+            );
+        }
+        // A numeric pattern coerces like `tv_get_string_chk`.
+        assert_eq!(
+            super::dictwatcher_add_args(&[dict(), Typval::Number(1), name()])
+                .unwrap()
+                .1
+                .unwrap()
+                .as_bytes(),
+            b"1"
+        );
+        for (arguments, code) in [
+            // delete path: numbers are `E475`, digit names `E921`.
+            (vec![dict(), text("x"), Typval::Number(42)], "E475"),
+            (vec![dict(), text("x"), text("123")], "E921"),
+            (vec![dict(), text("x"), Typval::Bool(true)], "E475"),
+        ] {
+            assert_eq!(
+                super::dictwatcher_del_args(&arguments).unwrap_err().code,
+                code,
+                "{arguments:?}"
+            );
+        }
     }
 }

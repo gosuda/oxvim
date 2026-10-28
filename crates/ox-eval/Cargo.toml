@@ -12,6 +12,7 @@ workspace = true
 ox-sys = { path = "../ox-sys" }
 ox-types = { path = "../ox-types" }
 serde_json.workspace = true
+rmpv = { workspace = true }
 sha2.workspace = true
 stacker = "0.1.25"
 thiserror.workspace = true
