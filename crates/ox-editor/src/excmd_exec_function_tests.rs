@@ -2071,6 +2071,85 @@ fn window_screen_and_state_builtins_use_editor_state() {
     assert_eq!(global_string(exec.scope(), "text").as_deref(), Some("口"));
 }
 
+/// Blank screen cells are spaces, not holes: upstream's default grid answers
+/// every in-range coordinate (`eval/funcs.c:5711-5729`), so a 24x80 screen
+/// reports 32 for window rows past the buffer's last line and for grid rows
+/// no window covers, and -1 only outside the grid. `Screenline(&lines - 1)`
+/// in the oldtest suite feeds those cells straight into `nr2char()`, where
+/// a -1 surfaces as `E5070: Character number must not be less than zero`.
+#[test]
+fn screen_builtins_answer_the_whole_grid_with_blanks() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    let _tabpage = editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 20, 6).unwrap())
+        .unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(
+        &editor,
+        "builtins.vim",
+        concat!(
+            "set lines=24 columns=80\n",
+            "call setline(1, 'ab')\n",
+            // Inside the window, past the end of the line and past the last
+            // buffer line: blanks, never -1.
+            "let g:past_eol = screenchar(1, 3)\n",
+            "let g:past_eof = screenchar(2, 1)\n",
+            "let g:window_edge = screenchar(6, 20)\n",
+            // In-grid rows no window covers (status-line and message rows):
+            // blanks with default attributes.
+            "let g:uncovered = screenchar(23, 1)\n",
+            "let g:last_cell = screenchar(24, 80)\n",
+            "let g:uncovered_attr = screenattr(23, 1)\n",
+            "let g:uncovered_string = screenstring(23, 1)\n",
+            "let g:uncovered_chars = screenchars(23, 1)\n",
+            // Outside the grid: no cell at all.
+            "let g:beyond_rows = screenchar(25, 1)\n",
+            "let g:beyond_cols = screenchar(1, 81)\n",
+            "let g:row_zero = screenchar(0, 1)\n",
+            "let g:col_zero = screenchar(1, 0)\n",
+            "let g:beyond_attr = screenattr(25, 1)\n",
+            "let g:beyond_string = screenstring(25, 1)\n",
+            "let g:beyond_chars = screenchars(25, 1)\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(global_number(exec.scope(), "past_eol"), Some(32));
+    assert_eq!(global_number(exec.scope(), "past_eof"), Some(32));
+    assert_eq!(global_number(exec.scope(), "window_edge"), Some(32));
+    assert_eq!(global_number(exec.scope(), "uncovered"), Some(32));
+    assert_eq!(global_number(exec.scope(), "last_cell"), Some(32));
+    assert_eq!(global_number(exec.scope(), "uncovered_attr"), Some(0));
+    assert_eq!(
+        global_string(exec.scope(), "uncovered_string").as_deref(),
+        Some(" ")
+    );
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"uncovered_chars", 0)
+            .unwrap(),
+        &Typval::list(vec![Typval::Number(32)])
+    );
+    assert_eq!(global_number(exec.scope(), "beyond_rows"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "beyond_cols"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "row_zero"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "col_zero"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "beyond_attr"), Some(-1));
+    assert_eq!(
+        global_string(exec.scope(), "beyond_string").as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"beyond_chars", 0)
+            .unwrap(),
+        &Typval::list(vec![])
+    );
+}
+
 #[test]
 fn higher_order_callbacks_preserve_editor_host() {
     let editor = TestEditorAccess::new(Editor::new());
@@ -3511,11 +3590,10 @@ fn sourced_script_error_displays_and_aborts() {
     );
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(io);
-    let error = exec.source_file(&editor, "/inner.vim".as_ref()).unwrap_err();
-    assert!(
-        error.to_string().contains("NoSuchFunc123"),
-        "got {error}"
-    );
+    let error = exec
+        .source_file(&editor, "/inner.vim".as_ref())
+        .unwrap_err();
+    assert!(error.to_string().contains("NoSuchFunc123"), "got {error}");
     assert_eq!(global_number(exec.scope(), "inner_after"), None);
     assert!(exec.did_emsg());
 }

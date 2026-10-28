@@ -837,6 +837,9 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// (`cause_errthrow` returns false, `should_abort` returns false). When
     /// nonzero, errors become catchable exceptions.
     pub(crate) try_depth: usize,
+    /// `text_locked()` depth: non-zero while an expression that must not
+    /// change text (a substitute replacement) is being evaluated.
+    pub(crate) textlock: usize,
     /// Monotonic counter giving every script-source and function-call
     /// frame a push order; `throwpoint` merges both stacks through it,
     /// matching upstream's single `estack` list.
@@ -870,6 +873,7 @@ impl<F: FileIO> ExRuntime<F> {
             closures: ClosureRegistry::new(),
             pending_edit_mode: None,
             try_depth: 0,
+            textlock: 0,
             mode_machine: None,
             swap_names: Rc::new(RefCell::new(HashMap::new())),
             swap_written: Rc::new(RefCell::new(BTreeSet::new())),
@@ -968,7 +972,11 @@ impl<F: FileIO> ExRuntime<F> {
             // The `nvim_exec2` pseudo-source is named `nvim_exec2()`
             // upstream (`do_source_str` names the estack entry); oxvim
             // stores the internal `<nvim>` tag, so rename at display.
-            let name = if *name == "<nvim>" { "nvim_exec2()" } else { name };
+            let name = if *name == "<nvim>" {
+                "nvim_exec2()"
+            } else {
+                name
+            };
             if index == last {
                 let _ = write!(result, "{name}, line {current_line}");
             } else {
@@ -1188,7 +1196,8 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
                 return flow;
             }
         }
-        let drained = before.saturating_sub(access.with_ex_editor(|editor| editor.typeahead().len()));
+        let drained =
+            before.saturating_sub(access.with_ex_editor(|editor| editor.typeahead().len()));
         consumed += drained.max(1);
     }
     Flow::Normal
@@ -2449,36 +2458,15 @@ fn append_line_instructions<P: UserCommandProvider + ?Sized>(
             Ok(None) => break,
             // A line that does not parse is stored deferred: the slot keeps
             // no command and `run_instructions` re-resolves it against the
-            // live user-command view when its turn comes.
+            // live user-command view when its turn comes. (`:put ={expr}`
+            // parses natively now that `parse_register` consumes the `=`
+            // expression in the parser, so no whole-line rescan is needed.)
             Err(_) => {
-                if cursor == 0
-                    && let Some(commands) = parse_put_expression(parser, command_text)
-                {
-                    let mut read_from = 0_usize;
-                    for command in commands {
-                        let next_from = command.span.end.min(command_text.len());
-                        push_instruction(
-                            program,
-                            command,
-                            command_text,
-                            read_from,
-                            0,
-                            heredoc_body,
-                            first_line,
-                            cmdline,
-                        );
-                        read_from = next_from;
-                        if matches!(bytes.get(read_from), Some(b'|' | b'\n')) {
-                            read_from += 1;
-                        }
-                    }
-                } else {
-                    program.push(deferred_instruction(
-                        &command_text[raw_start..],
-                        first_line,
-                        cmdline,
-                    ));
-                }
+                program.push(deferred_instruction(
+                    &command_text[raw_start..],
+                    first_line,
+                    cmdline,
+                ));
                 return;
             }
         };
@@ -2504,9 +2492,7 @@ fn append_line_instructions<P: UserCommandProvider + ?Sized>(
             // (ex_docmd.c:4170-4178). `ex_append`/`ex_insert` still read
             // their input lines after the newline the comment ends at.
             Some(b'"') => {
-                if reads_lines
-                    && let Some(relative) = command_text[end..].find('\n')
-                {
+                if reads_lines && let Some(relative) = command_text[end..].find('\n') {
                     cursor = consume_append_lines(
                         program,
                         command_text,
@@ -2520,13 +2506,8 @@ fn append_line_instructions<P: UserCommandProvider + ?Sized>(
             }
             Some(b'|' | b'\n') => {
                 if reads_lines && bytes[end] == b'\n' {
-                    cursor = consume_append_lines(
-                        program,
-                        command_text,
-                        end + 1,
-                        first_line,
-                        cmdline,
-                    );
+                    cursor =
+                        consume_append_lines(program, command_text, end + 1, first_line, cmdline);
                     continue;
                 }
                 cursor = end + 1;
@@ -2593,8 +2574,8 @@ fn push_instruction(
     cmdline: bool,
 ) {
     let raw = command_text[raw_start..].to_owned();
-    let typed = command_text[parse_base + command.span.start
-        ..(parse_base + command.span.end).min(command_text.len())]
+    let typed = command_text
+        [parse_base + command.span.start..(parse_base + command.span.end).min(command_text.len())]
         .to_owned();
     if let Some(body) = heredoc_body {
         command.args.push('\n');
@@ -2609,31 +2590,6 @@ fn push_instruction(
         retried: false,
         cmdline,
     });
-}
-
-fn parse_put_expression<P: UserCommandProvider + ?Sized>(
-    parser: &ExParser<'_, P>,
-    line: &str,
-) -> Option<Vec<ExCommand>> {
-    for (offset, _) in line.match_indices('=') {
-        let Ok(mut commands) = parser.parse(&line[..=offset]) else {
-            continue;
-        };
-        if commands.len() != 1
-            || commands[0].command.name() != "put"
-            || commands[0].register != Some('=')
-        {
-            continue;
-        }
-        let expression = line[offset + 1..].trim();
-        if expression.is_empty() {
-            return None;
-        }
-        expression.clone_into(&mut commands[0].args);
-        commands[0].span.end = line.len();
-        return Some(commands);
-    }
-    None
 }
 
 /// Upstream `emsg()` displays the error and sets `did_emsg`, which then
@@ -2931,21 +2887,16 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                             lua,
                             skipwhite_trim(&command.args),
                         ) {
-                            Ok(true) => match run_program(
-                                runtime,
-                                access,
-                                scope,
-                                lua,
-                                program,
-                                pc + 1,
-                                end,
-                            ) {
-                                Flow::Normal | Flow::Continue | Flow::Break => {}
-                                flow => {
-                                    display_error_message(runtime, access, &flow);
-                                    return flow;
+                            Ok(true) => {
+                                match run_program(runtime, access, scope, lua, program, pc + 1, end)
+                                {
+                                    Flow::Normal | Flow::Continue | Flow::Break => {}
+                                    flow => {
+                                        display_error_message(runtime, access, &flow);
+                                        return flow;
+                                    }
                                 }
-                            },
+                            }
                             Ok(false) => {}
                             Err(flow) => return flow,
                         }
@@ -3001,15 +2952,7 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                             {
                                 return flow;
                             }
-                            match run_program(
-                                runtime,
-                                access,
-                                scope,
-                                lua,
-                                program,
-                                pc + 1,
-                                end,
-                            ) {
+                            match run_program(runtime, access, scope, lua, program, pc + 1, end) {
                                 Flow::Normal | Flow::Continue | Flow::Break => {}
                                 flow => {
                                     display_error_message(runtime, access, &flow);
@@ -3062,8 +3005,7 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     // string that simply ends discards the open `:try`
                     // silently.
                     runtime.try_depth += 1;
-                    let flow =
-                        run_program(runtime, access, scope, lua, program, pc + 1, end);
+                    let flow = run_program(runtime, access, scope, lua, program, pc + 1, end);
                     runtime.try_depth -= 1;
                     if !matches!(flow, Flow::Normal) {
                         display_error_message(runtime, access, &flow);
@@ -3574,6 +3516,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "setglobal" => command_set(runtime, access, scope, lua, &command.args, SetLayer::Global),
         "syntax" if matches!(command.args.trim(), "on" | "off") => Flow::Normal,
         "filetype" => command_filetype(runtime, access, scope, lua, command),
+        "setfiletype" => command_setfiletype(runtime, access, scope, lua, command),
         "insert" => Flow::Normal,
         "startinsert" => {
             runtime.pending_edit_mode = Some(if command.bang {
@@ -3667,17 +3610,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "preserve" => command_preserve(runtime, access),
         "wshada" | "wviminfo" => command_wshada(runtime, access, command),
         "rshada" | "rviminfo" => command_rshada(runtime, access, command),
-        "iabbrev" => command_iabbrev(runtime, access, scope, command),
-        "abclear" => {
-            // `:abclear` removes abbreviations in both scopes (ex_cmds.lua
-            // `abclear`, `map_clear` over abbrs).
-            access.with_ex_editor(|editor| {
-                editor.mappings_mut().abbrevclear(MapScope::Global);
-                editor
-                    .mappings_mut()
-                    .abbrevclear(MapScope::Buffer(BufHandle::CURRENT));
-            });
-            Flow::Normal
+        "iabbrev" | "abclear" => {
+            crate::builtins::mapping::command_abbrev(runtime, access, scope, command)
         }
         "clearjumps" => access.with_ex_editor(command_clearjumps),
         "argadd" => access.with_ex_editor(|editor| command_argadd(runtime, editor, command)),
@@ -3756,6 +3690,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "hide" => access.with_ex_editor(|editor| command_hide(runtime, editor, command)),
         "sleep" => access.with_ex_editor(|editor| command_sleep(runtime, editor, command)),
         "scriptencoding" => command_scriptencoding(runtime, command),
+        "scriptnames" => command_scriptnames(runtime, access, scope, lua, command),
         "argdelete" => access.with_ex_editor(|editor| command_argdelete(runtime, editor, command)),
         "z" => access.with_ex_editor(|editor| command_z(runtime, editor, command)),
         "lockvar" => command_lockvar(runtime, access, scope, command, true),
@@ -3767,6 +3702,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "diffthis" => access.with_ex_editor(|editor| command_diffthis(runtime, editor)),
         "diffoff" => access.with_ex_editor(|editor| command_diffoff(runtime, editor, command)),
         "diffupdate" => access.with_ex_editor(|editor| command_diffupdate(runtime, editor)),
+        "diffget" => command_diffgetput(runtime, access, command, false),
+        "diffput" => command_diffgetput(runtime, access, command, true),
         "resize" => access.with_ex_editor(|editor| command_resize(runtime, editor, command)),
         "wincmd" => access.with_ex_editor(|editor| command_wincmd(runtime, editor, command)),
         "echohl" => access.with_ex_editor(|editor| command_echohl(runtime, editor, command)),
@@ -3829,9 +3766,20 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
                 flow
             }
         }
+        // `ex_wnext` with the previous-file direction (CMD_wNext): same
+        // write-then-move shape as `:wprevious`.
+        "wNext" => {
+            let flow = command_write(runtime, access, scope, lua, command);
+            if matches!(flow, Flow::Normal) && !runtime.write_silent_fail {
+                command_previous(runtime, access, scope, lua, command)
+            } else {
+                flow
+            }
+        }
         "!" => command_bang(runtime, access, scope, lua, command),
         "argdo" => command_argdo(runtime, access, scope, lua, command),
         "windo" => command_windo(runtime, access, scope, lua, command),
+        "tabdo" => command_tabdo(runtime, access, scope, lua, command),
         "put" => command_put(runtime, access, scope, lua, command),
         "print" => access.with_ex_editor(|editor| command_print(runtime, editor, command)),
         "delete" => access.with_ex_editor(|editor| command_delete(runtime, editor, command)),
@@ -3880,6 +3828,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "cexpr" | "cgetexpr" | "laddexpr" | "caddexpr" | "lexpr" | "lgetexpr" | "lcexpr" => {
             command_quickfix_expr(runtime, access, scope, lua, command)
         }
+        "vimgrep" | "vimgrepadd" | "lvimgrep" | "lvimgrepadd" => {
+            command_vimgrep(runtime, access, scope, lua, command)
+        }
         "cbuffer" | "cgetbuffer" | "lbuffer" | "lgetbuffer" | "caddbuffer" | "laddbuffer" => access
             .with_ex_editor(|editor| command_quickfix_buffer(runtime, editor, scope, lua, command)),
         "cfile" | "cgetfile" | "lfile" | "lgetfile" | "caddfile" | "laddfile" => {
@@ -3910,8 +3861,17 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         | "inoremap" | "cnoremap" | "lnoremap" | "tnoremap" | "unmap" | "nunmap" | "vunmap"
         | "xunmap" | "sunmap" | "ounmap" | "iunmap" | "cunmap" | "lunmap" | "tunmap"
         | "mapclear" | "nmapclear" | "vmapclear" | "xmapclear" | "smapclear" | "omapclear"
-        | "imapclear" | "cmapclear" | "lmapclear" | "tmapclear" => {
-            access.with_ex_editor(|editor| command_map(runtime, editor, scope, command))
+        | "imapclear" | "cmapclear" | "lmapclear" | "tmapclear" | "abbreviate" | "cabbrev"
+        | "cabclear" | "cnoreabbrev" | "cunabbrev" | "iabclear" | "inoreabbrev"
+        | "iunabbrev" | "noreabbrev" | "unabbreviate" => {
+            // The abbreviation family rides the mapping engine
+            // (`mapping.c:do_exmap`); `"iabbrev"` and `"abclear"` route
+            // through their own arm to the same `command_abbrev` path.
+            if crate::mapping::is_abbrev_command(command.command.name()) {
+                crate::builtins::mapping::command_abbrev(runtime, access, scope, command)
+            } else {
+                access.with_ex_editor(|editor| command_map(runtime, editor, scope, command))
+            }
         }
         "tag" | "tjump" | "tselect" | "tnext" | "tprevious" | "tNext" | "tfirst" | "trewind"
         | "tlast" | "pop" | "ltag" | "ptag" | "ptjump" | "ptnext" | "ptprevious" | "ptNext"
@@ -3930,7 +3890,17 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             ResolvedCommand::User(user_info) => {
                 command_invoke_user(runtime, access, scope, lua, &user_info.name, command)
             }
-            ResolvedCommand::Builtin(spec) => Flow::NotImplemented(spec.name.to_owned()),
+            // A builtin without a handler arm is not silently skipped: the
+            // command line names a command the editor does not carry, so it
+            // reports the standard unknown-command error rather than the
+            // function-call error (`swallow_error_message` renders a
+            // surviving `NotImplemented` as E117, which is reserved for
+            // genuine function-call and feature-scoped flows).
+            ResolvedCommand::Builtin(spec) => error_flow(
+                runtime,
+                "E492",
+                format!("Not an editor command: {}", spec.name),
+            ),
         },
     }
 }
@@ -4724,7 +4694,7 @@ impl RegexEngine for VimRegex {
             pattern.to_string_lossy().into_owned()
         };
         let program = compile_regex(&source, Magic::Magic)
-            .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+            .map_err(|error| EvalError::new(error.code(), 0, error.to_string()))?;
         Ok(ox_regex::exec(
             &program,
             &RegexText::new(text.to_string_lossy().into_owned()),
@@ -4740,7 +4710,7 @@ impl RegexEngine for VimRegex {
     ) -> ox_eval::Result<Option<(usize, usize)>> {
         let source = text.to_string_lossy().into_owned();
         let program = compile_regex(&pattern.to_string_lossy(), Magic::Magic)
-            .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+            .map_err(|error| EvalError::new(error.code(), 0, error.to_string()))?;
         let text = RegexText::new(source);
         let Some(position) = text.position(start) else {
             return Ok(None);
@@ -4763,7 +4733,7 @@ impl RegexEngine for VimRegex {
                         message: "lookaround suffix follows nothing",
                         ..
                     } => EvalError::new("E866", 0, "(NFA regexp) Misplaced @"),
-                    other => EvalError::new("E54", 0, other.to_string()),
+                    other => EvalError::new(other.code(), 0, other.to_string()),
                 },
             )?;
         let text = RegexText::new(source);
@@ -4791,7 +4761,7 @@ impl RegexEngine for VimRegex {
     ) -> ox_eval::Result<Vec<OxStr>> {
         let source = text.to_string_lossy().into_owned();
         let program = compile_regex(&pattern.to_string_lossy(), Magic::Magic)
-            .map_err(|error| EvalError::new("E54", 0, error.to_string()))?;
+            .map_err(|error| EvalError::new(error.code(), 0, error.to_string()))?;
         let regex_text = RegexText::new(source.clone());
         let mut result = Vec::new();
         let mut previous = 0;
@@ -4942,8 +4912,8 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
     // frame's lifetime.
     runtime.deferred_ops.push(Vec::new());
     let sid = function.context.sid;
-    let switched_script = sid != 0 && runtime.scripts.current_sid() != Some(sid);
-    let caller_script = scope.script.clone();
+    let caller_sid = runtime.scripts.current_sid();
+    let switched_script = sid != 0 && caller_sid != Some(sid);
     if sid != 0 {
         let name = runtime
             .scripts
@@ -4958,13 +4928,23 @@ pub(crate) fn call_user_function_with_self<F: FileIO, E: ExEditorAccess>(
         );
     }
     if switched_script {
-        runtime.scripts.load_script_scope(sid, scope);
+        // Flush the outgoing frame's live `s:` map before replacing it: the
+        // defining script may still be executing further down the stack, in
+        // which case the registry copy predates its assignments and loading
+        // it would hide them (`s:has_ffi` going missing in `Ntest_override`).
+        runtime.scripts.switch_script_scope(caller_sid, sid, scope);
     }
     let flow = run_program(runtime, access, scope, lua, &parsed, 0, parsed.len());
     let deferred_flow = drain_frame_defers(runtime, access, scope, lua, first_line, last_line);
     if switched_script {
         runtime.scripts.store_script_scope(sid, scope);
-        scope.script = caller_script;
+        // Read the caller's map back from its SID instead of restoring a
+        // pre-call clone: a nested call into the caller's own script stores
+        // that script's updates in the registry on the way out.
+        match caller_sid {
+            Some(from) => runtime.scripts.load_script_scope(from, scope),
+            None => scope.script = ScopeMap::new(),
+        }
     }
     let flow = match flow {
         Flow::NotImplemented(name) => {
@@ -5067,7 +5047,9 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
         .to_string();
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
-    let sid = runtime.scripts.push_source(name, runtime.next_frame_order());
+    let sid = runtime
+        .scripts
+        .push_source(name, runtime.next_frame_order());
     let lines = expand_script_lines(&runtime.scripts, lines, sid);
     runtime.scripts.load_script_scope(sid, scope);
     if load_once {
@@ -5249,7 +5231,10 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
         let mut lines: Vec<&str> = if body.is_empty() {
             Vec::new()
         } else {
-            body.strip_suffix('\n').unwrap_or(body).split('\n').collect()
+            body.strip_suffix('\n')
+                .unwrap_or(body)
+                .split('\n')
+                .collect()
         };
         // Terminator (eval/vars.c:853-857): the bare marker, or under
         // `trim` the marker preceded by exactly the command chunk's own
@@ -5264,7 +5249,8 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
         let mut items = Vec::new();
         for line in lines {
             if trim && text_indent.is_none() && !line.is_empty() {
-                text_indent = Some(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()]);
+                text_indent =
+                    Some(&line[..line.len() - line.trim_start_matches([' ', '\t']).len()]);
             }
             let content = match text_indent {
                 Some(indent) => {
@@ -5908,7 +5894,7 @@ fn command_function_list<F: FileIO>(
         }
         let compiled = match compile_regex(&pattern, Magic::Magic) {
             Ok(compiled) => compiled,
-            Err(error) => return error_flow(runtime, "E54", error.to_string()),
+            Err(error) => return error_flow(runtime, error.code(), error.to_string()),
         };
         Some(compiled)
     };
@@ -6600,7 +6586,7 @@ fn command_global<F: FileIO, E: ExEditorAccess>(
     };
     let program_regex = match compile_regex(&pattern, Magic::Magic) {
         Ok(program) => program,
-        Err(error) => return error_flow(runtime, "E54", error.to_string()),
+        Err(error) => return error_flow(runtime, error.code(), error.to_string()),
     };
     let lines = match access.with_ex_editor(|editor| buffer_lines(editor, buffer)) {
         Ok(lines) => lines,
@@ -6723,6 +6709,12 @@ fn command_substitute<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     command: &ExCommand,
 ) -> Flow {
+    // `text_locked()` (`ex_docmd.c`): a substitute running inside another
+    // substitute's replacement expression must not change text. Without this
+    // guard a self-recursive replacement never terminates.
+    if runtime.textlock > 0 {
+        return error_flow(runtime, "E565", "Not allowed to change text or change window");
+    }
     let args = command.args.trim_start();
     let Some(delimiter) = args.chars().next() else {
         return error_flow(runtime, "E33", "No previous substitute regular expression");
@@ -6776,7 +6768,7 @@ fn command_substitute<F: FileIO, E: ExEditorAccess>(
     };
     let program_regex = match compile_regex(&compiled_pattern, Magic::Magic) {
         Ok(program) => program,
-        Err(error) => return error_flow(runtime, "E54", error.to_string()),
+        Err(error) => return error_flow(runtime, error.code(), error.to_string()),
     };
     let mut substitutions = Vec::new();
     let mut changed = false;
@@ -6967,10 +6959,13 @@ fn eval_substitute_expression<F: FileIO, E: ExEditorAccess>(
         submatches: Some(groups),
         escaped_exception: None,
     };
-    Evaluator::new(&mut host, &regex)
+    host.runtime.textlock += 1;
+    let result = Evaluator::new(&mut host, &regex)
         .eval(&parsed, scope)
         .map(|value| typval_to_text(&value))
-        .map_err(|error| eval_error_flow(host.runtime, error))
+        .map_err(|error| eval_error_flow(host.runtime, error));
+    host.runtime.textlock = host.runtime.textlock.saturating_sub(1);
+    result
 }
 
 /// The tabpage geometry every command that has to create one uses.
@@ -7126,41 +7121,6 @@ fn command_runtime<F: FileIO, E: ExEditorAccess>(
         }
     }
     Flow::Normal
-}
-/// `:iabbrev {lhs} {rhs}` (`ex_cmds.lua` `abbreviate`, insert-mode): define
-/// one insert-mode abbreviation. The other `:abbreviate` mode prefixes and
-/// `:unabbreviate` remain unrouted until the abbreviation command family
-/// gets its full parser.
-fn command_iabbrev<F: FileIO, E: ExEditorAccess>(
-    runtime: &mut ExRuntime<F>,
-    access: &E,
-    scope: &mut Scope,
-    command: &ExCommand,
-) -> Flow {
-    let args = command.args.trim();
-    let Some((lhs, rhs)) = args.split_once(char::is_whitespace) else {
-        return error_flow(runtime, "E471", "Argument required");
-    };
-    let (lhs, rhs) = (lhs.trim(), rhs.trim());
-    let action = match MappingAction::parse_rhs(
-        rhs,
-        &map_leader(scope, "mapleader"),
-        &map_leader(scope, "maplocalleader"),
-    ) {
-        Ok(action) => action,
-        Err(error) => return error_flow(runtime, "E224", error.to_string()),
-    };
-    let defined = access.with_ex_editor(|editor| {
-        editor
-            .mappings_mut()
-            .abbreviate(lhs, action, MapScope::Global, !command.bang)
-            .is_ok()
-    });
-    if defined {
-        Flow::Normal
-    } else {
-        error_flow(runtime, "E736", "Invalid abbreviation")
-    }
 }
 /// `:packadd[!] {name}` (`runtime.c` `ex_packadd`): search `'packpath'` for
 /// `pack/*/{start,opt}/{name}`, insert each found directory into
@@ -7466,6 +7426,99 @@ fn edit_winfixbuf_guard<F: FileIO, E: ExEditorAccess>(
         return None;
     }
     access.with_ex_editor(|editor| winfixbuf_blocks(runtime, editor, command.bang))
+}
+
+/// Displays a sourced-script path the way `:scriptnames` lists it:
+/// `home_replace` (`path.c`) swaps a `$HOME` prefix for `~`, so a script
+/// under the home directory lists as `~/home_script.vim`.
+fn home_replaced_name(name: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return name.to_owned();
+    };
+    let home = home.to_string_lossy();
+    let Some(rest) = name.strip_prefix(home.as_ref()) else {
+        return name.to_owned();
+    };
+    if rest.is_empty() {
+        return "~".to_owned();
+    }
+    if rest.starts_with('/') {
+        return format!("~{rest}");
+    }
+    name.to_owned()
+}
+
+/// `:scriptnames` (`runtime.c` `ex_scriptnames`): with no range and no
+/// argument list every sourced script as `%3d: name` in SID order, replacing
+/// a `$HOME` prefix with `~` and skipping nameless entries; with a count
+/// (`:scriptnames {id}`) or a range (`:{id}scriptnames`) edit that script,
+/// and with a bare argument edit that file. Upstream edits through
+/// `do_exedit`, the same path as `:edit`, so both edit arms delegate to
+/// [`command_edit`] with the resolved name as its argument.
+fn command_scriptnames<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    // No message-kind concept exists here (`:registers` and `:ls` both emit
+    // plain echo lines), so the listing uses the same text-message path
+    // rather than inventing a `list_cmd` kind.
+    if command.range.is_none() && command.count.is_none() && command.args.trim().is_empty() {
+        let entries: Vec<(Sid, String)> = runtime
+            .scripts
+            .script_names()
+            .into_iter()
+            .filter(|(_, name)| !name.is_empty())
+            .map(|(sid, name)| (sid, home_replaced_name(name)))
+            .collect();
+        for (sid, name) in entries {
+            access.with_ex_editor(|editor| {
+                push_text_message(editor, format!("{sid:3}: {name}"), false, false);
+            });
+        }
+        return Flow::Normal;
+    }
+    // `set_cmd_count` (`ex_docmd.c:1373-1393`) folds a post-command count
+    // into the address for non-line domains, so `:scriptnames {id}` arrives
+    // as `count` while `:{id}scriptnames` arrives as `range`; the count
+    // wins over the range, the same merge `command_sleep` applies.
+    if command.range.is_none() && command.count.is_none() {
+        // A bare argument names a file, exactly what `:edit` would open.
+        let edit = ExCommand {
+            args: command.args.clone(),
+            ..command.clone()
+        };
+        return command_edit(runtime, access, scope, lua, &edit);
+    }
+    let sid = match (command.range.is_some(), command.count) {
+        (_, Some(count)) => count,
+        (true, None) => match access.with_ex_editor(|editor| resolve_range_raw(editor, command)) {
+            Ok((_, end)) => match u64::try_from(end) {
+                Ok(sid) => sid,
+                Err(_) => return error_flow(runtime, "E16", "Invalid range"),
+            },
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+        (false, None) => return error_flow(runtime, "E474", "Invalid argument"),
+    };
+    // `correct_range` (`ex_docmd.c:3843-3853`): without `ZEROR` an address
+    // of 0 counts as 1, so `:0scriptnames` edits the first script.
+    let sid = if sid == 0 { 1 } else { sid };
+    let Some(name) = runtime
+        .scripts
+        .script_name(sid)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+    else {
+        return error_flow(runtime, "E474", "Invalid argument");
+    };
+    let edit = ExCommand {
+        args: name,
+        ..command.clone()
+    };
+    command_edit(runtime, access, scope, lua, &edit)
 }
 
 fn command_edit<F: FileIO, E: ExEditorAccess>(
@@ -9962,6 +10015,17 @@ fn fire_filetype_autocmd<F: FileIO, E: ExEditorAccess>(
     if runtime.autocmd_busy > 0 && !force && !runtime.active_autocmd.nested {
         return Flow::Normal;
     }
+    // `do_filetype_autocmd` (`autocmd.c:2595-2613`) marks the buffer before
+    // applying, so `did_filetype()` already answers true while the `FileType`
+    // handlers run; an empty value never marks. The mark survives an empty
+    // plan the way the upstream mark survives an `apply_autocmds` bypass.
+    if !filetype.is_empty() {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.mark_did_filetype();
+            }
+        });
+    }
     let name = access.with_ex_editor(|editor| {
         editor
             .buffer(buffer)
@@ -10156,16 +10220,10 @@ fn read_file_format(bytes: &[u8], formats: &str, fallback: &str, binary: bool) -
 /// 'mac' with CR, 'unix' with LF; the trailing EOL is written whenever
 /// 'endofline' is set or 'fixeol' fixes it, but never under 'binary'
 /// without 'endofline'.
-fn buffer_file_bytes(
-    editor: &Editor,
-    buffer: BufHandle,
-    bytes: &[u8],
-) -> Vec<u8> {
-    let bool_option = |name: &str, default: bool| {
-        match editor.options().get_buffer(buffer, name) {
-            Ok(OptionValue::Boolean(value)) => *value,
-            _ => default,
-        }
+fn buffer_file_bytes(editor: &Editor, buffer: BufHandle, bytes: &[u8]) -> Vec<u8> {
+    let bool_option = |name: &str, default: bool| match editor.options().get_buffer(buffer, name) {
+        Ok(OptionValue::Boolean(value)) => *value,
+        _ => default,
     };
     let fileformat = match editor.options().get_buffer(buffer, "fileformat") {
         Ok(OptionValue::String(value)) => value.clone(),
@@ -10189,7 +10247,11 @@ fn buffer_file_bytes(
             out.push(b'\r');
         }
     } else {
-        let separator = if fileformat == "dos" { b"\r\n".as_slice() } else { b"\n".as_slice() };
+        let separator = if fileformat == "dos" {
+            b"\r\n".as_slice()
+        } else {
+            b"\n".as_slice()
+        };
         let mut parts = body.split(|byte| *byte == b'\n').peekable();
         while let Some(part) = parts.next() {
             out.extend_from_slice(part);
@@ -10232,9 +10294,10 @@ pub fn detect_file_format(
             "fileformat",
             OptionValue::String(read.fileformat.to_owned()),
         );
-        let _ = editor
-            .options_mut()
-            .set_buffer(buffer, "endofline", OptionValue::Boolean(read.eol));
+        let _ =
+            editor
+                .options_mut()
+                .set_buffer(buffer, "endofline", OptionValue::Boolean(read.eol));
     }
     read
 }
@@ -10249,9 +10312,7 @@ fn read_file_text<F: FileIO, E: ExEditorAccess>(
     path: &Path,
 ) -> std::io::Result<Vec<u8>> {
     let bytes = runtime.scripts.io().read_bytes(path)?;
-    Ok(access.with_ex_editor(|editor| {
-        detect_file_format(editor, Some(buffer), &bytes).text
-    }))
+    Ok(access.with_ex_editor(|editor| detect_file_format(editor, Some(buffer), &bytes).text))
 }
 
 /// Splits read bytes into buffer lines. A trailing newline terminates the last
@@ -12328,6 +12389,10 @@ fn command_foldopen<F: FileIO>(
     let opening = command.command.name() == "foldopen";
     let recurse = command.bang;
     let method = current_fold_method(runtime, editor);
+    // Refresh the computed folds before opening/closing: method/shiftwidth
+    // changes leave a stale or empty cache, which misreports E490
+    // (builtins/fold.rs `refresh_for_window` mirrors `synced_folds`).
+    crate::builtins::fold::refresh_for_window(editor);
     let mut found = false;
     for lnum in first..=last {
         let position = FoldPosition::new(lnum - 1, 0);
@@ -12380,6 +12445,88 @@ fn command_diffoff<F: FileIO>(
 fn command_diffupdate<F: FileIO>(_runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
     crate::diffmode::diffupdate(editor);
     Flow::Normal
+}
+
+/// `:diffget [buf]` / `:diffput [buf]` (`ex_diffgetput`, diff.c:3679-3800):
+/// copy hunks from the other diff buffer into the current one (`get`) or
+/// from the current one into it (`put`). An all-digit argument is a buffer
+/// number; anything else resolves by name with the `:buffer` rules (E94
+/// when nothing matches, E93 when several do). E99-E103/E21/E793 come
+/// from the diff layer itself.
+fn command_diffgetput<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+    put: bool,
+) -> Flow {
+        let (first, last, addr_count) = match &command.range {
+        None => {
+            let line = access.with_ex_editor(|editor| {
+                editor
+                    .current_window()
+                    .and_then(|window| editor.window(window).ok())
+                    .map(|window| window.cursor.lnum)
+                    .unwrap_or(1)
+            });
+            (line, line, 0_usize)
+        }
+        Some(range) => {
+            // Unclamped: upstream lets `:diffget` address one line past the
+            // end (`:3,4diffget` on three lines fetches the trailing
+            // insertion); the diff layer bounds the range itself.
+            let (start, end) =
+                match access.with_ex_editor(|editor| resolve_range_raw(editor, command)) {
+                    Ok(range) => range,
+                    Err(message) => return error_flow(runtime, "E16", message),
+                };
+            let count = match range.kind {
+                RangeKind::Single => 1_usize,
+                RangeKind::WholeBuffer | RangeKind::Pair { .. } => 2_usize,
+            };
+            (start, end, count)
+        }
+    };
+    let argument = command.args.trim();
+    let target = if argument.is_empty() {
+        None
+    } else if let Ok(number) = argument.parse::<i64>()
+        && let Ok(handle) = BufHandle::try_from(number)
+    {
+        Some(handle)
+    } else if argument.parse::<i64>().is_ok() {
+        return error_flow(
+            runtime,
+            "E102",
+            format!("Can't find buffer \"{argument}\""),
+        );
+    } else {
+        let found = access.with_ex_editor(|editor| {
+            editor
+                .buffers()
+                .into_iter()
+                .filter(|handle| {
+                    editor
+                        .buffer(*handle)
+                        .is_ok_and(|buffer| buffer_name_matches(buffer.name(), argument))
+                })
+                .collect::<Vec<_>>()
+        });
+        match found.as_slice() {
+            [handle] => Some(*handle),
+            [] => {
+                return error_flow(runtime, "E94", format!("No matching buffer for {argument}"));
+            }
+            _ => {
+                return error_flow(runtime, "E93", format!("More than one match for {argument}"));
+            }
+        }
+    };
+    match access.with_ex_editor(|editor| {
+        crate::diffmode::diffgetput(editor, put, target, first, last, addr_count)
+    }) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, error.code, error.message),
+    }
 }
 
 /// `:hide` (`ex_docmd.c` `ex_hide`:5369): close a window without freeing its
@@ -13173,14 +13320,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         });
     }
 
-    let flow = fire_buffer_lifecycle(
-        runtime,
-        access,
-        scope,
-        lua,
-        &[Event::BufReadPost],
-        buffer,
-    );
+    let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPost], buffer);
     if !matches!(flow, Flow::Normal) {
         rollback_buffer_switch(access, buffer, &mut restore, false);
         return Err(LoadSwitchError::Flow(flow));
@@ -14031,9 +14171,10 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
             "fileformat",
             OptionValue::String(read.fileformat.to_owned()),
         );
-        let _ = editor
-            .options_mut()
-            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
+        let _ =
+            editor
+                .options_mut()
+                .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         let state = editor.buffer_mut(handle)?;
         state.set_name(OxStr::from(name));
         state.mark_saved();
@@ -14185,6 +14326,55 @@ fn command_windo<F: FileIO, E: ExEditorAccess>(
     Flow::Normal
 }
 
+/// Runs one Ex command for each tabpage in range (`ex_listdo` `CMD_tabdo`,
+/// ex_cmds2.c:461). Like `:windo`, tab visits never switch a window's
+/// buffer, so the 'winfixbuf' preamble does not apply (ex_listdo skips it
+/// for `CMD_windo` and `CMD_tabdo` alike).
+fn command_tabdo<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let nested = command.args.trim();
+    if nested.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let tabs = access.with_ex_editor(|editor| editor.tabpages());
+    if tabs.is_empty() {
+        return Flow::Normal;
+    }
+    let (start, end) = match access.with_ex_editor(|editor| resolve_range(editor, command)) {
+        Ok(range) => range,
+        Err(message) if message == "Invalid range" => {
+            return error_flow(runtime, "E493", "Backwards range given");
+        }
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let program = parse_cmdline_program(
+        &runtime.user_commands,
+        access.with_ex_editor(|editor| editor.current_buffer()),
+        nested,
+        runtime.scripts.current_line(),
+    );
+    for &tab in tabs
+        .iter()
+        .skip(start.saturating_sub(1))
+        .take(end.saturating_sub(start).saturating_add(1))
+    {
+        if access.with_ex_editor(|editor| editor.tabpage(tab).is_err()) {
+            break;
+        }
+        switch_current_tabpage(runtime, access, scope, lua, tab);
+        let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    Flow::Normal
+}
+
 /// Resolves a `:argdo` range against the argument list itself (entries,
 /// not buffer lines); without a range the whole list is addressed.
 fn resolve_arg_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usize), String> {
@@ -14226,8 +14416,36 @@ fn command_put<F: FileIO, E: ExEditorAccess>(
         return error_flow(runtime, "E749", "Empty buffer");
     };
     let register = command.register.unwrap_or('"');
-    if register == '=' && !command.args.is_empty() {
-        let value = match eval_text(runtime, access, scope, lua, &command.args) {
+    // `set_expr_line` (ex_docmd.c:1363-1366) keeps the last `=` source text,
+    // so a bare `:put =` re-evaluates it — and with nothing stored yet it is
+    // a silent no-op (`get_spec_reg` returns NULL and `do_put` returns
+    // before any error).
+    let args = if register == '=' && command.args.is_empty() {
+        match access
+            .with_ex_editor(|editor| editor.registers().expression_source().map(<[u8]>::to_vec))
+        {
+            Some(source) => match String::from_utf8(source) {
+                Ok(source) => source,
+                Err(_) => return Flow::Normal,
+            },
+            None => return Flow::Normal,
+        }
+    } else {
+        command.args.clone()
+    };
+    if register == '=' {
+        // Store the source text the way `set_expr_line` does, so `getreg('=')`
+        // and the next bare `:put =` see this same expression. An empty
+        // expression stores nothing: upstream only calls `set_expr_line`
+        // when text follows the `=`, leaving the previous source in place.
+        if !args.is_empty()
+            && let Ok(content) = RegisterContent::characterwise(args.as_bytes())
+        {
+            access.with_ex_editor(|editor| {
+                let _ = editor.registers_mut().set('=', content);
+            });
+        }
+        let value = match eval_text(runtime, access, scope, lua, &args) {
             Ok(value) => value,
             Err(flow) => return flow,
         };
@@ -14277,6 +14495,8 @@ fn command_delete<F: FileIO>(
         Ok(lines) => lines,
         Err(message) => return error_flow(runtime, "E749", message),
     };
+    let (start, end) = fold_line_count(start, end, command.count);
+    let end = end.min(lines.len().max(1));
     let selected = lines[start.saturating_sub(1)..end.min(lines.len())].to_vec();
     let content = match RegisterContent::linewise(selected) {
         Ok(content) => content,
@@ -14330,6 +14550,8 @@ fn command_yank<F: FileIO>(
         Ok(lines) => lines,
         Err(message) => return error_flow(runtime, "E749", message),
     };
+    let (start, end) = fold_line_count(start, end, command.count);
+    let end = end.min(lines.len().max(1));
     let content = match RegisterContent::linewise(
         lines[start.saturating_sub(1)..end.min(lines.len())].to_vec(),
     ) {
@@ -14520,7 +14742,7 @@ fn command_sort<F: FileIO>(
             let compiled = pattern_with_case(pat, ignorecase);
             match compile_regex(&compiled, Magic::Magic) {
                 Ok(program) => Some(program),
-                Err(error) => return error_flow(runtime, "E54", error.to_string()),
+                Err(error) => return error_flow(runtime, error.code(), error.to_string()),
             }
         }
     };
@@ -15376,6 +15598,71 @@ fn command_filetype<F: FileIO, E: ExEditorAccess>(
     }
 }
 
+/// `:setfiletype` (`ex_docmd.c` `ex_setfiletype`).
+///
+/// A silent no-op while the buffer's `did_filetype` flag is set; otherwise a
+/// buffer-local `filetype` write through the `:set` path, so the same
+/// `FileType` autocmd firing applies. A `FALLBACK ` prefix leaves the flag
+/// clear afterwards so a later plain `:setfiletype` still applies; any other
+/// value must satisfy upstream `valid_filetype` or the write fails with
+/// `E474` exactly like the option layer rejects it.
+fn command_setfiletype<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+    if let Some(buffer) = buffer
+        && access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.did_filetype())
+        })
+    {
+        return Flow::Normal;
+    }
+    let mut arg = command.args.trim();
+    let fallback = match arg.strip_prefix("FALLBACK ") {
+        Some(rest) => {
+            arg = rest;
+            true
+        }
+        None => false,
+    };
+    if !valid_filetype_name(arg) {
+        return error_flow(runtime, "E474", "Invalid argument");
+    }
+    let flow = command_set(
+        runtime,
+        access,
+        scope,
+        lua,
+        &format!("filetype={arg}"),
+        SetLayer::Local,
+    );
+    if fallback
+        && matches!(flow, Flow::Normal)
+        && let Some(buffer) = buffer
+    {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.clear_did_filetype();
+            }
+        });
+    }
+    flow
+}
+
+/// Upstream `valid_filetype` (`optionstr.c`): a filetype name is ASCII
+/// alphanumeric plus `.`, `-`, `_`. `ex_setfiletype` reaches the option layer
+/// only with such a name, otherwise it fails with `E474`.
+fn valid_filetype_name(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+}
+
 /// `do_doautocmd("filetypedetect BufRead", true, NULL)` from `ex_filetype`:
 /// re-fire the `filetypedetect` augroup's `BufRead` autocommands against the
 /// current buffer. An absent group has nothing to fire.
@@ -15567,7 +15854,24 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
     // inside the callee, so the steady-state cost is flag checks.
     // `autocmd_busy` (`autocmd.c:1657`): one plan counts as one busy span,
     // matching `apply_autocmds` which sets and restores it around the group.
+    // `apply_autocmds` entry/exit (`autocmd.c:1697-1704,1814-1821`): the
+    // outermost batch that actually runs resets the current buffer's
+    // `did_filetype` mark. A `FileType` fire keeps its mark: `fire` marked
+    // before running this plan, and upstream re-marks for the event right
+    // after its own entry reset.
+    let outermost = runtime.autocmd_busy == 0;
+    let runs = !plan.ready.is_empty();
+    let in_filetype_fire = runtime.filetype_autocmd_depth > 0;
     runtime.autocmd_busy += 1;
+    if outermost && runs && !in_filetype_fire {
+        access.with_ex_editor(|editor| {
+            if let Some(buffer) = editor.current_buffer()
+                && let Ok(state) = editor.buffer_mut(buffer)
+            {
+                state.clear_did_filetype();
+            }
+        });
+    }
     let mut flow = Flow::Normal;
     for action in plan.ready {
         if !access.with_ex_editor(|editor| editor.autocmds().is_entry_live(action.entry_id)) {
@@ -15649,7 +15953,8 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
                 // An uncaught `:throw` displays E605 *and* still aborts
                 // (`bufwrite.c:1861-1866`); other displayed errors are
                 // swallowed and the remaining autocmds run.
-                if matches!(&action_flow, Flow::Exception(exception) if matches!(exception.kind, VimExceptionKind::Throw)) {
+                if matches!(&action_flow, Flow::Exception(exception) if matches!(exception.kind, VimExceptionKind::Throw))
+                {
                     flow = action_flow;
                     break;
                 }
@@ -15660,6 +15965,20 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
         }
     }
     runtime.autocmd_busy -= 1;
+    // Upstream resets unconditionally here (`autocmd.c:1814-1821`), with no
+    // event carve-out: a top-level `:setf` whose `FileType` handlers ran
+    // answers `did_filetype() == 0` afterwards, while the no-handler bypass
+    // (`runs == false`) keeps the mark. The entry carve-out above is what
+    // lets the handlers themselves still observe the mark.
+    if runtime.autocmd_busy == 0 && runs {
+        access.with_ex_editor(|editor| {
+            if let Some(buffer) = editor.current_buffer()
+                && let Ok(state) = editor.buffer_mut(buffer)
+            {
+                state.clear_did_filetype();
+            }
+        });
+    }
     flow
 }
 
@@ -16979,15 +17298,13 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
     let caller_script = scope.script.clone();
     if !definition.keepscript && sid != 0 {
         let name = format!("command {name}");
-        runtime
-            .scripts
-            .push_alias_source(
-                sid,
-                runtime.scripts.current_seq(),
-                0,
-                name,
-                runtime.next_frame_order(),
-            );
+        runtime.scripts.push_alias_source(
+            sid,
+            runtime.scripts.current_seq(),
+            0,
+            name,
+            runtime.next_frame_order(),
+        );
         if switched {
             runtime.scripts.load_script_scope(sid, scope);
         }
@@ -19063,6 +19380,18 @@ fn resolve_range_raw(editor: &Editor, command: &ExCommand) -> Result<(usize, usi
     Ok((start, end))
 }
 
+/// `set_cmd_count` (`ex_docmd.c:1373-1393`) for line-addressed commands: a
+/// post-command count starts at the range end and extends it, so `:delete 2`
+/// covers two lines from the cursor and `:1,2delete 3` covers three from
+/// line 2. Callers clamp the result to the buffer like the range itself.
+fn fold_line_count(start: usize, end: usize, count: Option<u64>) -> (usize, usize) {
+    let Some(count) = count else {
+        return (start, end);
+    };
+    let extra = usize::try_from(count).unwrap_or(usize::MAX).saturating_sub(1);
+    (end, end.saturating_add(extra))
+}
+
 /// The `.` and `$` values for one address domain.
 ///
 /// `get_address` resolves both per `addr_type` (`ex_docmd.c:3435-3470` for
@@ -19193,6 +19522,14 @@ fn check_address_domain(editor: &Editor, command: &ExCommand) -> Result<(), Stri
         return Err("Invalid range".to_owned());
     }
     let (_, limit) = address_domain_bounds(editor, addr_type);
+    // `invalid_range` (ex_docmd.c:3762-3764): `:diffget`/`:diffput` accept
+    // one line past the end of the buffer (`:3,4diffget` on three lines
+    // fetches the trailing insertion); every other line command stops at
+    // the last line.
+    let limit = match command.command.name() {
+        "diffget" | "diffput" => limit.saturating_add(1),
+        _ => limit,
+    };
     if end > limit {
         return Err("Invalid range".to_owned());
     }
@@ -19311,11 +19648,7 @@ struct IfBranch {
 /// the depth-0 `endif` position. `terminated == None` means the program
 /// ended inside the block — upstream still picks and runs a branch from
 /// the markers before reporting the missing closer.
-fn if_markers(
-    program: &[Instruction],
-    open: usize,
-    limit: usize,
-) -> (Vec<usize>, Option<usize>) {
+fn if_markers(program: &[Instruction], open: usize, limit: usize) -> (Vec<usize>, Option<usize>) {
     let mut depth = 0usize;
     let mut markers = Vec::new();
     let mut index = open + 1;
@@ -19462,6 +19795,19 @@ pub(crate) fn render_command(command: &ExCommand) -> String {
     text.push_str(command.command.name());
     if command.bang {
         text.push('!');
+    }
+    // The register is part of the command text: function bodies store the
+    // rendered `source`, so dropping it would re-parse `:put =expr` as the
+    // unnamed register with trailing text. A bare `=` register renders its
+    // `=` directly against its expression (`:put =1+1` re-parses to the same
+    // register and argument); any other register renders with a separator.
+    if let Some(register) = command.register {
+        if register == '=' {
+            text.push_str(" =");
+        } else {
+            text.push(' ');
+            text.push(register);
+        }
     }
     if !command.args.is_empty() {
         text.push(' ');
@@ -21090,6 +21436,256 @@ fn command_quickfix_expr<F: FileIO, E: ExEditorAccess>(
     access.with_ex_editor(|editor| {
         command_quickfix_apply(runtime, editor, &items, command.command.name())
     })
+}
+
+/// Lines of the file `name` for `:vimgrep`: the loaded buffer's text when a
+/// buffer already carries that name (upstream searches the loaded buffer),
+/// otherwise the file on disk (`load_dummy_buffer` + `readfile`). `None`
+/// when the file cannot be read at all.
+fn read_vimgrep_file_lines<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    name: &str,
+) -> Option<Vec<Vec<u8>>> {
+    if let Some(handle) = access.with_ex_editor(|editor| {
+        editor.buffers().into_iter().find(|handle| {
+            editor
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+        })
+    }) && let Ok(lines) = access.with_ex_editor(|editor| buffer_lines(editor, handle)) {
+        return Some(lines);
+    }
+    let bytes = runtime
+        .scripts
+        .io()
+        .read_bytes(std::path::Path::new(name))
+        .ok()?;
+    Some(
+        bytes
+            .split(|byte| *byte == b'\n')
+            .map(|line| {
+                line.strip_suffix(b"\r").map_or_else(
+                    || line.to_vec(),
+                    <[u8]>::to_vec,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Finds the buffer named `name`, creating an unloaded one when absent so a
+/// later jump can load it on demand. Mirrors the `buflist_findnr` /
+/// `buflist_new` half of `parse_items_efm`'s `EditorEfmContext`, which lives
+/// in the quickfix module and stays the single owner of that logic.
+fn ensure_vimgrep_buffer<E: ExEditorAccess>(access: &E, name: &str) -> Option<BufHandle> {
+    access.with_ex_editor(|editor| {
+        if let Some(handle) = editor.buffers().into_iter().find(|handle| {
+            editor
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
+        }) {
+            return Some(handle);
+        }
+        let handle = editor.create_buffer(true).ok()?;
+        editor
+            .buffer_mut(handle)
+            .ok()
+            .map(|state| state.set_name(OxStr::from(name)))?;
+        Some(handle)
+    })
+}
+
+/// `:vimgrep` / `:vimgrepadd` (`:lvimgrep` / `:lvimgrepadd` for the location
+/// list): search files for a pattern and collect the matches (`ex_vimgrep`,
+/// quickfix.c:5836-5927). The `f` flag currently matches as a regular
+/// expression (upstream runs a fuzzy matcher): the flag parses, only that
+/// flag's matching differs. Without `!`, a 'winfixbuf' window refuses
+/// outright (`check_can_set_curbuf_forceit`, window.c:216-224); the jump at
+/// the end goes through the usual quickfix jump, which carries its own
+/// winfixbuf handling.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the vimgrep driver mirrors ex_vimgrep's phase order in one flow"
+)]
+fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    _scope: &mut Scope,
+    _lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let name = command.command.name();
+    let qf_scope = access.with_ex_editor(|editor| quickfix_scope(editor, name));
+    let add = name.contains("add");
+    if !command.bang
+        && access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer())
+    {
+        return error_flow(
+            runtime,
+            "E1513",
+            "Cannot switch buffer. 'winfixbuf' is enabled",
+        );
+    }
+    let Some(split) = ox_excmd::split_vimgrep_args(&command.args) else {
+        return error_flow(runtime, "E682", "Invalid search pattern or delimiter");
+    };
+    // An empty pattern reuses the last search pattern (`vgr_init_regmatch`);
+    // with none recorded that is E35, exactly like `:put /` with no history.
+    let pattern = if split.pattern.is_empty() {
+        match access.with_ex_editor(|editor| {
+            editor
+                .registers()
+                .get('/')
+                .map(|content| content.cloned())
+        }) {
+            Ok(Some(content)) => {
+                let bytes = content.getreg_bytes();
+                match String::from_utf8(bytes.to_vec()) {
+                    Ok(text) if !text.is_empty() => text,
+                    _ => {
+                        return error_flow(runtime, "E35", "No previous regular expression");
+                    }
+                }
+            }
+            _ => return error_flow(runtime, "E35", "No previous regular expression"),
+        }
+    } else {
+        split.pattern.to_owned()
+    };
+    if split.files.is_empty() {
+        return error_flow(runtime, "E683", "File name missing or invalid pattern");
+    }
+    let program = match compile_regex(&pattern, Magic::Magic) {
+        Ok(program) => program,
+        Err(error) => return error_flow(runtime, error.code(), error.to_string()),
+    };
+    let mut tomatch = match &command.range {
+        None => usize::MAX,
+        Some(_) => match access.with_ex_editor(|editor| resolve_range(editor, command)) {
+            Ok((_, end)) => end.max(1),
+            Err(message) => return error_flow(runtime, "E16", message),
+        },
+    };
+    // A replacing command opens a fresh list up front; an `add` command
+    // appends to the current one, creating it when the stack is empty
+    // (`ex_vimgrep`: a new list unless adding onto a non-empty one) — so a
+    // no-match search still leaves the new empty list current.
+    access.with_ex_editor(|editor| {
+        let stack = qf_scope.stack_mut(editor);
+        if !add || stack.current().is_none() {
+            stack.push(OxStr::from(format!(":{name}").as_str()));
+        }
+    });
+    let mut entries: Vec<crate::quickfix::QuickfixItem> = Vec::new();
+    for file in crate::arglist::split_file_list(split.files) {
+        if tomatch == 0 {
+            break;
+        }
+        let mut names =
+            crate::fs_builtins::expand_glob(runtime.scripts.io(), &file, false);
+        if names.is_empty() {
+            names.push(file);
+        }
+        for name in names {
+            if tomatch == 0 {
+                break;
+            }
+            let Some(lines) = read_vimgrep_file_lines(runtime, access, &name) else {
+                // `vgr_process_files`: a file that cannot be opened is
+                // reported and skipped, not fatal (`smsg("Cannot open
+                // file")`; the trailing E480 covers a fully empty list).
+                access.with_ex_editor(|editor| {
+                    push_text_message(editor, format!("Cannot open file \"{name}\""), false, true);
+                });
+                continue;
+            };
+            let mut handle: Option<BufHandle> = None;
+            for (index, line) in lines.iter().enumerate() {
+                if tomatch == 0 {
+                    break;
+                }
+                let text = RegexText::new(String::from_utf8_lossy(line).into_owned());
+                let lnum = index + 1;
+                let mut cursor = 0_usize;
+                loop {
+                    let Some(position) = text.position(cursor) else {
+                        break;
+                    };
+                    let Some(found) = regex_exec_at(&program, &text, position) else {
+                        break;
+                    };
+                    if handle.is_none() {
+                        handle = ensure_vimgrep_buffer(access, &name);
+                    }
+                    entries.push(crate::quickfix::QuickfixItem {
+                        bufnr: handle.map_or(0, i64::from),
+                        module: OxStr::from(""),
+                        lnum: i64::try_from(lnum).unwrap_or(i64::MAX),
+                        col: i64::try_from(found.start.byte.saturating_add(1))
+                            .unwrap_or(i64::MAX),
+                        end_lnum: i64::try_from(lnum).unwrap_or(i64::MAX),
+                        end_col: i64::try_from(found.end.byte.saturating_add(1))
+                            .unwrap_or(i64::MAX),
+                        vcol: 0,
+                        nr: 0,
+                        pattern: OxStr::from(""),
+                        text: OxStr::from(line.as_slice()),
+                        item_type: OxStr::from(""),
+                        valid: true,
+                        user_data: Typval::Special(Special::Null),
+                    });
+                    tomatch -= 1;
+                    if tomatch == 0 {
+                        break;
+                    }
+                    // Without `g` only the first match per line is listed;
+                    // `col == endcol` steps one byte past a zero-width match
+                    // so `^`/`$` cannot loop forever (vgr_match_buflines).
+                    if !split.global {
+                        break;
+                    }
+                    cursor = found.end.byte + usize::from(found.end.byte == found.start.byte);
+                    if cursor > line.len() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    access.with_ex_editor(|editor| {
+        if let Some(list) = qf_scope.stack_mut(editor).current_mut() {
+            if add {
+                list.append_items(entries);
+            } else {
+                list.set_items(entries);
+            }
+        }
+    });
+    let empty = access.with_ex_editor(|editor| {
+        qf_scope
+            .stack(editor)
+            .and_then(crate::quickfix::QuickfixStack::current)
+            .is_none_or(|list| list.items().is_empty())
+    });
+    if empty {
+        return error_flow(runtime, "E480", format!("No match: {pattern}"));
+    }
+    if split.nojump {
+        return Flow::Normal;
+    }
+    match access.with_ex_editor(|editor| {
+        crate::quickfix::jump(
+            editor,
+            runtime.scripts.io(),
+            qf_scope,
+            crate::quickfix::QuickfixMove::First,
+            command.bang,
+        )
+    }) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, error.code, error.message),
+    }
 }
 
 /// `:cbuffer`, `:cgetbuffer`, `:caddbuffer`: load entries from lines of a

@@ -2824,6 +2824,163 @@ fn a_quit_inside_a_sourced_script_runs_the_exit_sequence() {
 }
 
 // ---------------------------------------------------------------------------
+// :scriptnames
+// Citations: runtime.c ex_scriptnames (listing loop, SID edit, E474);
+// ex_docmd.c set_cmd_count (post-command count folds into the address),
+// correct_range (address 0 counts as 1 without ZEROR).
+// ---------------------------------------------------------------------------
+
+/// `:scriptnames` lists every sourced script as `%3d: name` in SID order.
+/// Upstream: `runtime.c` `ex_scriptnames` listing loop.
+#[test]
+fn scriptnames_lists_sourced_scripts_in_sid_order() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_script(&editor, "b.vim", "let g:xb = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["  1: a.vim", "  2: b.vim"]);
+}
+
+/// `:scriptnames` replaces a `$HOME` prefix with `~` (`home_replace` in
+/// `path.c`); without `$HOME` the path lists unchanged.
+#[test]
+fn scriptnames_replaces_home_prefix_with_tilde() {
+    let (editor, mut executor) = setup();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let (name, expected) = if home.is_empty() {
+        ("sn_home.vim".to_owned(), "sn_home.vim".to_owned())
+    } else {
+        (format!("{home}/sn_home.vim"), "~/sn_home.vim".to_owned())
+    };
+    executor
+        .execute_script(&editor, &name, "let g:xh = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames").unwrap();
+    assert_eq!(echo_messages(&editor), vec![format!("  1: {expected}")]);
+}
+
+/// `:scriptnames {id}` and `:{id}scriptnames` edit that script through the
+/// `:edit` path (`do_exedit`).
+#[test]
+fn scriptnames_count_and_range_edit_indexed_script() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("a.vim", "echo 'a'");
+    executor.scripts().io().insert("b.vim", "echo 'b'");
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_script(&editor, "b.vim", "let g:xb = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames 2").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "b.vim"
+    );
+    executor.execute_line(&editor, "1scriptnames").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "a.vim"
+    );
+}
+
+/// `:scriptnames {file}` edits that file, exactly what `:edit` would open.
+#[test]
+fn scriptnames_bare_filename_edits_file() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("other.vim", "echo 'other'");
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "scriptnames other.vim")
+        .unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "other.vim"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Script-local scope across nested calls
+// Upstream keeps one `s:` dict per script (`svars`), mutated in place, so a
+// function always sees its defining script's live variables — even when that
+// script is still executing further down the stack. Oxvim mirrors the visible
+// map into `scope.script`, so the switch has to flush the outgoing frame into
+// its own SID before loading the incoming one; loading the registry copy
+// without flushing hides mid-execution assignments (`s:has_ffi` going
+// missing inside `Ntest_override`).
+// ---------------------------------------------------------------------------
+
+/// A function defined in a script observes that script's live `s:` map when
+/// called from another script's function while the defining script is still
+/// executing on the stack.
+#[test]
+fn nested_function_call_sees_defining_scripts_live_script_locals() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("inner.vim", "func Inner()\nreturn Outer()\nendfunc\n");
+    executor
+        .execute_script(
+            &editor,
+            "outer.vim",
+            "let s:token = 7\nfunc Outer()\nreturn s:token\nendfunc\nsource inner.vim\nlet g:seen = Inner()\n",
+        )
+        .unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"seen", 0)
+            .unwrap(),
+        &ox_types::Typval::Number(7)
+    );
+}
+
+/// `:scriptnames {id}` past the registry is E474 (`e_invarg`); the oracle
+/// prints `E474: Invalid argument` for both the count and the range form.
+#[test]
+fn scriptnames_out_of_range_id_reports_invalid_argument() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    for line in ["scriptnames 99", "99scriptnames"] {
+        let err = executor.execute_line(&editor, line).unwrap_err();
+        match err {
+            ExecError::Vim(exception) => {
+                assert_eq!(exception.kind, VimExceptionKind::Error("E474".to_owned()));
+                assert_eq!(exception.emsg_text(), "E474: Invalid argument");
+            }
+            other => panic!("expected E474, got {other:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // :command definition / bang replacement / execution / deletion
 // Citations: ex_docmd.c ex_command (E174, E183), test_usercommands.vim
 // ---------------------------------------------------------------------------
@@ -9366,10 +9523,7 @@ fn depth_zero_script_error_displays_and_aborts() {
             "call NoSuchFunc123()\nlet g:after = 1\n",
         )
         .unwrap_err();
-    assert!(
-        error.to_string().contains("NoSuchFunc123"),
-        "got {error}"
-    );
+    assert!(error.to_string().contains("NoSuchFunc123"), "got {error}");
     assert!(!global_flag(&executor, "after"));
     assert!(executor.did_emsg());
 }

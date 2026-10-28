@@ -1065,10 +1065,10 @@ fn global_menu_cleanup_succeeds_for_empty_menu_state() {
 
     exec.execute_line(&editor, "aunmenu *").unwrap();
     exec.execute_line(&editor, "tlunmenu *").unwrap();
-    assert!(matches!(
-        exec.execute_line(&editor, "aunmenu File.Open"),
-        Err(crate::ExecError::NotImplemented(command)) if command == "aunmenu"
-    ));
+    // A builtin without a handler arm reports the standard unknown-command
+    // error rather than a function-call error.
+    let result = exec.execute_line(&editor, "aunmenu File.Open");
+    assert_vim_error(result, "E492");
 }
 
 // ex_docmd.c:ex_echo — `:echo "hello"` produces an Echo message without
@@ -1882,17 +1882,21 @@ fn highlight_default_and_link_forms_retain_definitions() {
 // ── unsupported-command NotImplemented identity ────────────────────────
 
 // ex_docmd.c:do_one_cmd dispatch — a builtin command not in the handler
-// table returns NotImplemented(name) rather than a silent no-op.
+// table reports the standard unknown-command error rather than a silent
+// no-op or a function-call error.
+// ":sort" used to stand in here; it is dispatched now, so the probe
+// moved to ":move", which the handler table still does not carry.
 #[test]
-fn unimplemented_builtin_returns_not_implemented() {
+fn unimplemented_builtin_reports_unknown_command_error() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
-    // ":sort" used to stand in here; it is dispatched now, so the probe
-    // moved to ":move", which the handler table still does not carry.
     let err = exec.execute_line(&editor, "move").unwrap_err();
     match err {
-        ExecError::NotImplemented(name) => assert_eq!(name, "move"),
-        other => panic!("expected NotImplemented, got {other:?}"),
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E492".to_owned()));
+            assert_eq!(exception.emsg_text(), "E492: Not an editor command: move");
+        }
+        other => panic!("expected E492, got {other:?}"),
     }
 }
 
@@ -2303,6 +2307,125 @@ fn put_expression_evaluates_and_inserts_expression_register() {
     assert_eq!(text.line(2).unwrap(), b"screen too small");
 }
 
+/// `:put ={expr}` keeps the expression register form anywhere on the line:
+/// an indented command and one following a bar both parse the `=` rest as
+/// the expression instead of raising `E488: Trailing characters`.
+#[test]
+fn put_expression_parses_with_indent_and_after_bar() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['do'])")
+        .unwrap();
+    exec.execute_line(&editor, "  put =1+1").unwrap();
+    exec.execute_line(&editor, "echo 1 | put =2+2").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    // `:put` inserts after the cursor line, so the second put lands first.
+    assert_eq!(text.line(1).unwrap(), b"do");
+    assert_eq!(text.line(2).unwrap(), b"4");
+    assert_eq!(text.line(3).unwrap(), b"2");
+}
+
+/// A bare `:put =` evaluates the previously stored expression if there is
+/// one, and is a silent no-op otherwise (upstream `get_spec_reg` returns
+/// NULL instead of raising E353).
+#[test]
+fn put_empty_expression_reuses_stored_expression() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['do'])")
+        .unwrap();
+    exec.execute_line(&editor, "put =").unwrap();
+    exec.execute_line(&editor, "put =40+2").unwrap();
+    exec.execute_line(&editor, "put =").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.line(2).unwrap(), b"42");
+    assert_eq!(text.line(3).unwrap(), b"42");
+    assert_eq!(text.line_count(), 3);
+}
+
+/// `parse_register` only takes a digit as a register when the command has
+/// no count (`ex_docmd.c:1352`): `:delete 2` deletes two lines instead of
+/// yanking one line into register `2`.
+#[test]
+fn delete_leading_digit_is_count_not_register() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['a', 'b', 'c', 'd'])")
+        .unwrap();
+    exec.execute_line(&editor, "delete 2").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.line_count(), 2);
+    assert_eq!(text.line(1).unwrap(), b"c");
+}
+
+/// `:tabdo` runs its nested command once per tabpage and leaves the cursor
+/// on the last tabpage visited.
+#[test]
+fn tabdo_runs_nested_command_in_each_tabpage() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "tabdo let g:seen = get(g:, 'seen', []) + [tabpagenr()]")
+        .unwrap();
+
+    let seen = exec.scope().get_scoped(ScopeKind::Global, b"seen", 0);
+    let seen = match seen {
+        Ok(Typval::List(reference)) => reference
+            .borrow()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Typval::Number(number) => Some(*number),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected g:seen list, got {other:?}"),
+    };
+    assert_eq!(seen, vec![1, 2, 3]);
+}
+
+/// `:vimgrep` collects one entry per matching line and jumps to the first
+/// match; without `!` a 'winfixbuf' window refuses with E1513.
+#[test]
+fn vimgrep_builds_list_and_jumps_to_first_match() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(root.join("b.txt"), "three\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let pattern = format!("vimgrep /t/ {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let ed = editor.editor();
+    let stack = ed.quickfix();
+    let list = stack.current().expect("quickfix list");
+    assert_eq!(list.items().len(), 2);
+    assert_eq!(list.items()[0].lnum, 2);
+    assert_eq!(list.items()[1].lnum, 1);
+    assert_eq!(
+        ed.current_buffer()
+            .and_then(|buffer| ed.buffer(buffer).ok())
+            .map(|state| state.name().to_string_lossy().into_owned()),
+        Some(root.join("a.txt").to_string_lossy().into_owned())
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn writable_vim_variables_match_upstream_table() {
     for name in [
@@ -2400,6 +2523,65 @@ fn luaeval_rejects_wrong_argument_counts() {
         .execute_line(&editor, "echo luaeval('1', 2, 3)")
         .unwrap_err();
     assert!(error.to_string().contains("E118"), "{}", error);
+}
+
+/// `function('g:Name')` accepts a `g:`-prefixed global function name the way
+/// upstream's `common_function` does (`eval/userfunc.c:1732-1735`, `1856`):
+/// the existence check runs on the stripped name while the reference keeps
+/// the written spelling, so the resulting Funcref calls the global function.
+/// `function('g:Nope')` is still `E700`, and a `g:`-prefixed builtin stays
+/// `E117` at call time because `call_func` consults the internal table with
+/// the original name.
+#[test]
+fn function_accepts_global_prefixed_function_name() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "global.vim",
+        "func GlobalFn(nr)\nreturn a:nr + 1\nendfunc\nlet g:made = function('g:GlobalFn')\nlet g:called = g:made(41)",
+    )
+    .unwrap();
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"called", 0)
+            .unwrap(),
+        &Typval::Number(42),
+    );
+    let made = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"made", 0)
+        .unwrap();
+    let ox_types::Typval::Funcref(made) = made else {
+        panic!("expected function('g:GlobalFn') to build a Funcref, got {made:?}");
+    };
+    assert_eq!(made.name.as_bytes(), b"g:GlobalFn");
+    assert!(made.args.is_empty());
+    assert!(made.dict.is_none());
+    assert!(made.registry.is_none());
+    let error = exec
+        .execute_line(&editor, "echo function('g:Nope')")
+        .unwrap_err();
+    assert!(error.to_string().contains("E700"), "{error}");
+    assert!(
+        error.to_string().contains("Unknown function: g:Nope"),
+        "{error}"
+    );
+}
+
+/// A `g:`-prefixed builtin name passes the `function()` existence check but
+/// stays uncallable: upstream reports `E117` with the written name, since the
+/// internal dispatch never sees the stripped spelling.
+#[test]
+fn function_of_global_prefixed_builtin_stays_uncallable() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "global.vim",
+        "let g:made = function('g:printf')\nlet g:called = g:made('%d', 1)",
+    )
+    .unwrap_err();
 }
 
 #[test]

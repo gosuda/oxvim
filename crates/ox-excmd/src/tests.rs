@@ -533,6 +533,53 @@ fn filter_modifier_pattern_may_abut_the_command() {
     assert_eq!(command.command.name(), "print");
 }
 
+// A colon may separate a modifier from the command it qualifies: upstream
+// re-skips space, tab and `:` at the top of every modifier iteration
+// (parse_command_modifiers, ex_docmd.c:2494-2499), so `:unsilent :norm! n`
+// parses as the `unsilent` modifier applied to `:norm! n` — not as a command
+// named "unsilent" with trailing text.
+#[test]
+fn modifier_followed_by_colon_still_qualifies_the_command() {
+    let command = parse_one("unsilent :echo 1");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Unsilent);
+    assert_eq!(command.command.name(), "echo");
+    assert_eq!(command.args, "1");
+}
+
+#[test]
+fn silent_bang_followed_by_colon_still_qualifies_the_command() {
+    let command = parse_one("silent! :norm! n");
+    assert_eq!(command.modifiers.len(), 1);
+    assert_eq!(command.modifiers[0].kind, ModifierKind::Silent);
+    assert!(command.modifiers[0].bang);
+    assert_eq!(command.command.name(), "normal");
+    assert_eq!(command.args, "n");
+}
+
+#[test]
+fn consecutive_colons_between_modifiers_are_skipped() {
+    let command = parse_one("silent :silent :echo 1");
+    let kinds: Vec<_> = command
+        .modifiers
+        .iter()
+        .map(|modifier| modifier.kind)
+        .collect();
+    assert_eq!(kinds, [ModifierKind::Silent, ModifierKind::Silent]);
+    assert_eq!(command.command.name(), "echo");
+}
+
+// `ea.cmd = skip_colon_white(ea.cmd, true)` (ex_docmd.c:2093-2094): a colon
+// may follow the address range, so `:1,2:s/x/y/` is a substitute over lines
+// 1-2, never a range-only command with the rest silently dropped.
+#[test]
+fn colon_between_range_and_command_is_skipped() {
+    let command = parse_one("1,2:s/x/y/");
+    assert_eq!(command.command.name(), "substitute");
+    assert_eq!(command.args, "/x/y/");
+    assert!(command.range.is_some());
+}
+
 #[test]
 fn filter_without_pattern_is_not_a_modifier() -> Result<(), String> {
     // ":filter" alone falls through to the builtin (NEEDARG -> E471).
@@ -975,10 +1022,14 @@ fn delete_extracts_register() {
     assert!(command.args.is_empty());
 }
 
+// Upstream never quotes a register in an Ex command: `separate_nextcmd`
+// turns the leading `"` into a comment before `parse_register` runs, so
+// `:delete "+` deletes into the unnamed register instead of register `+`.
 #[test]
-fn delete_extracts_quoted_register() {
+fn delete_initial_quote_is_a_comment_not_a_register() {
     let command = parse_one("delete \"+");
-    assert_eq!(command.register, Some('+'));
+    assert_eq!(command.register, None);
+    assert!(command.args.is_empty());
 }
 
 #[test]
@@ -989,10 +1040,137 @@ fn delete_extracts_register_then_count() {
 }
 
 #[test]
+fn split_vimgrep_args_delimited_pattern() {
+    let split = split_vimgrep_args("/foo/ bar.txt").expect("pattern must split");
+    assert_eq!(split.pattern, "foo");
+    assert!(!split.global);
+    assert!(!split.nojump);
+    assert!(!split.fuzzy);
+    assert_eq!(split.files, "bar.txt");
+}
+
+#[test]
+fn split_vimgrep_args_flags() {
+    let split = split_vimgrep_args("/foo/gj a.txt b.txt").expect("pattern must split");
+    assert_eq!(split.pattern, "foo");
+    assert!(split.global);
+    assert!(split.nojump);
+    assert!(!split.fuzzy);
+    assert_eq!(split.files, "a.txt b.txt");
+}
+
+#[test]
+fn split_vimgrep_args_bare_word_has_no_flags() {
+    let split = split_vimgrep_args("foo bar.txt").expect("pattern must split");
+    assert_eq!(split.pattern, "foo");
+    assert!(!split.global);
+    assert_eq!(split.files, "bar.txt");
+}
+
+#[test]
+fn split_vimgrep_args_needs_files() {
+    assert!(split_vimgrep_args("/foo/").is_none());
+    assert!(split_vimgrep_args("").is_none());
+}
+
+#[test]
+fn split_vimgrep_args_unterminated_pattern_is_none() {
+    assert!(split_vimgrep_args("/foo bar.txt").is_none());
+}
+
+#[test]
 fn comment_after_delete_register_is_skipped() {
     let command = parse_one("delete a \" comment");
     assert_eq!(command.register, Some('a'));
     assert!(command.args.is_empty());
+}
+
+// `parse_register` (ex_docmd.c:1348-1370): a digit leading a count
+// command's argument is the count, never a register — `:delete 2` deletes
+// two lines exactly like upstream.
+#[test]
+fn delete_leading_digit_is_count_not_register() {
+    let command = parse_one("delete 2");
+    assert_eq!(command.register, None);
+    assert_eq!(command.count, Some(2));
+    assert!(command.args.is_empty());
+}
+
+// `:put` reads registers, so a digit names a register instead of the
+// missing count (`:put 2` reports the empty register, like upstream).
+#[test]
+fn put_leading_digit_is_register_not_count() {
+    let command = parse_one("put 2");
+    assert_eq!(command.register, Some('2'));
+    assert_eq!(command.count, None);
+}
+
+// `parse_register`'s `=` case (ex_docmd.c:1358-1366): the rest of the
+// argument is the expression, which is why `:put =lineA` parses in any
+// position while `:delete =x` reports the `=` as trailing characters.
+#[test]
+fn put_expression_register_consumes_rest_of_argument() {
+    let command = parse_one("put =lineA");
+    assert_eq!(command.register, Some('='));
+    assert_eq!(command.args, "lineA");
+}
+
+#[test]
+fn put_empty_expression_register_parses() {
+    let command = parse_one("put =");
+    assert_eq!(command.register, Some('='));
+    assert!(command.args.is_empty());
+}
+
+#[test]
+fn put_expression_with_comment_stops_at_quote() {
+    let command = parse_one("put =lineA \" comment");
+    assert_eq!(command.register, Some('='));
+    assert_eq!(command.args, "lineA");
+}
+
+#[test]
+fn put_expression_with_bar_splits_command() {
+    let commands = Parser::new().parse("put =1+1 | print").unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].register, Some('='));
+    assert_eq!(commands[0].args, "1+1");
+    assert_eq!(commands[1].command.name(), "print");
+}
+
+// Read-only registers (`/`, `#`, `.`, `%`, `:`, `=`) are valid for `:put` —
+#[test]
+fn put_accepts_read_only_registers() {
+    let command = parse_one("put /");
+    assert_eq!(command.register, Some('/'));
+    assert!(command.args.is_empty());
+}
+
+// — but not for `:delete`/`:yank`, where upstream leaves the name in the
+// argument and reports it as trailing characters (`E488: /x`).
+#[test]
+fn delete_rejects_read_only_registers() {
+    assert!(Parser::new().parse("delete /x").is_err());
+    assert!(Parser::new().parse("delete %").is_err());
+    assert!(Parser::new().parse("yank :").is_err());
+    assert!(Parser::new().parse("delete =x").is_err());
+}
+
+// `@` is not a valid yank register at all, so `:delete @` reports it as
+// trailing characters exactly like upstream.
+#[test]
+fn delete_rejects_at_register() {
+    assert!(Parser::new().parse("delete @").is_err());
+}
+
+// A bare register does not need separating whitespace; upstream consumes
+// exactly one character and reports the remainder as trailing characters
+// (`E488: Trailing characters: x`), never the whole argument.
+#[test]
+fn delete_bare_register_consumes_one_character() {
+    let error = Parser::new().parse("delete ax").unwrap_err();
+    assert_eq!(error.code, ErrorCode::E488);
+    assert!(error.message.contains("Trailing characters: x"));
 }
 
 #[test]

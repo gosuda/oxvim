@@ -101,10 +101,14 @@ fn global_missing_pattern_reports_e148() {
 
 #[test]
 fn global_invalid_regex_reports_e54() {
-    // Unbalanced `[` fails regex compilation (`regexp.c`).
+    // An unmatched `\(` fails regex compilation (`regexp.c`); a lone `[` is a
+    // literal bracket and must not fail.
     let (editor, _buffer, _window, mut executor) = setup("foo\nbar");
-    let error = executor.execute_line(&editor, r"g/[/d").unwrap_err();
+    let error = executor.execute_line(&editor, r"g/\(/d").unwrap_err();
     assert!(error.to_string().contains("E54"));
+    let (editor, _buffer, _window, mut executor) = setup("foo\nbar");
+    let error = executor.execute_line(&editor, r"g/[z-a]/d").unwrap_err();
+    assert!(error.to_string().contains("E944"));
 }
 
 #[test]
