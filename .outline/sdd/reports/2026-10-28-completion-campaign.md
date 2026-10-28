@@ -95,10 +95,13 @@ Six read-only scouts grouped the remaining failures from the logs. Measured caus
 
 Two more findings matter for the harness. Eight of the sixteen functional groups ended in `Process
 terminated due to timeout`, so the 4076-failure figure is a floor and the gate needs a longer or
-per-file run before its counts can be trusted. And the terminal surface is further along than
-`docs/compat.md` claims: `terminal_screen.rs` holds a VT emulator with scrollback, `job.rs` pumps pty
-output into it, and `editor.rs` projects rows into the buffer, so the oldtest Makefile path may work
-now and should be retried before any terminal work is scheduled.
+per-file run before its counts can be trusted.
+
+The terminal surface has the parts but not the wiring. `terminal_screen.rs` holds a VT emulator with
+scrollback, `job.rs` pumps pty output, and `editor.rs` projects rows into the buffer, yet a probe of
+`:terminal echo hello-from-terminal` followed by `getline(1, '$')` returns blank lines, so the child's
+output never reaches the buffer in headless mode. The next terminal slice is to trace that path from
+the pty read to the row projection, not to write a new emulator.
 
 ## Evidence
 
