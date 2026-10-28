@@ -208,6 +208,8 @@ pub struct OptionStore {
     global: HashMap<&'static str, OptionValue>,
     buffers: HashMap<BufHandle, HashMap<&'static str, OptionValue>>,
     windows: HashMap<WinHandle, HashMap<&'static str, OptionValue>>,
+    /// Bumped by every mutation so readers can cache a resolved view.
+    version: u64,
 }
 
 impl Default for OptionStore {
@@ -222,11 +224,22 @@ impl Default for OptionStore {
             global,
             buffers: HashMap::new(),
             windows: HashMap::new(),
+            version: 0,
         }
     }
 }
 
 impl OptionStore {
+    /// Monotonic counter incremented by every mutation.
+    ///
+    /// Readers that mirror the resolved option set, such as the Vimscript
+    /// `&opt` table, compare this stamp instead of rebuilding the mirror on
+    /// every call.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Creates a store initialized with every statically known upstream default.
     #[must_use]
     pub fn new() -> Self {
@@ -322,6 +335,7 @@ impl OptionStore {
         require_scope(metadata, OptionScope::Global)?;
         validate_value(metadata, &value)?;
         self.global.insert(metadata.name, value);
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -346,6 +360,7 @@ impl OptionStore {
         if !metadata.no_global() {
             self.global.insert(metadata.name, value);
         }
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -370,6 +385,7 @@ impl OptionStore {
             .entry(buffer)
             .or_default()
             .insert(metadata.name, value);
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -394,6 +410,7 @@ impl OptionStore {
             .entry(window)
             .or_default()
             .insert(metadata.name, value);
+        self.version = self.version.wrapping_add(1);
         Ok(())
     }
 
@@ -413,6 +430,7 @@ impl OptionStore {
         if self.buffers.get(&buffer).is_some_and(HashMap::is_empty) {
             self.buffers.remove(&buffer);
         }
+        self.version = self.version.wrapping_add(1);
         Ok(removed)
     }
 
@@ -432,12 +450,14 @@ impl OptionStore {
         if self.windows.get(&window).is_some_and(HashMap::is_empty) {
             self.windows.remove(&window);
         }
+        self.version = self.version.wrapping_add(1);
         Ok(removed)
     }
 
     /// Drops every local value owned by a wiped buffer.
     pub fn remove_buffer(&mut self, buffer: BufHandle) {
         self.buffers.remove(&buffer);
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Copies current global baselines for every buffer-scoped option that has
@@ -468,6 +488,7 @@ impl OptionStore {
         }
         if !overlay.is_empty() {
             self.buffers.insert(buffer, overlay);
+            self.version = self.version.wrapping_add(1);
         }
     }
 
@@ -495,6 +516,7 @@ impl OptionStore {
                 .collect();
             if !overlay.is_empty() {
                 self.windows.insert(window, overlay);
+                self.version = self.version.wrapping_add(1);
             }
         }
     }
@@ -502,6 +524,7 @@ impl OptionStore {
     /// Drops every local value owned by a closed window.
     pub fn remove_window(&mut self, window: WinHandle) {
         self.windows.remove(&window);
+        self.version = self.version.wrapping_add(1);
     }
 
     fn baseline(&self, metadata: &'static OptionMetadata) -> Result<&OptionValue, OptionError> {

@@ -3862,8 +3862,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         | "xunmap" | "sunmap" | "ounmap" | "iunmap" | "cunmap" | "lunmap" | "tunmap"
         | "mapclear" | "nmapclear" | "vmapclear" | "xmapclear" | "smapclear" | "omapclear"
         | "imapclear" | "cmapclear" | "lmapclear" | "tmapclear" | "abbreviate" | "cabbrev"
-        | "cabclear" | "cnoreabbrev" | "cunabbrev" | "iabclear" | "inoreabbrev"
-        | "iunabbrev" | "noreabbrev" | "unabbreviate" => {
+        | "cabclear" | "cnoreabbrev" | "cunabbrev" | "iabclear" | "inoreabbrev" | "iunabbrev"
+        | "noreabbrev" | "unabbreviate" => {
             // The abbreviation family rides the mapping engine
             // (`mapping.c:do_exmap`); `"iabbrev"` and `"abclear"` route
             // through their own arm to the same `command_abbrev` path.
@@ -6713,7 +6713,11 @@ fn command_substitute<F: FileIO, E: ExEditorAccess>(
     // substitute's replacement expression must not change text. Without this
     // guard a self-recursive replacement never terminates.
     if runtime.textlock > 0 {
-        return error_flow(runtime, "E565", "Not allowed to change text or change window");
+        return error_flow(
+            runtime,
+            "E565",
+            "Not allowed to change text or change window",
+        );
     }
     let args = command.args.trim_start();
     let Some(delimiter) = args.chars().next() else {
@@ -12459,7 +12463,7 @@ fn command_diffgetput<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     put: bool,
 ) -> Flow {
-        let (first, last, addr_count) = match &command.range {
+    let (first, last, addr_count) = match &command.range {
         None => {
             let line = access.with_ex_editor(|editor| {
                 editor
@@ -12494,11 +12498,7 @@ fn command_diffgetput<F: FileIO, E: ExEditorAccess>(
     {
         Some(handle)
     } else if argument.parse::<i64>().is_ok() {
-        return error_flow(
-            runtime,
-            "E102",
-            format!("Can't find buffer \"{argument}\""),
-        );
+        return error_flow(runtime, "E102", format!("Can't find buffer \"{argument}\""));
     } else {
         let found = access.with_ex_editor(|editor| {
             editor
@@ -12517,7 +12517,11 @@ fn command_diffgetput<F: FileIO, E: ExEditorAccess>(
                 return error_flow(runtime, "E94", format!("No matching buffer for {argument}"));
             }
             _ => {
-                return error_flow(runtime, "E93", format!("More than one match for {argument}"));
+                return error_flow(
+                    runtime,
+                    "E93",
+                    format!("More than one match for {argument}"),
+                );
             }
         }
     };
@@ -18365,6 +18369,62 @@ fn pull_scope_map_from_editor(
     refresh_scope_mirror_map(current, mirror, kind)
 }
 
+/// Rebuilds the mirrored `&g:`/`&l:` option tables from the option store.
+///
+/// Upstream resolves `&opt` through the live store on every read; this port
+/// keeps a resolved table in the scope, so it refreshes the table whenever the
+/// store's version moved. Rebuilding unconditionally cost about half a
+/// millisecond per Lua-to-Vimscript builtin call, because the table covers
+/// every option with its short name and aliases.
+fn mirror_options(editor: &Editor, scope: &mut Scope) {
+    scope.options_global.clear();
+    scope.options_local.clear();
+    for metadata in OPTION_METADATA {
+        let mut global = None;
+        let mut local = None;
+        if metadata.scopes.contains(&OptionScope::Global)
+            && let Ok(value) = editor.options().get_global(metadata.name)
+        {
+            global = Some(option_to_typval(value));
+        }
+        if let (Some(buffer), true) = (
+            editor.current_buffer(),
+            metadata.scopes.contains(&OptionScope::Buffer),
+        ) && let Ok(value) = editor.options().get_buffer(buffer, metadata.name)
+        {
+            local = Some(option_to_typval(value));
+        }
+        if let (Some(window), true) = (
+            editor.current_window(),
+            metadata.scopes.contains(&OptionScope::Window),
+        ) && let Ok(value) = editor.options().get_window(window, metadata.name)
+        {
+            local = local.or_else(|| Some(option_to_typval(value)));
+        }
+        if let Some(value) = global.clone() {
+            scope.set_option(EvalOptionScope::Global, metadata.name.as_bytes(), value);
+        }
+        if let Some(value) = local.clone() {
+            scope.set_option(EvalOptionScope::Local, metadata.name.as_bytes(), value);
+        }
+        // `&opt` expressions keep the spelling as written, so every accepted
+        // name (canonical, short, historical alias) must reach the value.
+        for name in metadata
+            .short_name
+            .iter()
+            .copied()
+            .chain(metadata.aliases.iter().copied())
+        {
+            if let Some(value) = global.as_ref() {
+                scope.set_option(EvalOptionScope::Global, name.as_bytes(), value.clone());
+            }
+            if let Some(value) = local.as_ref() {
+                scope.set_option(EvalOptionScope::Local, name.as_bytes(), value.clone());
+            }
+        }
+    }
+}
+
 pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Result<(), ExecError> {
     // Differential sync: a map whose stamp still matches the editor's
     // version is kept as-is, so shared Typval values — and the mutability
@@ -18428,58 +18488,21 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     ) {
         scope.replace_pair(ScopeKind::Vim, "_null_blob", Typval::Blob(Vec::new()));
     }
-    scope.registers.clear();
-    for name in "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/@".chars() {
-        if let Ok(Some(content)) = editor.registers().get(name) {
-            scope.set_register(&[name as u8], Typval::String(OxStr(content.to_bytes())));
+    let register_version = editor.registers().version();
+    if scope.synced.registers() != register_version {
+        scope.registers.clear();
+        for name in "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/@".chars() {
+            if let Ok(Some(content)) = editor.registers().get(name) {
+                scope.set_register(&[name as u8], Typval::String(OxStr(content.to_bytes())));
+            }
         }
+        refresh_special_registers(editor, scope);
+        scope.synced.set_registers(register_version);
     }
-    refresh_special_registers(editor, scope);
-    scope.options_global.clear();
-    scope.options_local.clear();
-    for metadata in OPTION_METADATA {
-        let mut global = None;
-        let mut local = None;
-        if metadata.scopes.contains(&OptionScope::Global)
-            && let Ok(value) = editor.options().get_global(metadata.name)
-        {
-            global = Some(option_to_typval(value));
-        }
-        if let (Some(buffer), true) = (
-            editor.current_buffer(),
-            metadata.scopes.contains(&OptionScope::Buffer),
-        ) && let Ok(value) = editor.options().get_buffer(buffer, metadata.name)
-        {
-            local = Some(option_to_typval(value));
-        }
-        if let (Some(window), true) = (
-            editor.current_window(),
-            metadata.scopes.contains(&OptionScope::Window),
-        ) && let Ok(value) = editor.options().get_window(window, metadata.name)
-        {
-            local = local.or_else(|| Some(option_to_typval(value)));
-        }
-        if let Some(value) = global.clone() {
-            scope.set_option(EvalOptionScope::Global, metadata.name.as_bytes(), value);
-        }
-        if let Some(value) = local.clone() {
-            scope.set_option(EvalOptionScope::Local, metadata.name.as_bytes(), value);
-        }
-        // `&opt` expressions keep the spelling as written, so every accepted
-        // name (canonical, short, historical alias) must reach the value.
-        for name in metadata
-            .short_name
-            .iter()
-            .copied()
-            .chain(metadata.aliases.iter().copied())
-        {
-            if let Some(value) = global.as_ref() {
-                scope.set_option(EvalOptionScope::Global, name.as_bytes(), value.clone());
-            }
-            if let Some(value) = local.as_ref() {
-                scope.set_option(EvalOptionScope::Local, name.as_bytes(), value.clone());
-            }
-        }
+    let option_version = editor.options().version();
+    if scope.synced.options() != option_version {
+        mirror_options(editor, scope);
+        scope.synced.set_options(option_version);
     }
     Ok(())
 }
@@ -19388,7 +19411,9 @@ fn fold_line_count(start: usize, end: usize, count: Option<u64>) -> (usize, usiz
     let Some(count) = count else {
         return (start, end);
     };
-    let extra = usize::try_from(count).unwrap_or(usize::MAX).saturating_sub(1);
+    let extra = usize::try_from(count)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(1);
     (end, end.saturating_add(extra))
 }
 
@@ -21453,7 +21478,8 @@ fn read_vimgrep_file_lines<F: FileIO, E: ExEditorAccess>(
                 .buffer(*handle)
                 .is_ok_and(|state| state.name().as_bytes() == name.as_bytes())
         })
-    }) && let Ok(lines) = access.with_ex_editor(|editor| buffer_lines(editor, handle)) {
+    }) && let Ok(lines) = access.with_ex_editor(|editor| buffer_lines(editor, handle))
+    {
         return Some(lines);
     }
     let bytes = runtime
@@ -21465,10 +21491,8 @@ fn read_vimgrep_file_lines<F: FileIO, E: ExEditorAccess>(
         bytes
             .split(|byte| *byte == b'\n')
             .map(|line| {
-                line.strip_suffix(b"\r").map_or_else(
-                    || line.to_vec(),
-                    <[u8]>::to_vec,
-                )
+                line.strip_suffix(b"\r")
+                    .map_or_else(|| line.to_vec(), <[u8]>::to_vec)
             })
             .collect(),
     )
@@ -21518,9 +21542,7 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
     let name = command.command.name();
     let qf_scope = access.with_ex_editor(|editor| quickfix_scope(editor, name));
     let add = name.contains("add");
-    if !command.bang
-        && access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer())
-    {
+    if !command.bang && access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer()) {
         return error_flow(
             runtime,
             "E1513",
@@ -21533,12 +21555,9 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
     // An empty pattern reuses the last search pattern (`vgr_init_regmatch`);
     // with none recorded that is E35, exactly like `:put /` with no history.
     let pattern = if split.pattern.is_empty() {
-        match access.with_ex_editor(|editor| {
-            editor
-                .registers()
-                .get('/')
-                .map(|content| content.cloned())
-        }) {
+        match access
+            .with_ex_editor(|editor| editor.registers().get('/').map(|content| content.cloned()))
+        {
             Ok(Some(content)) => {
                 let bytes = content.getreg_bytes();
                 match String::from_utf8(bytes.to_vec()) {
@@ -21582,8 +21601,7 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
         if tomatch == 0 {
             break;
         }
-        let mut names =
-            crate::fs_builtins::expand_glob(runtime.scripts.io(), &file, false);
+        let mut names = crate::fs_builtins::expand_glob(runtime.scripts.io(), &file, false);
         if names.is_empty() {
             names.push(file);
         }
@@ -21622,8 +21640,7 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
                         bufnr: handle.map_or(0, i64::from),
                         module: OxStr::from(""),
                         lnum: i64::try_from(lnum).unwrap_or(i64::MAX),
-                        col: i64::try_from(found.start.byte.saturating_add(1))
-                            .unwrap_or(i64::MAX),
+                        col: i64::try_from(found.start.byte.saturating_add(1)).unwrap_or(i64::MAX),
                         end_lnum: i64::try_from(lnum).unwrap_or(i64::MAX),
                         end_col: i64::try_from(found.end.byte.saturating_add(1))
                             .unwrap_or(i64::MAX),

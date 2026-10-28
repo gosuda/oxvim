@@ -94,15 +94,22 @@ impl RegisterContent {
             }
             let width = match first {
                 0xc2..=0xdf => {
-                    if line.get(index + 1).is_some_and(|byte| (0x80..=0xbf).contains(byte)) {
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    {
                         2
                     } else {
                         0
                     }
                 }
                 0xe0..=0xef => {
-                    if line.get(index + 1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
-                        && line.get(index + 2).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 2)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
                     {
                         3
                     } else {
@@ -110,9 +117,15 @@ impl RegisterContent {
                     }
                 }
                 0xf0..=0xf4 => {
-                    if line.get(index + 1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
-                        && line.get(index + 2).is_some_and(|byte| (0x80..=0xbf).contains(byte))
-                        && line.get(index + 3).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 2)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 3)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
                     {
                         4
                     } else {
@@ -509,6 +522,8 @@ pub struct Registers {
     /// means no staged write, so reads fall through to the window's
     /// alternate buffer.
     alternate_override: Option<Vec<u8>>,
+    /// Bumped by every mutation so the Vimscript register mirror can be cached.
+    version: u64,
 }
 
 impl Default for Registers {
@@ -518,6 +533,12 @@ impl Default for Registers {
 }
 
 impl Registers {
+    /// Monotonic counter incremented by every mutation.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Creates an empty register bank.
     #[must_use]
     pub fn new() -> Self {
@@ -531,12 +552,14 @@ impl Registers {
             command_line: None,
             insert_content: None,
             alternate_override: None,
+            version: 0,
         }
     }
 
     /// Stages raw `#` text for later buffer resolution, or clears the
     /// staged write with `None`.
     pub fn set_alternate_override(&mut self, staged: Option<Vec<u8>>) {
+        self.version = self.version.wrapping_add(1);
         self.alternate_override = staged;
     }
 
@@ -601,6 +624,7 @@ impl Registers {
                 // `y_regs[0]` for `"` and `finish_write_reg` keeps that
                 // pointer (`register.c:362-373, 2685-2694`).
                 if let Some(slot) = self.numbered.get_mut(0) {
+                    self.version = self.version.wrapping_add(1);
                     *slot = Some(content);
                 }
                 self.unnamed_target = Some(UnnamedTarget::Slot('0'));
@@ -630,9 +654,9 @@ impl Registers {
             // them fails yank-register validation
             // (`valid_yank_reg(name, true)`, `register.c:153-165`), which
             // surfaces as E354.
-            RegisterName::CommandLine
-            | RegisterName::InsertContent
-            | RegisterName::CurrentFile => Err(RegisterError::InvalidName(name)),
+            RegisterName::CommandLine | RegisterName::InsertContent | RegisterName::CurrentFile => {
+                Err(RegisterError::InvalidName(name))
+            }
             // `#` resolves against live buffers at read time, so a write
             // only stages the raw text; the read side resolves it against
             // the buffer list or treats empty text as cleared.
@@ -664,6 +688,7 @@ impl Registers {
     /// Records an ordinary yank in register `0` and points the unnamed
     /// register at it (`get_yank_register`'s `YREG_YANK` pointer update).
     pub fn yank(&mut self, content: RegisterContent) {
+        self.version = self.version.wrapping_add(1);
         if let Some(slot) = self.numbered.get_mut(0) {
             *slot = Some(content);
         }
@@ -689,6 +714,7 @@ impl Registers {
         }
         self.set(name, content)?;
         if let Some(target) = unnamed_pointer_name(parsed) {
+            self.version = self.version.wrapping_add(1);
             self.unnamed_target = Some(UnnamedTarget::Slot(target));
         }
         Ok(())
@@ -734,6 +760,7 @@ impl Registers {
     /// `y_previous = &y_regs[DELETION_REGISTER]` and
     /// `y_previous = &y_regs[1]` updates).
     pub fn delete(&mut self, content: RegisterContent) {
+        self.version = self.version.wrapping_add(1);
         let small = content.kind == RegisterKind::CharacterWise && content.lines.len() == 1;
         if small {
             self.small_delete = Some(content);
@@ -775,8 +802,8 @@ impl Registers {
     /// Returns [`RegisterError::InvalidName`] if `name` is not a supported
     /// register.
     pub fn delete_to(&mut self, name: char, content: RegisterContent) -> Result<(), RegisterError> {
-        let shift = name != '_'
-            && (content.kind == RegisterKind::LineWise || content.lines.len() > 1);
+        let shift =
+            name != '_' && (content.kind == RegisterKind::LineWise || content.lines.len() > 1);
         self.yank_to(name, content.clone())?;
         if shift {
             self.shift_numbered(content);
@@ -801,6 +828,8 @@ impl Registers {
     /// `#`, or an unsupported character — leaves the current target
     /// unchanged, like upstream's failed index lookup.
     pub fn set_unnamed_target(&mut self, name: char) {
+        self.version = self.version.wrapping_add(1);
+        self.version = self.version.wrapping_add(1);
         if let Ok(parsed) = RegisterName::try_from(name)
             && let Some(target) = unnamed_pointer_name(parsed)
         {
@@ -934,6 +963,7 @@ impl Registers {
             }
             RegisterName::Unnamed => {
                 if let Some(slot) = self.numbered.get_mut(0) {
+                    self.version = self.version.wrapping_add(1);
                     *slot = None;
                 }
                 self.unnamed_target = Some(UnnamedTarget::Slot('0'));
@@ -956,9 +986,9 @@ impl Registers {
                 self.alternate_override = None;
                 Ok(())
             }
-            RegisterName::CommandLine
-            | RegisterName::InsertContent
-            | RegisterName::CurrentFile => Err(RegisterError::InvalidName(name)),
+            RegisterName::CommandLine | RegisterName::InsertContent | RegisterName::CurrentFile => {
+                Err(RegisterError::InvalidName(name))
+            }
             RegisterName::Selection(_) => Err(RegisterError::ProviderRequired(name)),
         }
     }

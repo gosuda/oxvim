@@ -208,6 +208,10 @@ pub struct SyncVersions {
     window: Cell<u64>,
     tab: Cell<u64>,
     vim: Cell<u64>,
+    // The option-store stamp the mirrored `&opt` tables were built from.
+    options: Cell<u64>,
+    // The register-store stamp the mirrored `@r` table was built from.
+    registers: Cell<u64>,
     // Buffer identity + version tracking: a `current_buffer()` switch
     // invalidates the cached `b:` map even when versions coincide.
     buffer_handle: Cell<Option<BufHandle>>,
@@ -257,6 +261,28 @@ impl SyncVersions {
             ScopeKind::Vim => self.vim.set(version),
             _ => {}
         }
+    }
+
+    /// The register-store stamp the mirrored `@r` table was built from.
+    #[must_use]
+    pub fn registers(&self) -> u64 {
+        self.registers.get()
+    }
+
+    /// Record the register-store stamp the mirror was built from.
+    pub fn set_registers(&self, version: u64) {
+        self.registers.set(version);
+    }
+
+    /// The option-store stamp the mirrored `&opt` tables were built from.
+    #[must_use]
+    pub fn options(&self) -> u64 {
+        self.options.get()
+    }
+
+    /// Record the option-store stamp the mirror was built from.
+    pub fn set_options(&self, version: u64) {
+        self.options.set(version);
     }
 
     /// The buffer whose variables the cached `b:` map mirrors, if any.
