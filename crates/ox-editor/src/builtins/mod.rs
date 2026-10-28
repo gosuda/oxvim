@@ -8,6 +8,7 @@
 
 pub(crate) mod assert;
 pub(crate) mod buffer;
+pub(crate) mod cmdline;
 pub(crate) mod completion;
 pub(crate) mod environment;
 pub(crate) mod eval;
@@ -68,6 +69,8 @@ pub(crate) enum Family {
     Completion,
     /// Match highlighting, served by [`matches`].
     Match,
+    /// Command-line introspection, served by [`cmdline`].
+    Cmdline,
     /// Tags-file queries, served by [`tag`].
     Tag,
     /// The listening-RPC server, served by [`server`].
@@ -83,9 +86,9 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "assert_match" | "assert_notequal" | "assert_notmatch" | "assert_report"
         | "assert_true" => Family::Assert,
         "append" | "appendbufline" | "bufadd" | "bufexists" | "bufload" | "bufname" | "bufnr"
-        | "changenr" | "deletebufline" | "getbufinfo" | "getbufline" | "getbufvar"
-        | "getchangelist" | "last_buffer_nr" | "prompt_getprompt" | "prompt_setprompt"
-        | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
+        | "changenr" | "deletebufline" | "did_filetype" | "getbufinfo" | "getbufline"
+        | "getbufvar" | "getchangelist" | "last_buffer_nr" | "prompt_getprompt"
+        | "prompt_setprompt" | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
         "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
         | "swapname" => Family::Environment,
@@ -114,6 +117,8 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "complete" | "complete_info" | "getcompletion" => Family::Completion,
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
+        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdprompt"
+        | "pumvisible" | "wildmenumode" => Family::Cmdline,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
         "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),
@@ -169,6 +174,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         Family::Match => host
             .access
             .with_ex_editor(|editor| matches::call(editor, name, args)),
+        Family::Cmdline => cmdline::call(host, name, args),
         Family::Tag => tag::call(host, name, args),
         Family::Window => window::call(host, name, args),
     }

@@ -114,6 +114,10 @@ pub struct CmdlineState {
     pub text: String,
     /// Insertion position: a UTF-8 boundary in `text`, including its end.
     pub cursor_byte: usize,
+    /// Cursor column deferred by `setcmdpos()` (`ex_getln.c` `new_cmdpos`):
+    /// a 1-based character position consumed — and cleared — by the next
+    /// `CTRL-R` paste, never applied eagerly. `None` outside `setcmdpos`.
+    pub new_cmdpos: Option<usize>,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
     /// Cursor position when the command line was entered
@@ -318,6 +322,10 @@ pub struct ModeMachine {
     pub completion: CompletionSession,
     /// `CTRL-V` in command-line mode: insert the next character literally.
     pending_cmdline_literal: bool,
+    /// `CTRL-R` seen in command-line mode, waiting for the register name.
+    /// A second `CTRL-R` is consumed the same way: the single paste path
+    /// below inserts literally either way, so no second flag is needed.
+    pending_cmdline_ctrl_r: bool,
     /// Insert mode temporarily yielded to one Normal-mode command with
     /// `CTRL-O`.
     one_normal_command: bool,
@@ -366,6 +374,7 @@ impl Default for ModeMachine {
             pending_ctrl_bslash: false,
             completion: CompletionSession::new(),
             pending_cmdline_literal: false,
+            pending_cmdline_ctrl_r: false,
             one_normal_command: false,
             insert_literal: None,
             pending_insert_ctrl_r: false,
@@ -830,9 +839,7 @@ impl ModeMachine {
                 // An unmapped Alt/Meta-prefixed key is the terminal's
                 // `ESC`-prefix form (`getchar.c` `mod_mask`): deliver `ESC`
                 // now and let the queued key itself arrive next.
-                Key::Special(KS_MODIFIER, mask)
-                    if mask & (MOD_MASK_ALT | MOD_MASK_META) != 0 =>
-                {
+                Key::Special(KS_MODIFIER, mask) if mask & (MOD_MASK_ALT | MOD_MASK_META) != 0 => {
                     Ok(Step::Key('\u{1b}'))
                 }
                 Key::Special(second, third) => match Self::named_key(second, third) {
@@ -1151,17 +1158,7 @@ impl ModeMachine {
     fn operand_prefix(prefix: &str) -> bool {
         matches!(
             prefix,
-            "register"
-                | "record"
-                | "exec"
-                | "r"
-                | "r\u{16}"
-                | "f"
-                | "F"
-                | "t"
-                | "T"
-                | "i"
-                | "a"
+            "register" | "record" | "exec" | "r" | "r\u{16}" | "f" | "F" | "t" | "T" | "i" | "a"
         )
     }
 
@@ -1300,7 +1297,9 @@ impl ModeMachine {
         let history = &self.cmdline_history;
         let start = state.history_index.unwrap_or(history.len());
         let found = if up {
-            (0..start).rev().find(|&index| history[index].starts_with(&lookfor))
+            (0..start)
+                .rev()
+                .find(|&index| history[index].starts_with(&lookfor))
         } else {
             (start + 1..history.len()).find(|&index| history[index].starts_with(&lookfor))
         };
@@ -1446,10 +1445,14 @@ impl ModeMachine {
                     i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX),
                     tabstop,
                 );
-                let cur_vcol = cur_vcol.saturating_add(usize::try_from(
-                    editor.window(ctx.window).map_or(0, |state| state.coladd.max(0)),
-                )
-                .unwrap_or(usize::MAX));
+                let cur_vcol = cur_vcol.saturating_add(
+                    usize::try_from(
+                        editor
+                            .window(ctx.window)
+                            .map_or(0, |state| state.coladd.max(0)),
+                    )
+                    .unwrap_or(usize::MAX),
+                );
                 let want = editor.window(ctx.window).ok().map_or(
                     i64::try_from(cur_vcol).unwrap_or(i64::MAX),
                     |state| {
@@ -1466,20 +1469,13 @@ impl ModeMachine {
                 // the covering cluster (the multi-byte snap is folded
                 // into the same translation).
                 let col = if want == i64::MAX
-                    || usize::try_from(want).unwrap_or(usize::MAX)
-                        >= display_len(&line, tabstop)
+                    || usize::try_from(want).unwrap_or(usize::MAX) >= display_len(&line, tabstop)
                 {
                     line.len()
                 } else {
                     vcol_to_byte(&line, usize::try_from(want).unwrap_or(0), tabstop)
                 };
-                editor.set_window_cursor(
-                    ctx.window,
-                    Position {
-                        lnum: target,
-                        col,
-                    },
-                )?;
+                editor.set_window_cursor(ctx.window, Position { lnum: target, col })?;
                 if let Ok(state) = editor.window_mut(ctx.window) {
                     state.curswant = want;
                     state.set_curswant = false;
@@ -1514,13 +1510,7 @@ impl ModeMachine {
             // not start a new undo block — return before `insert_moved`
             // is set.
             NamedKey::Del => {
-                insert::delete_forward(
-                    editor,
-                    ctx.buffer,
-                    ctx.window,
-                    ctx.cursor,
-                    self.timestamp,
-                )?;
+                insert::delete_forward(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?;
                 return Ok(());
             }
             // `i_<C-Left>`/`i_<C-Right>` are the `ins_s_left`/`ins_s_right`
@@ -1531,13 +1521,8 @@ impl ModeMachine {
                 let lines = (1..=count)
                     .map(|n| ctx.line(editor, n))
                     .collect::<Result<Vec<_>, _>>()?;
-                let command = if key == NamedKey::CtrlLeft {
-                    "b"
-                } else {
-                    "w"
-                };
-                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1)
-                {
+                let command = if key == NamedKey::CtrlLeft { "b" } else { "w" };
+                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1) {
                     let mut target = motion.target;
                     // `ins_s_right` (`fwd_word`): the insert cursor may
                     // rest one past the line, so a `w` that lands inside
@@ -1954,6 +1939,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             ':' => {
@@ -1982,6 +1968,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             'n' | 'N' => {
@@ -2160,11 +2147,7 @@ impl ModeMachine {
                             start: ctx.cursor,
                             end: Position {
                                 lnum: ctx.cursor.lnum,
-                                col: ctx
-                                    .cursor
-                                    .col
-                                    .saturating_add(count - 1)
-                                    .min(line.len() - 1),
+                                col: ctx.cursor.col.saturating_add(count - 1).min(line.len() - 1),
                             },
                             kind: MotionKind::CharacterWise,
                             inclusive: true,
@@ -2235,8 +2218,12 @@ impl ModeMachine {
                     if self.recordbuff.last() == Some(&b'q') {
                         self.recordbuff.pop();
                     }
-                    let rows: Vec<Vec<u8>> = self
-                        .recordbuff
+                    // `do_record` (`register.c:488-494`): strip `K_SPECIAL`
+                    // quoting from the captured bytes before storing them,
+                    // so a recorded multi-byte character reads back as the
+                    // typed bytes; `exec_register` re-adds the quoting when
+                    // the macro plays back.
+                    let rows: Vec<Vec<u8>> = Keys::unescape_ks(&self.recordbuff)
                         .split(|byte| *byte == b'\n')
                         .map(<[u8]>::to_vec)
                         .collect();
@@ -2822,6 +2809,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             'J' => {
@@ -3398,7 +3386,11 @@ impl ModeMachine {
             self.pending_insert_ctrl_r = false;
             return self.insert_register(editor, ctx, key, eval);
         }
-        match self.insert_literal.take().unwrap_or(InsertLiteral::Awaiting) {
+        match self
+            .insert_literal
+            .take()
+            .unwrap_or(InsertLiteral::Awaiting)
+        {
             InsertLiteral::Awaiting => {
                 let digits = match key {
                     'x' | 'X' => Some((16, 2)),
@@ -3451,11 +3443,7 @@ impl ModeMachine {
                     self.emit_literal_digits(editor, ctx, &digits, radix)?;
                     return self.insert(editor, state, key, eval);
                 } else {
-                    self.insert_literal = Some(InsertLiteral::Digits {
-                        radix,
-                        max,
-                        digits,
-                    });
+                    self.insert_literal = Some(InsertLiteral::Digits { radix, max, digits });
                 }
             }
         }
@@ -3480,8 +3468,59 @@ impl ModeMachine {
         if let Ok(value) = u32::from_str_radix(digits, radix)
             && let Some(ch) = char::from_u32(value).or_else(|| char::from_u32(value & 0xff))
         {
-            insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?;
+            insert::insert_char(
+                editor,
+                ctx.buffer,
+                ctx.window,
+                ctx.cursor,
+                ch,
+                self.timestamp,
+            )?;
         }
+        Ok(())
+    }
+
+    /// `c_CTRL-R`: pastes a register into the command line (`ex_getln.c`
+    /// `command_line_insert_reg`). The text lands in [`CmdlineState::text`]
+    /// at the cursor — never through the buffer insert path — and a
+    /// position deferred by `setcmdpos()` is consumed here and cleared,
+    /// matching upstream's `new_cmdpos` slot. An empty register is a beep,
+    /// not an edit.
+    fn cmdline_paste_register(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+        name: char,
+    ) -> Result<(), ModeError> {
+        let Some(lines) = editor
+            .registers()
+            .get(name)
+            .ok()
+            .flatten()
+            .map(|content| content.getreg_lines())
+        else {
+            return Ok(());
+        };
+        let pasted = lines
+            .iter()
+            .map(|line| String::from_utf8_lossy(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = state.text[..state.cursor_byte].chars().count();
+        state.text.insert_str(state.cursor_byte, &pasted);
+        state.cursor_byte += pasted.len();
+        let end = before + pasted.chars().count();
+        let total = state.text.chars().count();
+        let target = state
+            .new_cmdpos
+            .take()
+            .map(|position| position.clamp(1, total + 1))
+            .unwrap_or(end + 1);
+        state.cursor_byte = state
+            .text
+            .char_indices()
+            .nth(target.saturating_sub(1))
+            .map_or(state.text.len(), |(byte, _)| byte);
         Ok(())
     }
 
@@ -3687,7 +3726,10 @@ impl ModeMachine {
             beep_flush(editor);
             return Ok(());
         };
-        let keys = Keys::from_encoded(bytes)?;
+        // `put_in_typebuf` with escaping (`register.c:534-556`): the stored
+        // macro is raw bytes, so re-escape `K_SPECIAL` before the encoded
+        // validation the typeahead requires.
+        let keys = Keys::from_encoded(Keys::escape_ks(&bytes).as_bytes().to_vec())?;
         let flags = TypeaheadFlags {
             mapped: true,
             ..TypeaheadFlags::default()
@@ -3704,6 +3746,15 @@ impl ModeMachine {
         state: &mut CmdlineState,
         key: char,
     ) -> Result<Option<Mode>, ModeError> {
+        if self.pending_cmdline_ctrl_r && key != '\u{12}' {
+            self.pending_cmdline_ctrl_r = false;
+            // A cancel key aborts the pending paste and runs normally; any
+            // other key names the register to paste.
+            if !matches!(key, '\u{1b}' | '\u{3}' | '\n' | '\r') {
+                self.cmdline_paste_register(editor, state, key)?;
+                return Ok(None);
+            }
+        }
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
             state.history_index = None;
@@ -3729,6 +3780,10 @@ impl ModeMachine {
         }
         if key == '\u{16}' {
             self.pending_cmdline_literal = true;
+            return Ok(None);
+        }
+        if key == '\u{12}' {
+            self.pending_cmdline_ctrl_r = true;
             return Ok(None);
         }
         if key == '\u{1c}' {
@@ -4382,7 +4437,15 @@ impl ModeMachine {
         };
         let containing = self
             .search
-            .preview(&ctx.lines, probe, "", SearchDirection::Backward, 1, false, None)
+            .preview(
+                &ctx.lines,
+                probe,
+                "",
+                SearchDirection::Backward,
+                1,
+                false,
+                None,
+            )
             .ok()
             .filter(|m| (m.match_end.lnum, m.match_end.col) > (ctx.cursor.lnum, ctx.cursor.col));
         if let Some(m) = containing {
@@ -4396,7 +4459,15 @@ impl ModeMachine {
             };
             return Ok(self
                 .search
-                .preview(&ctx.lines, m.match_start, "", direction, count - 1, wrapscan, None)
+                .preview(
+                    &ctx.lines,
+                    m.match_start,
+                    "",
+                    direction,
+                    count - 1,
+                    wrapscan,
+                    None,
+                )
                 .ok()
                 .map(|m| (m.match_start, m.match_end)));
         }
@@ -5271,7 +5342,9 @@ fn display_text_width(
     );
     let numbers = number_on || relative_on || statuscolumn_on;
     let (min_sc, max_sc) = signcolumn_bounds(signcolumn, numbers);
-    let sign_width = min_sc.max(max_sc.min(live_sign_slots(editor, buffer))).saturating_mul(2);
+    let sign_width = min_sc
+        .max(max_sc.min(live_sign_slots(editor, buffer)))
+        .saturating_mul(2);
     let number_width = if number_on || relative_on {
         let minimum = match editor.options().get_window(window, "numberwidth") {
             Ok(OptionValue::Number(value)) => usize::try_from((*value).clamp(1, 20)).unwrap_or(4),
@@ -5284,7 +5357,9 @@ fn display_text_width(
     } else {
         0
     };
-    width.saturating_sub(sign_width.saturating_add(number_width)).max(1)
+    width
+        .saturating_sub(sign_width.saturating_add(number_width))
+        .max(1)
 }
 
 /// `nv_screengo`/`nv_g_home_m_cmd`/`nv_g_dollar_cmd`: the screen-line
@@ -5360,13 +5435,13 @@ fn display_motion(
                     return Ok(None);
                 }
             }
-            let col = vcol_to_byte(
-                line_at(lnum),
-                usize::try_from(want).unwrap_or(0),
-                tabstop,
-            );
+            let col = vcol_to_byte(line_at(lnum), usize::try_from(want).unwrap_or(0), tabstop);
             let want = if curswant == i64::MAX { i64::MAX } else { want };
-            Ok(motion(Position { lnum, col }, curswant == i64::MAX, Some(want)))
+            Ok(motion(
+                Position { lnum, col },
+                curswant == i64::MAX,
+                Some(want),
+            ))
         }
         "g0" | "g^" | "gm" => {
             let col = display_row_home(
@@ -5377,7 +5452,14 @@ fn display_motion(
                 tabstop,
                 wrap,
             );
-            Ok(motion(Position { lnum: ctx.cursor.lnum, col }, false, None))
+            Ok(motion(
+                Position {
+                    lnum: ctx.cursor.lnum,
+                    col,
+                },
+                false,
+                None,
+            ))
         }
         _ => Ok(display_row_dollar(
             &ctx.lines,
@@ -5419,7 +5501,11 @@ fn display_row_home(
 ) -> usize {
     let row_start = cur_vcol / width * width;
     let i = if command == "gm" {
-        if wrap { row_start + width / 2 } else { width / 2 }
+        if wrap {
+            row_start + width / 2
+        } else {
+            width / 2
+        }
     } else if wrap {
         row_start
     } else {
@@ -5461,7 +5547,13 @@ fn display_row_dollar(
         for _ in 0..count - 1 {
             if wrap {
                 if !display_row_step(
-                    &mut lnum, &mut linelen, &mut want, lines, tabstop, width, true,
+                    &mut lnum,
+                    &mut linelen,
+                    &mut want,
+                    lines,
+                    tabstop,
+                    width,
+                    true,
                 ) {
                     return None;
                 }
@@ -5515,7 +5607,11 @@ fn seed_row_want(
     if curswant == i64::MAX {
         return vcol_as_i64(cur_vcol / width * width + width - 1);
     }
-    let want = if set_curswant { vcol_as_i64(cur_vcol) } else { curswant };
+    let want = if set_curswant {
+        vcol_as_i64(cur_vcol)
+    } else {
+        curswant
+    };
     want.clamp(0, vcol_as_i64(display_rows_of(linelen, width) * width) - 1)
 }
 
