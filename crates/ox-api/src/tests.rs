@@ -4658,9 +4658,9 @@ fn replace_termcodes_translates_named_special_keys() {
         ("<F10>", [K_SPECIAL, b'k', b';']),
         ("<F11>", [K_SPECIAL, b'F', b'1']),
         ("<F12>", [K_SPECIAL, b'F', b'2']),
-        // <BS> and <Tab> are special keys (K_BS, K_TAB), not literal control bytes.
+        // <BS> stays a special key, but <Tab> is its control byte: the oracle's
+        // `vim.keycode('<Tab>')` is the single byte 0x09, not a K_SPECIAL key.
         ("<BS>", [K_SPECIAL, b'k', b'b']),
-        ("<Tab>", [K_SPECIAL, KS_EXTRA, 54]),
         ("<Ignore>", [K_SPECIAL, KS_EXTRA, 53]),
         ("<Nop>", [K_SPECIAL, KS_EXTRA, 97]),
         // Editing/document keys (K_INS, K_HELP, K_UNDO).
@@ -4706,7 +4706,9 @@ fn replace_termcodes_translates_named_special_keys() {
     for (input, bytes) in NAMED_KEY_CODES {
         assert_eq!(termcodes(input, true, true).as_bytes(), bytes.as_slice());
     }
-    // Literal control keys remain single bytes.
+    // Literal control keys remain single bytes, and <Tab> is one of them:
+    // the oracle answers 0x09 for `vim.keycode('<Tab>')`.
+    assert_eq!(termcodes("<Tab>", true, true).as_bytes(), b"\t");
     assert_eq!(termcodes("<CR>", true, true).as_bytes(), b"\r");
     assert_eq!(termcodes("<Esc>", true, true).as_bytes(), &[0x1b]);
     assert_eq!(termcodes("<Space>", true, true).as_bytes(), b" ");

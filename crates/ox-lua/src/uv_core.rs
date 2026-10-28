@@ -247,6 +247,37 @@ pub(crate) fn install(
     let core: Table = vim.get("_core")?;
     core.set("ui_flush", lua.create_function(|_, ()| Ok(()))?)?;
     core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
+    // `vim._core.keyparse` (`nlua_keyparse`, lua/stdlib.c:692): the internal
+    // key encoding parsed into one table per chord, so `vim.keycode(keys,
+    // true)` can report modifiers, the bare key, its keytrans spelling, and
+    // the alternate name. The parser itself lives beside `keytrans` in
+    // ox-eval, so both spellings come from one implementation.
+    core.set(
+        "keyparse",
+        lua.create_function(|lua, keys: mlua::LuaString| {
+            let chords = ox_eval::keyparse(&keys.as_bytes());
+            let list = lua.create_table()?;
+            for (index, chord) in chords.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                let mods = lua.create_table()?;
+                // `mod_mask_table` order (keycodes.c:31-44), stopping before
+                // its 'A' sentinel.
+                for (bit, name) in [(8_u8, "M"), (16, "T"), (4, "C"), (2, "S")] {
+                    if chord.mods & bit != 0 {
+                        mods.push(name)?;
+                    }
+                }
+                entry.set("mod", mods)?;
+                entry.set("key", lua.create_string(&chord.key)?)?;
+                entry.set("keys", chord.keys)?;
+                if let Some(alt) = chord.key_alt {
+                    entry.set("key_alt", lua.create_string(&alt)?)?;
+                }
+                list.set(index + 1, entry)?;
+            }
+            Ok(list)
+        })?,
+    )?;
 
     let poll_access = loop_access.clone();
     let pump_scheduler = scheduler.clone();

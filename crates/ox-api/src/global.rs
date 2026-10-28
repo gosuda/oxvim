@@ -2392,7 +2392,6 @@ const SPECIAL_KEY_PAIRS: &[(&[u8], (u8, u8))] = &[
     (b"delete", (b'k', b'D')),
     (b"bs", (b'k', b'b')),
     (b"backspace", (b'k', b'b')),
-    (b"tab", (KS_EXTRA, 54)),    // KE_TAB
     (b"ignore", (KS_EXTRA, 53)), // KE_IGNORE
     (b"nop", (KS_EXTRA, 97)),    // KE_NOP
     (b"insert", (b'k', b'I')),
@@ -2555,6 +2554,11 @@ fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {
         return do_lt.then_some(b'<');
     }
     let named = [
+        // Upstream's `string_escape` table maps these to their control bytes
+        // (`<Tab>` is Ctrl-I, `<NL>` is Ctrl-J), not to `K_SPECIAL` keys.
+        (&b"tab"[..], b'\t'),
+        (&b"nl"[..], b'\n'),
+        (&b"newline"[..], b'\n'),
         (&b"cr"[..], b'\r'),
         (&b"enter"[..], b'\r'),
         (&b"esc"[..], 0x1b),

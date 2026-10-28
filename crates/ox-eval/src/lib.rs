@@ -11,7 +11,7 @@ pub mod parser;
 mod path_builtins;
 pub mod scope;
 
-pub use builtins::{
+pub use builtins::{keyparse, KeyChord,
     BUILTINS, BuiltinSpec, Builtins, builtin_spec, call_buffer_builtin, call_higher_order_builtin,
     exists, float_as_string, is_buffer_builtin, is_builtin_implemented, is_higher_order_builtin,
     is_locked_value, lock_value,

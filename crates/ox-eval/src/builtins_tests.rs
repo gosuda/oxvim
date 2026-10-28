@@ -282,6 +282,35 @@ fn keytrans_preserves_named_and_modified_escapes() {
     );
 }
 
+/// `vim.keycode(keys, true)` reports one chord per key: the modifier list in
+/// `mod_mask_table` order, the bare key, the `keytrans` spelling, and the
+/// alternate name. Every row below is the oracle's answer for the same
+/// notation.
+#[test]
+fn keyparse_reports_the_oracle_chords() {
+    fn chord(keys: &[u8]) -> crate::KeyChord {
+        let mut chords = crate::keyparse(keys);
+        assert_eq!(chords.len(), 1, "one key per probe: {keys:?}");
+        chords.remove(0)
+    }
+    let cases: &[(&[u8], u8, &[u8], &str, Option<&[u8]>)] = &[
+        (b"\x01", 4, b"a", "<C-A>", Some(b"A")),
+        (b"A", 2, b"a", "A", Some(b"A")),
+        (b"\x1b", 0, b"\x1b", "<Esc>", Some(b"Esc")),
+        (b" ", 0, b" ", "<Space>", Some(b"Space")),
+        (&[0x80, 0x6b, b'B'], 2, b"Tab", "<S-Tab>", None),
+        (&[0x80, 0x6b, b'b'], 0, b"BS", "<BS>", None),
+        (&[0x80, 0xfc, 2, 6], 6, b"f", "<C-S-F>", Some(b"F")),
+    ];
+    for &(keys, mods, key, rendered, alt) in cases {
+        let parsed = chord(keys);
+        assert_eq!(parsed.mods, mods, "mods for {keys:?}");
+        assert_eq!(parsed.key, key, "key for {keys:?}");
+        assert_eq!(parsed.keys, rendered, "keys for {keys:?}");
+        assert_eq!(parsed.key_alt.as_deref(), alt, "key_alt for {keys:?}");
+    }
+}
+
 #[test]
 fn sha256_hashes_strings_and_blobs_with_lowercase_hex() {
     // Oracle: test/old/testdir/test_sha256.vim Test_sha256().

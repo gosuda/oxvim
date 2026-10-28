@@ -2877,16 +2877,131 @@ fn keytrans(value: &Typval) -> Result<Typval> {
     let Typval::String(value) = value else {
         return Err(EvalError::new("E1174", 0, "String required for argument 1"));
     };
-    let bytes = value.as_bytes();
+    Ok(Typval::String(OxStr(
+        translate_keys(value.as_bytes()).into_bytes(),
+    )))
+}
+
+/// One parsed key-chord, in the shape `vim._core.keyparse` returns
+/// (`nlua_keyparse`, lua/stdlib.c:692-735).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyChord {
+    /// Modifier mask (`MOD_MASK_*`): ALT 8, META 16, CTRL 4, SHIFT 2.
+    pub mods: u8,
+    /// The key without modifiers: the character for a printable or control
+    /// key, the canonical name for a special key code above `0x7f`.
+    pub key: Vec<u8>,
+    /// The chord in `keytrans` notation, modifiers included.
+    pub keys: String,
+    /// The alternate spelling upstream reports when the key is a named
+    /// character (`<Space>`, `<CR>`, `<lt>`, `lt`) or a shifted letter.
+    pub key_alt: Option<Vec<u8>>,
+}
+
+/// Splits the internal key encoding into chords for `vim._core.keyparse`.
+///
+/// The `keys` field of each chord is exactly what [`translate_keys`] renders
+/// for that byte span; `key` and `key_alt` follow `str2special`'s `keychord`
+/// bookkeeping (`keycodes.c:300-400`): a literal character keeps itself as the
+/// key and names itself in `key_alt` when a name exists, an ASCII uppercase
+/// letter lowers its key and reports SHIFT, a control character becomes its
+/// `@`-offset letter with CTRL, and a special key code above `0x7f` uses the
+/// canonical name with no alternate.
+#[must_use]
+pub fn keyparse(bytes: &[u8]) -> Vec<KeyChord> {
+    let mut chords = Vec::new();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let start = index;
+        let mut mods = 0u8;
+        while let Some(&[0x80, 0xfc, modifier]) = bytes.get(index..index + 3) {
+            mods = modifier;
+            index += 3;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+        let (derived, key, key_alt, consumed) = chord_key(bytes, index);
+        index += consumed;
+        chords.push(KeyChord {
+            mods: mods | derived,
+            key,
+            keys: translate_keys(&bytes[start..index]),
+            key_alt,
+        });
+    }
+    chords
+}
+
+/// `key`/`key_alt` for the single key that starts at `index`, plus the bytes
+/// it consumed.
+fn chord_key(bytes: &[u8], index: usize) -> (u8, Vec<u8>, Option<Vec<u8>>, usize) {
+    if let Some(&[0x80, second, third]) = bytes.get(index..index + 3) {
+        // A shifted terminal code (`S-Tab` and friends) is its base key plus
+        // the SHIFT mask, not a differently named key (`str2special`, whose
+        // `keys` string and `mods` come from the same parse).
+        if let Some(name) = special_key_name(second, third) {
+            if let Some(base) = name.strip_prefix("S-") {
+                return (2, base.as_bytes().to_vec(), None, 3);
+            }
+            return (0, name.into_bytes(), None, 3);
+        }
+        let key = if second == 0xfd {
+            vec![third]
+        } else {
+            format!("t_{}{}", char::from(second), char::from(third)).into_bytes()
+        };
+        return (0, key, None, 3);
+    }
+    let width = match bytes[index] {
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
+    .min(bytes.len() - index);
+    let raw = &bytes[index..index + width];
+    let named = match raw {
+        b" " => Some("Space"),
+        b"<" => Some("lt"),
+        b"|" => Some("Bar"),
+        b"\\" => Some("Bslash"),
+        [b'\t'] => Some("Tab"),
+        [0x0a] => Some("NL"),
+        [b'\r'] => Some("CR"),
+        [0x1b] => Some("Esc"),
+        _ => None,
+    };
+    if let Some(name) = named {
+        return (0, raw.to_vec(), Some(name.as_bytes().to_vec()), width);
+    }
+    match raw {
+        // A printable ASCII uppercase letter is a shifted key: the key is the
+        // lowercase character and the alternate spelling is the letter.
+        [b'A'..=b'Z'] => (2, raw.to_ascii_lowercase().to_vec(), Some(raw.to_vec()), width),
+        // A control character with no name is its `@`-offset letter with CTRL
+        // (`str2special`, keycodes.c:300-310); the shift that the uppercase
+        // letter would otherwise report is suppressed because the CTRL came
+        // from the control code itself.
+        [control @ 1..=31] => {
+            let letter = control + b'@';
+            (4, vec![letter.to_ascii_lowercase()], Some(vec![letter]), width)
+        }
+        _ => (0, raw.to_vec(), None, width),
+    }
+}
+
+/// `str2special` rendering of a byte slice in `keytrans` notation
+/// (`message.c:2084-2166`).
+fn translate_keys(bytes: &[u8]) -> String {
     let mut output = String::new();
     let mut index = 0usize;
     let mut modifiers = 0u8;
     while index < bytes.len() {
-        // `str2special` (`message.c:2084-2166`): every `K_SPECIAL` triple is
-        // one key. `KS_MODIFIER` prefixes the next key with a modifier mask;
-        // any other triple is a termcap or `KS_EXTRA` key resolved through
-        // [`special_key_name`], with unknown pairs taking upstream's
-        // `<t_xx>` termcap form (`keycodes.c:324-327`).
+        // Every `K_SPECIAL` triple is one key. `KS_MODIFIER` prefixes the next
+        // key with a modifier mask; any other triple is a termcap or
+        // `KS_EXTRA` key resolved through [`special_key_name`], with unknown
+        // pairs taking upstream's `<t_xx>` termcap form (`keycodes.c:324-327`).
         let (name, consumed) = match bytes.get(index..index + 3) {
             Some(&[0x80, 0xfc, modifier]) => {
                 modifiers = modifier;
@@ -2910,18 +3025,27 @@ fn keytrans(value: &Typval) -> Result<Typval> {
                 }
                 .min(bytes.len() - index);
                 let raw = &bytes[index..index + width];
-                let name = match raw {
-                    b" " => "Space".to_owned(),
-                    b"<" => "lt".to_owned(),
-                    b"|" => "Bar".to_owned(),
-                    b"\\" => "Bslash".to_owned(),
-                    [b'\t'] => "Tab".to_owned(),
-                    [0x0a] => "NL".to_owned(),
-                    [b'\r'] => "CR".to_owned(),
-                    [0x1b] => "Esc".to_owned(),
-                    [control @ 1..=31] => format!("C-{}", char::from(control + b'@')),
-                    _ => String::from_utf8_lossy(raw).into_owned(),
+                // A control byte without a name is its `@`-offset letter plus
+                // the CTRL mask, so the modifier prints in the canonical
+                // order ahead of any SHIFT the notation also carried
+                // (`<C-S-f>` renders `<C-S-F>`, not `<S-C-F>`).
+                let (name, control) = match raw {
+                    b" " => ("Space".to_owned(), false),
+                    b"<" => ("lt".to_owned(), false),
+                    b"|" => ("Bar".to_owned(), false),
+                    b"\\" => ("Bslash".to_owned(), false),
+                    [b'\t'] => ("Tab".to_owned(), false),
+                    [0x0a] => ("NL".to_owned(), false),
+                    [b'\r'] => ("CR".to_owned(), false),
+                    [0x1b] => ("Esc".to_owned(), false),
+                    [control @ 1..=31] => {
+                        (String::from(char::from(control + b'@')), true)
+                    }
+                    _ => (String::from_utf8_lossy(raw).into_owned(), false),
                 };
+                if control {
+                    modifiers |= 4;
+                }
                 (name, width)
             }
         };
@@ -2947,7 +3071,7 @@ fn keytrans(value: &Typval) -> Result<Typval> {
         }
         modifiers = 0;
     }
-    Ok(Typval::String(OxStr(output.into_bytes())))
+    output
 }
 
 /// Canonical `keytrans` name for an internal three-byte key

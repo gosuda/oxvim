@@ -638,6 +638,7 @@ dependencies = [
  "mlua",
  "ox-api",
  "ox-editor",
+ "ox-eval",
  "ox-regex",
  "ox-rpc",
  "ox-types",
