@@ -8,7 +8,10 @@
     clippy::no_effect_underscore_binding
 )]
 
-use ox_regex::{Engine, ExecError, Magic, Match, Position, Text, compile, exec, exec_at, try_exec};
+use ox_regex::{
+    Engine, ExecError, Magic, Match, Position, Text, compile, compile_strict, exec, exec_at,
+    try_exec,
+};
 
 fn matched(pattern: &str, magic: Magic, text: &Text) -> Option<String> {
     let prog =
@@ -1103,4 +1106,104 @@ fn explicit_recursion_limit_is_typed() {
         try_exec(&nested, &Text::from("a")),
         Err(ExecError::RecursionLimit)
     );
+}
+
+case!(
+    unclosed_bracket_is_literal,
+    "regexp.c:10845-10911 nfa_regatom collection fallthrough",
+    "[",
+    Magic::Magic,
+    "a[b",
+    Some("[")
+);
+case!(
+    unclosed_empty_collection_is_literal,
+    "regexp.c:10845-10911 skip_anyof finds no terminator",
+    "[]",
+    Magic::Magic,
+    "a[]b",
+    Some("[]")
+);
+case!(
+    unclosed_negated_collection_is_literal,
+    "regexp.c:10845-10911 negated collection without terminator",
+    "[^]",
+    Magic::Magic,
+    "a[^]b",
+    Some("[^]")
+);
+case!(
+    unclosed_prefix_is_literal,
+    "regexp.c:10845-10911 missing ] after character list",
+    "[a",
+    Magic::Magic,
+    "x[a",
+    Some("[a")
+);
+case!(
+    trailing_bracket_after_literal,
+    "regexp.c:10845-10911 bracket after atom without terminator",
+    "a[",
+    Magic::Magic,
+    "xa[",
+    Some("a[")
+);
+case!(
+    unclosed_slash_class_is_literal,
+    "regexp.c:10845-10911 class-like prefix without terminator",
+    "[/",
+    Magic::Magic,
+    "x[/y",
+    Some("[/")
+);
+case!(
+    unclosed_posix_prefix_scans_past_inner_bracket,
+    "regexp.c:10845-10911 skip_anyof skips the [:alpha:] opener",
+    "[[:alpha:]",
+    Magic::Magic,
+    "x[:a",
+    Some("[:")
+);
+case!(
+    closed_multiline_collection_excludes_bracket,
+    "regexp.c:10845-10911 NFA_ADD_NL members exclude the opener",
+    "\\_[a]",
+    Magic::Magic,
+    "[",
+    None
+);
+case!(
+    unclosed_multiline_bracket_is_literal,
+    "regexp.c:10845-10911 extra dropped when the scan fails",
+    "\\_[",
+    Magic::Magic,
+    "a[b",
+    Some("[")
+);
+case!(
+    trailing_dash_is_literal_member,
+    "regexp.c:10845-10911 dash before the terminator is literal",
+    "[a-]",
+    Magic::Magic,
+    "-",
+    Some("-")
+);
+
+#[test]
+fn reversed_range_reports_e944() {
+    let _spec = "regexp.c:10921-10926 E944 Reverse range in character class";
+    let error = compile("[z-a]", Magic::Magic).unwrap_err();
+    assert_eq!(error.code(), "E944");
+    assert_eq!(
+        error.to_string(),
+        "Reverse range in character class"
+    );
+}
+
+#[test]
+fn strict_unclosed_bracket_reports_e769() {
+    let _spec = "regexp.c:10869 E769 Missing ] after %s[";
+    let error = compile_strict("[", Magic::Magic).unwrap_err();
+    assert_eq!(error.code(), "E769");
+    assert_eq!(error.to_string(), "Missing ] after %s[");
 }
