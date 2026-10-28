@@ -12628,8 +12628,38 @@ fn command_sleep<F: FileIO>(
         "m" => amount,
         other => return error_flow(runtime, "E475", format!("Invalid argument: {other}")),
     };
-    std::thread::sleep(std::time::Duration::from_millis(milliseconds));
+    // `:sleep` is an event-pumping delay upstream (`ex_sleep` ->
+    // `os_delay(..., events=true)`), so job output, PTY reads and timers keep
+    // running while the script waits: a test that starts `:terminal` and then
+    // sleeps sees the screen fill. A bare thread sleep starves the reactor and
+    // leaves every terminal buffer empty.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(milliseconds);
+    loop {
+        pump_job_output(runtime, editor);
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(5)));
+    }
     Flow::Normal
+}
+
+/// Poll job events and project ready PTY output into terminal buffers.
+///
+/// Callback events stay deferred, which is what the other synchronous call
+/// sites do (`flush_pty_output`); only the visible buffer text and the emulator
+/// replies move here.
+fn pump_job_output<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) {
+    let Some(manager) = runtime.jobs.as_mut() else {
+        return;
+    };
+    let Ok(output) = manager.take_all_pty_output() else {
+        return;
+    };
+    for (channel, bytes) in output {
+        let _ = editor.append_terminal_buffer(channel, &bytes);
+    }
 }
 
 /// `:scriptencoding` (`runtime.c` `ex_scriptencoding`:2946).

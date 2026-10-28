@@ -1726,6 +1726,50 @@ fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
 }
 #[cfg(unix)]
 #[test]
+fn terminal_command_marks_the_buffer_and_sleep_pumps_its_output() {
+    let _guard = crate::lock_process_state();
+    let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "terminal echo terminal-marker\nsleep 500m\n",
+    );
+
+    let ed = editor.editor();
+    let buffer = ed.current_buffer().expect("terminal buffer is current");
+    let state = ed.buffer(buffer).expect("terminal buffer must exist");
+    // `terminal_open` marks the buffer before any output arrives
+    // (terminal.c:608), so 'buftype' reads "terminal" on the first frame.
+    assert_eq!(
+        ed.options().get_buffer(buffer, "buftype").unwrap(),
+        &crate::options::OptionValue::String("terminal".to_owned())
+    );
+    assert!(
+        state.name().to_string_lossy().starts_with("term://"),
+        "terminal buffer name: {}",
+        state.name().to_string_lossy()
+    );
+    // `:sleep` pumps the job reactor, so the child's output reaches the
+    // emulator while the script waits. A bare thread sleep would leave the
+    // screen empty and the buffer blank.
+    let text = {
+        let text = state.text().expect("terminal text is readable");
+        (1..=text.line_count())
+            .map(|lnum| {
+                String::from_utf8_lossy(&text.line(lnum).expect("row is in range")).into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        text.contains("terminal-marker"),
+        "terminal buffer did not receive the child's output: {text:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn pty_output_reaches_terminal_buffer_after_chansend() {
     let _guard = crate::lock_process_state();
     let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));

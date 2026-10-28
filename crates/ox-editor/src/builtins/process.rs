@@ -428,6 +428,19 @@ pub(crate) fn start_terminal<F: FileIO, E: ExEditorAccess>(
     if let Some(manager) = runtime.jobs.as_mut() {
         manager.set_terminal_exit_message(id, runtime.terminal_exit_message);
     }
+    // `terminal_open` marks the attached buffer with `buftype` "terminal"
+    // (terminal.c:608, OPT_LOCAL) so 'buftype'-driven behaviour — the
+    // BufReadCmd that reattaches on reload, `:write` refusal, window swap
+    // rules — sees the buffer as a terminal.
+    access
+        .with_ex_editor(|editor| {
+            editor.options_mut().set_buffer(
+                buffer,
+                "buftype",
+                OptionValue::String("terminal".to_owned()),
+            )
+        })
+        .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
     Ok((id, buffer))
 }
 
