@@ -56,9 +56,8 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
         let compiled = std::str::from_utf8(&bytes)
             .map_err(|_| "regex pattern is not valid UTF-8".to_owned())
             .and_then(|pattern| {
-                ox_regex::compile_strict(pattern, Magic::Magic).map_err(|error| {
-                    format!("couldn't parse regex: Vim:{}: {error}", error.code())
-                })
+                ox_regex::compile_strict(pattern, Magic::Magic)
+                    .map_err(|error| format!("couldn't parse regex: Vim:{}: {error}", error.code()))
             });
         match compiled {
             Ok(program) => Ok((
