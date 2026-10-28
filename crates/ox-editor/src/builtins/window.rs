@@ -50,6 +50,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "win_gettype" => host
             .access
             .with_ex_editor(|editor| call_win_gettype_builtin(editor, args)),
+        "win_findbuf" => host
+            .access
+            .with_ex_editor(|editor| call_win_findbuf(editor, args)),
         "winbufnr" => host
             .access
             .with_ex_editor(|editor| call_winbufnr_builtin(editor, args)),
@@ -352,6 +355,41 @@ fn call_winbufnr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Ty
 /// facts per window. Without an argument that is every window of every
 /// tabpage; with an id it narrows to that one window, and an unknown id
 /// yields an empty list like upstream `win_id2wp` returning NULL.
+/// `win_findbuf({buf})` (`eval/window.c:516`): every window in every tabpage
+/// that displays the buffer, in tabpage then window order. A buffer that is
+/// loaded in no window answers an empty list, not an error.
+fn call_win_findbuf(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: win_findbuf",
+        ));
+    }
+    let Some(value) = args.first() else {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            "Not enough arguments for function: win_findbuf",
+        ));
+    };
+    let buffer = number_value(value)?;
+    let mut windows = Vec::new();
+    if let Ok(handle) = ox_types::BufHandle::try_from(buffer) {
+        for tab in editor.tabpages() {
+            for window in editor.tabpage_windows(tab).unwrap_or_default() {
+                let shows = editor
+                    .window(window)
+                    .is_ok_and(|state| state.buffer == handle);
+                if shows {
+                    windows.push(Typval::Number(i64::from(window)));
+                }
+            }
+        }
+    }
+    Ok(Typval::list(windows))
+}
+
 fn call_getwininfo(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     if args.len() > 1 {
         return Err(EvalError::new(

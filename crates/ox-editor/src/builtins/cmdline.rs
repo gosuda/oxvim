@@ -28,6 +28,11 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "getcmdpos" => Ok(Typval::Number(cmdline_cursor(host))),
         "setcmdpos" => call_setcmdpos(host, args),
         "getcmdtype" => Ok(Typval::String(OxStr::from(cmdline_type(host)))),
+        // `getcmdwintype` (`eval.c:f_getcmdwintype`): the command-line window's
+        // type, or an empty string while no such window is open. This port has
+        // no command-line window, so the answer is always empty, which is what
+        // upstream returns outside `q:`, `q/` and `q?`.
+        "getcmdwintype" => Ok(Typval::String(OxStr::from(""))),
         "getcmdprompt" => Ok(Typval::String(OxStr::from(cmdline_prompt(host).as_str()))),
         "pumvisible" => Ok(Typval::Number(i64::from(completion_visible(host)))),
         "wildmenumode" => Ok(Typval::Number(0)),

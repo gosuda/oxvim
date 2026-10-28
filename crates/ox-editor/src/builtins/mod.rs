@@ -109,7 +109,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
         | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
-        | "win_gettype" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
+        | "win_gettype" | "win_findbuf" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
         | "winrestview" | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout"
         | "getwininfo" => Family::Window,
 
@@ -117,7 +117,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "complete" | "complete_info" | "getcompletion" => Family::Completion,
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
-        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdprompt" | "pumvisible"
+        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdwintype" | "getcmdprompt" | "pumvisible"
         | "wildmenumode" => Family::Cmdline,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
         "serverstart" | "serverstop" | "serverlist" => Family::Server,
