@@ -686,7 +686,11 @@ fn path_head(name: &str) -> String {
     }
     match rfind_path_sep(name) {
         Some(index) => name[..index.max(1)].to_owned(),
-        None => String::new(),
+        // `path_head` (filepath.c) answers "." for a name with no separator,
+        // which is what `fnamemodify('foo', ':h')` reports upstream. An empty
+        // answer makes `vim.fs.parents`, which walks `:h` until the path stops
+        // changing, walk forever.
+        None => ".".to_owned(),
     }
 }
 
