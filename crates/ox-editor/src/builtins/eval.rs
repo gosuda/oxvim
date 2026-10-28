@@ -38,6 +38,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     match name {
         "eval" => call_eval_builtin(host, args, scope),
         "call" => call_call_builtin(host, args, scope),
+        "uniq" => call_uniq_builtin(host, args, scope),
         "execute" => call_execute_builtin(host.runtime, host.access, scope, host.lua, args),
         "exists" => exists_with_editor(host.runtime, host.access, scope, args),
         "expand" => call_expand_builtin(host.runtime, host.access, args),
@@ -55,6 +56,105 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 
 /// `eval()`: parse the argument and evaluate it against this same host, so the
 /// editor seams stay reachable from the nested expression (`f_eval`).
+/// `uniq({list} [, {func} [, {dict}]])` (`eval/list.c` `f_uniq`).
+///
+/// Without a comparator adjacent items are removed when they are equal; with
+/// one, the comparator decides. The comparator runs with no borrow on the list
+/// held, because it may reenter the editor, and a comparator that changes the
+/// list is refused the way upstream refuses it.
+fn call_uniq_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let container = args[0].clone();
+    let Typval::List(reference) = &container else {
+        return Err(EvalError::new(
+            "E686",
+            0,
+            "Argument of uniq() must be a List",
+        ));
+    };
+    let comparator = match args.get(1) {
+        None | Some(Typval::Special(Special::Null)) => None,
+        Some(value) => Some(value.clone()),
+    };
+    let receiver = match args.get(2) {
+        None | Some(Typval::Special(Special::Null)) => None,
+        Some(value @ Typval::Dict(_)) => Some(value.clone()),
+        Some(_) => return Err(EvalError::new("E731", 0, "Using a List as a Dict")),
+    };
+    let snapshot = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .items
+        .clone();
+    let mut removals = Vec::new();
+    // Both paths compare the last kept item with the next original one, which
+    // is what upstream does; comparing snapshot[index - 1] instead keeps an
+    // item that the last kept item would have swallowed.
+    let mut kept = 0_usize;
+    for index in 1..snapshot.len() {
+        let duplicate = match &comparator {
+            None => snapshot[kept] == snapshot[index],
+            Some(comparator) => {
+                let callable = match (&receiver, comparator) {
+                    (Some(receiver), Typval::String(name)) => {
+                        let function = resolve_function_reference(
+                            host.runtime,
+                            None,
+                            &Typval::String(name.clone()),
+                        )?;
+                        let function =
+                            bind_function_arguments(function, std::slice::from_ref(receiver))?;
+                        Typval::Partial(function)
+                    }
+                    (Some(receiver), Typval::Funcref(funcref) | Typval::Partial(funcref)) => {
+                        let function = bind_function_arguments(
+                            funcref.clone(),
+                            std::slice::from_ref(receiver),
+                        )?;
+                        Typval::Partial(function)
+                    }
+                    (None, comparator) => comparator.clone(),
+                    (Some(_), _) => return Err(EvalError::new("E1085", 0, "not a callable value")),
+                };
+                let value = Evaluator::new(host, &VimRegex).invoke(
+                    callable,
+                    vec![snapshot[kept].clone(), snapshot[index].clone()],
+                    scope,
+                )?;
+                // The item is dropped when the comparator answers false:
+                // `uniq([1,2,3], {a,b -> a < b})` keeps every item while
+                // `{a,b -> a > b}` keeps only the first, and both follow from
+                // that rule.
+                match value {
+                    Typval::Number(number) => number == 0,
+                    Typval::Float(number) => number == 0.0,
+                    Typval::Bool(value) => !value,
+                    _ => return Err(EvalError::new("E474", 0, "Invalid argument")),
+                }
+            }
+        };
+        if duplicate {
+            removals.push(index);
+        } else {
+            kept = index;
+        }
+    }
+    let mut data = reference
+        .try_borrow_mut()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    if data.items.len() != snapshot.len() {
+        return Err(EvalError::new("E741", 0, "Cannot change list"));
+    }
+    for index in removals.into_iter().rev() {
+        data.items.remove(index);
+    }
+    drop(data);
+    Ok(container)
+}
+
 /// `call({func}, {arglist} [, {dict}])` (`eval/funcs.c` `f_call`).
 ///
 /// The callee may be a Funcref or Partial, which goes through the evaluator's
