@@ -200,16 +200,17 @@ fn span_bytes(lines: &[Vec<u8>], start: ExtmarkPosition, end: ExtmarkPosition) -
 /// total for the editor's internal invariant while matching the replacement
 /// character accounting if an invalid byte sequence ever crosses this seam.
 fn linewise_deleted_sizes(lines: &[Vec<u8>]) -> (usize, usize, usize) {
-    lines.iter().fold((0, 0, 0), |(bytes, codepoints, codeunits), line| {
-        let text = String::from_utf8_lossy(line);
-        (
-            bytes.saturating_add(line.len().saturating_add(1)),
-            codepoints.saturating_add(text.chars().count().saturating_add(1)),
-            codeunits.saturating_add(text.encode_utf16().count().saturating_add(1)),
-        )
-    })
+    lines
+        .iter()
+        .fold((0, 0, 0), |(bytes, codepoints, codeunits), line| {
+            let text = String::from_utf8_lossy(line);
+            (
+                bytes.saturating_add(line.len().saturating_add(1)),
+                codepoints.saturating_add(text.chars().count().saturating_add(1)),
+                codeunits.saturating_add(text.encode_utf16().count().saturating_add(1)),
+            )
+        })
 }
-
 
 /// End column relative to the change start: absolute when the span covers
 /// several rows, start-relative within a single row, matching upstream
@@ -415,6 +416,10 @@ pub struct BufferState {
     pub residency: BufferResidency,
     /// Number of windows displaying the buffer.
     pub attachments: usize,
+    /// Upstream `b_did_filetype`: whether the `FileType` event fired for this
+    /// buffer with a non-empty value and no reset has run since. `:setf` is a
+    /// silent no-op while set; `did_filetype()` reads it.
+    did_filetype: bool,
     /// Text generation last consumed by diagnostics.
     pub changedtick_diag: u64,
     /// Text generation last consumed by fold computation.
@@ -476,6 +481,7 @@ impl BufferState {
             saved_undo_state: (0, 0),
             forced_modified: false,
             attachments: 0,
+            did_filetype: false,
             changedtick_diag: 0,
             changedtick_fold: 0,
         }
@@ -523,6 +529,24 @@ impl BufferState {
     /// Replaces the API-visible buffer name.
     pub fn set_name(&mut self, name: OxStr) {
         self.name = name;
+    }
+
+    /// Reports upstream `b_did_filetype` for `:setf` gating and
+    /// `did_filetype()`.
+    #[must_use]
+    pub const fn did_filetype(&self) -> bool {
+        self.did_filetype
+    }
+
+    /// Records a `FileType` fire with a non-empty value (`:setf` gates on
+    /// this until the next reset).
+    pub const fn mark_did_filetype(&mut self) {
+        self.did_filetype = true;
+    }
+
+    /// Clears upstream `b_did_filetype` (`:setf FALLBACK`, batch reset).
+    pub const fn clear_did_filetype(&mut self) {
+        self.did_filetype = false;
     }
 
     /// Returns buffer-local API variables.
@@ -598,11 +622,7 @@ impl BufferState {
     }
 
     /// Adds a subscription, queuing the previous value when its identity is reused.
-    pub fn insert_subscription(
-        &mut self,
-        id: u128,
-        subscription: BufferAttachSubscription,
-    ) {
+    pub fn insert_subscription(&mut self, id: u128, subscription: BufferAttachSubscription) {
         let is_rpc = subscription.channel_id != 0;
         let send_buffer = subscription.send_buffer;
         if let Some(previous) = self.subscriptions.insert(id, subscription) {
@@ -648,10 +668,7 @@ impl BufferState {
     /// Removes one attachment as part of a reload without creating a normal
     /// release record. The reload drain owns that record so it can preserve
     /// callback ordering before freeing its Lua references.
-    pub fn remove_subscription_for_reload(
-        &mut self,
-        id: u128,
-    ) -> Option<BufferAttachSubscription> {
+    pub fn remove_subscription_for_reload(&mut self, id: u128) -> Option<BufferAttachSubscription> {
         let subscription = self.subscriptions.remove(&id)?;
         for event in &mut self.pending_bytes {
             event.subscribers.retain(|recipient| *recipient != id);
@@ -714,14 +731,12 @@ impl BufferState {
                 subscription,
             })
             .collect::<Vec<_>>();
-        released.extend(
-            std::mem::take(&mut self.subscriptions)
-                .into_values()
-                .map(|subscription| BufferSubscriptionRelease {
-                    buffer,
-                    subscription,
-                }),
-        );
+        released.extend(std::mem::take(&mut self.subscriptions).into_values().map(
+            |subscription| BufferSubscriptionRelease {
+                buffer,
+                subscription,
+            },
+        ));
         released
     }
 
@@ -838,11 +853,10 @@ impl BufferState {
         if recipients.is_empty() {
             return;
         }
-        self.pending_bytes
-            .push(BufferBytesEvent::reload_for(
-                recipients,
-                self.script_changedtick(),
-            ));
+        self.pending_bytes.push(BufferBytesEvent::reload_for(
+            recipients,
+            self.script_changedtick(),
+        ));
     }
 
     /// Attaches one window to resident text.
@@ -2084,8 +2098,14 @@ mod tests {
         // A re-read has no splice geometry: it must not replay as a delta.
         assert_eq!(
             (
-                event.start_row, event.start_col, event.start_byte, event.old_row,
-                event.old_col, event.old_byte, event.new_row, event.new_col,
+                event.start_row,
+                event.start_col,
+                event.start_byte,
+                event.old_row,
+                event.old_col,
+                event.old_byte,
+                event.new_row,
+                event.new_col,
                 event.new_byte,
             ),
             (0, 0, 0, 0, 0, 0, 0, 0, 0)

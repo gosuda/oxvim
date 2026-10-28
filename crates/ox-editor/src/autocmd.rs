@@ -289,10 +289,7 @@ impl AutocmdAction {
                 Object::String(self.match_name.clone()),
             ),
             (OxStr::from("buf"), buffer),
-            (
-                OxStr::from("file"),
-                Object::String(self.file_name.clone()),
-            ),
+            (OxStr::from("file"), Object::String(self.file_name.clone())),
         ];
         if self.group != AugroupId::default() {
             let group = i64::try_from(self.group.0)
@@ -1036,27 +1033,32 @@ impl Autocmds {
             }),
             match_name: match context.match_name {
                 Some(name) => OxStr::from(name),
-                None => context.file_name.map_or_else(|| OxStr(Vec::new()), |name| {
-                    let name = OxStr::from(name);
-                    if entry.event.pattern_kind() == PatternKind::None || name.as_bytes().is_empty() {
-                        return name;
-                    }
-                    let path = crate::excmd_exec::path_from_ox_str(&name);
-                    if path.is_absolute() {
-                        return name;
-                    }
-                    let full = std::env::current_dir().unwrap_or_default().join(path);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStrExt;
+                None => context.file_name.map_or_else(
+                    || OxStr(Vec::new()),
+                    |name| {
+                        let name = OxStr::from(name);
+                        if entry.event.pattern_kind() == PatternKind::None
+                            || name.as_bytes().is_empty()
+                        {
+                            return name;
+                        }
+                        let path = crate::excmd_exec::path_from_ox_str(&name);
+                        if path.is_absolute() {
+                            return name;
+                        }
+                        let full = std::env::current_dir().unwrap_or_default().join(path);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt;
 
-                        OxStr::from(full.as_os_str().as_bytes())
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        OxStr::from(full.to_string_lossy().as_ref())
-                    }
-                }),
+                            OxStr::from(full.as_os_str().as_bytes())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            OxStr::from(full.to_string_lossy().as_ref())
+                        }
+                    },
+                ),
             },
             file_name: OxStr::from(context.file_name.unwrap_or_default()),
             description: entry.options.description.clone(),

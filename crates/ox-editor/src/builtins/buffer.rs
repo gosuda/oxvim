@@ -72,6 +72,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "changenr" => host
             .access
             .with_ex_editor(|editor| call_changenr_builtin(editor, args)),
+        "did_filetype" => host
+            .access
+            .with_ex_editor(|editor| call_did_filetype_builtin(editor, args)),
         "undotree" => host
             .access
             .with_ex_editor(|editor| call_undotree_builtin(editor, args)),
@@ -1123,6 +1126,25 @@ fn call_changenr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Ty
         .and_then(|buffer| editor.buffer_undo_tree(buffer).ok())
         .map_or(0, ox_text::UndoTree::current_seq);
     Ok(Typval::Number(i64::try_from(seq).unwrap_or(i64::MAX)))
+}
+
+/// `did_filetype()`: whether the `FileType` event fired for the current
+/// buffer with a non-empty value and no reset has run since (upstream
+/// `f_did_filetype`, reading `b_did_filetype`). A missing current buffer
+/// answers false.
+fn call_did_filetype_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if !args.is_empty() {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: did_filetype",
+        ));
+    }
+    let did = editor
+        .current_buffer()
+        .and_then(|buffer| editor.buffer(buffer).ok())
+        .is_some_and(|state| state.did_filetype());
+    Ok(Typval::Number(i64::from(did)))
 }
 
 /// `undotree([{buf}])`: the buffer's undo state and header list

@@ -2509,9 +2509,7 @@ fn line_bytes(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod completion_engine_tests {
-    use super::{
-        CTRL_D, CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession,
-    };
+    use super::{CTRL_D, CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession};
     use crate::layout::Geometry;
     use ox_text::{Buffer, Position};
 
