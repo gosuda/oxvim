@@ -45,8 +45,11 @@ impl RegisterContent {
         for line in &lines {
             validate_register_line(line)?;
         }
+        // Upstream `y_width` is a display-cell width (`update_yankreg_width`
+        // sums `win_charsize`, `register.c`), so a multibyte row passes when
+        // its cells fit even though its bytes do not.
         if let RegisterKind::BlockWise { width } = kind
-            && (width == 0 || lines.iter().any(|line| line.len() > width))
+            && (width == 0 || lines.iter().any(|line| Self::display_cells(line) > width))
         {
             return Err(RegisterError::InvalidBlockWidth { width });
         }
@@ -807,6 +810,20 @@ impl Registers {
         self.yank_to(name, content.clone())?;
         if shift {
             self.shift_numbered(content);
+            // A named delete yanks into the named slot first and only then
+            // shifts the numbered registers (`op_delete`, `ops.c:793-817),
+            // but `shift_delete_registers` repoints the unnamed register at
+            // `1` unless the delete appended (`register.c:976-979`). Only an
+            // appending delete keeps the named target, so `""p` after
+            // `"add"Add` pastes both lines while a plain `"add` still reads
+            // through `1`.
+            if let Ok(parsed) = RegisterName::try_from(name)
+                && matches!(parsed, RegisterName::Named { append: true, .. })
+                && let Some(target) = unnamed_pointer_name(parsed)
+            {
+                self.version = self.version.wrapping_add(1);
+                self.unnamed_target = Some(UnnamedTarget::Slot(target));
+            }
         }
         Ok(())
     }

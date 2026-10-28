@@ -18,16 +18,19 @@ use crate::builtins::position::cursor_vcol;
 use crate::decoration::Decorations;
 use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
+use crate::indent::ExprEval;
 use crate::layout::{
     CursorScreenPosition, Geometry, Layout, LayoutError, RelativeTo, TabpageState, WinConfig,
     WindowState,
 };
 use crate::mapping::Mappings;
 use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
+use crate::ops::{self, EditRange, Operator, OperatorRequest};
 use crate::options::{OptionStore, OptionValue};
-use crate::put::{PutDirection, PutEdit, PutPlan, plan_put, put_origin};
-use crate::register::{RegisterError, RegisterKind, Registers};
+use crate::put::{PutDirection, PutEdit, PutPlan, PutRequest, plan_put, put_origin};
+use crate::register::{RegisterContent, RegisterError, RegisterKind, Registers};
 use crate::typeahead::Typeahead;
+use crate::visual::VisualKind;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
 
@@ -300,12 +303,22 @@ pub enum EditorError {
     /// A named-mark operation failed.
     #[error(transparent)]
     Mark(#[from] MarkError),
+    /// An operator pipeline step failed (boxed: [`OperatorError`] already
+    /// wraps [`EditorError`]).
+    #[error(transparent)]
+    Operator(Box<crate::ops::OperatorError>),
     /// A fold operation failed.
     #[error(transparent)]
     Fold(#[from] FoldError),
     /// An extmark store operation failed.
     #[error(transparent)]
     Extmark(#[from] crate::ExtmarkError),
+}
+
+impl From<crate::ops::OperatorError> for EditorError {
+    fn from(error: crate::ops::OperatorError) -> Self {
+        Self::Operator(Box::new(error))
+    }
 }
 
 /// What to do with an old buffer after its last window switches away.
@@ -421,6 +434,10 @@ pub struct Editor {
     /// Per-window location list stacks (`quickfix.c` `w_llist`), freed with
     /// their window (`win_free` → `qf_free_all`, window.c:5667).
     loclists: std::collections::BTreeMap<WinHandle, crate::quickfix::QuickfixStack>,
+    /// Command-line, search, expression, input and debug history tables
+    /// (`cmdhist.c` `history[]`), newest last, each entry carrying its stable
+    /// `hisnum`.
+    history: crate::history::History,
     /// Diff-mode state: saved window options and per-tabpage diff blocks
     /// (`diff.c` `w_p_diff_saved` and `tp_first_diff`).
     pub diff: crate::diffmode::DiffState,
@@ -538,6 +555,75 @@ impl Default for Editor {
     }
 }
 
+/// One register put through the buffer mutation pipeline: named fields keep
+/// the window, register, placement, count, and cursor/indent modes from being
+/// transposed at a call site.
+///
+/// `cursend` is upstream `PUT_CURSEND` (`gp`/`gP`): the cursor lands after
+/// the inserted text. `fixindent` is upstream `PUT_FIXINDENT` (`[p`, `]p`,
+/// `:iput`): linewise rows are reindented to the cursor line.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegisterPut {
+    /// Window whose cursor positions the put.
+    pub window: WinHandle,
+    /// Register to put (`%`/`#` resolve against live buffers).
+    pub name: char,
+    /// `p` (after) or `P` (before) placement.
+    pub direction: PutDirection,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text.
+    pub cursend: bool,
+    /// Reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Undo timestamp.
+    pub timestamp: i64,
+}
+
+/// One put of already-resolved content: the same fields as [`RegisterPut`]
+/// without the register name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedPut {
+    /// Window whose cursor positions the put.
+    pub window: WinHandle,
+    /// `p` (after) or `P` (before) placement.
+    pub direction: PutDirection,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text.
+    pub cursend: bool,
+    /// Reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Undo timestamp.
+    pub timestamp: i64,
+}
+
+/// One visual-mode put: the selection is deleted, then the register is put
+/// over the deletion (`nv_put`, `normal.c:6630-6690`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VisualPut {
+    /// Window showing the selection.
+    pub window: WinHandle,
+    /// Normalized selection range (from `VisualState::range`).
+    pub range: EditRange,
+    /// Selection shape.
+    pub kind: VisualKind,
+    /// Register to put.
+    pub name: char,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text (`gp`).
+    pub cursend: bool,
+    /// Reindent linewise rows (`[p`).
+    pub fixindent: bool,
+    /// Delete the selection to the black hole (`P` keeps registers).
+    pub keep_registers: bool,
+    /// `p` (after) or `P` (before) placement at the deletion point.
+    pub direction: PutDirection,
+    /// Undo timestamp.
+    pub timestamp: i64,
+}
+
 /// One domain request to replace an inclusive line range: named fields keep
 /// buffer, range bounds, replacement, and both undo cursors from being
 /// transposed at a call site.
@@ -576,6 +662,7 @@ impl Editor {
             jumplist: Jumplist::new(),
             quickfix: crate::quickfix::QuickfixStack::new(),
             loclists: std::collections::BTreeMap::new(),
+            history: crate::history::History::new(),
             diff: crate::diffmode::DiffState::default(),
             changelists: Changelists::new(),
             arglist: ArgList::new(),
@@ -2092,6 +2179,17 @@ impl Editor {
     #[must_use]
     pub const fn quickfix(&self) -> &crate::quickfix::QuickfixStack {
         &self.quickfix
+    }
+
+    /// Returns the editor's history tables.
+    #[must_use]
+    pub const fn history(&self) -> &crate::history::History {
+        &self.history
+    }
+
+    /// Returns the editor's history tables for mutation.
+    pub const fn history_mut(&mut self) -> &mut crate::history::History {
+        &mut self.history
     }
 
     /// Returns the location list stack owned by `window`, if it has one
@@ -3872,23 +3970,89 @@ impl Editor {
         }
     }
 
+    /// Whether the buffer accepts text changes (`'modifiable'`).
+    #[must_use]
+    pub(crate) fn is_modifiable(&self, buffer: BufHandle) -> bool {
+        self.options()
+            .get_buffer(buffer, "modifiable")
+            .is_ok_and(|value| !matches!(value, crate::options::OptionValue::Boolean(false)))
+    }
+
     /// Puts a stored register through the buffer mutation pipeline.
     ///
     /// Returns false when the selected register has no retained content.
-    pub(crate) fn put_register(
-        &mut self,
-        window: WinHandle,
-        name: char,
-        direction: PutDirection,
-        count: usize,
-        timestamp: i64,
-    ) -> Result<bool, EditorError> {
+    pub(crate) fn put_register(&mut self, put: RegisterPut) -> Result<bool, EditorError> {
+        let RegisterPut {
+            window,
+            name,
+            direction,
+            count,
+            cursend,
+            fixindent,
+            timestamp,
+        } = put;
         let window = self.resolve_window_handle(window)?;
-        let state = self.window(window)?;
-        let buffer = state.buffer;
-        let mut cursor = state.cursor;
-        let Some(content) = self.registers.get(name)?.cloned() else {
-            return Ok(false);
+        let buffer = self.window(window)?.buffer;
+        let owned;
+        let content = match name {
+            // `get_spec_reg` (`register.c:850-949`): `%` and `#` synthesize
+            // their text from buffer names at paste time.
+            '%' | '#' => {
+                owned = self.spec_reg_content(window, buffer, name)?;
+                let Some(content) = owned.as_ref() else {
+                    return Ok(false);
+                };
+                content.clone()
+            }
+            _ => {
+                let Some(content) = self.registers.get(name)?.cloned() else {
+                    return Ok(false);
+                };
+                content
+            }
+        };
+        self.put_resolved(
+            &content,
+            ResolvedPut {
+                window,
+                direction,
+                count,
+                cursend,
+                fixindent,
+                timestamp,
+            },
+        )
+    }
+
+    /// Puts already-resolved content through the buffer mutation pipeline.
+    /// `put_register` funnels here after resolving names; visual put funnels
+    /// here with the pre-delete clone, so a `"` put never re-reads the
+    /// just-deleted selection.
+    pub(crate) fn put_resolved(
+        &mut self,
+        content: &RegisterContent,
+        put: ResolvedPut,
+    ) -> Result<bool, EditorError> {
+        let ResolvedPut {
+            window,
+            direction,
+            count,
+            cursend,
+            fixindent,
+            timestamp,
+        } = put;
+        let window = self.resolve_window_handle(window)?;
+        let buffer = self.window(window)?.buffer;
+        let mut cursor = self.window(window)?.cursor;
+        let owned;
+        let content = if fixindent && matches!(content.kind(), RegisterKind::LineWise) {
+            owned = Some(self.reindent_for_put(buffer, cursor, content)?);
+            let Some(content) = owned.as_ref() else {
+                return Ok(false);
+            };
+            content
+        } else {
+            content
         };
         let kind = content.kind();
         let text = self.buffer(buffer)?.text()?;
@@ -3909,16 +4073,367 @@ impl Editor {
         };
         let origin_line = target_lines.first().map_or(&[][..], Vec::as_slice);
         let origin = put_origin(origin_line, line_count, cursor, kind, direction);
-        let plan = plan_put(
-            &target_lines,
+        let plan = plan_put(&PutRequest {
+            target_lines: &target_lines,
             line_count,
             origin,
-            &content,
-            count.max(1),
-            cursor,
-        )?;
+            content,
+            count: count.max(1),
+            cursor_before: cursor,
+            cursend,
+        })?;
         self.commit_put_plan(buffer, Some(window), plan, timestamp)?;
         Ok(true)
+    }
+
+    /// Synthesizes `%`/`#` register text from live buffer names
+    /// (`get_spec_reg`, `register.c:850-892`). Returns `None` (a silent
+    /// no-op put, like upstream's NULL return) when the name is empty.
+    fn spec_reg_content(
+        &self,
+        window: WinHandle,
+        buffer: BufHandle,
+        name: char,
+    ) -> Result<Option<RegisterContent>, EditorError> {
+        let handle = if name == '%' {
+            Some(buffer)
+        } else {
+            self.window(window).ok().and_then(|state| {
+                state
+                    .alternate_buffer
+                    .filter(|alternate| *alternate != buffer)
+            })
+        };
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let name = self
+            .buffer(handle)
+            .map_err(|_| EditorError::UnknownBuffer(handle))?
+            .name()
+            .to_string_lossy()
+            .into_owned();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        RegisterContent::characterwise(name.as_bytes())
+            .map(Some)
+            .map_err(EditorError::from)
+    }
+
+    /// Reindents linewise put rows to the cursor line (`PUT_FIXINDENT`,
+    /// `register.c:2056-2095`): every non-empty row keeps its own indent
+    /// below the base indent of the put target, rendered with the buffer's
+    /// `'expandtab'`/`'tabstop'` settings.
+    pub(crate) fn reindent_for_put(
+        &self,
+        buffer: BufHandle,
+        cursor: Position,
+        content: &RegisterContent,
+    ) -> Result<RegisterContent, EditorError> {
+        use crate::indent::{IndentOptions, indent_columns, leading_len, whitespace_for};
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        let base_line = text
+            .line(cursor.lnum.clamp(1, line_count.max(1)))
+            .map_err(crate::buffer::BufferStateError::from)?;
+        let opts = IndentOptions::capture(self, buffer);
+        let base = indent_columns(&base_line, &opts);
+        let mut lines = Vec::with_capacity(content.lines().len());
+        for row in content.lines() {
+            if row.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+                // Upstream leaves empty rows (and `#` preprocessor rows)
+                // alone; whitespace-only rows stay empty here.
+                lines.push(Vec::new());
+                continue;
+            }
+            let stripped = &row[leading_len(row)..];
+            let total = base.saturating_add(indent_columns(row, &opts));
+            let mut rendered = whitespace_for(total, row, &opts);
+            rendered.extend_from_slice(stripped);
+            lines.push(rendered);
+        }
+        RegisterContent::linewise(lines).map_err(EditorError::from)
+    }
+
+    /// Puts a register over a visual selection.
+    ///
+    /// The selection is deleted first (into the unnamed/numbered registers,
+    /// or the black hole for `keep_registers`), then the register is put at
+    /// the deletion point — upstream's delete-then-`do_put` shape
+    /// (`nv_put`, `normal.c:6630-6690`). A linewise-forced put (visual-line
+    /// mode, or `:put`-style callers) replaces whole lines; a characterwise
+    /// single-line register over a block repeats on every selected line, the
+    /// way `do_put` loops over visual lines (`register.c:2007-2036`).
+    /// `']` after the put marks the inserted span (`commit_put_plan`).
+    ///
+    /// Returns false when the selected register has no retained content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError`] when the window, buffer, or register cannot
+    /// be resolved, or the operator pipeline fails.
+    pub(crate) fn put_visual(
+        &mut self,
+        put: VisualPut,
+        eval: &mut dyn ExprEval,
+    ) -> Result<bool, EditorError> {
+        let window = self.resolve_window_handle(put.window)?;
+        let buffer = self.window(window)?.buffer;
+        let text = self.buffer(buffer)?.text()?;
+        let old_count = text.line_count();
+        // `'<'`/`'>` track the selection (`b_visual`), with `MAXCOL` for a
+        // linewise end (`getpos("'>")` answers `v:maxcol`, `test_put.vim`).
+        let mut visual_end = put.range.end;
+        if matches!(put.kind, VisualKind::Line) {
+            // Largest valid cursor column (`MAXCOL`, `pos_defs.h:17-19`).
+            visual_end.col = 0x7FFF_FFFF;
+        }
+        let _ = self.set_local_mark(buffer, '<', put.range.start);
+        let _ = self.set_local_mark(buffer, '>', visual_end);
+        // Clone the register before the delete below swings `"` elsewhere;
+        // upstream saves and restores it for the same reason (`nv_put`).
+        // Every branch below threads this clone: re-reading by name would
+        // put the just-deleted selection for `"`.
+        let owned;
+        let content = match put.name {
+            '%' | '#' => {
+                owned = self.spec_reg_content(window, buffer, put.name)?;
+                let Some(content) = owned.as_ref() else {
+                    return Ok(false);
+                };
+                content.clone()
+            }
+            _ => {
+                let Some(content) = self.registers.get(put.name)?.cloned() else {
+                    return Ok(false);
+                };
+                content
+            }
+        };
+        let deleted_all = matches!(put.kind, VisualKind::Line)
+            && put.range.start.lnum <= 1
+            && put.range.end.lnum >= old_count;
+        let resolved = ResolvedPut {
+            window,
+            direction: put.direction,
+            count: put.count,
+            cursend: put.cursend,
+            fixindent: put.fixindent,
+            timestamp: put.timestamp,
+        };
+        // The delete below is part of the same undo step shape as the put;
+        // run it through the operator pipeline first, then branch on the
+        // selection/register shapes (`nv_put`, `normal.c:6630-6690`).
+        self.delete_visual_range(buffer, window, put, eval)?;
+        if matches!(put.kind, VisualKind::Line) {
+            // Whole-line replacement: the register lands as lines, whatever
+            // it held (`PUT_LINE`).
+            let lines = content.getreg_lines();
+            let lines = self.maybe_reindent(buffer, window, put, lines)?;
+            self.insert_visual_lines(buffer, window, &lines, put.timestamp)?;
+            if deleted_all {
+                self.drop_trailing_empty_line(buffer, put.timestamp)?;
+            }
+        } else if matches!(put.kind, VisualKind::Block)
+            && matches!(content.kind(), RegisterKind::CharacterWise)
+            && content.lines().len() == 1
+        {
+            // One-line text over a block repeats on every selected line
+            // (`register.c:2007-2036`); multi-line text over a block falls
+            // through to the single put below.
+            let start = put.range.start;
+            for offset in 0..=put.range.end.lnum.saturating_sub(start.lnum) {
+                let lnum = start.lnum.saturating_add(offset);
+                self.set_window_cursor(window, Position { lnum, col: start.col })?;
+                self.put_resolved(&content, resolved)?;
+            }
+        } else {
+            // Characterwise over characterwise (including the linewise
+            // register split in between, `PUT_LINE_SPLIT`): the deletion
+            // above left one merged line, so a normal put at the deletion
+            // point reproduces the split shape.
+            let content = if matches!(content.kind(), RegisterKind::LineWise) {
+                RegisterContent::characterwise(&content.to_bytes())
+                    .map_err(EditorError::from)?
+            } else {
+                content
+            };
+            self.put_resolved(&content, resolved)?;
+        }
+        Ok(true)
+    }
+
+    /// Deletes a visual-put selection through the operator pipeline
+    /// (`nv_put` deletes before `do_put`, routing to numbered registers or
+    /// to the black hole for `P`).
+    fn delete_visual_range(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        put: VisualPut,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), EditorError> {
+        ops::apply(
+            self,
+            OperatorRequest {
+                buffer,
+                window,
+                operator: Operator::Delete,
+                range: put.range,
+                register: put.keep_registers.then_some('_'),
+                timestamp: put.timestamp,
+                eval,
+            },
+        )
+        .map(|_| ())
+        .map_err(EditorError::from)
+    }
+
+    /// Reindents put rows for visual `[p`/`]p` (`PUT_FIXINDENT`); other puts
+    /// keep the register rows verbatim.
+    fn maybe_reindent(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        put: VisualPut,
+        lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, EditorError> {
+        if !put.fixindent {
+            return Ok(lines);
+        }
+        let content = RegisterContent::linewise(lines).map_err(EditorError::from)?;
+        let cursor = self.window(window)?.cursor;
+        Ok(self
+            .reindent_for_put(buffer, cursor, &content)?
+            .lines()
+            .to_vec())
+    }
+
+    /// Inserts linewise put rows at the window cursor after a visual-line
+    /// deletion, then leaves the cursor on the first inserted line's first
+    /// non-blank byte (`do_put` linewise cursor, `register.c:2216-2226`).
+    fn insert_visual_lines(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        lines: &[Vec<u8>],
+        timestamp: i64,
+    ) -> Result<(), EditorError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let window_state = self.window(window)?;
+        let cursor = window_state.cursor;
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        // An emptied buffer holds one empty line: replace it instead of
+        // inserting after it, so a whole-buffer put leaves no residue.
+        if line_count == 1
+            && text
+                .line(1)
+                .map_err(crate::buffer::BufferStateError::from)?
+                .is_empty()
+        {
+            let last = lines.len();
+            let cursor_after = Position {
+                lnum: last,
+                col: 0,
+            };
+            self.replace_buffer_lines(crate::LineReplaceRequest {
+                buffer,
+                start: 1,
+                end: 1,
+                lines,
+                cursor_before: cursor,
+                cursor_after,
+                timestamp,
+            })?;
+            let _ = self.set_local_mark(buffer, '[', Position { lnum: 1, col: 0 });
+            let _ = self.set_local_mark(buffer, ']', Self::last_byte_of(lines, last));
+            self.set_first_nonblank(window, buffer, last)?;
+            return Ok(());
+        }
+        let after_lnum = cursor.lnum.saturating_sub(1).min(line_count);
+        let before = Position {
+            lnum: after_lnum.saturating_add(1).min(line_count),
+            col: 0,
+        };
+        self.buffer_mut(buffer)?.insert_lines(
+            after_lnum,
+            lines,
+            cursor,
+            Position {
+                lnum: before.lnum,
+                col: 0,
+            },
+            timestamp,
+        )?;
+        let first_lnum = after_lnum.saturating_add(1);
+        let last_lnum = after_lnum.saturating_add(lines.len());
+        let _ = self.set_local_mark(buffer, '[', Position { lnum: first_lnum, col: 0 });
+        let _ = self.set_local_mark(buffer, ']', Self::last_byte_of(lines, last_lnum));
+        self.set_first_nonblank(window, buffer, first_lnum)?;
+        Ok(())
+    }
+
+    /// `']` for a linewise put: the last byte of the last inserted row
+    /// (`register.c:2187-2198`), zero for an empty row.
+    pub(crate) fn last_byte_of(lines: &[Vec<u8>], lnum: usize) -> Position {
+        let row = lines.last().map_or(&[][..], Vec::as_slice);
+        Position {
+            lnum,
+            col: if row.is_empty() {
+                0
+            } else {
+                row.len().saturating_sub(crate::put::last_scalar_len(row))
+            },
+        }
+    }
+
+    /// Moves the window cursor to the first non-blank byte of `lnum`.
+    fn set_first_nonblank(
+        &mut self,
+        window: WinHandle,
+        buffer: BufHandle,
+        lnum: usize,
+    ) -> Result<(), EditorError> {
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count().max(1);
+        let lnum = lnum.clamp(1, line_count);
+        let line = text
+            .line(lnum)
+            .map_err(crate::buffer::BufferStateError::from)?;
+        let col = line
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(0);
+        self.set_window_cursor(window, Position { lnum, col })?;
+        Ok(())
+    }
+
+    /// Drops a leftover empty last line after a whole-buffer visual put
+    /// (`nv_put`'s `empty` cleanup, `normal.c:6684-6695`).
+    fn drop_trailing_empty_line(
+        &mut self,
+        buffer: BufHandle,
+        timestamp: i64,
+    ) -> Result<(), EditorError> {
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        if line_count > 1
+            && text
+                .line(line_count)
+                .map_err(crate::buffer::BufferStateError::from)?
+                .is_empty()
+        {
+            let cursor = Position {
+                lnum: line_count.saturating_sub(1),
+                col: 0,
+            };
+            self.buffer_mut(buffer)?.delete_lines(line_count, line_count, cursor, timestamp)?;
+        }
+        Ok(())
     }
 
     /// Inserts explicit content through the same undo-aware pipeline as a register put.
@@ -3953,9 +4468,51 @@ impl Editor {
         } else {
             Vec::new()
         };
-        let plan = plan_put(&target_lines, line_count, position, content, 1, position)?;
+        let plan = plan_put(&PutRequest {
+            target_lines: &target_lines,
+            line_count,
+            origin: position,
+            content,
+            count: 1,
+            cursor_before: position,
+            cursend: false,
+        })?;
         self.commit_put_plan(buffer, None, plan, timestamp)?;
         Ok(())
+    }
+
+    /// Caps put cursor and marks at their lines, the way `do_put` caps
+    /// `w_cursor.col` at the line length after every put
+    /// (`register.c:2208-2215`). Positions stay on the buffer; callers pass
+    /// the uncapped plan values.
+    fn clamp_put_positions(
+        &self,
+        buffer: BufHandle,
+        cursor: Position,
+        start: Position,
+        end: Position,
+    ) -> (Position, Position, Position) {
+        let clamp = |position: Position| {
+            let line_count = self
+                .buffer(buffer)
+                .ok()
+                .and_then(|state| state.text().ok())
+                .map_or(1, |text| text.line_count().max(1));
+            let lnum = position.lnum.clamp(1, line_count);
+            let len = self
+                .buffer(buffer)
+                .ok()
+                .and_then(|state| state.text().ok())
+                .and_then(|text| text.line(lnum).ok())
+                .map_or(0, |line| line.len());
+            // Byte columns from the planner already sit on character
+            // boundaries; only the length cap can move them.
+            Position {
+                lnum,
+                col: position.col.min(len),
+            }
+        };
+        (clamp(cursor), clamp(start), clamp(end))
     }
 
     fn commit_put_plan(
@@ -3969,6 +4526,8 @@ impl Editor {
             edits,
             cursor_before,
             cursor_after,
+            mark_start,
+            mark_end,
         } = plan;
         if edits.is_empty() {
             return Ok(false);
@@ -4036,6 +4595,13 @@ impl Editor {
         if let Some((after_lnum, line_count)) = inserted_lines {
             self.splice_positions(buffer, after_lnum + 1, 0, line_count);
         }
+        // `do_put` always records the put span in `'[`/`']`
+        // (`register.c:2179-2200`); the cursor never rests past the line end
+        // (`register.c:2208-2215` caps `w_cursor.col` at the line length).
+        let (cursor_after, mark_start, mark_end) =
+            self.clamp_put_positions(buffer, cursor_after, mark_start, mark_end);
+        let _ = self.set_local_mark(buffer, '[', mark_start);
+        let _ = self.set_local_mark(buffer, ']', mark_end);
         self.changelists.push(buffer, cursor_after);
         if opens_active_edit {
             self.active_text_edit = Some(buffer);

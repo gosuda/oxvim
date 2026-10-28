@@ -10323,3 +10323,628 @@ fn plan_abort_rules_follow_try_depth_inheritance() {
         "explicit :throw must still abort later plan actions",
     );
 }
+
+// ---------------------------------------------------------------------------
+// :join / :change / :move / :uniq / :badd / :checktime / :tabfirst /
+// :tablast / :helpclose
+//
+// Citations:
+// - `src/nvim/ex_docmd.c` `ex_join` (6709-6725), `ex_copymove` (6668-6707),
+//   `ex_tabnext` (5755-5795), `ex_edit`/`do_ecmd` (6023-6076), `get_address`
+//   (3402-3713), `set_cmd_count` (1373-1393)
+// - `src/nvim/ops.c` `do_join` (1900-2010), `skip_comment`/`get_leader_len`
+// - `src/nvim/ex_cmds.c` `ex_change` (3148-3181), `ex_append` (3017-3146),
+//   `do_move` (896-994), `ex_uniq` (697-880)
+// - `src/nvim/ex_cmds2.c` `ex_checktime` (787-800)
+// - `src/nvim/fileio.c` `buf_check_timestamp` (2997+), `check_timestamps`
+// - `src/nvim/help.c` `ex_helpclose` (238-244)
+// - `src/nvim/buffer.c` `buflist_new` (existing name returns the entry)
+// - `src/nvim/message.c` `msgmore` (1652+: "N fewer lines")
+// - `src/nvim/ex_cmds.lua` command flags (BANG/RANGE/COUNT/EXTRA/TRLBAR)
+// - `runtime/doc/change.txt` `:uniq` semantics (`[!]` keeps the first line
+//   of each duplicate run and drops lines that never repeat)
+// - `test/old/testdir/test_join.vim`, `test_uniq.vim`, `test_buffer.vim`
+//   (`Test_badd_options`), `test_tabpage.vim`
+// ---------------------------------------------------------------------------
+
+fn cursor_line(editor: &TestEditorAccess) -> usize {
+    let window = editor.editor().current_window().unwrap();
+    editor.editor().window(window).unwrap().cursor.lnum
+}
+
+/// `:join` joins the addressed lines with one space by default.
+/// Upstream: `ex_join` → `do_join(..., insert_space=true, ...)`; the cursor
+/// lands on the joined line (`beginline(BL_WHITE | BL_FIX)`).
+#[test]
+fn join_joins_range_with_single_space() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1,2join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a b", "c"]);
+    assert_eq!(cursor_line(&editor), 1);
+}
+
+/// `:join!` concatenates without inserting spaces.
+/// Upstream: `do_join(..., insert_space=false, ...)` (`!eap->forceit`).
+#[test]
+fn join_bang_concatenates_without_space() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1,2join!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["ab", "c"]);
+}
+
+/// `:join` with no range joins the cursor line with the next one.
+/// Upstream: `ex_join` sets `line2 = line1 + 1` when both name the cursor
+/// line and only one address was given.
+#[test]
+fn join_without_range_joins_cursor_line_with_next() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "2").unwrap();
+    assert_eq!(cursor_line(&editor), 2);
+    executor.execute_line(&editor, "join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b c"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// A post-command count extends the joined range (`set_cmd_count`).
+#[test]
+fn join_count_extends_range() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1join 2").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a b", "c"]);
+}
+
+/// `'joinspaces'` inserts two spaces after `.`, `?` and `!`.
+/// Upstream: `do_join`'s `p_js` branch.
+#[test]
+fn join_spaces_adds_second_space_after_period() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"end.".to_vec(), b"next".to_vec()]);
+    executor.execute_line(&editor, "set joinspaces").unwrap();
+    executor.execute_line(&editor, "join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["end.  next"]);
+}
+
+/// `:2,2join` changes nothing (`addr_count >= 2` returns early), but the
+/// cursor still moves onto `line1` first (`ex_join` sets it before the
+/// early return).
+#[test]
+fn join_repeated_single_line_address_is_noop() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "2,2join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// Joining the last line alone only beeps upstream; here it changes nothing.
+#[test]
+fn join_last_line_alone_is_noop() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "3join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+}
+
+/// `:change` deletes the range and inserts the following lines in its place;
+/// the cursor lands on the last inserted line.
+/// Upstream: `ex_change` (delete) then `ex_append` with `line2 = line1`.
+#[test]
+fn change_replaces_range_with_inserted_text() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor
+        .execute_line(&editor, "2,3change\nX\nY\n.\n")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "Y", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 3);
+}
+
+/// `:change` with an immediate `.` deletes the range and inserts nothing;
+/// the cursor lands on the line the deletion left behind.
+/// Upstream: the `get_append_line` loop breaks at once, leaving
+/// `w_cursor.lnum = line1 - 1`.
+#[test]
+fn change_bare_dot_deletes_only() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3change\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 1);
+}
+
+/// A count extends the changed range from its end (`set_cmd_count`).
+#[test]
+fn change_count_extends_deleted_range() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor
+        .execute_line(&editor, "2change 2\nX\n.\n")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "d", "e"]);
+}
+
+/// `:change!` accepts input the same way (`!` only toggles autoindent, which
+/// this port does not model for any append-family command).
+#[test]
+fn change_bang_accepts_input() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2change!\nX\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "c", "d", "e"]);
+}
+
+/// `:%change` replaces the whole buffer.
+#[test]
+fn change_whole_buffer_replaces_all() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "%change\nX\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["X"]);
+}
+
+/// `:move` relocates lines below the destination, which is evaluated before
+/// the move (`ex_copymove`); `:0` names the gap before the first line.
+#[test]
+fn move_lines_below_destination() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move 0").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["b", "c", "a", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// A destination past the range shifts down by the moved count (`do_move`
+/// copies before deleting, netting an insert after `dest - count`).
+#[test]
+fn move_after_later_line() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move 4").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+    assert_eq!(cursor_line(&editor), 4);
+}
+
+/// Destination address arithmetic: `$` with offsets (`get_address`).
+#[test]
+fn move_destination_address_arithmetic() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move $-1").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+}
+
+/// A `/pattern/` destination searches from the cursor line; trailing
+/// `p`/`l`/`#` flags are skipped (`get_flags`) and the rest ignored.
+#[test]
+fn move_search_destination() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move /d/").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+}
+
+/// Moving a range into itself is `E134` (`do_move`).
+#[test]
+fn move_into_itself_is_e134() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    let result = executor.execute_line(&editor, "2,3move 2");
+    assert_vim_error(result, "E134");
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["a", "b", "c", "d", "e"],
+        "a failed move changes nothing",
+    );
+}
+
+/// A missing destination parses to `MAXLNUM`, which `ex_copymove` reports as
+/// `E16` (`e_invrange`).
+#[test]
+fn move_missing_destination_is_e16() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    let result = executor.execute_line(&editor, "1,2move");
+    assert_vim_error(result, "E16");
+}
+
+/// `:move` takes no bang: the parser rejects it with `E477` before the
+/// command runs. Oracle: `1,2move!` → `E477: No ! allowed`.
+#[test]
+fn move_bang_is_e477() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    let result = executor.execute_line(&editor, "1,2move!");
+    assert_vim_error(result, "E477");
+}
+
+/// `%uniq` drops adjacent duplicates, keeping the first of each run.
+/// Upstream: `ex_uniq` with neither `u` nor `!` (`test_uniq.vim`
+/// "Alphabetical uniq #1").
+#[test]
+fn uniq_removes_adjacent_duplicates() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["aa", "cc", "bb", "aa", "yyy", "zz"]
+    );
+}
+
+/// `%uniq!` keeps the first line of each duplicate run and deletes lines
+/// that never repeat (`keep_only_not_unique`; `!` wins over `u`).
+/// Upstream: `test_uniq.vim` "uniq not uniqued #1" → `["cc", "yyy"]`.
+#[test]
+fn uniq_bang_keeps_first_of_run_and_drops_singletons() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["cc", "yyy"]);
+}
+
+/// `%uniq u` keeps only lines that do not repeat.
+/// Upstream: `test_uniq.vim` "uniq only unique #1" → `["aa", "bb", "aa",
+/// "zz"]`.
+#[test]
+fn uniq_u_keeps_only_non_repeating_lines() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq u").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["aa", "bb", "aa", "zz"]);
+}
+
+/// `:uniq` honors an explicit range, and a single-line range returns before
+/// argument parsing ("Uniq one line is really quick!").
+#[test]
+fn uniq_range_and_single_line_noop() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"1".to_vec(),
+        b"2".to_vec(),
+        b"3".to_vec(),
+        b"4".to_vec(),
+        b"5".to_vec(),
+        b"6".to_vec(),
+        b"7".to_vec(),
+        b"8".to_vec(),
+        b"9".to_vec(),
+    ]);
+    executor.execute_line(&editor, "3,5uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    );
+    executor.execute_line(&editor, "4uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    );
+}
+
+/// Deletions longer than `'report'` announce `N fewer lines` (`msgmore`).
+/// Upstream: `test_uniq.vim` `Test_uniq_cmd_report` ("6 fewer lines").
+#[test]
+fn uniq_reports_fewer_lines_message() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"1".to_vec(),
+        b"1".to_vec(),
+        b"1".to_vec(),
+        b"2".to_vec(),
+        b"2".to_vec(),
+        b"2".to_vec(),
+        b"3".to_vec(),
+        b"3".to_vec(),
+        b"3".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["1", "2", "3"]);
+    let reports: Vec<String> = editor
+        .editor()
+        .messages()
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        reports.iter().any(|text| text == "6 fewer lines"),
+        "expected a '6 fewer lines' report, got: {reports:?}",
+    );
+}
+
+/// A deletion marks the buffer modified (`test_uniq.vim` modified check,
+/// `Test_uniq_undo`).
+#[test]
+fn uniq_with_deletions_sets_modified() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_saved();
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b"]);
+    assert!(editor
+        .editor()
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED));
+}
+
+/// An unchanged buffer stays unmodified (`test_uniq.vim` modified check).
+#[test]
+fn uniq_without_deletions_keeps_unmodified() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert!(!editor
+        .editor()
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED));
+}
+
+/// Unknown uniq flags are `E475` (`semsg(e_invarg2, p)`).
+/// Upstream: `test_uniq.vim` `uniq no` → `E475:`.
+#[test]
+fn uniq_invalid_flag_is_e475() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "uniq no");
+    assert_vim_error(result, "E475");
+}
+
+/// An unterminated uniq pattern is `E654` (`skip_regexp_err`).
+/// Upstream: `test_uniq.vim` `uniq #pat%` → `E654:`.
+#[test]
+fn uniq_unterminated_pattern_is_e654() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "uniq #pat%");
+    assert_vim_error(result, "E654");
+}
+
+/// A range past the end of the buffer is `E16` (`invalid_range`).
+/// Upstream: `test_uniq.vim` `1,999uniq` → `E16:`.
+#[test]
+fn uniq_out_of_range_is_e16() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "1,999uniq");
+    assert_vim_error(result, "E16");
+}
+
+/// `:badd` adds an unloaded but listed buffer (`buflist_new` with
+/// `BLN_LISTED` never reads the file).
+#[test]
+fn badd_adds_unloaded_listed_buffer() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    let found = editor
+        .editor()
+        .buffers()
+        .into_iter()
+        .find(|handle| {
+            editor
+                .editor()
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == b"newfile.txt")
+        })
+        .expect("badd must add the named buffer");
+    let guard = editor.editor();
+    let state = guard.buffer(found).unwrap();
+    assert!(state.flags.contains(crate::BufferFlags::LISTED));
+    assert!(!state.residency.is_loaded());
+}
+
+/// `:badd` with no argument is `E471` (`NEEDARG`).
+#[test]
+fn badd_empty_argument_is_e471() {
+    let (editor, mut executor) = setup();
+    let result = executor.execute_line(&editor, "badd");
+    assert_vim_error(result, "E471");
+}
+
+/// A name that is already listed is a silent no-op (`buflist_new` returns
+/// the existing entry).
+#[test]
+fn badd_listed_name_is_noop() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    let before = editor.editor().buffers().len();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    assert_eq!(editor.editor().buffers().len(), before);
+}
+
+/// `:checktime` is silent when no loaded buffer changed on disk.
+/// Upstream: `ex_checktime` → `check_timestamps(false)` with nothing to do.
+#[test]
+fn checktime_quiet_when_nothing_changed() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "checktime").unwrap();
+    assert_eq!(editor.editor().messages().len(), seen);
+}
+
+/// `:checktime` warns when the file changed under an unmodified buffer.
+/// Upstream: `buf_check_timestamp` → `W11` (no `FileChangedShell` handlers
+/// here to consume the warning first). `noautoread` forces the warning path:
+/// this port defaults `'autoread'` on (upstream defaults it off), and under
+/// `'autoread'` an unmodified buffer reloads silently instead.
+#[test]
+fn checktime_warns_when_disk_changed() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    executor.execute_line(&editor, "set noautoread").unwrap();
+    executor.scripts().io().insert("current.txt", "changed\n");
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "checktime").unwrap();
+    let fresh: Vec<String> = editor.editor().messages()[seen..]
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        fresh.iter().any(|text| text.contains("W11")),
+        "expected a W11 warning, got: {fresh:?}",
+    );
+}
+
+/// `:checktime` reloads a changed, unmodified buffer under `'autoread'`.
+/// Upstream: `buf_check_timestamp` with `RELOAD_NORMAL`.
+#[test]
+fn checktime_reloads_changed_buffer_under_autoread() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    executor.execute_line(&editor, "set autoread").unwrap();
+    executor.scripts().io().insert("current.txt", "changed\n");
+    executor.execute_line(&editor, "checktime").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["changed"]);
+}
+
+/// `:tabfirst` (and `:tabrewind`) enters the first tabpage.
+/// Upstream: `ex_tabnext` `CMD_tabfirst`/`CMD_tabrewind` → `goto_tabpage(1)`.
+#[test]
+fn tabfirst_goes_to_first_tabpage() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    assert_eq!(current_tab_index(&editor), 3);
+    executor.execute_line(&editor, "tabfirst").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabrewind").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+}
+
+/// `:tablast` enters the last tabpage.
+/// Upstream: `ex_tabnext` `CMD_tablast` → `goto_tabpage(9999)`.
+#[test]
+fn tablast_goes_to_last_tabpage() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabfirst").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+    executor.execute_line(&editor, "tablast").unwrap();
+    assert_eq!(current_tab_index(&editor), 3);
+}
+
+/// `:helpclose` closes one help window in the current tabpage.
+/// Upstream: `ex_helpclose` closes the first `bt_help` window.
+#[test]
+fn helpclose_closes_open_help_window() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let help = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(
+            help,
+            "buftype",
+            crate::options::OptionValue::String("help".to_owned()),
+        )
+        .unwrap();
+    executor.execute_line(&editor, "split").unwrap();
+    assert_eq!(editor.editor().windows().len(), 2);
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(help)))
+        .unwrap();
+    executor.execute_line(&editor, "helpclose").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+}
+
+/// `:helpclose` with no help window open is a silent no-op.
+#[test]
+fn helpclose_without_help_window_is_noop() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "helpclose").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+    assert_eq!(editor.editor().messages().len(), seen);
+}

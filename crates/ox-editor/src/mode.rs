@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
 use crate::builtins::position::{cursor_vcol, display_len, getvcol, vcol_to_byte};
+use crate::editor::{RegisterPut, VisualPut};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{FindDirection, FindMotion, Motion, resolve, resolve_find};
@@ -36,6 +37,39 @@ pub enum CmdlineKind {
     Ex,
 }
 
+/// One normal-mode put request: the register, placement, and cursor/indent
+/// modes travel together so call sites keep a stable order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalPut {
+    /// Register to put (`=` entry stores source text for `getreg`).
+    pub register: char,
+    /// `p` (after) versus `P` (before) placement.
+    pub forward: bool,
+    /// `gp`/`gP`: land the cursor after the inserted text.
+    pub cursend: bool,
+    /// `[p`/`]p`: reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Repetition count.
+    pub count: usize,
+}
+
+/// One visual-mode put request: the register handling and cursor/indent
+/// modes travel together so call sites keep a stable order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualPutKind {
+    /// Delete the selection, then put the register over it.
+    Put {
+        /// Delete to the black hole instead of routing registers (`P`).
+        keep_registers: bool,
+        /// Land the cursor after the inserted text (`gp`).
+        cursend: bool,
+        /// Reindent linewise rows (`[p`/`]p`).
+        fixindent: bool,
+        /// `p` (after) versus `P` (before) placement.
+        forward: bool,
+    },
+}
+
 /// Parser state retained between normal-mode keys.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NormalState {
@@ -45,6 +79,9 @@ pub struct NormalState {
     pub prefix: String,
     /// Explicit register selected with `"`.
     pub register: Option<char>,
+    /// Expression-register input after `"=` (`get_expr_line` source text),
+    /// collected until `<CR>`; `None` outside `=` entry.
+    pub expression: Option<String>,
 }
 /// Insert mode has no extra retained state for the supported basics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1594,6 +1631,93 @@ impl ModeMachine {
         Ok(())
     }
 
+    /// One expression-register input key while `"=` entry is active.
+    /// Returns `None` to stay in Normal state collecting, or the mode the
+    /// entry resolves to (only cancellation changes it).
+    fn expression_entry(
+        editor: &mut Editor,
+        state: &mut NormalState,
+        key: char,
+    ) -> Result<Option<Mode>, ModeError> {
+        if key == '\r' || key == '\n' {
+            let source = state.expression.take().map_or(String::new(), |text| text);
+            if !source.is_empty() {
+                if let Ok(content) = RegisterContent::characterwise(source.as_bytes()) {
+                    let _ = editor.registers_mut().set('=', content);
+                }
+                beep_flush(editor);
+            }
+            return Ok(None);
+        }
+        if key == '\u{1b}' || key == '\u{3}' {
+            state.expression = None;
+            state.register = None;
+            return Ok(Some(Mode::default()));
+        }
+        if let Some(expression) = state.expression.as_mut() {
+            expression.push(key);
+        }
+        Ok(None)
+    }
+
+    /// One normal-mode put (`p`/`P`/`gp`/`gP`/`[p`/`]p`).
+    ///
+    /// `forward` selects `p` over `P` placement, `cursend` is `gp`/`gP`,
+    /// and `fixindent` is `[p`/`]p`. Non-modifiable buffers fail with `E21`
+    /// before the register is even read, like upstream's `u_save`
+    /// (`register.c:do_put`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModeError`] when the buffer or register cannot be read, or
+    /// the put overflows (`E1240`) or targets a non-modifiable buffer
+    /// (`E21`).
+    fn normal_put(&mut self, editor: &mut Editor, put: NormalPut) -> Result<bool, ModeError> {
+        let ctx = cursor_context(editor)?;
+        if !editor.is_modifiable(ctx.buffer) {
+            return Err(ModeError::Vim(
+                "E21",
+                "Cannot make changes, 'modifiable' is off".to_owned(),
+            ));
+        }
+        // `do_put` refuses a count whose multiplication overflows before it
+        // allocates anything: characterwise text checks
+        // `count > INT_MAX / yanklen` (`register.c:1979`) and a block checks
+        // the same against its row width plus padding (`register.c:1854`).
+        // Without the guard `999999999p` builds a plan of a billion rows
+        // and never returns.
+        let width = editor
+            .registers()
+            .get(put.register)
+            .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
+            .map_or(0, |content| content.to_bytes().len());
+        if width > 0
+            && put.count
+                > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
+                    .unwrap_or(usize::MAX)
+        {
+            return Err(ModeError::Vim(
+                "E1240",
+                "Resulting text too long".to_owned(),
+            ));
+        }
+        editor
+            .put_register(RegisterPut {
+                window: ctx.window,
+                name: put.register,
+                direction: if put.forward {
+                    PutDirection::After
+                } else {
+                    PutDirection::Before
+                },
+                count: put.count,
+                cursend: put.cursend,
+                fixindent: put.fixindent,
+                timestamp: self.timestamp,
+            })
+            .map_err(ModeError::Editor)
+    }
+
     fn execute_key(
         &mut self,
         editor: &mut Editor,
@@ -1658,6 +1782,14 @@ impl ModeMachine {
         if state.count == 0 && state.prefix.is_empty() && state.register.is_none() {
             editor.set_v_register('"');
         }
+        // Expression-register entry (`"=` then text then `<CR>`): collect
+        // the source instead of executing it as commands. The mode machine
+        // has no general expression evaluator (only `indentexpr`), so a
+        // non-empty source is stored for `getreg('=')` and beeped — a later
+        // `p` cannot evaluate it and stays a silent no-op.
+        if state.expression.is_some() {
+            return Self::expression_entry(editor, state, key);
+        }
         if state.prefix == "register" {
             state.prefix.clear();
             // `op_reg_index` / `set_reg_may_clear` (`normal.c`): validate
@@ -1668,6 +1800,11 @@ impl ModeMachine {
             // invalid register survives to corrupt the following operation.
             if !is_valid_register_name(key) {
                 return Ok(None);
+            }
+            if key == '=' {
+                // Start expression entry; the register stays selected for
+                // the command after `<CR>` (`set_expr_line`, `ex_docmd.c`).
+                state.expression = Some(String::new());
             }
             // Retain the original case in `state.register` so uppercase
             // prefixes keep their append semantics (`A` appends to `a`).
@@ -1789,13 +1926,87 @@ impl ModeMachine {
                 Self::goto_tabpage(editor, key == 'T', state.count);
                 return Ok(Some(Mode::default()));
             }
+            // `gp`/`gP` put like `p`/`P` but leave the cursor after the
+            // inserted text (`PUT_CURSEND`, `nv_put`).
+            if matches!(key, 'p' | 'P') {
+                state.prefix.clear();
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: key == 'p',
+                    cursend: true,
+                    fixindent: false,
+                    count: state.count.max(1),
+                };
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
+                return Ok(Some(Mode::default()));
+            }
             let command = format!("g{key}");
             Self::move_command(editor, &command, state.count.max(1), false)?;
+            return Ok(Some(Mode::default()));
+        }
+        // `zo` opens one fold at the cursor like upstream (`nv_zet`); with
+        // no closed fold under the cursor it is a silent no-op, so a
+        // following motion (e.g. `Gkzo`) never leaks into Insert via `o`.
+        if state.prefix == "z" {
+            state.prefix.clear();
+            // `nv_zet`/`nv_zb`: place the cursor line at the top, middle or
+            // bottom of the window (`normal.c`). `zz` is the centre case;
+            // `zt` and `zb` differ only in where the first displayed line
+            // lands, clamped so the cursor stays visible.
+            if matches!(key, 'z' | 't' | 'b') {
+                let ctx = cursor_context(editor)?;
+                let height = editor
+                    .window_geometry(ctx.window)
+                    .map(|geometry| geometry.height.max(1))
+                    .unwrap_or(1);
+                let topline = match key {
+                    't' => ctx.cursor.lnum,
+                    'b' => ctx.cursor.lnum.saturating_sub(height.saturating_sub(1)).max(1),
+                    _ => ctx
+                        .cursor
+                        .lnum
+                        .saturating_sub(height.saturating_sub(1) / 2)
+                        .max(1),
+                };
+                editor.window_mut(ctx.window)?.topline = topline;
+                return Ok(Some(Mode::default()));
+            }
+            if matches!(key, 'o' | 'O' | 'c' | 'C') {
+                let ctx = cursor_context(editor)?;
+                let position = crate::fold::Position::new(
+                    ctx.cursor.lnum.saturating_sub(1),
+                    ctx.cursor.col,
+                );
+                if key == 'c' || key == 'C' {
+                    let _ = editor.fold_close(ctx.buffer, position);
+                } else {
+                    let _ = editor.fold_open(ctx.buffer, position);
+                }
+                return Ok(Some(Mode::default()));
+            }
+            beep_flush(editor);
             return Ok(Some(Mode::default()));
         }
         if state.prefix == "[" || state.prefix == "]" {
             let prefix = state.prefix.clone();
             state.prefix.clear();
+            // `[p`, `[P`, `]p`, `]P` put with indent adjustment
+            // (`PUT_FIXINDENT`, `nv_put_opt`): only `]p` moves forward.
+            if matches!(key, 'p' | 'P') {
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: prefix == "]" && key == 'p',
+                    cursend: false,
+                    fixindent: true,
+                    count: state.count.max(1),
+                };
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
+                return Ok(Some(Mode::default()));
+            }
             if matches!(key, 'i' | 'I' | '\t' | 'd' | 'D' | '\u{4}') {
                 Self::ident_search(editor, &prefix, key, state.count.max(1))?;
                 return Ok(Some(Mode::default()));
@@ -1851,7 +2062,7 @@ impl ModeMachine {
                     search: None,
                 })))
             }
-            'g' | '[' | ']' | '\u{17}' | 'f' | 'F' | 't' | 'T' => {
+            'g' | '[' | ']' | 'z' | '\u{17}' | 'f' | 'F' | 't' | 'T' => {
                 state.prefix = key.to_string();
                 Ok(None)
             }
@@ -1909,17 +2120,35 @@ impl ModeMachine {
                 Ok(Some(Mode::Insert(InsertState)))
             }
             'v' | 'V' | '\u{16}' | '\u{11}' => {
-                let cursor = cursor_context(editor)?.cursor;
-                Ok(Some(Mode::Visual(VisualState::new(
-                    cursor,
-                    if key == 'v' {
-                        VisualKind::Character
-                    } else if key == 'V' {
-                        VisualKind::Line
-                    } else {
-                        VisualKind::Block
-                    },
-                ))))
+                let ctx = cursor_context(editor)?;
+                let kind = if key == 'v' {
+                    VisualKind::Character
+                } else if key == 'V' {
+                    VisualKind::Line
+                } else {
+                    VisualKind::Block
+                };
+                let mut state = VisualState::new(ctx.cursor, kind);
+                // `V` on a closed fold selects the whole fold
+                // (`hasFolding` in `nv_visual`, `normal.c`).
+                if matches!(kind, VisualKind::Line)
+                    && let Ok(buffer) = editor.buffer(ctx.buffer)
+                    && let Ok(text) = buffer.text()
+                    && let Some((first, last)) =
+                        buffer.folds.closed_rows_at(ctx.cursor.lnum.saturating_sub(1))
+                {
+                    let line_count = text.line_count().max(1);
+                    state.anchor = Position {
+                        lnum: first.saturating_add(1).clamp(1, line_count),
+                        col: 0,
+                    };
+                    state.cursor = Position {
+                        lnum: last.saturating_add(1).clamp(1, line_count),
+                        col: 0,
+                    };
+                    editor.set_window_cursor(ctx.window, state.cursor)?;
+                }
+                Ok(Some(Mode::Visual(state)))
             }
             '/' | '?' => {
                 let ctx = cursor_context(editor)?;
@@ -1980,34 +2209,16 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             'p' | 'P' => {
-                let ctx = cursor_context(editor)?;
-                let name = state.register.unwrap_or('"');
-                let direction = if key == 'p' {
-                    PutDirection::After
-                } else {
-                    PutDirection::Before
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: key == 'p',
+                    cursend: false,
+                    fixindent: false,
+                    count: state.count.max(1),
                 };
-                // `do_put` refuses a count whose multiplication overflows
-                // before it allocates anything: characterwise text checks
-                // `count > INT_MAX / yanklen` (register.c:1979) and a block
-                // checks the same against its row width plus padding
-                // (register.c:1854). Without the guard `999999999p` builds a
-                // plan of a billion rows and never returns.
-                let width = editor
-                    .registers()
-                    .get(name)
-                    .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
-                    .map_or(0, |content| content.to_bytes().len());
-                if width > 0
-                    && count > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
-                        .unwrap_or(usize::MAX)
-                {
-                    return Err(ModeError::Vim(
-                        "E1240",
-                        "Resulting text too long".to_owned(),
-                    ));
-                }
-                let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
                 Ok(Some(Mode::default()))
             }
             'J' => {
@@ -2745,8 +2956,54 @@ impl ModeMachine {
             self.visual_replace(editor, state, classify_replace_key(key, quoted))?;
             return Ok(Some(Mode::default()));
         }
+        // `"` in visual mode selects the register for a following `p`
+        // (`nv_put` reads `oap->regname` for the put after the delete).
+        if state.prefix == "register" {
+            state.prefix.clear();
+            if is_valid_register_name(key) {
+                state.register = Some(key);
+                return Ok(None);
+            }
+            state.register = None;
+            beep_flush(editor);
+            return Ok(None);
+        }
+        // `[p`/`]p` in visual mode puts with indent adjustment
+        // (`PUT_FIXINDENT`, `nv_put_opt`).
+        if state.prefix == "[" || state.prefix == "]" {
+            state.prefix.clear();
+            if matches!(key, 'p' | 'P') {
+                return self.visual_put(
+                    editor,
+                    state,
+                    VisualPutKind::Put {
+                        keep_registers: false,
+                        cursend: false,
+                        fixindent: true,
+                        forward: Self::visual_put_forward(state),
+                    },
+                    eval,
+                );
+            }
+            return Ok(None);
+        }
         if state.prefix == "g" {
             state.prefix.clear();
+            // `gp` in visual mode puts and lands after the text
+            // (`PUT_CURSEND`, `nv_put`).
+            if matches!(key, 'p' | 'P') {
+                return self.visual_put(
+                    editor,
+                    state,
+                    VisualPutKind::Put {
+                        keep_registers: key == 'P',
+                        cursend: true,
+                        fixindent: false,
+                        forward: Self::visual_put_forward(state),
+                    },
+                    eval,
+                );
+            }
             if matches!(key, 'u' | 'U' | '~') {
                 let operator = match key {
                     'u' => Operator::Lowercase,
@@ -2842,6 +3099,28 @@ impl ModeMachine {
             'I' | 'A' if state.kind == VisualKind::Block => {
                 self.block_insert_begin(editor, state, key == 'A')
             }
+            '"' => {
+                state.prefix = "register".into();
+                Ok(None)
+            }
+            '[' | ']' => {
+                state.prefix = key.to_string();
+                Ok(None)
+            }
+            // Visual-mode put: the selection is deleted, then the register
+            // is put over it (`nv_put`, `normal.c:6630-6690`). `P` keeps
+            // registers (the selection goes to the black hole).
+            'p' | 'P' => self.visual_put(
+                editor,
+                state,
+                VisualPutKind::Put {
+                    keep_registers: key == 'P',
+                    cursend: false,
+                    fixindent: false,
+                    forward: Self::visual_put_forward(state),
+                },
+                eval,
+            ),
             'd' | 'x' | 'X' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self
                 .finish_visual_operator(
                     editor,
@@ -3132,6 +3411,91 @@ impl ModeMachine {
         Ok(())
     }
 
+    /// Visual-mode put direction: linewise is always backward; otherwise
+    /// forward only when the active end sits before the selection start
+    /// (`nv_put`, `normal.c:6660-6668`).
+    fn visual_put_forward(state: &VisualState) -> bool {
+        if matches!(state.kind, VisualKind::Line) {
+            return false;
+        }
+        state.cursor.col < state.range().start.col
+    }
+
+    /// One visual-mode put (`p`/`P`/`gp`/`[p`/`]p`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModeError`] when the buffer or register cannot be read, the
+    /// put overflows (`E1240`), or the buffer is non-modifiable (`E21`).
+    fn visual_put(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut VisualState,
+        kind: VisualPutKind,
+        eval: &mut dyn ExprEval,
+    ) -> Result<Option<Mode>, ModeError> {
+        let VisualPutKind::Put {
+            keep_registers,
+            cursend,
+            fixindent,
+            forward,
+        } = kind;
+        let ctx = cursor_context(editor)?;
+        if !editor.is_modifiable(ctx.buffer) {
+            return Err(ModeError::Vim(
+                "E21",
+                "Cannot make changes, 'modifiable' is off".to_owned(),
+            ));
+        }
+        let count = state.count.max(1);
+        let name = state.register.unwrap_or('"');
+        let visual_kind = state.kind;
+        let range = state.range();
+        let direction = if forward {
+            PutDirection::After
+        } else {
+            PutDirection::Before
+        };
+        state.count = 0;
+        state.register = None;
+        state.prefix.clear();
+        self.last_visual = Some(state.clone());
+        // `do_put` overflow refusal mirrors the normal-mode guard.
+        let width = editor
+            .registers()
+            .get(name)
+            .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
+            .map_or(0, |content| content.to_bytes().len());
+        if width > 0
+            && count
+                > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
+                    .unwrap_or(usize::MAX)
+        {
+            return Err(ModeError::Vim(
+                "E1240",
+                "Resulting text too long".to_owned(),
+            ));
+        }
+        editor
+            .put_visual(
+                VisualPut {
+                    window: ctx.window,
+                    range,
+                    kind: visual_kind,
+                    name,
+                    count,
+                    cursend,
+                    fixindent,
+                    keep_registers,
+                    direction,
+                    timestamp: self.timestamp,
+                },
+                eval,
+            )
+            .map_err(ModeError::Editor)?;
+        Ok(Some(Mode::default()))
+    }
+
     fn finish_visual_operator(
         &mut self,
         editor: &mut Editor,
@@ -3153,6 +3517,16 @@ impl ModeMachine {
                 eval,
             },
         )?;
+        // Visual operators record the selection in `'<'`/`'>`
+        // (`b_visual`); a linewise end reads as `MAXCOL`
+        // (`getpos("'>")`, `test_put.vim`).
+        let range = state.range();
+        let mut end = range.end;
+        if matches!(state.kind, VisualKind::Line) {
+            end.col = 0x7FFF_FFFF;
+        }
+        let _ = editor.set_local_mark(ctx.buffer, '<', range.start);
+        let _ = editor.set_local_mark(ctx.buffer, '>', end);
         Ok(Some(if result.enter_insert {
             Mode::Insert(InsertState)
         } else {
@@ -3710,7 +4084,10 @@ impl ModeMachine {
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
         match key {
-            '\u{1b}' => {
+            // `i_CTRL-C` quits Replace like `<Esc>` (`edit.c`); without it
+            // a `:normal ...R...\<C-C>...` tail leaks Replace mode and every
+            // later `:normal` line types into the buffer instead of running.
+            '\u{1b}' | '\u{3}' => {
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
                 Ok(Some(Mode::default()))
             }

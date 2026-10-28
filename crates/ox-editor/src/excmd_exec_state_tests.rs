@@ -1884,17 +1884,19 @@ fn highlight_default_and_link_forms_retain_definitions() {
 // ex_docmd.c:do_one_cmd dispatch — a builtin command not in the handler
 // table reports the standard unknown-command error rather than a silent
 // no-op or a function-call error.
-// ":sort" used to stand in here; it is dispatched now, so the probe
-// moved to ":move", which the handler table still does not carry.
+// ":sort" used to stand in here; it is dispatched now, so the probe moved
+// on. `:move` grew a handler and `:mkspell` carries `NEEDARG` (bare use is
+// `E471`), so the probe is now `:breakadd`, which parses cleanly and still
+// has no handler arm.
 #[test]
 fn unimplemented_builtin_reports_unknown_command_error() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
-    let err = exec.execute_line(&editor, "move").unwrap_err();
+    let err = exec.execute_line(&editor, "breakadd").unwrap_err();
     match err {
         ExecError::Vim(exception) => {
             assert_eq!(exception.kind, VimExceptionKind::Error("E492".to_owned()));
-            assert_eq!(exception.emsg_text(), "E492: Not an editor command: move");
+            assert_eq!(exception.emsg_text(), "E492: Not an editor command: breakadd");
         }
         other => panic!("expected E492, got {other:?}"),
     }
@@ -2322,10 +2324,12 @@ fn put_expression_parses_with_indent_and_after_bar() {
 
     let ed = editor.editor();
     let text = ed.buffer(buffer).unwrap().text().unwrap();
-    // `:put` inserts after the cursor line, so the second put lands first.
+    // The cursor moves onto the line a put inserted (`do_put`'s
+    // `curwin->w_cursor.lnum` update), so the second put lands below the
+    // first. The oracle answers `do,2,4` for exactly this script.
     assert_eq!(text.line(1).unwrap(), b"do");
-    assert_eq!(text.line(2).unwrap(), b"4");
-    assert_eq!(text.line(3).unwrap(), b"2");
+    assert_eq!(text.line(2).unwrap(), b"2");
+    assert_eq!(text.line(3).unwrap(), b"4");
 }
 
 /// A bare `:put =` evaluates the previously stored expression if there is

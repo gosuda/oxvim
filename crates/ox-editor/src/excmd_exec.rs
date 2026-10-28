@@ -3161,7 +3161,7 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 pc = block_end + 1;
                 continue;
             }
-            "append" | "insert" => {
+            "append" | "insert" | "change" => {
                 let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
                     return error_flow(runtime, "E749", "Empty buffer");
                 };
@@ -3171,8 +3171,54 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         .and_then(|window| editor.window(window).ok())
                         .map_or(1, |window| window.cursor.lnum)
                 });
+                // `:change` (`ex_cmds.c` `ex_change`) deletes its range first
+                // and then appends after the resulting line, so inserted text
+                // lands where the deleted lines were.
+                let change_base = if name == "change" {
+                    let (start, end) =
+                        match access.with_ex_editor(|editor| resolve_range(editor, command)) {
+                            Ok(range) => range,
+                            Err(message) => return error_flow(runtime, "E16", message),
+                        };
+                    let (start, end) = fold_line_count(start, end, command.count);
+                    let existing = access
+                        .with_ex_editor(|editor| buffer_lines(editor, buffer))
+                        .unwrap_or_default();
+                    let end = end.min(existing.len().max(1));
+                    // Whole-buffer deletion leaves one dummy empty line
+                    // (`ML_EMPTY`); the insert below must replace it rather
+                    // than append after it.
+                    let deleted_all = start == 1 && end >= existing.len();
+                    let replacement = if deleted_all {
+                        vec![Vec::new()]
+                    } else {
+                        Vec::new()
+                    };
+                    let anchor = Position {
+                        lnum: current,
+                        col: 0,
+                    };
+                    if let Err(error) = access.with_ex_editor(|editor| {
+                        editor.replace_buffer_lines(crate::LineReplaceRequest {
+                            buffer,
+                            start,
+                            end,
+                            lines: &replacement,
+                            cursor_before: anchor,
+                            cursor_after: anchor,
+                            timestamp: 0,
+                        })
+                    }) {
+                        return error_flow(runtime, "E16", error.to_string());
+                    }
+                    Some((start.saturating_sub(1), deleted_all))
+                } else {
+                    None
+                };
                 let after = if name == "insert" {
                     current.saturating_sub(1)
+                } else if let Some((base, _)) = change_base {
+                    base
                 } else {
                     let empty = access
                         .with_ex_editor(|editor| buffer_lines(editor, buffer))
@@ -3195,6 +3241,26 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     }
                     lines.push(raw.into_bytes());
                 }
+                // With no input lines upstream never reaches `u_save`: skip
+                // the splice so `:change` with an immediate `.` deletes
+                // without recording an empty edit.
+                if name == "change" && lines.is_empty() {
+                    if let Some((base, _)) = change_base
+                        && let Some(window) = access.with_ex_editor(|editor| editor.current_window())
+                        && let Err(error) = access.with_ex_editor(|editor| {
+                            editor.set_window_cursor(
+                                window,
+                                Position {
+                                    lnum: base.max(1),
+                                    col: 0,
+                                },
+                            )
+                        })
+                    {
+                        return error_flow(runtime, "E16", error.to_string());
+                    }
+                    continue;
+                }
                 let cursor = access.with_ex_editor(|editor| {
                     editor
                         .current_window()
@@ -3210,9 +3276,13 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 let existing = access
                     .with_ex_editor(|editor| buffer_lines(editor, buffer))
                     .unwrap_or_default();
+                // `:change` that deleted every line replaces the dummy line
+                // the deletion left, exactly like `:append` on an empty
+                // buffer.
+                let change_emptied = change_base.is_some_and(|(_, all)| all);
                 let replace_empty = existing.len() == 1
                     && existing[0].iter().all(u8::is_ascii_whitespace)
-                    && name == "append";
+                    && (name == "append" || change_emptied);
                 let result = if replace_empty {
                     access.with_ex_editor(|editor| {
                         editor.replace_buffer_lines(crate::LineReplaceRequest {
@@ -3232,6 +3302,38 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 };
                 if let Err(error) = result {
                     return error_flow(runtime, "E16", error.to_string());
+                }
+                // `ex_append` leaves the cursor on the last inserted line
+                // (`curwin->w_cursor.lnum = lnum`) and marks the inserted
+                // span (`b_op_start`/`b_op_end`, adjusted for `:change`).
+                if let Some((base, _)) = change_base {
+                    if !lines.is_empty() {
+                        let _ = access.with_ex_editor(|editor| {
+                            editor.set_local_mark(buffer, '[', Position {
+                                lnum: base.saturating_add(1).max(1),
+                                col: 0,
+                            })
+                        });
+                        let _ = access.with_ex_editor(|editor| {
+                            editor.set_local_mark(buffer, ']', Position {
+                                lnum: base.saturating_add(lines.len()).max(1),
+                                col: 0,
+                            })
+                        });
+                    }
+                    if let Some(window) = access.with_ex_editor(|editor| editor.current_window())
+                        && let Err(error) = access.with_ex_editor(|editor| {
+                            editor.set_window_cursor(
+                                window,
+                                Position {
+                                    lnum: base.saturating_add(lines.len()).max(1),
+                                    col: 0,
+                                },
+                            )
+                        })
+                    {
+                        return error_flow(runtime, "E16", error.to_string());
+                    }
                 }
                 continue;
             }
@@ -3778,12 +3880,26 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "!" => command_bang(runtime, access, scope, lua, command),
         "argdo" => command_argdo(runtime, access, scope, lua, command),
+        "bufdo" => command_bufdo(runtime, access, scope, lua, command),
+        "cdo" | "ldo" => command_cdo(runtime, access, scope, lua, command),
+        "cfdo" | "lfdo" => command_cfdo(runtime, access, scope, lua, command),
         "windo" => command_windo(runtime, access, scope, lua, command),
         "tabdo" => command_tabdo(runtime, access, scope, lua, command),
         "put" => command_put(runtime, access, scope, lua, command),
+        "iput" => command_iput(runtime, access, scope, lua, command),
         "print" => access.with_ex_editor(|editor| command_print(runtime, editor, command)),
         "delete" => access.with_ex_editor(|editor| command_delete(runtime, editor, command)),
         "yank" => access.with_ex_editor(|editor| command_yank(runtime, editor, command)),
+        "join" => access.with_ex_editor(|editor| command_join(runtime, editor, command)),
+        "move" => access.with_ex_editor(|editor| command_move(runtime, editor, command)),
+        "uniq" => command_uniq(runtime, access, scope, lua, command),
+        "badd" => access.with_ex_editor(|editor| command_badd(runtime, editor, command)),
+        "checktime" => command_checktime(runtime, access, scope, lua, command),
+        "tabfirst" | "tabrewind" => {
+            command_tabfirst(runtime, access, scope, lua, command)
+        }
+        "tablast" => command_tablast(runtime, access, scope, lua, command),
+        "helpclose" => access.with_ex_editor(|editor| command_helpclose(runtime, editor, command)),
         "mark" | "k" => access.with_ex_editor(|editor| command_mark(runtime, editor, command)),
         "marks" => access.with_ex_editor(|editor| command_marks(runtime, editor)),
         "jumps" => access.with_ex_editor(command_jumps),
@@ -6174,6 +6290,13 @@ fn capture_command_messages<F: FileIO>(
     Ok(())
 }
 
+/// Generic `:defer Func(args)` (`ex_call` with `CMD_defer`,
+/// eval/userfunc.c:3394-3484 `ex_defer_inner`): register any function call
+/// for last-registered-first execution when the enclosing function
+/// returns. Outside a function is `E193`; a partial binding a dictionary
+/// is `E1300`; text after the closing paren is `E488`. Arity is validated
+/// at registration (`E119`/`E118`), while an unknown name is tolerated
+/// and fails at execution time when still undefined.
 fn command_defer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -6184,39 +6307,121 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
     if !runtime.can_add_defer() {
         return error_flow(runtime, "E193", "defer not inside a function");
     }
-    let text = command.args.trim();
-    let Some(arguments) = text
-        .strip_prefix("delete(")
-        .and_then(|arguments| arguments.strip_suffix(')'))
-    else {
-        return Flow::NotImplemented(format!("defer {text}"));
+    let text = skipwhite_trim(&command.args);
+    let Some(open) = text.find('(') else {
+        return error_flow(runtime, "E107", format!("Missing parentheses: {text}"));
     };
-    let parts = split_comma_args(arguments);
-    if let Err(error) = crate::fs_builtins::check_arity("delete", parts.len()) {
-        return error_flow(runtime, error.code, error.message);
+    let Some(close) = text.rfind(')') else {
+        return error_flow(runtime, "E107", format!("Missing parentheses: {text}"));
+    };
+    let name = text[..open].trim();
+    if name.is_empty() {
+        return error_flow(runtime, "E107", format!("Missing parentheses: {text}"));
     }
-    let mut parts = parts.into_iter();
-    let path = match eval_text(runtime, access, scope, lua, parts.next().unwrap_or("")) {
-        Ok(value) => PathBuf::from(typval_to_text(&value)),
+    let mut values = Vec::new();
+    for arg in split_comma_args(&text[open + 1..close]) {
+        if arg.trim().is_empty() {
+            continue;
+        }
+        match eval_text(runtime, access, scope, lua, arg) {
+            Ok(value) => values.push(value),
+            Err(flow) => return flow,
+        }
+    }
+    // A callee naming a `Funcref`/`Partial` variable (`defer Part(..)`)
+    // contributes its bound arguments before the call's own, exactly like
+    // `deref_func_name` supplying `ex_defer_inner` its `partial`.
+    let (effective, mut combined) = match resolve_defer_callee(runtime, access, scope, lua, name)
+    {
+        Ok(resolved) => resolved,
         Err(flow) => return flow,
     };
-    let flags = match parts.next() {
-        Some(expression) => match eval_text(runtime, access, scope, lua, expression) {
-            Ok(value) => typval_to_text(&value),
-            Err(flow) => return flow,
-        },
-        None => String::new(),
-    };
-    // Upstream `add_defer` stores the raw call and evaluates it (including
-    // flag validation) at deferred execution time.  This port validates the
-    // `delete()` flags here at registration, which changes the abort
-    // semantics for invalid flags; the `E193` message has no leading colon.
-    let mode = match crate::fs_builtins::DeleteMode::parse(&flags) {
-        Ok(mode) => mode,
-        Err(error) => return error_flow(runtime, error.code, error.message),
-    };
-    runtime.push_deferred_delete(path, mode);
+    combined.extend(values);
+    let sid = runtime.scripts.current_sid().unwrap_or(0);
+    if let Some(spec) = ox_eval::builtin_spec(&effective) {
+        if combined.len() < spec.min_args {
+            return error_flow(
+                runtime,
+                "E119",
+                format!("Not enough arguments for function: {effective}"),
+            );
+        }
+        if spec.max_args.is_some_and(|maximum| combined.len() > maximum) {
+            return error_flow(
+                runtime,
+                "E118",
+                format!("Too many arguments for function: {effective}"),
+            );
+        }
+    } else if let Some(function) = runtime
+        .functions
+        .get(&effective, sid)
+        .or_else(|| runtime.functions.get(&effective, 0))
+    {
+        let required = function.args.len().saturating_sub(function.default_args.len());
+        if combined.len() < required {
+            return error_flow(
+                runtime,
+                "E119",
+                format!("Not enough arguments for function: {effective}"),
+            );
+        }
+        if !function.varargs && combined.len() > function.args.len() {
+            return error_flow(
+                runtime,
+                "E118",
+                format!("Too many arguments for function: {effective}"),
+            );
+        }
+    }
+    // `ex_call`: only text that `ends_excmd` rejects is trailing — a `"`
+    // comment (with or without leading whitespace) ends the command. It is
+    // checked after argument evaluation and arity, so a bad call reports
+    // its own error first (`!failed` gate around `check_nextcmd`).
+    let trailing = text[close + 1..].trim_start_matches([' ', '\t']);
+    if !trailing.is_empty() && !trailing.starts_with('"') {
+        return error_flow(runtime, "E488", format!("Trailing characters: {trailing}"));
+    }
+    runtime.push_deferred_call(effective, combined);
     Flow::Normal
+}
+
+/// Resolves a `:defer` callee name to its effective function name plus any
+/// arguments bound by a `Funcref`/`Partial` variable of that name. A plain
+/// function or builtin name resolves to itself with no bound arguments.
+fn resolve_defer_callee<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    name: &str,
+) -> Result<(String, Vec<Typval>), Flow> {
+    let bound = parse_and_bind_lvalue(runtime, access, scope, lua, name)
+        .ok()
+        .and_then(|lvalue| read_lvalue(runtime, access, scope, &lvalue).ok())
+        .and_then(|value| match value {
+            Typval::Partial(funcref) | Typval::Funcref(funcref) => Some(funcref),
+            _ => None,
+        });
+    let Some(funcref) = bound else {
+        return Ok((name.to_owned(), Vec::new()));
+    };
+    if funcref.dict.is_some() {
+        return Err(error_flow(
+            runtime,
+            "E1300",
+            "Cannot use a partial with dictionary for :defer",
+        ));
+    }
+    let effective = funcref.name.to_string_lossy().into_owned();
+    if effective.is_empty() {
+        return Err(error_flow(
+            runtime,
+            "E117",
+            format!("Unknown function: {name}"),
+        ));
+    }
+    Ok((effective, funcref.args.clone()))
 }
 fn command_call<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
@@ -6515,6 +6720,32 @@ fn run_normal_keys<F: FileIO, E: ExEditorAccess>(
                 })
             {
                 break error_flow(runtime, "E16", error.to_string());
+            }
+            // `exec_normal` runs `normal_cmd` directly, bypassing any leaked
+            // Insert/Replace state (`ex_docmd.c:exec_normal`): without this
+            // a `:normal` tail that entered insert would swallow the whole
+            // argument as typed text. Flush back to Normal with a direct
+            // ESC first, mirroring the post-drain escape below; the mode
+            // the argument itself leaves behind is kept.
+            if matches!(
+                machine.borrow().mode(),
+                Mode::Insert(_) | Mode::Replace(_)
+            ) {
+                let escape = Keys::from("\u{1b}");
+                let flags = mapped_flags(
+                    access.with_ex_editor(|editor| editor.current_buffer()),
+                    false,
+                    MapModes::ALL,
+                );
+                if let Err(error) =
+                    access.with_ex_editor(|editor| editor.typeahead_mut().push(&escape, 0, flags))
+                {
+                    break error_flow(runtime, "E523", error.to_string());
+                }
+                let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
+                if !matches!(flow, Flow::Normal) {
+                    break flow;
+                }
             }
             let flags = mapped_flags(
                 access.with_ex_editor(|editor| editor.current_buffer()),
@@ -14429,6 +14660,447 @@ fn command_tabdo<F: FileIO, E: ExEditorAccess>(
     Flow::Normal
 }
 
+/// `ex_listdo` winfixbuf preamble (`ex_cmds2.c:465-500`): `:windo` and
+/// `:tabdo` never switch buffers so they skip it; every other list command
+/// refuses a `++nested`-less `:ldo`/`:lfdo` in a pinned window, otherwise
+/// prefers the previous non-pinned window and splits a fresh
+/// nowinfixbuf window when none exists.
+fn listdo_winfixbuf_preamble<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+    is_loclist: bool,
+) -> Result<(), Flow> {
+    if !access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer()) {
+        return Ok(());
+    }
+    if is_loclist && !command.bang {
+        return Err(error_flow(
+            runtime,
+            "E1513",
+            "Cannot switch buffer. 'winfixbuf' is enabled",
+        ));
+    }
+    if let Some(previous) = access.with_ex_editor(|editor| editor.previous_window())
+        && access.with_ex_editor(|editor| {
+            editor.window(previous).is_ok()
+                && !matches!(
+                    editor.options().get_window(previous, "winfixbuf"),
+                    Ok(OptionValue::Boolean(true))
+                )
+        })
+        && access
+            .with_ex_editor(|editor| editor.set_current_window(previous))
+            .is_ok()
+        && !access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer())
+    {
+        return Ok(());
+    }
+    let split = access.with_ex_editor(|editor| {
+        let tab = editor.current_tabpage()?;
+        let window = editor.current_window()?;
+        let buffer = editor.current_buffer()?;
+        editor
+            .split_horizontal(tab, window, buffer, true)
+            .ok()
+    });
+    if let Some(window) = split {
+        let _ = access.with_ex_editor(|editor| editor.set_current_window(window));
+        if !access.with_ex_editor(|editor| editor.current_window_fixed_to_buffer()) {
+            return Ok(());
+        }
+    }
+    Err(error_flow(
+        runtime,
+        "E1513",
+        "Cannot switch buffer. 'winfixbuf' is enabled",
+    ))
+}
+
+/// `buf_hide(curbuf) || !check_changed(...)` gate at the top of `ex_listdo`:
+/// a modified current buffer aborts the whole iteration unless `'hidden'`
+/// is set or the command bangs. Returns the error flow when the switch
+/// away from `current` must not happen.
+fn listdo_modified_gate<F: FileIO>(
+    runtime: &ExRuntime<F>,
+    editor: &Editor,
+    command: &ExCommand,
+    current: Option<BufHandle>,
+    target: Option<BufHandle>,
+) -> Option<Flow> {
+    if target == current || command.bang {
+        return None;
+    }
+    let Some(current) = current else {
+        return None;
+    };
+    let modified = editor
+        .buffer(current)
+        .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED));
+    if !modified {
+        return None;
+    }
+    let hidden = matches!(
+        editor.options().get_global("hidden"),
+        Ok(OptionValue::Boolean(true))
+    );
+    if hidden {
+        return None;
+    }
+    Some(error_flow(
+        runtime,
+        "E37",
+        "No write since last change (add ! to override)",
+    ))
+}
+
+/// Number of valid quickfix/location entries (`qf_get_valid_size`,
+/// quickfix.c:4763-4792). With `files_only` (`:cfdo`/`:lfdo`) each distinct
+/// non-zero buffer counts once instead of each entry.
+fn qf_valid_size(editor: &Editor, scope: crate::quickfix::QfScope, files_only: bool) -> usize {
+    let Some(stack) = scope.stack(editor) else {
+        return 0;
+    };
+    let Some(list) = stack.current() else {
+        return 0;
+    };
+    if !files_only {
+        return list.items().iter().filter(|item| item.valid).count();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut count = 0;
+    for item in list.items() {
+        if item.valid && item.bufnr != 0 && seen.insert(item.bufnr) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// One-based ordinal of the current entry among valid entries
+/// (`qf_get_cur_valid_idx`, quickfix.c:4816-4862). Returns 1 when the list
+/// has no valid entries, matching upstream.
+fn qf_cur_valid_idx(editor: &Editor, scope: crate::quickfix::QfScope, files_only: bool) -> usize {
+    let Some(stack) = scope.stack(editor) else {
+        return 1;
+    };
+    let Some(list) = stack.current() else {
+        return 1;
+    };
+    let items = list.items();
+    if !items.iter().any(|item| item.valid) {
+        return 1;
+    }
+    let current = list.idx().saturating_sub(1);
+    if !files_only {
+        let mut ordinal = 0;
+        for (index, item) in items.iter().enumerate() {
+            if item.valid {
+                ordinal += 1;
+            }
+            if index == current.min(items.len().saturating_sub(1)) {
+                return ordinal.max(1);
+            }
+        }
+        return ordinal.max(1);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ordinal = 0;
+    let end = current.min(items.len().saturating_sub(1));
+    for item in items.iter().take(end.saturating_add(1)) {
+        if item.valid && item.bufnr != 0 && seen.insert(item.bufnr) {
+            ordinal += 1;
+        }
+    }
+    ordinal.max(1)
+}
+
+/// Zero-based item index of the `n`th (one-based) valid entry
+/// (`qf_get_nth_valid_entry`, quickfix.c:4864-4898). With `files_only` the
+/// `n`th distinct file's first entry wins. Returns `None` when `n == 0` or
+/// the list has fewer than `n` entries.
+fn qf_nth_valid_pos(
+    editor: &Editor,
+    scope: crate::quickfix::QfScope,
+    n: usize,
+    files_only: bool,
+) -> Option<usize> {
+    if n == 0 {
+        return None;
+    }
+    let stack = scope.stack(editor)?;
+    let list = stack.current()?;
+    if !files_only {
+        let mut ordinal = 0;
+        for (index, item) in list.items().iter().enumerate() {
+            if item.valid {
+                ordinal += 1;
+            }
+            if ordinal == n {
+                return Some(index);
+            }
+        }
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut ordinal = 0;
+    for (index, item) in list.items().iter().enumerate() {
+        if item.valid && item.bufnr != 0 && seen.insert(item.bufnr) {
+            ordinal += 1;
+        }
+        if ordinal == n {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Range over valid-entry ordinals for `:cdo`/`:ldo`/`:cfdo`/`:lfdo`.
+/// `.` is the current valid index, `$` the valid size (1 when empty, per
+/// `ex_docmd.c` `ADDR_QUICKFIX_VALID`), numbers are ordinals. A missing
+/// range defaults to the whole list; `%` maps to `(1, size)`.
+fn qf_listdo_range(
+    editor: &Editor,
+    command: &ExCommand,
+    scope: crate::quickfix::QfScope,
+    files_only: bool,
+) -> Result<(usize, usize), String> {
+    let size = qf_valid_size(editor, scope, files_only);
+    let current = qf_cur_valid_idx(editor, scope, files_only);
+    let last = size.max(1);
+    let Some(range) = &command.range else {
+        return Ok((1, size));
+    };
+    if matches!(range.kind, RangeKind::WholeBuffer) {
+        return Ok((1, size));
+    }
+    let start = range.start.as_ref().map_or(Ok(current), |address| {
+        resolve_address(editor, address, current, last)
+    })?;
+    let end = range.end.as_ref().map_or(Ok(start), |address| {
+        resolve_address(editor, address, current, last)
+    })?;
+    if start > end {
+        return Err("Invalid range".to_owned());
+    }
+    Ok((start.max(1), end))
+}
+
+/// `:bufdo` (`ex_listdo` `CMD_bufdo`, ex_cmds2.c:465-723): switch the
+/// current window through each listed buffer in the range and run the
+/// nested command. Unlisted buffers are skipped; a buffer wiped mid-loop
+/// ends the iteration.
+fn command_bufdo<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let nested = command.args.trim();
+    if nested.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    if let Err(flow) = listdo_winfixbuf_preamble(runtime, access, command, false) {
+        return flow;
+    }
+    let (start, end) = match access.with_ex_editor(|editor| resolve_range(editor, command)) {
+        Ok(range) => range,
+        Err(message) if message == "Invalid range" => {
+            return error_flow(runtime, "E493", "Backwards range given");
+        }
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let targets: Vec<BufHandle> = access.with_ex_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .filter(|buffer| {
+                editor.buffer(*buffer).is_ok_and(|state| {
+                    state.flags.contains(crate::BufferFlags::LISTED)
+                        && usize::try_from(i64::from(*buffer))
+                            .is_ok_and(|fnum| fnum >= start && fnum <= end)
+                })
+            })
+            .collect()
+    });
+    if targets.is_empty() {
+        return Flow::Normal;
+    }
+    if let Some(flow) = access.with_ex_editor(|editor| {
+        let current = editor.current_buffer();
+        let first = targets.first().copied();
+        listdo_modified_gate(runtime, editor, command, current, first).map(|flow| flow)
+    }) {
+        return flow;
+    }
+    let program = parse_cmdline_program(
+        &runtime.user_commands,
+        access.with_ex_editor(|editor| editor.current_buffer()),
+        nested,
+        runtime.scripts.current_line(),
+    );
+    for target in targets {
+        if access.with_ex_editor(|editor| editor.buffer(target).is_err()) {
+            break;
+        }
+        let current = access.with_ex_editor(|editor| editor.current_buffer());
+        if current != Some(target) {
+            if let Some(flow) = access.with_ex_editor(|editor| {
+                listdo_modified_gate(runtime, editor, command, current, Some(target))
+                    .map(|flow| flow)
+            }) {
+                return flow;
+            }
+            let flow = switch_current_buffer(runtime, access, scope, lua, current, target);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+            if access.with_ex_editor(|editor| editor.current_buffer()) != Some(target) {
+                break;
+            }
+        }
+        let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    Flow::Normal
+}
+
+/// `:cdo`/`:ldo` (`ex_listdo`, ex_cmds2.c:556-690): visit each valid
+/// quickfix/location entry in the ordinal range and run the nested command.
+/// An empty list is a silent no-op; an out-of-range explicit address is
+/// `E16`.
+fn command_cdo<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    listdo_quickfix(runtime, access, scope, lua, command, false)
+}
+
+/// `:cfdo`/`:lfdo` (`ex_listdo` with `FORWARD_FILE`, ex_cmds2.c:556-690):
+/// like `:cdo`/`:ldo` but one visit per file (the first valid entry of
+/// each distinct buffer).
+fn command_cfdo<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    listdo_quickfix(runtime, access, scope, lua, command, true)
+}
+
+fn listdo_quickfix<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+    files_only: bool,
+) -> Flow {
+    let nested = command.args.trim();
+    if nested.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let is_loclist = command.command.name().starts_with('l');
+    if let Err(flow) = listdo_winfixbuf_preamble(runtime, access, command, is_loclist) {
+        return flow;
+    }
+    let resolved_scope =
+        access.with_ex_editor(|editor| quickfix_scope(editor, command.command.name()));
+    let (start, end) = match access.with_ex_editor(|editor| {
+        qf_listdo_range(editor, command, resolved_scope, files_only)
+    }) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let size = access.with_ex_editor(|editor| qf_valid_size(editor, resolved_scope, files_only));
+    if size == 0 {
+        // An empty list is a silent no-op (`ex_listdo` leaves `buf` NULL
+        // and skips the loop) unless an explicit address selects beyond
+        // the tolerated `(1, 1)`: upstream's `invalid_range` exempts only
+        // `line2 == 1` (`ex_docmd.c:3827-3829`), so bare `cdo`, `%cdo`,
+        // `1,$cdo`, `.cdo` and `1cdo` stay silent while `2cdo` is `E16`.
+        if command.range.as_ref().is_none_or(|range| matches!(range.kind, RangeKind::WholeBuffer)) {
+            return Flow::Normal;
+        }
+        if start == 1 && end == 1 {
+            return Flow::Normal;
+        }
+        return error_flow(runtime, "E16", "Invalid range");
+    }
+    if end != 1 && end > size {
+        return error_flow(runtime, "E16", "Invalid range");
+    }
+    let end = end.min(size);
+    if start > end {
+        return error_flow(runtime, "E16", "Invalid range");
+    }
+    if let Some(flow) = access.with_ex_editor(|editor| {
+        let current = editor.current_buffer();
+        let first_pos = qf_nth_valid_pos(editor, resolved_scope, start, files_only);
+        let first = first_pos.and_then(|pos| {
+            resolved_scope
+                .stack(editor)
+                .and_then(|stack| stack.current())
+                .and_then(|list| list.items().get(pos))
+                .and_then(|item| BufHandle::try_from(item.bufnr).ok())
+        });
+        listdo_modified_gate(runtime, editor, command, current, first).map(|flow| flow)
+    }) {
+        return flow;
+    }
+    let program = parse_cmdline_program(
+        &runtime.user_commands,
+        access.with_ex_editor(|editor| editor.current_buffer()),
+        nested,
+        runtime.scripts.current_line(),
+    );
+    for ordinal in start..=end {
+        let pos = access
+            .with_ex_editor(|editor| qf_nth_valid_pos(editor, resolved_scope, ordinal, files_only));
+        let Some(pos) = pos else {
+            break;
+        };
+        let target = access.with_ex_editor(|editor| {
+            resolved_scope
+                .stack(editor)
+                .and_then(|stack| stack.current())
+                .and_then(|list| list.items().get(pos))
+                .and_then(|item| BufHandle::try_from(item.bufnr).ok())
+        });
+        if let Some(flow) = access.with_ex_editor(|editor| {
+            let current = editor.current_buffer();
+            listdo_modified_gate(runtime, editor, command, current, target).map(|flow| flow)
+        }) {
+            return flow;
+        }
+        let jumped = access.with_ex_editor(|editor| {
+            crate::quickfix::jump(
+                editor,
+                runtime.scripts.io(),
+                resolved_scope,
+                QuickfixMove::Absolute(pos),
+                command.bang,
+            )
+            .is_ok()
+        });
+        if !jumped {
+            break;
+        }
+        let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    Flow::Normal
+}
+
 /// Resolves a `:argdo` range against the argument list itself (entries,
 /// not buffer lines); without a range the whole list is addressed.
 fn resolve_arg_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usize), String> {
@@ -14452,6 +15124,11 @@ fn resolve_arg_range(editor: &Editor, command: &ExCommand) -> Result<(usize, usi
     Ok((start.max(1), end))
 }
 
+/// `:put` (`ex_put`, `ex_docmd.c:6640-6653`): `:put` inserts linewise text
+/// after the addressed line, `:put!` before it, and `:0put` behaves like
+/// `:1put!`. The register's stored shape is ignored (`PUT_LINE` forces
+/// linewise in `do_put`); the cursor lands on the last inserted line and
+/// `'[`/`']` span the inserted rows (`PUT_CURSLINE`).
 fn command_put<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -14459,41 +15136,84 @@ fn command_put<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let (buffer, position) = access.with_ex_editor(|editor| {
-        let position = editor
-            .current_window()
+    command_put_impl(runtime, access, scope, lua, command, false)
+}
+
+/// `:iput` (`ex_iput`, `ex_docmd.c:6655-6669`): `:put` with indent
+/// adjustment (`PUT_FIXINDENT`) — each inserted row is reindented to the
+/// target line, rendered with the buffer's `'expandtab'`/`'tabstop'`.
+fn command_iput<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    command_put_impl(runtime, access, scope, lua, command, true)
+}
+
+fn command_put_impl<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+    fixindent: bool,
+) -> Flow {
+    let (buffer, window, cursor) = access.with_ex_editor(|editor| {
+        let window = editor.current_window();
+        let cursor = window
             .and_then(|window| editor.window(window).ok())
-            .map_or(Position { lnum: 1, col: 0 }, |window| window.cursor);
-        (editor.current_buffer(), position)
+            .map_or(Position { lnum: 1, col: 0 }, |state| state.cursor);
+        (editor.current_buffer(), window, cursor)
     });
     let Some(buffer) = buffer else {
         return error_flow(runtime, "E749", "Empty buffer");
     };
-    let register = command.register.unwrap_or('"');
-    // `set_expr_line` (ex_docmd.c:1363-1366) keeps the last `=` source text,
-    // so a bare `:put =` re-evaluates it — and with nothing stored yet it is
-    // a silent no-op (`get_spec_reg` returns NULL and `do_put` returns
-    // before any error).
-    let args = if register == '=' && command.args.is_empty() {
-        match access
-            .with_ex_editor(|editor| editor.registers().expression_source().map(<[u8]>::to_vec))
-        {
-            Some(source) => match String::from_utf8(source) {
-                Ok(source) => source,
-                Err(_) => return Flow::Normal,
-            },
-            None => return Flow::Normal,
-        }
-    } else {
-        command.args.clone()
+    // `do_put` saves for undo before reading the register, so a
+    // non-modifiable buffer fails with `E21` even for an empty register.
+    if access.with_ex_editor(|editor| !editor.is_modifiable(buffer)) {
+        return error_flow(runtime, "E21", "Cannot make changes, 'modifiable' is off");
+    }
+    // `set_cmd_count` folds a post-command count into the range silently;
+    // `:0put` addresses line 1 from above (`ex_docmd.c:6642-6646`).
+    let end = match access.with_ex_editor(|editor| resolve_range_raw(editor, command)) {
+        Ok((_, end)) => end,
+        Err(message) => return error_flow(runtime, "E16", message),
     };
-    if register == '=' {
-        // Store the source text the way `set_expr_line` does, so `getreg('=')`
-        // and the next bare `:put =` see this same expression. An empty
-        // expression stores nothing: upstream only calls `set_expr_line`
-        // when text follows the `=`, leaving the previous source in place.
-        if !args.is_empty()
-            && let Ok(content) = RegisterContent::characterwise(args.as_bytes())
+    let (_, end) = fold_line_count(end, end, command.count);
+    let mut backward = command.bang;
+    if end == 0 {
+        backward = true;
+    }
+    let last = access.with_ex_editor(|editor| buffer_last_line(editor));
+    let target = end.max(1).min(last.max(1));
+    let register = command.register.unwrap_or('"');
+    // A list value puts one row per item; every other value puts its text
+    // split at line feeds. Either way the rows land as lines (`PUT_LINE`).
+    let lines: Vec<Vec<u8>> = if register == '=' {
+        // `set_expr_line` (ex_docmd.c:1363-1366) keeps the last `=` source
+        // text, so a bare `:put =` re-evaluates it — and with nothing stored
+        // yet it is a silent no-op (`get_spec_reg` returns NULL).
+        let args = if command.args.is_empty() {
+            match access.with_ex_editor(|editor| {
+                editor.registers().expression_source().map(<[u8]>::to_vec)
+            }) {
+                Some(source) => match String::from_utf8(source) {
+                    Ok(source) => source,
+                    Err(_) => return Flow::Normal,
+                },
+                None => return Flow::Normal,
+            }
+        } else {
+            command.args.clone()
+        };
+        // Store the source text the way `set_expr_line` does, so
+        // `getreg('=')` and the next bare `:put =` see this same expression.
+        // An empty expression stores nothing: upstream only calls
+        // `set_expr_line` when text follows the `=`.
+        if !command.args.is_empty()
+            && let Ok(content) = RegisterContent::characterwise(command.args.as_bytes())
         {
             access.with_ex_editor(|editor| {
                 let _ = editor.registers_mut().set('=', content);
@@ -14503,34 +15223,81 @@ fn command_put<F: FileIO, E: ExEditorAccess>(
             Ok(value) => value,
             Err(flow) => return flow,
         };
-        let lines = typval_to_text(&value)
-            .split('\n')
-            .map(|line| line.as_bytes().to_vec())
-            .collect::<Vec<_>>();
-        return match access.with_ex_editor(|editor| {
-            editor.buffer_mut(buffer).and_then(|state| {
-                state
-                    .append_lines(position.lnum, &lines, position, 0)
-                    .map_err(Into::into)
-            })
-        }) {
-            Ok(_) => Flow::Normal,
-            Err(error) => error_flow(runtime, "E354", error.to_string()),
-        };
-    }
-    access.with_ex_editor(|editor| {
-        let content = match editor.registers().get(register) {
-            Ok(Some(content)) => content.clone(),
+        if let Typval::List(items) = &value {
+            items.try_borrow().map_or_else(
+                |_| vec![Vec::new()],
+                |data| {
+                    data.items
+                        .iter()
+                        .map(|item| typval_to_text(item).into_bytes())
+                        .collect()
+                },
+            )
+        } else {
+            typval_to_text(&value)
+                .split('\n')
+                .map(|line| line.as_bytes().to_vec())
+                .collect()
+        }
+    } else {
+        match access.with_ex_editor(|editor| editor.registers().get(register).map(|slot| slot.cloned())) {
+            Ok(Some(content)) => content.getreg_lines(),
             Ok(None) => {
                 return error_flow(runtime, "E353", format!("Nothing in register {register}"));
             }
             Err(error) => return error_flow(runtime, "E353", error.to_string()),
-        };
-        match editor.put_content(buffer, position, &content, 0) {
-            Ok(()) => Flow::Normal,
-            Err(error) => error_flow(runtime, "E353", error.to_string()),
         }
-    })
+    };
+    // `:iput` reindents every row to the target line (`PUT_FIXINDENT`,
+    // `register.c:2056-2095`).
+    let lines = if fixindent {
+        let content = match RegisterContent::linewise(lines) {
+            Ok(content) => content,
+            Err(error) => return error_flow(runtime, "E354", error.to_string()),
+        };
+        match access.with_ex_editor(|editor| {
+            editor.reindent_for_put(buffer, Position { lnum: target, col: 0 }, &content)
+        }) {
+            Ok(content) => content.lines().to_vec(),
+            Err(error) => return error_flow(runtime, "E354", error.to_string()),
+        }
+    } else {
+        lines
+    };
+    let after_lnum = if backward {
+        target.saturating_sub(1)
+    } else {
+        target
+    };
+    let first = after_lnum.saturating_add(1);
+    let last_row = after_lnum.saturating_add(lines.len());
+    let cursor_after = Position {
+        lnum: last_row,
+        col: lines
+            .last()
+            .map_or(0, |row| crate::put::first_nonblank(row)),
+    };
+    if let Err(error) = access.with_ex_editor(|editor| {
+        editor.buffer_mut(buffer).and_then(|state| {
+            state
+                .insert_lines(after_lnum, &lines, cursor, cursor_after, 0)
+                .map_err(Into::into)
+        })
+    }) {
+        return error_flow(runtime, "E354", error.to_string());
+    }
+    access.with_ex_editor(|editor| {
+        let _ = editor.set_local_mark(buffer, '[', Position { lnum: first, col: 0 });
+        let _ = editor.set_local_mark(
+            buffer,
+            ']',
+            Editor::last_byte_of(&lines, last_row),
+        );
+        if let Some(window) = window {
+            let _ = editor.set_window_cursor(window, cursor_after);
+        }
+    });
+    Flow::Normal
 }
 
 fn command_delete<F: FileIO>(
@@ -14624,8 +15391,1141 @@ fn command_yank<F: FileIO>(
     }
 }
 
+/// `:join` (`ex_docmd.c` `ex_join` → `do_join`, `ops.c:1900`): join the
+/// addressed lines into one. With no range the cursor line joins its next
+/// line; a single addressed line (`:2,2join`) is a silent no-op, and joining
+/// the last line alone only beeps upstream (a silent no-op here). `!` skips
+/// space insertion but still strips comment leaders exactly like the spaced
+/// form (`skip_comment`, `ops.c`), keeping the space the leader is followed
+/// by. A post-command count extends the range (`set_cmd_count`,
+/// `ex_docmd.c:1373-1393`), and cursor lands on the first non-blank of the
+/// joined line (`beginline(BL_WHITE | BL_FIX)`).
+fn command_join<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    if lines.len() == 1 && lines[0].is_empty() {
+        return Flow::Normal;
+    }
+    let (start, end) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let (start, end) = fold_line_count(start, end, command.count);
+    let last = lines.len().max(1);
+    let start = start.max(1);
+    let mut end = end.min(last).max(start);
+    // `addr_count >= 2` (`:2,2join`) joins nothing; with an implicit single
+    // line the join extends to the next line unless already on the last one
+    // (`ex_join`, `ex_docmd.c:6709-6725`).
+    let addr_count = match &command.range {
+        None => 0,
+        Some(range) => match range.kind {
+            RangeKind::Single => 1,
+            RangeKind::WholeBuffer | RangeKind::Pair { .. } => 2,
+        },
+    };
+    // `ex_join` moves onto `line1` before anything else, so even the
+    // no-op forms leave the cursor there.
+    if let Some(window) = editor.current_window()
+        && let Ok(state) = editor.window(window)
+        && let Err(error) = editor.set_window_cursor(
+            window,
+            Position {
+                lnum: start,
+                col: state.cursor.col,
+            },
+        )
+    {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    if start == end {
+        if addr_count >= 2 {
+            return Flow::Normal;
+        }
+        if end >= lines.len() {
+            return Flow::Normal;
+        }
+        end += 1;
+    }
+    let insert_space = !command.bang;
+    let joinspaces = matches!(
+        editor.options().get_global("joinspaces"),
+        Ok(OptionValue::Boolean(true))
+    );
+    let formatoptions = match editor.options().get_buffer(buffer, "formatoptions") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => "tcqj".to_owned(),
+    };
+    let comments = match editor.options().get_buffer(buffer, "comments") {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => "s1:/*,mb:*,ex:*/,://,b:#,:%,:XCOMM,n:>,fb:-,fb:•".to_owned(),
+    };
+    let remove_comments = formatoptions.contains('j');
+    let policy = ExJoinPolicy {
+        joinspaces,
+        multibyte: formatoptions.contains('M'),
+        multibyte_pairs: formatoptions.contains('B'),
+    };
+    let span = &lines[start - 1..end.min(lines.len())];
+    let Some(first) = span.first() else {
+        return Flow::Normal;
+    };
+    let mut joined = first.clone();
+    // `skip_comment(curr, false, ...)` on the first line only records whether
+    // it ends inside a comment; leaders come off the following lines.
+    let mut prev_was_comment = remove_comments && ex_comment_scan(first, &comments).ends_open;
+    for line in span.iter().skip(1) {
+        let scan = if remove_comments {
+            ex_comment_scan(line, &comments)
+        } else {
+            ExCommentScan::default()
+        };
+        if prev_was_comment {
+            if insert_space {
+                // `get_leader_len(..., include_space=true)`: the leader and
+                // the whitespace after it both come off before `skipwhite`.
+                let strip = scan.strip_including_space.min(line.len());
+                let segment = &line[strip..];
+                let extra = ex_join_separator_len(&joined, segment, policy);
+                joined.extend(std::iter::repeat_n(b' ', extra));
+                joined.extend_from_slice(segment);
+            } else {
+                // `get_leader_len(..., include_space=false)`: the leader
+                // comes off but its trailing space stays and no separator is
+                // added (`:join!` keeps `/* comment`, not `/*comment`).
+                let strip = scan.strip_leader_only.min(line.len());
+                joined.extend_from_slice(&line[strip..]);
+            }
+        } else if insert_space {
+            let leading = line
+                .iter()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count();
+            let segment = &line[leading..];
+            let extra = ex_join_separator_len(&joined, segment, policy);
+            joined.extend(std::iter::repeat_n(b' ', extra));
+            joined.extend_from_slice(segment);
+        } else {
+            joined.extend_from_slice(line);
+        }
+        prev_was_comment = remove_comments && scan.ends_open;
+    }
+    let first_blank = joined
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let cursor = Position {
+        lnum: start,
+        col: first_blank,
+    };
+    // `do_join` with `setmark`: `'[` is the end of the first line, `']`
+    // the end of the joined line (`ops.c:1909-1912,1990-1993`).
+    let first_len = span.first().map_or(0, Vec::len);
+    let joined_len = joined.len();
+    if let Err(error) = editor.replace_buffer_lines(crate::LineReplaceRequest {
+        buffer,
+        start,
+        end,
+        lines: &[joined],
+        cursor_before: cursor,
+        cursor_after: cursor,
+        timestamp: 0,
+    }) {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    let _ = editor.set_local_mark(buffer, '[', Position {
+        lnum: start,
+        col: first_len,
+    });
+    let _ = editor.set_local_mark(buffer, ']', Position {
+        lnum: start,
+        col: joined_len,
+    });
+    if let Some(window) = editor.current_window()
+        && let Err(error) = editor.set_window_cursor(window, cursor)
+    {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    Flow::Normal
+}
+
+/// Space policy for `:join`, mirroring `do_join`'s `'joinspaces'`,
+/// `'formatoptions'` `M`/`B` handling (`ops.c:1900-2010`).
+#[derive(Clone, Copy)]
+struct ExJoinPolicy {
+    joinspaces: bool,
+    multibyte: bool,
+    multibyte_pairs: bool,
+}
+
+/// Separator width between a joined prefix and the next segment
+/// (`do_join`'s `spaces[t]` computation).
+fn ex_join_separator_len(left: &[u8], right: &[u8], policy: ExJoinPolicy) -> usize {
+    let (Some(&last), Some(&first)) = (left.last(), right.first()) else {
+        return 0;
+    };
+    if first == b')' || last == b'\t' {
+        return 0;
+    }
+    let left_char = ex_last_codepoint(left);
+    let right_char = ex_first_codepoint(right);
+    if policy.multibyte && (left_char >= 0x100 || right_char >= 0x100) {
+        return 0;
+    }
+    if policy.multibyte_pairs
+        && (right_char >= 0x100 || ex_eats_join_space(left_char))
+        && (left_char >= 0x100 || ex_eats_join_space(right_char))
+    {
+        return 0;
+    }
+    if last.is_ascii_whitespace() {
+        return usize::from(
+            policy.joinspaces
+                && last == b' '
+                && left
+                    .get(left.len().saturating_sub(2))
+                    .is_some_and(|byte| matches!(byte, b'.' | b'?' | b'!')),
+        );
+    }
+    1 + usize::from(policy.joinspaces && matches!(last, b'.' | b'?' | b'!'))
+}
+
+fn ex_first_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next())
+        .map_or_else(|| u32::from(bytes[0]), u32::from)
+}
+
+fn ex_last_codepoint(bytes: &[u8]) -> u32 {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|text| text.chars().next_back())
+        .map_or_else(|| u32::from(bytes[bytes.len() - 1]), u32::from)
+}
+
+fn ex_eats_join_space(codepoint: u32) -> bool {
+    matches!(
+        codepoint,
+        0x2000..=0x206f
+            | 0x2e00..=0x2e7f
+            | 0x3000..=0x303f
+            | 0xff01..=0xff0f
+            | 0xff1a..=0xff20
+            | 0xff3b..=0xff40
+            | 0xff5b..=0xff65
+    )
+}
+
+/// Comment-leader strip offsets for one joined line (`get_leader_len`,
+/// `change.c:1941`, as ported for Normal-mode joins): `strip_leader_only`
+/// drops the leader itself while `strip_including_space` also drops the
+/// whitespace after it.
+#[derive(Clone, Copy, Default)]
+struct ExCommentScan {
+    strip_leader_only: usize,
+    strip_including_space: usize,
+    ends_open: bool,
+}
+
+#[derive(Clone, Copy)]
+struct ExCommentPart<'a> {
+    flags: &'a str,
+    leader: &'a [u8],
+}
+
+fn ex_comment_parts(value: &str) -> impl Iterator<Item = ExCommentPart<'_>> {
+    value.split(',').filter_map(|part| {
+        let (flags, leader) = part.split_once(':')?;
+        Some(ExCommentPart {
+            flags,
+            leader: leader.as_bytes(),
+        })
+    })
+}
+
+fn ex_leader_match_len(line: &[u8], offset: usize, part: ExCommentPart<'_>) -> Option<usize> {
+    if part.leader.is_empty() {
+        return None;
+    }
+    let mut leader = part.leader;
+    if leader[0].is_ascii_whitespace() {
+        if offset == 0 || !line[offset - 1].is_ascii_whitespace() {
+            return None;
+        }
+        leader = &leader[leader
+            .iter()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count()..];
+    }
+    if !line.get(offset..)?.starts_with(leader) {
+        return None;
+    }
+    let end = offset + leader.len();
+    if part.flags.contains('b')
+        && line
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    if part.flags.contains('m')
+        && line[..offset]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(leader.len())
+}
+
+fn ex_leading_comment_part<'a>(
+    line: &[u8],
+    offset: usize,
+    comments: &'a str,
+) -> Option<(ExCommentPart<'a>, usize)> {
+    let mut middle = None;
+    for part in ex_comment_parts(comments) {
+        let Some(len) = ex_leader_match_len(line, offset, part) else {
+            continue;
+        };
+        if part.flags.contains('m') {
+            middle.get_or_insert((part, len));
+            continue;
+        }
+        if let Some((_, middle_len)) = middle {
+            if part.flags.contains('e') && len > middle_len {
+                return Some((part, len));
+            }
+            return middle;
+        }
+        return Some((part, len));
+    }
+    middle
+}
+
+fn ex_comment_scan(line: &[u8], comments: &str) -> ExCommentScan {
+    let leading = line
+        .iter()
+        .take_while(|byte| byte.is_ascii_whitespace())
+        .count();
+    let mut scan = ExCommentScan::default();
+    for offset in 0..line.len() {
+        let Some((part, len)) = ex_leading_comment_part(line, offset, comments) else {
+            continue;
+        };
+        if offset == leading && !part.flags.contains('e') {
+            let mut end = offset + len;
+            while line.get(end).is_some_and(u8::is_ascii_whitespace) {
+                end += 1;
+            }
+            scan.strip_leader_only = offset + len;
+            scan.strip_including_space = end;
+        }
+        scan.ends_open = !part.flags.contains('e');
+    }
+    scan
+}
+
+/// `:move` (`ex_docmd.c` `ex_copymove` → `do_move`, `ex_cmds.c:896`): move
+/// the addressed lines to below the destination address carried in the
+/// command arguments. A missing destination is `E16` (`get_address` returns
+/// `MAXLNUM`), an out-of-range destination is `E16` (`e_invrange`), and a
+/// destination inside the moved range is `E134`. Destinations equal to the
+/// line before the range or the range end move nothing but still place the
+/// cursor as if they had; every other move splices the lines out and inserts
+/// them after the destination, with the cursor on the last moved line.
+fn command_move<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let Some(buffer) = editor.current_buffer() else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let lines = match buffer_lines(editor, buffer) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    let (mut line1, mut line2) = match resolve_range(editor, command) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    (line1, line2) = fold_line_count(line1, line2, command.count);
+    let last = lines.len().max(1);
+    line2 = line2.min(last);
+    let dest = match move_destination(editor, buffer, &command.args) {
+        Ok(dest) => dest,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    // `n == MAXLNUM || n < 0 || n > line_count` (`ex_copymove`): the move
+    // destination lives outside the buffer. Zero addresses the gap before
+    // the first line, exactly like `:0put`'s position.
+    if dest < 0 || dest > last as i64 {
+        return error_flow(runtime, "E16", "Invalid range");
+    }
+    let dest = dest as usize;
+    if dest >= line1 && dest < line2 {
+        return error_flow(
+            runtime,
+            "E134",
+            "Cannot move a range of lines into itself",
+        );
+    }
+    let count = line2.saturating_sub(line1).saturating_add(1);
+    if dest == line1.saturating_sub(1) || dest == line2 {
+        // `do_move`'s no-op arm: nothing moves, but the cursor lands where a
+        // move would have left it.
+        let cursor_lnum = if dest >= line1 { dest } else { dest + count };
+        let cursor = Position {
+            lnum: cursor_lnum.max(1).min(last),
+            col: 0,
+        };
+        if let Some(window) = editor.current_window()
+            && let Err(error) = editor.set_window_cursor(window, cursor)
+        {
+            return error_flow(runtime, "E16", error.to_string());
+        }
+        return Flow::Normal;
+    }
+    let moving = lines[line1.saturating_sub(1)..line2.min(lines.len())].to_vec();
+    let mut rest: Vec<Vec<u8>> = Vec::with_capacity(lines.len() - count);
+    rest.extend_from_slice(&lines[..line1.saturating_sub(1).min(lines.len())]);
+    rest.extend_from_slice(&lines[line2.min(lines.len())..]);
+    // The destination names an original line number: lines above it that
+    // moved away shift it down by the moved count.
+    let at = if dest >= line2 { dest - count } else { dest };
+    let at = at.min(rest.len());
+    let mut spliced = Vec::with_capacity(lines.len());
+    spliced.extend_from_slice(&rest[..at]);
+    spliced.extend_from_slice(&moving);
+    spliced.extend_from_slice(&rest[at..]);
+    let cursor_lnum = if dest >= line1 { dest } else { dest + count };
+    let cursor = Position {
+        lnum: cursor_lnum.max(1),
+        col: 0,
+    };
+    if let Err(error) = editor.replace_buffer_lines(crate::LineReplaceRequest {
+        buffer,
+        start: 1,
+        end: last,
+        lines: &spliced,
+        cursor_before: cursor,
+        cursor_after: cursor,
+        timestamp: 0,
+    }) {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    if let Some(window) = editor.current_window()
+        && let Err(error) = editor.set_window_cursor(window, cursor)
+    {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    // `do_move` marks the moved span unless locked (`ex_cmds.c`): after a
+    // downward move it ends at the destination, after an upward move it
+    // starts just below it. Set after the splice so the shared mark
+    // adjustment cannot shift them.
+    let (mark_start, mark_end) = if dest >= line2 {
+        (dest - count + 1, dest)
+    } else {
+        (dest + 1, dest + count)
+    };
+    let _ = editor.set_local_mark(buffer, '[', Position {
+        lnum: mark_start.max(1),
+        col: 0,
+    });
+    let _ = editor.set_local_mark(buffer, ']', Position {
+        lnum: mark_end.max(1),
+        col: 0,
+    });
+    report_line_move(editor, count);
+    Flow::Normal
+}
+
+/// Destination address of `:move` (`get_address`, `ex_docmd.c:3402`, with
+/// `ADDR_LINES`): `.`, `$`, absolute numbers, `'mark`, `/pat`/, `?pat`? and
+/// `+`/`-` offset chains, including a bare offset from the cursor line. The
+/// address is evaluated before any move, so `.` and bare offsets name the
+/// current cursor line. A trailing `p`/`l`/`#` flag run is skipped
+/// (`get_flags`) and anything after it ignored, matching `ex_copymove`.
+fn move_destination(editor: &Editor, buffer: BufHandle, args: &str) -> Result<i64, String> {
+    let cursor = editor
+        .current_window()
+        .and_then(|window| editor.window(window).ok())
+        .map_or(1, |window| window.cursor.lnum) as i64;
+    let last = editor
+        .buffer(buffer)
+        .ok()
+        .and_then(|state| state.text().ok())
+        .map_or(1, Buffer::line_count) as i64;
+    let bytes = args.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        // `get_address` on an empty argument returns `MAXLNUM`, which
+        // `ex_copymove` reports as `e_invrange`.
+        return Err("Invalid range".to_owned());
+    }
+    // One address base, or none when the argument starts with an offset
+    // (`+1` is `.+1`, `ex_docmd.c:3643-3668`).
+    let mut lnum: Option<i64> = None;
+    match bytes[pos] {
+        b'.' => {
+            lnum = Some(cursor);
+            pos += 1;
+        }
+        b'$' => {
+            lnum = Some(last);
+            pos += 1;
+        }
+        b'\'' => {
+            pos += 1;
+            let name = *bytes.get(pos).ok_or_else(|| "Invalid range".to_owned())? as char;
+            pos += 1;
+            let mark = editor
+                .local_mark(buffer, name)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Mark not set".to_owned())?;
+            lnum = Some(mark.lnum as i64);
+        }
+        b'/' | b'?' => {
+            let forward = bytes[pos] == b'/';
+            let delimiter = bytes[pos] as char;
+            let (pattern, _) = take_delimited(&args[pos..], delimiter)
+                .ok_or_else(|| "Invalid range".to_owned())?;
+            // Skip past the pattern the same scan did (delimiter bytes are
+            // ASCII, so byte and char lengths agree here).
+            pos += delimiter.len_utf8() + pattern.len() + delimiter.len_utf8();
+            let found = search_address(editor, &pattern, forward, cursor as usize)
+                .map_err(|message| {
+                    message
+                        .split_once(": ")
+                        .map_or_else(|| message.clone(), |(_, rest)| rest.to_owned())
+                })?;
+            lnum = Some(found.lnum as i64);
+        }
+        b'0'..=b'9' => {
+            let begin = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            let value: i64 = args[begin..pos].parse().map_err(|_| "Invalid range".to_owned())?;
+            lnum = Some(value);
+        }
+        b'+' | b'-' => {}
+        _ => return Err("Invalid range".to_owned()),
+    }
+    // Offset chain: each `+`/`-` defaults to one, digits stand alone.
+    loop {
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t') {
+            pos += 1;
+        }
+        let Some(&byte) = bytes.get(pos) else {
+            break;
+        };
+        if !matches!(byte, b'+' | b'-') && !byte.is_ascii_digit() {
+            break;
+        }
+        if lnum.is_none() {
+            lnum = Some(cursor);
+        }
+        let negative = if byte.is_ascii_digit() {
+            false
+        } else {
+            pos += 1;
+            byte == b'-'
+        };
+        let begin = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        let magnitude: i64 = if begin == pos {
+            1
+        } else {
+            args[begin..pos]
+                .parse()
+                .map_err(|_| "Invalid range".to_owned())?
+        };
+        let base = lnum.unwrap_or(cursor);
+        lnum = Some(if negative {
+            base.saturating_sub(magnitude)
+        } else {
+            base.saturating_add(magnitude)
+        });
+    }
+    let Some(lnum) = lnum else {
+        return Err("Invalid range".to_owned());
+    };
+    // `get_flags` consumes trailing `p`/`l`/`#` runs; `ex_copymove` never
+    // looks past them.
+    Ok(lnum)
+}
+
+/// `do_move`'s `msgmore` report (`ex_cmds.c:936-939`): moves longer than
+/// `'report'` announce themselves.
+fn report_line_move(editor: &mut Editor, count: usize) {
+    if count as i64 > report_threshold(editor) {
+        let message = if count == 1 {
+            "1 line moved".to_owned()
+        } else {
+            format!("{count} lines moved")
+        };
+        push_text_message(editor, message, false, false);
+    }
+}
+
+/// Effective `'report'` threshold for `msgmore`-style reports.
+fn report_threshold(editor: &Editor) -> i64 {
+    match option_value(editor, "report", SetLayer::Effective) {
+        Some(OptionValue::Number(value)) => *value,
+        _ => 2,
+    }
+}
+
+/// `:uniq` (`ex_cmds.c` `ex_uniq`): drop adjacent duplicate lines in the
+/// range (the whole buffer by default, `DFLALL`). Plain `:uniq` keeps the
+/// first line of each run, `u` keeps only lines that do not repeat, and `!`
+/// keeps the first line of each duplicate run while deleting lines that
+/// never repeat (`!` wins over `u`, and `u` is ignored when `!` is given).
+/// `i` folds case, `l` is accepted for compatibility, `r` compares only the
+/// matched portion of `/{pattern}/` (otherwise comparison starts after the
+/// match), and an empty pattern reuses the last search pattern (`E35` when
+/// there is none). A `|` tail runs as the next command (`check_nextcmd`) and
+/// a `"` starts a comment; anything else is `E475` and an unterminated
+/// pattern is `E654`. Deletions longer than `'report'` report
+/// `N fewer lines` (`msgmore`), and an unchanged buffer stays unmodified.
+#[allow(clippy::too_many_lines)]
+fn command_uniq<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let (start, end) = match access.with_ex_editor(|editor| resolve_range(editor, command)) {
+        Ok(range) => range,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let (start, end) = fold_line_count(start, end, command.count);
+    let lines = match access.with_ex_editor(|editor| buffer_lines(editor, buffer)) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E749", message),
+    };
+    let last = lines.len().max(1);
+    let end = end.min(last);
+    if end.saturating_sub(start).saturating_add(1) <= 1 {
+        // `ex_uniq` returns before parsing arguments for a single line.
+        return Flow::Normal;
+    }
+    // Argument scan (`ex_uniq`, `ex_cmds.c:697-765`).
+    let mut ignore_case = false;
+    let mut match_portion = false;
+    let mut only_unique = false;
+    let mut pattern: Option<String> = None;
+    let mut tail: Option<String> = None;
+    let args = command.args.as_str();
+    let mut pos = 0;
+    let arg_bytes = args.as_bytes();
+    while pos < arg_bytes.len() {
+        let byte = arg_bytes[pos];
+        if byte == b' ' || byte == b'\t' {
+            pos += 1;
+            continue;
+        }
+        let rest = &args[pos..];
+        let first = rest.chars().next().unwrap_or('\0');
+        if first == 'i' {
+            ignore_case = true;
+            pos += 1;
+        } else if first == 'l' {
+            // Accepted for compatibility; locale collation is unavailable,
+            // matching `:sort l`.
+            pos += 1;
+        } else if first == 'r' {
+            match_portion = true;
+            pos += 1;
+        } else if first == 'u' {
+            if !command.bang {
+                only_unique = true;
+            }
+            pos += 1;
+        } else if first == '"' {
+            break;
+        } else if first == '|' {
+            tail = Some(args[pos + 1..].to_owned());
+            break;
+        } else if !first.is_ascii_alphabetic() && pattern.is_none() {
+            let Some((found, after)) = take_delimited(rest, first) else {
+                return error_flow(
+                    runtime,
+                    "E654",
+                    format!("Missing delimiter after search pattern: {rest}"),
+                );
+            };
+            if found.is_empty() {
+                let search = runtime.mode_machine.as_ref().and_then(|machine| {
+                    let borrowed = machine.borrow();
+                    borrowed.search_state().last_pattern().map(String::from)
+                });
+                let Some(search) = search else {
+                    return error_flow(runtime, "E35", "No previous regular expression");
+                };
+                pattern = Some(search);
+            } else {
+                pattern = Some(found);
+            }
+            // Continue past the pattern the delimiter scan consumed.
+            pos = args.len() - after.len();
+        } else {
+            return error_flow(runtime, "E475", format!("Invalid argument: {rest}"));
+        }
+    }
+    let regex = match &pattern {
+        None => None,
+        Some(pattern) => {
+            let compiled = pattern_with_case(pattern, ignore_case);
+            match compile_regex(&compiled, Magic::Magic) {
+                Ok(program) => Some(program),
+                Err(error) => return error_flow(runtime, error.code(), error.to_string()),
+            }
+        }
+    };
+    let uniq_key = |line: &[u8], regex: Option<&ox_regex::Prog>| -> Vec<u8> {
+        let Some(program) = regex else {
+            return line.to_vec();
+        };
+        let text = RegexText::new(String::from_utf8_lossy(line).into_owned());
+        let Some(matched) = regex_exec_at(
+            program,
+            &text,
+            ox_regex::Position {
+                lnum: 1,
+                col: 0,
+                byte: 0,
+            },
+        ) else {
+            // No match narrows nothing: the whole line compares
+            // (`ex_uniq` leaves `end_col` at zero, skipping truncation).
+            return line.to_vec();
+        };
+        if match_portion {
+            line[matched.start.byte.min(line.len())..matched.end.byte.min(line.len())].to_vec()
+        } else {
+            line[matched.end.byte.min(line.len())..].to_vec()
+        }
+    };
+    // Deletion pass over 1-based absolute line numbers, mirroring `ml_delete`
+    // shifts by removing from a working copy (`ex_uniq` `uniqend` loop). The
+    // cursor is signed exactly like upstream's `linenr_T i`: a deletion moves
+    // it back past the removed line, so a run opened before the deletion is
+    // re-examined at its new position.
+    let mut work: Vec<Vec<u8>> = lines[start - 1..end.min(lines.len())].to_vec();
+    let mut key = Vec::new();
+    let mut match_continue = false;
+    let mut next_is_unmatch = false;
+    let mut done_lnum = start as i64 - 1;
+    let mut index: i64 = 0;
+    let mut remaining = work.len() as i64;
+    let mut deleted = 0usize;
+    let mut removed: Vec<i64> = Vec::new();
+    while index < remaining {
+        let get_lnum = start as i64 + index;
+        let at = (get_lnum - start as i64).max(0) as usize;
+        let is_match = if index == 0 {
+            false
+        } else {
+            line_compare(&uniq_key(&work[at], regex.as_ref()), &key, ignore_case)
+                == std::cmp::Ordering::Equal
+        };
+        let is_match = if next_is_unmatch {
+            next_is_unmatch = false;
+            false
+        } else {
+            is_match
+        };
+        let mut delete_lnum = 0i64;
+        if !only_unique && !command.bang {
+            if is_match {
+                delete_lnum = get_lnum;
+            } else {
+                key = uniq_key(&work[at], regex.as_ref());
+            }
+        } else if command.bang {
+            if is_match {
+                done_lnum = get_lnum - 1;
+                delete_lnum = get_lnum;
+                match_continue = true;
+            } else {
+                if index > 0 && !match_continue && get_lnum - 1 > done_lnum {
+                    delete_lnum = get_lnum - 1;
+                    next_is_unmatch = true;
+                } else if index >= remaining - 1 {
+                    delete_lnum = get_lnum;
+                }
+                match_continue = false;
+                key = uniq_key(&work[at], regex.as_ref());
+            }
+        } else if is_match {
+            if !match_continue {
+                delete_lnum = get_lnum - 1;
+            } else {
+                delete_lnum = get_lnum;
+            }
+            match_continue = true;
+        } else {
+            if index == 0 && match_continue {
+                delete_lnum = get_lnum;
+            }
+            match_continue = false;
+            key = uniq_key(&work[at], regex.as_ref());
+        }
+        if delete_lnum > 0 {
+            work.remove((delete_lnum - start as i64).max(0) as usize);
+            // `i -= get_lnum - delete_lnum + 1`.
+            index -= get_lnum - delete_lnum + 1;
+            remaining -= 1;
+            deleted += 1;
+            removed.push(delete_lnum);
+        }
+        index += 1;
+    }
+    if deleted > 0 {
+        // `ml_delete` drops marks on every deleted line (`mark_adjust`);
+        // the shared splice only collapses them to the range start, so
+        // remove the local and buffer-scoped global marks first.
+        access.with_ex_editor(|editor| {
+            let victims: Vec<char> = editor
+                .buffer(buffer)
+                .ok()
+                .map(|state| {
+                    state
+                        .marks
+                        .iter()
+                        .filter(|(name, position)| {
+                            name.is_ascii_lowercase()
+                                && i64::try_from(position.lnum)
+                                    .is_ok_and(|lnum| removed.contains(&lnum))
+                        })
+                        .map(|(name, _)| name)
+                        .collect()
+                })
+                .unwrap_or_default();
+            for name in victims {
+                let _ = editor.remove_local_mark(buffer, name);
+            }
+            let globals: Vec<char> = editor
+                .global_marks()
+                .iter()
+                .filter(|(name, location)| {
+                    name.is_ascii_uppercase()
+                        && location.buffer() == Some(buffer)
+                        && i64::try_from(location.position.lnum)
+                            .is_ok_and(|lnum| removed.contains(&lnum))
+                })
+                .map(|(name, _)| name)
+                .collect();
+            for name in globals {
+                let _ = editor.global_marks_mut().remove(name);
+            }
+        });
+        let mut spliced: Vec<Vec<u8>> = Vec::with_capacity(lines.len() - deleted);
+        spliced.extend_from_slice(&lines[..start - 1]);
+        spliced.extend_from_slice(&work);
+        spliced.extend_from_slice(&lines[end.min(lines.len())..]);
+        let cursor = Position {
+            lnum: start,
+            col: 0,
+        };
+        let result = access.with_ex_editor(|editor| {
+            editor.replace_buffer_lines(crate::LineReplaceRequest {
+                buffer,
+                start: 1,
+                end: last,
+                lines: &spliced,
+                cursor_before: cursor,
+                cursor_after: cursor,
+                timestamp: 0,
+            })
+        });
+        if let Err(error) = result {
+            return error_flow(runtime, "E16", error.to_string());
+        }
+        if let Some(window) = access.with_ex_editor(|editor| editor.current_window())
+            && let Err(error) =
+                access.with_ex_editor(|editor| editor.set_window_cursor(window, cursor))
+        {
+            return error_flow(runtime, "E16", error.to_string());
+        }
+        let threshold = access.with_ex_editor(|editor| report_threshold(editor));
+        if deleted as i64 > threshold {
+            let message = if deleted == 1 {
+                "1 line less".to_owned()
+            } else {
+                format!("{deleted} fewer lines")
+            };
+            access.with_ex_editor(|editor| push_text_message(editor, message, false, false));
+        }
+    }
+    if let Some(tail) = tail {
+        // `check_nextcmd`: the `|` tail runs as the next command.
+        let program = parse_cmdline_program(
+            &runtime.user_commands,
+            access.with_ex_editor(|editor| editor.current_buffer()),
+            &tail,
+            runtime.scripts.current_line(),
+        );
+        return run_program(runtime, access, scope, lua, &program, 0, program.len());
+    }
+    Flow::Normal
+}
+
+/// `:badd` (`ex_docmd.c` `ex_edit` with `ECMD_ADDBUF` → `buflist_new`,
+/// `buffer.c`): add an unlisted-by-default-named buffer to the buffer list
+/// without loading it. An empty argument is `E471` (already enforced by the
+/// `NEEDARG` table flag, repeated here for direct calls), and a name that is
+/// already listed is a silent no-op.
+fn command_badd<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let mut name = command.args.trim();
+    if name.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    // `parse_plus_cmd` (`ex_docmd.c`): a leading `+{lnum}`/`+{cmd}` sets the
+    // cursor placement, not the name.
+    if let Some(stripped) = name.strip_prefix('+') {
+        let end = stripped
+            .find(|character: char| character == ' ' || character == '\t')
+            .map_or(stripped.len(), |index| index);
+        name = stripped[end..].trim();
+        if name.is_empty() {
+            return error_flow(runtime, "E471", "Argument required");
+        }
+    }
+    for handle in editor.buffers() {
+        let Ok(state) = editor.buffer(handle) else {
+            continue;
+        };
+        if state.name().as_bytes() != name.as_bytes() {
+            continue;
+        }
+        // `buflist_new` returns the existing entry (marking it listed) when
+        // the name is already known.
+        if !state.flags.contains(crate::BufferFlags::LISTED) {
+            if let Ok(state) = editor.buffer_mut(handle) {
+                state.flags.set(crate::BufferFlags::LISTED, true);
+            }
+        }
+        return Flow::Normal;
+    }
+    let handle = match editor.create_buffer(true) {
+        Ok(handle) => handle,
+        Err(error) => return error_flow(runtime, "E86", error.to_string()),
+    };
+    if let Ok(state) = editor.buffer_mut(handle) {
+        state.set_name(OxStr::from(name.as_bytes()));
+        // `buflist_new` with `BLN_LISTED` never reads the file: the buffer
+        // stays unloaded until first use.
+        let _ = state.unload();
+    }
+    Flow::Normal
+}
+
+/// `:checktime` (`ex_cmds2.c` `ex_checktime` → `check_timestamps`,
+/// `fileio.c:2902`): when no loaded buffer changed on disk this is silent.
+/// Change detection compares current file bytes against the write-path
+/// serialization, the same content check `buf_check_timestamp` uses to tell
+/// a real change from a timestamp-only touch. A changed unmodified buffer
+/// reloads under `'autoread'`; otherwise a `W11` (or `W12` when the buffer
+/// itself is modified) warning is shown.
+fn command_checktime<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let targets: Vec<BufHandle> = access.with_ex_editor(|editor| {
+        if command.range.is_some() {
+            // `ADDR_OTHER`: the address names a buffer number
+            // (`ex_checktime` reads `eap->line2` as a buffer).
+            match resolve_range_raw(editor, command) {
+                Ok((_, end)) => i64::try_from(end)
+                    .ok()
+                    .and_then(|number| BufHandle::try_from(number).ok())
+                    .and_then(|handle| editor.buffer(handle).ok().map(|_| handle))
+                    .into_iter()
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            editor.buffers()
+        }
+    });
+    for buffer in targets {
+        let (name, loaded, modified, buftype, terminal) = access.with_ex_editor(|editor| {
+            editor.buffer(buffer).map_or(
+                (OxStr::from(""), false, false, String::new(), true),
+                |state| {
+                    let buftype = match editor.options().get_buffer(buffer, "buftype") {
+                        Ok(OptionValue::String(value)) => value.clone(),
+                        _ => String::new(),
+                    };
+                    (
+                        state.name().clone(),
+                        state.residency.is_loaded(),
+                        state.flags.contains(crate::BufferFlags::MODIFIED),
+                        buftype,
+                        editor.is_terminal_buffer(buffer),
+                    )
+                },
+            )
+        });
+        // `buf_check_timestamp` ignores terminals, unnamed buffers, unloaded
+        // buffers and non-normal `buftype`s.
+        if !loaded || name.as_bytes().is_empty() || terminal || !buftype.is_empty() {
+            continue;
+        }
+        let path = path_from_ox_str(&name);
+        let disk = match runtime.scripts.io().read_bytes(&path) {
+            Ok(bytes) => bytes,
+            // Without a read baseline the port cannot tell a never-read file
+            // from a deleted one (`b_mtime == 0` upstream skips both); it
+            // stays silent instead of guessing `E211`.
+            Err(_) => continue,
+        };
+        let current = access.with_ex_editor(|editor| {
+            editor
+                .buffer(buffer)
+                .ok()
+                .and_then(|state| state.text().ok())
+                .map(|text| buffer_file_bytes(editor, buffer, &text.to_bytes()))
+        });
+        let Some(current) = current else {
+            continue;
+        };
+        if disk == current {
+            continue;
+        }
+        let autoread = access.with_ex_editor(|editor| {
+            matches!(
+                option_value(editor, "autoread", SetLayer::Effective),
+                Some(OptionValue::Boolean(true))
+            )
+        });
+        if autoread && !modified {
+            let text = match Buffer::from_bytes(&disk) {
+                Ok(text) => text,
+                Err(error) => return error_flow(runtime, "E474", error.to_string()),
+            };
+            let result = access.with_ex_editor(|editor| {
+                editor
+                    .buffer_mut(buffer)
+                    .map(|state| {
+                        state.load(text);
+                        state.flags.set(crate::BufferFlags::NOTEDITED, false);
+                    })
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(message) = result {
+                return error_flow(runtime, "E16", message);
+            }
+            continue;
+        }
+        let display = name.to_string_lossy().into_owned();
+        let message = if modified {
+            format!("W12: Warning: File \"{display}\" has changed and the buffer was changed in Vim as well")
+        } else {
+            format!("W11: Warning: File \"{display}\" has changed since editing started")
+        };
+        access.with_ex_editor(|editor| push_text_message(editor, message, true, false));
+    }
+    let _ = (scope, lua);
+    Flow::Normal
+}
+
+/// `:tabfirst`/`:tabrewind` (`ex_docmd.c` `ex_tabnext`): go to the first
+/// tabpage. A single tabpage is a silent no-op.
+fn command_tabfirst<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let first = access.with_ex_editor(|editor| editor.tabpages().into_iter().next());
+    let Some(target) = first else {
+        return error_flow(runtime, "E475", "Invalid argument: ".to_owned() + &command.args);
+    };
+    switch_current_tabpage(runtime, access, scope, lua, target)
+}
+
+/// `:tablast` (`ex_docmd.c` `ex_tabnext`): go to the last tabpage.
+fn command_tablast<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let last = access.with_ex_editor(|editor| editor.tabpages().last().copied());
+    let Some(target) = last else {
+        return error_flow(runtime, "E475", "Invalid argument: ".to_owned() + &command.args);
+    };
+    switch_current_tabpage(runtime, access, scope, lua, target)
+}
+
+/// `:helpclose` (`help.c` `ex_helpclose`): close one help window in the
+/// current tabpage. With no help window open this is a silent no-op.
+fn command_helpclose<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let _ = command;
+    let Some(tab) = editor.current_tabpage() else {
+        return Flow::Normal;
+    };
+    let Ok(windows) = editor.tabpage_windows(tab) else {
+        return Flow::Normal;
+    };
+    for window in windows {
+        let buffer = match editor.window(window) {
+            Ok(state) => state.buffer,
+            Err(_) => continue,
+        };
+        let is_help = matches!(
+            editor.options().get_buffer(buffer, "buftype"),
+            Ok(OptionValue::String(value)) if value == "help"
+        );
+        if !is_help {
+            continue;
+        }
+        if editor.close_window(tab, window, true).is_err() {
+            return error_flow(runtime, "E444", "Cannot close last window");
+        }
+        return Flow::Normal;
+    }
+    Flow::Normal
+}
+
 /// `:print` / `:p` — `ex_docmd.c` `ex_print`: every addressed line goes to
-/// the message sink as an Echo message. Numbering follows `print_line` →
 /// `print_line_no_prefix` (`ex_cmds.c`): the 'number' option prefixes each
 /// line with its right-aligned line number padded to the width of the last
 /// line number (`number_width`). An empty buffer raises E749 first, and the
@@ -16835,6 +18735,15 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
         .next()
         .unwrap_or("")
         .trim_start_matches(char::is_whitespace);
+    // `++once` / `++nested` (`autocmd.c:824-840 arg_autocmd_flag_get`):
+    // definition flags between the pattern and the command body. They are
+    // not part of the pattern, so `++once` must not be stored as one.
+    let (once, nested, body) = match parse_autocmd_def_flags(body) {
+        Ok(flags) => flags,
+        Err(flag) => {
+            return error_flow(runtime, "E983", format!("Duplicate argument: {flag}"));
+        }
+    };
     let patterns = pattern_text.map(split_autocmd_patterns).unwrap_or_default();
     let current_buffer = access.with_ex_editor(|editor| editor.current_buffer());
     if command.bang {
@@ -16873,6 +18782,8 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
             &AutocmdOptions {
                 group,
                 buffer: legacy_buffer_pattern(&patterns, current_buffer),
+                once,
+                nested,
                 ..AutocmdOptions::default()
             },
         )
@@ -16911,6 +18822,50 @@ fn buffer_local_patterns(patterns: &[String], current: Option<BufHandle>) -> Vec
             }
         })
         .collect()
+}
+
+/// Definition flags between an `:autocmd` pattern and its body
+/// (`arg_autocmd_flag_get`, autocmd.c:2504-2519): `++once`, `++nested`,
+/// and the deprecated bare `nested`. Each flag ends at whitespace or the
+/// end of the command, so `nested_call()` is a command, not a flag; a
+/// repeated flag is `E983`. Returns the flags with the remaining body.
+fn parse_autocmd_def_flags(body: &str) -> Result<(bool, bool, &str), &'static str> {
+    let mut once = false;
+    let mut nested = false;
+    let mut rest = body.trim_start_matches(char::is_whitespace);
+    loop {
+        let (flag, len) = if strip_autocmd_flag(rest, "++once") {
+            ("++once", 6)
+        } else if strip_autocmd_flag(rest, "++nested") {
+            ("++nested", 8)
+        } else if strip_autocmd_flag(rest, "nested") {
+            ("nested", 6)
+        } else {
+            break;
+        };
+        if flag == "++once" {
+            if once {
+                return Err("++once");
+            }
+            once = true;
+        } else {
+            if nested {
+                return Err(flag);
+            }
+            nested = true;
+        }
+        rest = rest[len..].trim_start_matches(char::is_whitespace);
+    }
+    Ok((once, nested, rest))
+}
+
+/// Whether `rest` holds `flag` as a whole word: the flag text followed by
+/// whitespace or the end of the command (`arg_autocmd_flag_get`'s
+/// `strncmp` + `ascii_iswhite` check).
+fn strip_autocmd_flag(rest: &str, flag: &str) -> bool {
+    rest.strip_prefix(flag).is_some_and(|tail| {
+        tail.is_empty() || tail.starts_with(char::is_whitespace)
+    })
 }
 
 /// Splits an `:autocmd` pattern list on its unescaped commas, upstream's
@@ -19575,6 +21530,44 @@ fn check_address_domain(editor: &Editor, command: &ExCommand) -> Result<(), Stri
         addr_type,
         AddrType::Other | AddrType::TabsRelative | AddrType::Unsigned | AddrType::None
     ) {
+        return Ok(());
+    }
+    // `invalid_range` for `ADDR_QUICKFIX_VALID` (ex_docmd.c:3827-3829):
+    // `:cdo`/`:ldo`/`:cfdo`/`:lfdo` addresses count valid entries (or
+    // distinct files), not buffer lines, so the generic line-bound check
+    // below would reject in-range ordinals in short buffers and accept
+    // out-of-range ones in long buffers. Validate against the live list
+    // size here; the handler re-resolves the same range to iterate it.
+    if matches!(
+        command.command.name(),
+        "cdo" | "ldo" | "cfdo" | "lfdo"
+    ) {
+        let scope = quickfix_scope(editor, command.command.name());
+        let files_only = matches!(command.command.name(), "cfdo" | "lfdo");
+        let size = qf_valid_size(editor, scope, files_only);
+        let Some(range) = &command.range else {
+            return Ok(());
+        };
+        if matches!(range.kind, RangeKind::WholeBuffer) {
+            return Ok(());
+        }
+        let current = qf_cur_valid_idx(editor, scope, files_only);
+        let last = size.max(1);
+        let start = range.start.as_ref().map_or(Ok(current), |address| {
+            resolve_address(editor, address, current, last)
+        })?;
+        let end = range.end.as_ref().map_or(Ok(start), |address| {
+            resolve_address(editor, address, current, last)
+        })?;
+        if start > end {
+            return Err("Invalid range".to_owned());
+        }
+        if size == 0 {
+            return Ok(());
+        }
+        if end != 1 && end > size {
+            return Err("Invalid range".to_owned());
+        }
         return Ok(());
     }
     // Search addresses are not numeric bounds; a miss is E486 from
