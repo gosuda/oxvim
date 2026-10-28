@@ -558,6 +558,18 @@ pub fn bind_variables(lua: &Lua, host: Rc<dyn VariableHost>) -> mlua::Result<()>
                     .map_err(mlua::Error::runtime)?
                 {
                     Some(value) => object_to_lua(lua, &value).map_err(mlua::Error::external),
+                    // `v:exiting` exists and is NIL until the editor starts
+                    // exiting (`vv_exiting`, eval/vars.c), and Lua sees the
+                    // `vim.NIL` sentinel, not `nil`. The distinction is load
+                    // bearing: `runtime/lua/vim/_core/editor.lua:141-146`
+                    // closes the `vim.wait` wake timer when
+                    // `vim.v.exiting ~= vim.NIL`, so a Lua `nil` here stops
+                    // every wait from waking on its interval.
+                    None if scope == VariableScope::Vim && name.as_bytes() == b"exiting" => Ok(
+                        lua.globals()
+                            .get::<Table>("vim")?
+                            .get::<Value>("NIL")?,
+                    ),
                     None => Ok(Value::Nil),
                 }
             },
