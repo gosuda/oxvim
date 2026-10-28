@@ -2924,6 +2924,123 @@ fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Generic `:defer Func(args)` registers any call and fires
+/// last-registered-first when the frame ends (`ex_defer_inner`,
+/// `handle_defer_one`, eval/userfunc.c:3394-3524); a `Funcref` variable
+/// contributes its bound arguments before the call's own, exactly like
+/// `deref_func_name` supplying the partial.
+#[test]
+fn defer_registers_generic_calls_and_fires_last_registered_first() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func AddSeen(val)\n\
+         call add(g:order, a:val)\n\
+         endfunc\n\
+         func Main()\n\
+         defer AddSeen('one')\n\
+         defer AddSeen('two')\n\
+         call add(g:order, 'body')\n\
+         endfunc\n\
+         let g:order = []\n\
+         call Main()\n",
+    );
+    let order = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"order", 0)
+        .cloned();
+    match order {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["body", "two", "one"]);
+        }
+        other => panic!("expected g:order list, got {other:?}"),
+    }
+}
+
+/// `:defer` rejects a dictionary-bound partial (`E1300`), reports text after
+/// the balanced call as trailing (`E488`), and requires a function frame
+/// (`E193`); a partial without a dictionary fires with its bound arguments
+/// first (test_user_func.vim `Test_defer`).
+#[test]
+fn defer_rejects_dict_partial_trailing_text_and_top_level() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func OneArg(val)\n\
+         endfunc\n\
+         func TwoArgs(first, second)\n\
+         call add(g:pargs, a:first)\n\
+         call add(g:pargs, a:second)\n\
+         endfunc\n\
+         func Probe()\n\
+         let D = function('tr', {'x': 1})\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer D('x')\n\
+         let g:e1300 = v:errmsg\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x')->Another()\n\
+         let g:earrow = v:errmsg\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x').member\n\
+         let g:emember = v:errmsg\n\
+         let P = function('TwoArgs', ['bound'])\n\
+         defer P('own')\n\
+         endfunc\n\
+         let g:pargs = []\n\
+         call Probe()\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x')\n\
+         let g:e193 = v:errmsg\n",
+    );
+    let flag = |name: &[u8]| {
+        exec.scope()
+            .get_scoped(ScopeKind::Global, name, 0)
+            .cloned()
+    };
+    for (name, code) in [
+        ("e1300", "E1300"),
+        ("earrow", "E488"),
+        ("emember", "E488"),
+        ("e193", "E193"),
+    ] {
+        match flag(name.as_bytes()) {
+            Ok(Typval::String(text)) => assert!(
+                text.to_string_lossy().starts_with(code),
+                "{name} must report {code}, got {text:?}"
+            ),
+            other => panic!("expected {name} string, got {other:?}"),
+        }
+    }
+    match flag(b"pargs") {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["bound", "own"]);
+        }
+        other => panic!("expected g:pargs list, got {other:?}"),
+    }
+}
+
 // eval/funcs.c f_system through os_system, os/shell.c shell_build_argv 60-97 —
 // a String command runs through 'shell' + 'shellcmdflag', the second argument
 // is the child's standard input and its pipe is closed, and a shell that

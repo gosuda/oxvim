@@ -45,11 +45,11 @@ use ox_excmd::ExCommand;
 use ox_types::{BufHandle, OxStr, Typval};
 
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, Flow, map_leader, push_info_text_message,
+    EvalHost, ExEditorAccess, ExRuntime, Flow, map_leader, push_info_text_message, typval_number,
 };
 use crate::mapping::{
-    AbbrevCommandKind, AbbrevOptions, Abbreviation, MapFlags, MapModes, MapScope, Mapping,
-    MappingAction, abbrev_modes_for_command, classify_abbrev_command,
+    AbbrevCommandKind, AbbrevOptions, Abbreviation, MapFlags, MapMode, MapModes, MapScope, Mapping,
+    MappingAction, MappingOptions, abbrev_modes_for_command, classify_abbrev_command,
 };
 use crate::script::FileIO;
 use crate::typeahead::{Keys, special_notation};
@@ -65,7 +65,278 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "maparg" => maparg(host, args, scope),
         "mapcheck" => mapcheck(host, args, scope),
         "hasmapto" => hasmapto(host, args, scope),
+        "mapset" => mapset(host, args, scope),
         _ => unreachable!("mapping builtin route and dispatcher disagree"),
+    }
+}
+
+/// `f_mapset` (`mapping.c:2323-2417`): restores one mapping from a
+/// `maparg()`/`maplist()` dictionary, either as `mapset({mode}, {abbr},
+/// {dict})` or as `mapset({dict})` with mode and abbr taken from the dict.
+///
+/// The existing entry for the left-hand side and mode is deleted first and
+/// the dict's right-hand side, flags, description, and script context are
+/// stored, so a saved mapping round-trips. `{mode}` selects the mode set;
+/// the dict's own `mode` entry is not used. Errors mirror upstream: `E460`
+/// for a missing `mode`/`abbr`/`lhs`/`lhsraw`/`rhs` entry and `E1276` for an
+/// illegal mode string.
+///
+/// Named gaps: a `callback` Funcref cannot name a host callback identity
+/// (`MappingAction::Callback` is a `u64` no script value can construct), so
+/// a dict with a callback and no `rhs` answers `E460` instead of inventing
+/// one; `lhsrawalt` restores a second entry for the alternate form rather
+/// than the linked `m_alt` pair upstream keeps (this port has no key
+/// simplification, so both forms answer lookups either way); and
+/// `replace_keycodes` is accepted but stored nowhere, matching the report
+/// of 0 for every `:map`-created mapping.
+fn mapset<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &Scope,
+) -> ox_eval::Result<Typval> {
+    check_arity("mapset", args.len())?;
+    // The dict-only form reads everything from `args[0]`, like upstream's
+    // `dict_only` leg (`mapping.c:2334-2346`); further arguments are ignored.
+    let (mode_string, is_abbr, dict) = if let Typval::Dict(dict) = &args[0] {
+        let borrowed = dict.borrow();
+        let mode = dict_string(&borrowed, "mode")
+            .ok_or_else(|| mapset_entries_error())?;
+        let abbr = borrowed
+            .get(b"abbr")
+            .ok_or_else(|| mapset_entries_error())?;
+        (mode, abbr.is_truthy(), dict.clone())
+    } else {
+        let mode = super::input_string_arg(&args[0])?
+            .to_string_lossy()
+            .into_owned();
+        let abbr = args.get(1).is_some_and(Typval::is_truthy);
+        // `tv_check_for_dict_arg` (`typval.c:4551`): `E1206: Dictionary
+        // required for argument %d`.
+        let dict = match args.get(2) {
+            Some(Typval::Dict(dict)) => dict.clone(),
+            _ => {
+                return Err(EvalError::new(
+                    "E1206",
+                    0,
+                    "Dictionary required for argument 3",
+                ));
+            }
+        };
+        (mode, abbr, dict)
+    };
+    let modes = parse_mapset_mode(&mode_string, is_abbr).ok_or_else(|| {
+        EvalError::new(
+            "E1276",
+            0,
+            format!("Illegal map mode string: '{mode_string}'"),
+        )
+    })?;
+    let borrowed = dict.borrow();
+    let lhs = dict_string(&borrowed, "lhs").ok_or_else(mapset_entries_error)?;
+    let lhsraw = dict_string(&borrowed, "lhsraw").ok_or_else(mapset_entries_error)?;
+    let lhsrawalt = dict_string(&borrowed, "lhsrawalt");
+    // `orig_rhs` is NULL without an `rhs` entry unless a Lua callback
+    // resolved (`mapping.c:2357-2373`); no script value can name this port's
+    // host callback identity, so a missing `rhs` is always `E460` here.
+    let rhs = dict_string(&borrowed, "rhs").ok_or_else(mapset_entries_error)?;
+    let scope_value = if borrowed.get(b"buffer").and_then(typval_number).unwrap_or(0) != 0 {
+        let buffer = host
+            .access
+            .with_ex_editor(|editor| editor.current_buffer());
+        match buffer {
+            Some(buffer) => MapScope::Buffer(buffer),
+            None => MapScope::Global,
+        }
+    } else {
+        MapScope::Global
+    };
+    let leader = map_leader(scope, "mapleader");
+    let local_leader = map_leader(scope, "maplocalleader");
+    let action = if borrowed.get(b"expr").and_then(typval_number).unwrap_or(0) != 0 {
+        MappingAction::Expr(rhs.clone())
+    } else {
+        MappingAction::parse_rhs(&rhs, &leader, &local_leader)
+            .map_err(|error| EvalError::new("E474", 0, error.to_string()))?
+    };
+    let mut flags = MapFlags::REMAP;
+    flags.set(
+        MapFlags::NOWAIT,
+        borrowed.get(b"nowait").and_then(typval_number).unwrap_or(0) != 0,
+    );
+    flags.set(
+        MapFlags::SILENT,
+        borrowed.get(b"silent").and_then(typval_number).unwrap_or(0) != 0,
+    );
+    flags.set(
+        MapFlags::SCRIPT,
+        borrowed.get(b"script").and_then(typval_number).unwrap_or(0) != 0,
+    );
+    let remap =
+        borrowed.get(b"noremap").and_then(typval_number).unwrap_or(0) == 0 && !flags.contains(MapFlags::SCRIPT);
+    let description = dict_string(&borrowed, "desc");
+    let mut script_context = host.runtime.scripts.current_context();
+    if let Some(sid) = borrowed.get(b"sid").and_then(typval_number)
+        && let Ok(sid) = u64::try_from(sid)
+    {
+        script_context.sid = sid;
+    }
+    if let Some(lnum) = borrowed.get(b"lnum").and_then(typval_number)
+        && let Ok(lnum) = usize::try_from(lnum)
+    {
+        script_context.lnum = lnum;
+    }
+    drop(borrowed);
+    if is_abbr {
+        let options = AbbrevOptions {
+            modes,
+            scope: scope_value,
+            flags,
+            orig_rhs: rhs,
+            script_context,
+        };
+        // The trigger is the raw left-hand side, like `map_add` on the
+        // abbreviation table (`mapping.c:2404`).
+        host.access
+            .with_ex_editor(|editor| {
+                editor.mappings_mut().abbreviate_full(&lhsraw, action, options)
+            })
+            .map_err(|error| EvalError::new("E474", 0, error.to_string()))?;
+        return Ok(Typval::Number(0));
+    }
+    let options = MappingOptions {
+        modes,
+        scope: scope_value,
+        flags,
+        description,
+        orig_rhs: rhs,
+        script_context,
+    };
+    // The human-readable `lhs` may name a different byte form than the raw
+    // one when the left-hand side simplifies (`<C-I>` versus `<Tab>`);
+    // upstream unmaps that form before adding the raw (and alternate) forms
+    // (`mapping.c:2398-2402`), so strip it explicitly while `map()` strips
+    // the raw form itself.
+    let human = Keys::parse_notation(&lhs, &leader, &local_leader);
+    host.access
+        .with_ex_editor(|editor| {
+            editor
+                .mappings_mut()
+                .unmap(&human, modes, scope_value);
+            let lhs = decode_mapset_lhs(&lhsraw);
+            let stored = if remap {
+                editor
+                    .mappings_mut()
+                    .map(lhs, action.clone(), options.clone())
+            } else {
+                editor
+                    .mappings_mut()
+                    .noremap(lhs, action.clone(), options.clone())
+            };
+            if let Err(error) = stored {
+                return Err(error);
+            }
+            // The alternate left-hand side answers the same lookups through
+            // a second entry; upstream links the pair as `m_alt` instead.
+            if let Some(alt) = lhsrawalt {
+                let lhs = decode_mapset_lhs(&alt);
+                if remap {
+                    editor.mappings_mut().map(lhs, action, options)
+                } else {
+                    editor.mappings_mut().noremap(lhs, action, options)
+                }
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|error| EvalError::new("E474", 0, error.to_string()))?;
+    Ok(Typval::Number(0))
+}
+
+/// `E460: Entries missing in mapset() dict argument`
+/// (`mapping.c:133-134`).
+fn mapset_entries_error() -> EvalError {
+    EvalError::new(
+        "E460",
+        0,
+        "Entries missing in mapset() dict argument",
+    )
+}
+
+/// `get_map_mode_string` (`mapping.c:2270-2321`): the mode characters
+/// `mapset()` accepts — `i l c n x s o t v !` and space, with an empty
+/// string meaning `" "` — over the abbreviation table (`!`) or the mapping
+/// table. `None` is upstream's 0, which `f_mapset` reports as `E1276`.
+fn parse_mapset_mode(mode_string: &str, abbr: bool) -> Option<MapModes> {
+    const BANG: u16 = MapMode::Insert as u16 | MapMode::CommandLine as u16;
+    const MAP: u16 = MapMode::Visual as u16
+        | MapMode::Select as u16
+        | MapMode::Normal as u16
+        | MapMode::OperatorPending as u16;
+    let text = if mode_string.is_empty() {
+        " "
+    } else {
+        mode_string
+    };
+    let mut mode: u16 = 0;
+    for byte in text.bytes() {
+        let bits = match byte {
+            b'i' => MapMode::Insert as u16,
+            b'l' => MapMode::LangArg as u16,
+            b'c' => MapMode::CommandLine as u16,
+            b'n' => MapMode::Normal as u16,
+            b'x' => MapMode::Visual as u16,
+            b's' => MapMode::Select as u16,
+            b'o' => MapMode::OperatorPending as u16,
+            b't' => MapMode::Terminal as u16,
+            b'v' => MapMode::Visual as u16 | MapMode::Select as u16,
+            b'!' => BANG,
+            b' ' => MAP,
+            _ => return None,
+        };
+        mode |= bits;
+    }
+    if abbr && mode & !BANG != 0 {
+        return None;
+    }
+    if !abbr
+        && mode.count_ones() > 1
+        && (mode & BANG == 0 || mode & !BANG != 0)
+        && (mode & MAP == 0 || mode & !MAP != 0)
+    {
+        return None;
+    }
+    let mut modes = MapModes::NONE;
+    for variant in [
+        MapMode::Normal,
+        MapMode::Visual,
+        MapMode::OperatorPending,
+        MapMode::CommandLine,
+        MapMode::Insert,
+        MapMode::LangArg,
+        MapMode::Select,
+        MapMode::Terminal,
+    ] {
+        if mode & variant as u16 != 0 {
+            modes |= MapModes::one(variant);
+        }
+    }
+    Some(modes)
+}
+
+/// The raw left-hand side as stored encoded bytes (`m_keys`). A value that
+/// fails validation cannot come from `maparg()`; it is kept literally rather
+/// than rejected.
+fn decode_mapset_lhs(lhsraw: &str) -> Keys {
+    Keys::from_encoded(lhsraw.as_bytes().to_vec())
+        .unwrap_or_else(|_| Keys::encode(lhsraw.as_bytes()))
+}
+
+/// Strict `tv_dict_get_string`: only a String value counts, mirroring the
+/// NULL upstream answers for a missing or mistyped entry.
+fn dict_string(dict: &ox_types::DictData, key: &str) -> Option<String> {
+    match dict.get(key.as_bytes()) {
+        Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
+        _ => None,
     }
 }
 
@@ -711,4 +982,180 @@ fn list_abbreviations<E: ExEditorAccess>(
         }
     });
     Flow::Normal
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{ExExecutor, TestEditorAccess};
+    use crate::Editor;
+
+    /// One listed buffer shown in one 80x24 window, so buffer-local and
+    /// global scopes both resolve.
+    fn editor() -> Editor {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        editor
+    }
+
+    /// Reads a global string set by a probe script.
+    fn global_string(exec: &ExExecutor, name: &str) -> Option<String> {
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Reads a global number set by a probe script.
+    fn global_number(exec: &ExExecutor, name: &str) -> Option<i64> {
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::Number(value) => Some(*value),
+            Typval::Bool(value) => Some(i64::from(*value)),
+            _ => None,
+        }
+    }
+
+    fn error_code(error: crate::excmd_exec::ExecError) -> String {
+        match error {
+            crate::excmd_exec::ExecError::Vim(exception) => match &exception.kind {
+                crate::VimExceptionKind::Error(code) => code.clone(),
+                crate::VimExceptionKind::Throw => "Throw".to_owned(),
+            },
+            other => panic!("expected Vim error, got {other:?}"),
+        }
+    }
+
+    /// `mapset({mode}, {abbr}, {dict})` (`mapping.c:2323-2417`): the
+    /// oracle round trip from `:help mapset()` — save with `maparg()`,
+    /// overwrite, restore — brings back the original right-hand side.
+    #[test]
+    fn mapset_restores_saved_mapping() {
+        let editor = TestEditorAccess::new(editor());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "mapset.vim",
+            r#"
+nnoremap K :echo "orig"<CR>
+let g:save = maparg('K', 'n', 0, 1)
+nnoremap K :echo "changed"<CR>
+let g:changed = maparg('K', 'n', 0, 0)
+call mapset('n', 0, g:save)
+let g:restored = maparg('K', 'n', 0, 1)
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            global_string(&exec, "changed").as_deref(),
+            Some(":echo \"changed\"<CR>")
+        );
+        assert_eq!(
+            global_string(&exec, "restored").as_deref(),
+            None,
+            "dict form is not a string"
+        );
+        let value = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"restored", 0)
+            .unwrap();
+        let Typval::Dict(dict) = value else {
+            panic!("expected dict, got {value:?}");
+        };
+        let borrowed = dict.borrow();
+        assert_eq!(
+            dict_string_for_test(&borrowed, "rhs").as_deref(),
+            Some(":echo \"orig\"<CR>")
+        );
+        assert_eq!(
+            borrowed.get(b"noremap").and_then(typval_number),
+            Some(1),
+            "nnoremap restores as noremap"
+        );
+    }
+
+    /// Reads a strict string entry out of a `maparg()`-shaped dict.
+    fn dict_string_for_test(dict: &ox_types::DictData, key: &str) -> Option<String> {
+        match dict.get(key.as_bytes()) {
+            Some(Typval::String(value)) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// `mapset({dict})` takes mode and abbr from the dict, and abbreviations
+    /// round-trip through the same form.
+    #[test]
+    fn mapset_dict_only_form_restores_mapping_and_abbrev() {
+        let editor = TestEditorAccess::new(editor());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "mapset_dict.vim",
+            r#"
+nnoremap K :echo "orig"<CR>
+let g:save = maparg('K', 'n', 0, 1)
+nnoremap K :echo "changed"<CR>
+unmap K
+call mapset(g:save)
+let g:rhs = maparg('K', 'n', 0, 1).rhs
+iabbrev foo bar
+let g:asave = maparg('foo', 'i', 1, 1)
+iunabbrev foo
+call mapset(g:asave)
+let g:arhs = maparg('foo', 'i', 1, 1).rhs
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            global_string(&exec, "rhs").as_deref(),
+            Some(":echo \"orig\"<CR>")
+        );
+        assert_eq!(global_string(&exec, "arhs").as_deref(), Some("bar"));
+    }
+
+    /// `mapset` errors mirror upstream: `E460` for entries missing from the
+    /// dict argument and `E1276` for an illegal mode string.
+    #[test]
+    fn mapset_rejects_missing_entries_and_bad_modes() {
+        let editor = TestEditorAccess::new(editor());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(&editor, "mapset_setup.vim", "nnoremap K :echo \"x\"<CR>")
+            .unwrap();
+        let missing = exec
+            .execute_line(&editor, "call mapset('n', 0, {})")
+            .unwrap_err();
+        assert_eq!(error_code(missing), "E460");
+        let bad_mode = exec
+            .execute_line(
+                &editor,
+                "call mapset('zzz', 0, maparg('K', 'n', 0, 1))",
+            )
+            .unwrap_err();
+        assert_eq!(error_code(bad_mode), "E1276");
+        // A non-dict third argument is upstream's `E1206: Dictionary
+        // required for argument 3` (`tv_check_for_dict_arg`).
+        let bad_dict = exec
+            .execute_line(&editor, "call mapset('n', 0, 'K')")
+            .unwrap_err();
+        assert_eq!(error_code(bad_dict), "E1206");
+        // The mapping survives the failed restores.
+        assert_eq!(global_number(&exec, "never"), None);
+        exec.execute_line(&editor, "let g:still = maparg('K', 'n', 0, 0)")
+            .unwrap();
+        assert_eq!(
+            global_string(&exec, "still").as_deref(),
+            Some(":echo \"x\"<CR>")
+        );
+    }
 }

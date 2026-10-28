@@ -151,6 +151,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "rpcnotify" => call_rpc_notify(runtime, args),
         "rpcrequest" => call_rpc_request(runtime, args),
         "sockconnect" => call_sock_connect(runtime, args),
+        "timer_info" | "timer_pause" | "timer_start" | "timer_stop" | "timer_stopall" => {
+            crate::timers::call(host, name, args, scope)
+        }
         _ => unreachable!("process builtin route and dispatcher disagree"),
     }
 }
@@ -1300,6 +1303,13 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     let mut lua_deferred = false;
     let mut batch = std::mem::take(events).into_iter();
     while let Some(event) = batch.next() {
+        // Counts timer-callback failures (`emsg_count`); the id must be
+        // read before the event moves into the call, and receiver-`Rc`
+        // identity means job events never match.
+        let timer_id = runtime
+            .jobs
+            .as_ref()
+            .and_then(|manager| manager.timer_id_for_event(&event));
         if event_lua_reference(&event).is_some() {
             if lua.is_none() {
                 redefer_job_events(runtime, vec![event]);
@@ -1332,6 +1342,11 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             Some(event.receiver),
         ) {
+            if let Some(id) = timer_id
+                && let Some(manager) = runtime.jobs.as_mut()
+            {
+                manager.record_timer_error(id);
+            }
             redefer_job_events(runtime, batch.collect());
             return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
         }
@@ -1604,6 +1619,12 @@ mod tests {
     // tick in interactive mode -- delivers them. Delivering them inline
     // while the executor is in user code is what sent a Lua callback's
     // `vim.fn` re-entry to the nested executor's never-pumped manager.
+    //
+    // There is deliberately no `sleep` between the spawns and the write:
+    // upstream `:sleep` pumps the event loop (`do_sleep` with events), so a
+    // sleeping setup would deliver the writer's callback before `chansend`
+    // runs and defeat the arrangement. The pin is that the write itself
+    // never delivers, whatever has arrived by then.
     #[test]
     fn chansend_poll_defers_swept_events_for_a_later_drain() {
         let _guard = crate::lock_process_state();
@@ -1617,7 +1638,7 @@ mod tests {
         exec.execute_script(
             &editor,
             "<test>",
-            "function! Bcb(id, data, event)\nlet g:seen = 1\nendfunction\nlet g:seen = 0\nlet g:writer = jobstart(['sh', '-c', 'echo ready'], {'on_stdout': 'Bcb'})\nlet g:term = jobstart(['cat'], {'term': v:true})\nsleep 250m\ncall chansend(g:term, \"go\\n\")\nlet g:seen_after_chansend = g:seen\ncall jobwait([g:writer], 2000)\nlet g:seen_after_drain = g:seen",
+            "function! Bcb(id, data, event)\nlet g:seen = 1\nendfunction\nlet g:seen = 0\nlet g:writer = jobstart(['sh', '-c', 'echo ready'], {'on_stdout': 'Bcb'})\nlet g:term = jobstart(['cat'], {'term': v:true})\ncall chansend(g:term, \"go\\n\")\nlet g:seen_after_chansend = g:seen\ncall jobwait([g:writer], 2000)\nlet g:seen_after_drain = g:seen",
         )
         .unwrap();
         assert!(

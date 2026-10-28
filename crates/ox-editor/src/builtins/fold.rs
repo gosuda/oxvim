@@ -35,7 +35,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 ) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
     host.access.with_ex_editor(|editor| {
-        // `tv_get_lnum` runs before the range check in every one of the three, so
+        // `tv_get_lnum` runs before the range check in every one of the four, so
         // an argument with no numeric value raises its error whatever the folds
         // hold.
         let lnum = super::position::current_lnum_arg(editor, &args[0])?;
@@ -43,6 +43,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             "foldclosed" => closed_line(editor, lnum, false),
             "foldclosedend" => closed_line(editor, lnum, true),
             "foldlevel" => level(editor, lnum),
+            "diff_filler" => diff_filler(editor, lnum),
             _ => unreachable!("fold builtin route and dispatcher disagree"),
         };
         Ok(Typval::Number(value))
@@ -94,6 +95,18 @@ fn closed_line(editor: &mut Editor, lnum: i64, end: bool) -> i64 {
         first.saturating_add(1)
     };
     i64::try_from(result).unwrap_or(i64::MAX)
+}
+
+/// `f_diff_filler` (`diff.c:4359-4361`): the filler lines above `{lnum}` in
+/// the current window, through the tabpage's computed diff blocks
+/// (`diff_check_fill`, `diff.c:2414`). A window outside diff mode, filler
+/// display disabled, or a line outside `1..=line_count + 1` all answer 0 —
+/// never a negative number.
+fn diff_filler(editor: &mut Editor, lnum: i64) -> i64 {
+    let Some(window) = editor.current_window() else {
+        return 0;
+    };
+    crate::diffmode::diff_filler_for(editor, window, lnum)
 }
 
 /// `f_foldlevel` (`fold.c:3206-3212`): the nesting level at `lnum`, and `0`
@@ -510,5 +523,65 @@ mod tests {
         assert_eq!(error_code("let g:a = foldclosed(1, 2)"), "E118");
         assert_eq!(error_code("let g:a = foldclosedend(1, 2)"), "E118");
         assert_eq!(error_code("let g:a = foldlevel(1, 2)"), "E118");
+    }
+
+    /// `diff_filler({lnum})` (`diff.c:4359-4361`).
+    ///
+    /// Oracle ground truth (headless `nvim -u NONE -S`, left window holding
+    /// the 7-line side of a 2-line insertion after line 2, right window the
+    /// 5-line side): every line of the insertion side answers 0, and the
+    /// other side answers 2 above its line 3 and 0 elsewhere; outside diff
+    /// mode the answer is always 0.
+    #[test]
+    fn diff_filler_reports_insertion_filler() {
+        let editor = TestEditorAccess::new(editor());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "diff_filler.vim",
+            r#"
+call setline(1, ['one','two','three','four','five'])
+let g:plain = diff_filler(2)
+split | enew
+call setline(1, ['one','two','AAA','BBB','three','four','five'])
+windo diffthis
+let g:here = win_getid()
+wincmd w
+let g:a_f3 = diff_filler(3)
+let g:a_end = diff_filler(line('$') + 1)
+let g:a_lines = line('$')
+call win_gotoid(g:here)
+let g:b_f3 = diff_filler(3)
+let g:b_lines = line('$')
+"#,
+        )
+        .unwrap();
+        let values = ["a_f3", "a_end", "a_lines", "b_f3", "b_lines", "plain"]
+            .into_iter()
+            .map(|name| {
+                match exec
+                    .scope()
+                    .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+                    .unwrap_or_else(|error| panic!("no g:{name}: {error:?}"))
+                {
+                    Typval::Number(value) => *value,
+                    other => panic!("expected a Number in g:{name}, got {other:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let (a_f3, a_end, a_lines, b_f3, b_lines, plain) =
+            (values[0], values[1], values[2], values[3], values[4], values[5]);
+        assert_eq!(plain, 0, "outside diff mode diff_filler answers 0");
+        // One window holds 5 lines, the other 7; whichever holds 5 answers
+        // the 2-line insertion filler above its line 3.
+        assert!((a_lines, b_lines) == (5, 7) || (a_lines, b_lines) == (7, 5));
+        let (five_f3, seven_f3) = if a_lines == 5 {
+            (a_f3, b_f3)
+        } else {
+            (b_f3, a_f3)
+        };
+        assert_eq!(five_f3, 2, "filler above the insertion point");
+        assert_eq!(seven_f3, 0, "no filler inside the insertion");
+        assert_eq!(a_end, 0, "nothing past the last hunk");
     }
 }

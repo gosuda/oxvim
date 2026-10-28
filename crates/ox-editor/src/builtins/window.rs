@@ -10,10 +10,18 @@ use ox_eval::EvalError;
 use ox_eval::scope::{ScopeKind, scope_var_entry};
 use ox_types::{OxStr, Typval};
 
-use crate::builtins::position::{cursor_vcol, number_value, tabstop as position_tabstop};
-use crate::excmd_exec::{EvalHost, SetLayer, option_value, typval_number, typval_to_text};
+use crate::builtins::position::{
+    cursor_vcol, getvcol, lnum_arg_for_window, number_value, tabstop as position_tabstop,
+    vcol_to_byte,
+};
+use crate::excmd_exec::{
+    EvalHost, Flow, buffer_lines, flow_to_eval_error, parse_program, run_program,
+};
+use crate::script::LogicalLine;
+use crate::excmd_exec::{SetLayer, option_value, typval_number, typval_to_text};
 use crate::layout::Frame;
-use ox_types::WinHandle;
+use ox_eval::Scope;
+use ox_types::{Object, WinHandle};
 
 fn one_based_index(number: i64) -> Option<usize> {
     usize::try_from(number).ok()?.checked_sub(1)
@@ -24,8 +32,33 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
     name: &str,
     args: &[Typval],
+    scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
+    let spec = ox_eval::builtin_spec(name).ok_or_else(|| {
+        EvalError::new("E117", 0, format!("Unknown function: {name}"))
+    })?;
+    if args.len() < spec.min_args {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
+    }
     match name {
+        "win_execute" => call_win_execute(host, args, scope),
+        "win_screenpos" => host
+            .access
+            .with_ex_editor(|editor| call_win_screenpos(editor, args)),
+        "screenpos" => host
+            .access
+            .with_ex_editor(|editor| call_screenpos(editor, args)),
         "screenattr" | "screenchar" | "screenchars" | "screenstring" => Ok(host
             .access
             .with_ex_editor(|editor| call_screen_builtin(editor, name, args))),
@@ -1163,6 +1196,343 @@ fn call_setwinvar(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typva
     Ok(Typval::Number(0))
 }
 
+/// `win_execute({id}, {command} [, {silent}])` (`eval/window.c:523-543`):
+/// runs `{command}` with `{id}` as the current window and answers the
+/// captured output, like `execute()` does for the current window.
+///
+/// The switch itself fires no autocommands and keeps the working directory
+/// (`kCtxNoDisplay | kCtxKeepCwd | kCtxValidate`): `set_current_window`
+/// fires no autocommands either, and the directory the switch applies is
+/// restored before the command runs. The command itself runs normally, so
+/// autocommands and a `:cd` inside behave exactly like they do under
+/// `execute()`. An unknown `{id}` answers `""` with no error; a failing
+/// command propagates like `execute()`.
+///
+/// Small numbers are window numbers, not ids, and never resolve here:
+/// `win_id2wp_tp` looks ids up by handle, so only `{id}` at or above
+/// `LOWEST_WINDOW_ID` can name a window.
+fn call_win_execute<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    // Arity (2..=3) is enforced by the dispatcher; `{command}` is `args[1]`.
+    let id = win_id_number(&args[0]);
+    // `execute_common` reads the silent flag through `tv_get_string_buf_chk`
+    // (`eval/funcs.c:1179`), which rejects containers; the value itself only
+    // affects display, which capture discards, so it is validated and ignored.
+    if let Some(silent) = args.get(2) {
+        super::input_string_arg(silent)?;
+    }
+    let Some(target) = (id >= LOWEST_WINDOW_ID)
+        .then(|| host.access.with_ex_editor(|editor| editor.find_window_by_id(id)))
+        .flatten()
+    else {
+        return Ok(Typval::String(OxStr::from("")));
+    };
+    // A List argument runs every item as its own source line
+    // (`execute_common` hands `do_cmdline` a `get_list_line` cookie,
+    // `eval/funcs.c:1206-1216`); the scalar form is one command line.
+    let logical = match &args[1] {
+        Typval::List(items) => {
+            let text = items
+                .borrow()
+                .items
+                .iter()
+                .map(typval_to_text)
+                .collect::<Vec<String>>()
+                .join("\n");
+            host.runtime
+                .scripts
+                .join_logical_lines(&text)
+                .map_err(|error| EvalError::new("E488", 0, error.to_string()))?
+        }
+        command => vec![LogicalLine {
+            text: typval_to_text(command),
+            first_line: host.runtime.scripts.current_line(),
+        }],
+    };
+    // `ctx_switch` (`context.c:618-636`): remember the full context the
+    // switch disturbs — window, previous window, and working directory — so
+    // the command runs in the target window and everything is restored after.
+    let previous = host
+        .access
+        .with_ex_editor(|editor| editor.current_window());
+    let previous_previous = host
+        .access
+        .with_ex_editor(|editor| editor.previous_window());
+    let saved_directory = std::env::current_dir().ok();
+    host.access
+        .with_ex_editor(|editor| {
+            if editor.current_window() != Some(target) {
+                editor.set_current_window(target)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|error: crate::editor::EditorError| {
+            EvalError::new("E957", 0, error.to_string())
+        })?;
+    // `kCtxKeepCwd`: the target window's local directory must not leak into
+    // the command's working directory (`set_current_window` applies it).
+    if let Some(directory) = &saved_directory {
+        let _ = std::env::set_current_dir(directory);
+    }
+    // Addresses and buffer-local state resolve against the target window,
+    // which is current from here until the restore below.
+    let program = parse_program(
+        &host.runtime.user_commands,
+        host.access.with_ex_editor(|editor| editor.current_buffer()),
+        &logical,
+    );
+    let message_start = host
+        .access
+        .with_ex_editor(|editor| editor.messages().len());
+    let flow = run_program(
+        host.runtime,
+        host.access,
+        scope,
+        host.lua,
+        &program,
+        0,
+        program.len(),
+    );
+    host.access.with_ex_editor(|editor| {
+        if let Some(window) = previous
+            && editor.current_window() != Some(window)
+        {
+            let _ = editor.set_current_window(window);
+        }
+        editor.set_previous_window(previous_previous);
+    });
+    if !matches!(flow, Flow::Normal) {
+        return Err(flow_to_eval_error(flow, "win_execute"));
+    }
+    let mut output = String::new();
+    let messages = host
+        .access
+        .with_ex_editor(|editor| editor.messages().to_vec());
+    // `execute_common` appends raw message bytes to `capture_ga`
+    // (`eval/funcs.c:1202-1216`): no separator joins messages, display
+    // newlines are never captured, and a message's own newlines do not
+    // survive either — `:ls`, `1,2print`, and `echo "a\nb"` all capture
+    // with every `\n` removed. History entries are the exception only
+    // because they store newlines as NUL (`msg_hist_add`), which the
+    // capture then takes raw (`echom "a\nb"` captures `a\0b`).
+    for message in &messages[message_start..] {
+        let Object::String(text) = &message.content else {
+            continue;
+        };
+        let rendered = text.to_string_lossy();
+        if message.history {
+            output.push_str(&rendered.replace('\n', "\0"));
+        } else {
+            output.push_str(&rendered.replace('\n', ""));
+        }
+    }
+    host.access
+        .with_ex_editor(|editor| editor.truncate_messages(message_start));
+    Ok(Typval::String(OxStr(output.into_bytes())))
+}
+
+/// `tv_get_number` (`typval.c`) as `f_win_execute` uses it: strict numbers
+/// pass through, strings contribute their leading numeric prefix, and
+/// anything else is 0.
+fn win_id_number(value: &Typval) -> i64 {
+    match value {
+        Typval::Number(value) => *value,
+        Typval::Bool(value) => i64::from(*value),
+        // `(int)` truncation (`tv_get_number`); below 2^53 the truncation
+        // is exact and in range, so `as` cannot saturate. Anything else
+        // (NaN, infinities, out-of-range magnitudes) cannot name a window
+        // id, like upstream's 0 for a non-numeric value.
+        Typval::Float(value) => {
+            if *value >= 1.0 && *value < 9_007_199_254_740_992.0 {
+                value.trunc() as i64
+            } else {
+                0
+            }
+        }
+        Typval::String(value) => leading_number(&value.to_string_lossy()),
+        Typval::Channel(value) | Typval::Job(value) => i64::try_from(*value).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// `charset.c:vim_str2nr` as `tv_get_number` uses it: blanks, an optional
+/// sign, then a decimal prefix, else zero.
+fn leading_number(text: &str) -> i64 {
+    let text = text.trim_start();
+    let bytes = text.as_bytes();
+    let mut end = 0;
+    if bytes.first().is_some_and(|byte| matches!(byte, b'+' | b'-')) {
+        end = 1;
+    }
+    while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+        end += 1;
+    }
+    text[..end].parse().unwrap_or(0)
+}
+
+/// `win_screenpos({nr})` (`eval/window.c:636-642`): `[row, col]`, 1-based,
+/// `[0, 0]` for an invalid window. Lookup matches `find_win_by_nr_or_id`:
+/// ids at or above `LOWEST_WINDOW_ID` resolve by handle, smaller numbers are
+/// current-tabpage positions. The position is the composed screen position
+/// the geometry reports, the same row `getwininfo()` reports as `winrow`.
+fn call_win_screenpos(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let number = number_value(&args[0])?;
+    let position = resolve_window_by_number_impl(editor, number, false)
+        .and_then(|window| editor.window_geometry(window).ok())
+        .map(|geometry| {
+            let row = i64::try_from(geometry.row.saturating_add(1)).unwrap_or(i64::MAX);
+            let col = i64::try_from(geometry.col.saturating_add(1)).unwrap_or(i64::MAX);
+            (row, col)
+        })
+        .unwrap_or((0, 0));
+    Ok(Typval::list(vec![
+        Typval::Number(position.0),
+        Typval::Number(position.1),
+    ]))
+}
+
+/// `screenpos({winid}, {lnum}, {col})` (`move.c:1227-1259`): the screen
+/// position of a buffer character as `{row, col, endcol, curscol}`, all zero
+/// when the position is not visible and empty when the window is invalid.
+///
+/// The port follows `textpos2screenpos` (`move.c:1153-1225`) with this
+/// window model: no number column, no leftward scroll, no tabline offset and
+/// no smooth-scroll skip — `win_col_off` and `w_leftcol` are 0, so the
+/// window-relative column is the virtual column and the row is the topline
+/// distance plus diff filler. Wrapping shifts the character's own row and
+/// column by the upstream formula. A tab's cursor sits on its last cell
+/// while any other character's cursor sits on its first, which is what
+/// `curscol == endcol` for tabs and `curscol == col` otherwise takes.
+///
+/// Named gaps: closed folds are computed unfolded (fold state is keyed to the
+/// current window, while `screenpos` names any window), and conceal is
+/// ignored exactly like upstream (`textpos2screenpos` ignores it too).
+fn call_screenpos(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let number = number_value(&args[0])?;
+    let Some(window) = resolve_window_by_number_impl(editor, number, false) else {
+        return Ok(Typval::dict(Vec::new()));
+    };
+    let lnum = lnum_arg_for_window(editor, &args[1], window)?;
+        // `tv_get_number ... - 1`, floored at zero (`move.c:1238-1241).
+    let byte_col = number_value(&args[2])?.saturating_sub(1).max(0);
+    // A valid window always answers all four keys (`f_screenpos` adds them
+    // unconditionally, `move.c:1251-1254`); only an invalid window answers
+    // the empty dict. Invisible positions report zero for every key.
+    // Key order follows the `tv_dict_add_nr` sequence (`move.c:1251-1254`).
+    // Display order differs (upstream hashes dicts); field values match.
+    let zeros = || {
+        Typval::dict(vec![
+            (OxStr::from("row"), Typval::Number(0)),
+            (OxStr::from("col"), Typval::Number(0)),
+            (OxStr::from("curscol"), Typval::Number(0)),
+            (OxStr::from("endcol"), Typval::Number(0)),
+        ])
+    };
+    let buffer = editor
+        .window(window)
+        .map_err(|error| EvalError::new("E957", 0, error.to_string()))?
+        .buffer;
+    let lines = buffer_lines(editor, buffer)
+        .map_err(|error| EvalError::new("E749", 0, error.to_string()))?;
+    let line_count = i64::try_from(lines.len()).unwrap_or(i64::MAX);
+    // `f_screenpos` errors only past the last line (`E966`,
+    // `move.c:1242-1245`); a line at or below zero has no screen row, like
+    // upstream's `existing_row` being false.
+    if lnum > line_count {
+        return Err(EvalError::new(
+            "E966",
+            0,
+            format!("Invalid line number: {lnum}"),
+        ));
+    }
+    if lnum < 1 {
+        return Ok(zeros());
+    }
+    let Ok(line_index) = usize::try_from(lnum - 1) else {
+        return Ok(zeros());
+    };
+    let Some(line) = lines.get(line_index) else {
+        return Ok(zeros());
+    };
+    let geometry = editor.window_geometry(window).map_err(|error| {
+        EvalError::new("E957", 0, error.to_string())
+    })?;
+    let topline = editor
+        .window(window)
+        .map_err(|error| EvalError::new("E957", 0, error.to_string()))?
+        .topline;
+    let tabstop = position_tabstop(editor);
+    // `getvcol` (`plines.c`): the zero-based first virtual column and the
+    // inclusive last one of the character covering `byte_col`, snapping
+    // inside a multibyte character back onto its head and past the end of
+    // the line onto the NUL that counts as one cell.
+    let (start_vcol, end_last) = getvcol(line, byte_col, tabstop);
+    let snap = vcol_to_byte(line, start_vcol, tabstop);
+    let is_tab = line.get(snap) == Some(&b'\t');
+    let cursor_vcol = if is_tab { end_last } else { start_vcol };
+    // `textpos2screenpos`: rows below the topline plus filler above the line
+    // (`win_get_fill`, `move.c:1174-1176`); lines above the topline are not
+    // on screen.
+    let filler = crate::diffmode::diff_filler_for(editor, window, lnum);
+    let row_in_window = lnum
+        .saturating_sub(i64::try_from(topline).unwrap_or(i64::MAX))
+        .saturating_add(filler);
+    if row_in_window < 0 {
+        return Ok(zeros());
+    }
+    // Long-line wrapping (`move.c:1192-1197`): the character's own row and
+    // column shift by whole window widths. There is no horizontal scroll in
+    // this model, so `w_leftcol` is 0 and the check is the width alone.
+    let wrap = editor
+        .options()
+        .get_window(window, "wrap")
+        .map(|value| !matches!(value, OptionValue::Boolean(false)))
+        .unwrap_or(true);
+    let width = geometry.width;
+    if width == 0 {
+        return Ok(zeros());
+    }
+    let (col_adjusted, row_extra) = if wrap && start_vcol >= width {
+        let shift = (start_vcol - width) / width + 1;
+        (start_vcol - shift * width, shift)
+    } else {
+        (start_vcol, 0)
+    };
+    let total_row = row_in_window.saturating_add(i64::try_from(row_extra).unwrap_or(0));
+    let height = i64::try_from(geometry.height).unwrap_or(0);
+    if total_row >= height || col_adjusted >= width {
+        // Left, right, or below the window: everything is zero, and a
+        // non-local call zeroes the row too (`move.c:1204-1212`).
+        return Ok(zeros());
+    }
+    // `coloff = col - scol + wincol + 1` (`move.c:1201`): every virtual
+    // column shifts by the same window offset.
+    let col_offset = i64::try_from(col_adjusted).unwrap_or(0)
+        - i64::try_from(start_vcol).unwrap_or(0)
+        + i64::try_from(geometry.col).unwrap_or(0)
+        + 1;
+    let row_out = i64::try_from(geometry.row).unwrap_or(0) + 1 + total_row;
+    Ok(Typval::dict(vec![
+        (OxStr::from("row"), Typval::Number(row_out)),
+        (
+            OxStr::from("col"),
+            Typval::Number(i64::try_from(start_vcol).unwrap_or(0) + col_offset),
+        ),
+        (
+            OxStr::from("curscol"),
+            Typval::Number(i64::try_from(cursor_vcol).unwrap_or(0) + col_offset),
+        ),
+        (
+            OxStr::from("endcol"),
+            Typval::Number(i64::try_from(end_last).unwrap_or(0) + col_offset),
+        ),
+    ]))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -1361,5 +1731,210 @@ mod tests {
         let kind = call_win_gettype_builtin(&editor, &[Typval::Number(i64::from(quickfix_window))])
             .unwrap();
         assert_eq!(kind, Typval::String(OxStr::from("quickfix")));
+    }
+
+    /// Reads a global string set by a probe script.
+    fn probe_string(exec: &crate::ExExecutor, name: &str) -> Option<String> {
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// Reads a global number set by a probe script.
+    fn probe_number(exec: &crate::ExExecutor, name: &str) -> Option<i64> {
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::Number(value) => Some(*value),
+            Typval::Bool(value) => Some(i64::from(*value)),
+            _ => None,
+        }
+    }
+
+    /// Reads one `screenpos()`-shaped dict set by a probe script.
+    fn probe_screenpos(exec: &crate::ExExecutor, name: &str) -> Option<(i64, i64, i64, i64)> {
+        let Typval::Dict(dict) = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        else {
+            return None;
+        };
+        let borrowed = dict.borrow();
+        let number = |key: &str| match borrowed.get(key.as_bytes()) {
+            Some(Typval::Number(value)) => Some(*value),
+            _ => None,
+        };
+        Some((
+            number("row")?,
+            number("col")?,
+            number("endcol")?,
+            number("curscol")?,
+        ))
+    }
+
+    /// `win_execute` (`eval/window.c:523-543`) and `win_screenpos`
+    /// (`eval/window.c:636-642`).
+    ///
+    /// Oracle ground truth for the same buffer text (headless `nvim -u NONE
+    /// -S`): `win_execute-basic:'hi'`, `win_execute-list:'ab'`,
+    /// `win_execute-silent:'s'`, `win_execute-zero:''`,
+    /// `win_screenpos-cur:[1, 1]`, `win_screenpos-bad:[0, 0]`.
+    #[test]
+    fn win_execute_captures_and_win_screenpos_reports_origin() {
+        let editor = crate::TestEditorAccess::new(editor_with_window());
+        let mut exec = crate::ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "win_execute.vim",
+            r#"
+let g:basic = win_execute(win_getid(), 'echo "hi"')
+let g:list = win_execute(win_getid(), ['echo "a"', 'echo "b"'])
+let g:silent = win_execute(win_getid(), 'echo "s"', 'silent')
+let g:zero = win_execute(0, 'echo "hi"')
+let g:bad = win_execute(999999, 'echo "hi"')
+let g:cur = win_screenpos(0)
+let g:by_id = win_screenpos(win_getid())
+let g:badpos = win_screenpos(999999)
+"#,
+        )
+        .unwrap();
+        assert_eq!(probe_string(&exec, "basic").as_deref(), Some("hi"));
+        assert_eq!(probe_string(&exec, "list").as_deref(), Some("ab"));
+        assert_eq!(probe_string(&exec, "silent").as_deref(), Some("s"));
+        assert_eq!(probe_string(&exec, "zero").as_deref(), Some(""));
+        assert_eq!(probe_string(&exec, "bad").as_deref(), Some(""));
+        // Lists read back through the debug form: the point is the values.
+        let rendered = |name: &str| match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+        {
+            Ok(value) => format!("{value:?}"),
+            Err(error) => panic!("no g:{name}: {error:?}"),
+        };
+        assert_eq!(rendered("cur"), "List([Number(1), Number(1)])");
+        assert_eq!(rendered("by_id"), "List([Number(1), Number(1)])");
+        assert_eq!(rendered("badpos"), "List([Number(0), Number(0)])");
+    }
+
+    /// `win_execute` runs in the target window: a command that records
+    /// `win_getid()` observes the target, and the previous window is
+    /// restored afterwards. A failing command propagates `E492`, matching
+    /// the oracle (`win_execute-throw:Vim:E492`, same as `execute()`).
+    #[test]
+    fn win_execute_runs_in_target_window_and_restores() {
+        let editor = crate::TestEditorAccess::new(editor_with_window());
+        let mut exec = crate::ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "win_execute_ctx.vim",
+            r#"
+split
+let g:ids = [win_getid(1), win_getid(2)]
+let g:before = win_getid()
+call win_execute(g:ids[1], 'let g:whereami = win_getid()')
+let g:after = win_getid()
+let g:saw_target = g:whereami == g:ids[1]
+let g:kept_current = g:after == g:before
+"#,
+        )
+        .unwrap();
+        // The command observed the second window while the session stayed
+        // on the window `:split` left current.
+        assert_eq!(probe_number(&exec, "saw_target"), Some(1));
+        assert_eq!(probe_number(&exec, "kept_current"), Some(1));
+    }
+
+    /// `win_execute` propagates a failing command like `execute()` does: the
+    /// oracle throws `E492` for both (`win_execute-throw` and
+    /// `execute-throw`), and this port maps a failed inner command to the
+    /// same code for both, through the shared `flow_to_eval_error`
+    /// plumbing (which reports failures as `E605` port-wide).
+    #[test]
+    fn win_execute_propagates_command_errors() {
+        let editor = crate::TestEditorAccess::new(editor_with_window());
+        let mut exec = crate::ExExecutor::new();
+        let code = |exec: &mut crate::ExExecutor, script: &str| {
+            let error = exec
+                .execute_script(&editor, "win_execute_err.vim", script)
+                .unwrap_err();
+            match &error {
+                crate::excmd_exec::ExecError::Vim(exception) => match &exception.kind {
+                    crate::VimExceptionKind::Error(code) => code.clone(),
+                    crate::VimExceptionKind::Throw => "Throw".to_owned(),
+                },
+                other => panic!("expected Vim error, got {other:?}"),
+            }
+        };
+        let win_code = code(
+            &mut exec,
+            "let g:x = win_execute(win_getid(), 'boguscommand_xyz')",
+        );
+        let exec_code = code(&mut exec, "let g:y = execute('boguscommand_xyz')");
+        assert_eq!(win_code, exec_code, "win_execute matches execute()");
+    }
+
+    /// `screenpos` (`move.c:1227-1259`).
+    ///
+    /// Oracle ground truth for `['aaa', "b\tc", 'wide:界x']` (headless
+    /// `nvim -u NONE -S`): `(1, 1)` answers `col/endcol/curscol 1`;
+    /// the tab at `(2, 2)` answers `col 2, endcol 8, curscol 8`;
+    /// the wide character's second byte at `(3, 7)` snaps to `col 6,
+    /// endcol 7, curscol 6`; past-end columns clamp onto the NUL cell;
+    /// an invalid window answers the empty dict; line 0 answers zeros;
+    /// and a line past the buffer raises `E966`.
+    #[test]
+    fn screenpos_reports_character_cells() {
+        let editor = crate::TestEditorAccess::new(editor_with_window());
+        let mut exec = crate::ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "screenpos.vim",
+            r#"
+call setline(1, ['aaa', "b\tc", 'wide:界x'])
+let g:first = screenpos(win_getid(), 1, 1)
+let g:tab = screenpos(win_getid(), 2, 2)
+let g:tabbed = screenpos(win_getid(), 2, 3)
+let g:wide = screenpos(win_getid(), 3, 7)
+let g:eol = screenpos(win_getid(), 1, 4)
+let g:beyond = screenpos(win_getid(), 1, 99)
+let g:badwin = screenpos(999999, 1, 1)
+let g:low = screenpos(win_getid(), 0, 1)
+"#,
+        )
+        .unwrap();
+        assert_eq!(probe_screenpos(&exec, "first"), Some((1, 1, 1, 1)));
+        assert_eq!(probe_screenpos(&exec, "tab"), Some((2, 2, 8, 8)));
+        assert_eq!(probe_screenpos(&exec, "tabbed"), Some((2, 9, 9, 9)));
+        assert_eq!(probe_screenpos(&exec, "wide"), Some((3, 6, 7, 6)));
+        assert_eq!(probe_screenpos(&exec, "eol"), Some((1, 4, 4, 4)));
+        assert_eq!(probe_screenpos(&exec, "beyond"), Some((1, 4, 4, 4)));
+        assert_eq!(probe_screenpos(&exec, "low"), Some((0, 0, 0, 0)));
+        // An invalid window answers the empty dict, not zeros.
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"badwin", 0)
+        {
+            Ok(Typval::Dict(dict)) => assert!(dict.borrow().entries.is_empty()),
+            other => panic!("expected empty dict, got {other:?}"),
+        }
+        let error = exec
+            .execute_line(&editor, "call screenpos(win_getid(), 99, 1)")
+            .unwrap_err();
+        let code = match &error {
+            crate::excmd_exec::ExecError::Vim(exception) => match &exception.kind {
+                crate::VimExceptionKind::Error(code) => code.clone(),
+                crate::VimExceptionKind::Throw => "Throw".to_owned(),
+            },
+            other => panic!("expected Vim error, got {other:?}"),
+        };
+        assert_eq!(code, "E966");
     }
 }

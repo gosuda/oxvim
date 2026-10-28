@@ -7,6 +7,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::rc::Rc;
 #[cfg(not(unix))]
 use std::process::ChildStdin;
 #[cfg(not(unix))]
@@ -18,7 +19,7 @@ use ox_rpc::{IncrementalDecoder, Message, MsgidCounter};
 use ox_types::{ApiError, DictRef, Object, OxStr, Typval};
 #[cfg(unix)]
 use ox_uv::NetEvent;
-use ox_uv::UvLoop;
+use ox_uv::{Timer, UvLoop};
 use ox_uv::process::{self, Process, PtySize, SpawnOptions, StdioConfig};
 #[cfg(unix)]
 use ox_uv::process::{ProcessPipe, PtyHandle};
@@ -344,6 +345,19 @@ pub struct JobManager {
     /// events`, funcs.c:3668/3721), so the first borrow-free boundary after
     /// the builtin returns must deliver them, not the next tick.
     lua_flush_pending: bool,
+    /// Vimscript `timer_start` timers (`eval.c` `timer_T`), keyed by the
+    /// monotonic id `timer_start` answers. They arm [`Timer`] handles on
+    /// this same loop — the only loop the editor polls — so firings surface
+    /// during `:sleep`, `vim.wait`, and the RPC pump without a second loop.
+    timers: HashMap<u64, VimTimer>,
+    /// Next `timer_start` id, monotonic from 1 (upstream `last_timer_id`).
+    next_timer_id: u64,
+    /// Vim timer ids whose loop handles fired since the last poll. The
+    /// `Timer` closure runs while the loop is borrowed, so it cannot touch
+    /// the timer table; it only records here, and the poll drains the queue
+    /// into [`JobEvent`]s once the borrow is free (the same defer-to-a-
+    /// borrow-free-boundary shape the channel callbacks use).
+    timer_fired: Arc<Mutex<Vec<u64>>>,
 }
 
 impl JobManager {
@@ -361,6 +375,9 @@ impl JobManager {
             raw: Arc::new(Mutex::new(VecDeque::new())),
             deferred: Vec::new(),
             lua_flush_pending: false,
+            timers: HashMap::new(),
+            next_timer_id: 1,
+            timer_fired: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -535,6 +552,7 @@ impl JobManager {
         self.loop_.run_nowait().map_err(|error| error.to_string())?;
         let mut events = std::mem::take(&mut self.deferred);
         events.extend(self.drain_raw());
+        events.extend(self.drain_timers());
         Ok(events)
     }
 
@@ -1094,12 +1112,13 @@ impl JobManager {
     }
 
     /// Pump one transport turn so a pending reply can arrive: one non-blocking
-    /// reactor turn for jobs (re-deferring callback events), one
-    /// timeout-bounded read for sockets.
+    /// reactor turn (re-deferring callback events, which also drives due
+    /// timers so they cannot starve while a request waits), then a
+    /// timeout-bounded read for socket transports.
     fn pump_rpc(&mut self, id: u64) -> Result<(), String> {
+        let events = self.poll()?;
+        self.defer_events(events);
         if self.jobs.contains_key(&id) {
-            let events = self.poll()?;
-            self.defer_events(events);
             return Ok(());
         }
         let Some(socket) = self.sockets.get_mut(&id) else {
@@ -1345,6 +1364,316 @@ impl Drop for JobManager {
                 let _ignored = ox_uv::Handle::close(&job.process, &mut self.loop_);
             }
         }
+    }
+}
+
+/// One Vimscript `timer_start` timer (upstream `eval.c` `timer_T`).
+///
+/// The loop handle fires on [`JobManager::loop_`], so every reactor pump —
+/// `:sleep`, `vim.wait`, the RPC wait — drives it. The handle closure never
+/// runs Vimscript: it only records the firing, and [`JobManager::poll`]
+/// turns the record into a [`JobEvent`] on a borrow-free boundary.
+struct VimTimer {
+    /// Loop handle armed for the next firing while the timer is live.
+    handle: Timer,
+    /// Requested delay in milliseconds, kept verbatim for `timer_info`
+    /// (upstream stores the raw `timeout`, including negatives, which arm
+    /// the watcher with a wrapped-around delay that effectively never
+    /// fires; this port leaves such timers unarmed instead).
+    timeout_ms: i64,
+    /// Firings still owed; negative repeats forever. `repeat == 0` is
+    /// normalized to 1 at start (upstream `f_timer_start`).
+    repeat_remaining: i64,
+    /// Paused timers hold no armed handle until resumed (upstream
+    /// `f_timer_pause` stops/starts the watcher).
+    paused: bool,
+    /// Whether the handle is currently armed. A `TimeOverflow` timeout
+    /// (negative or absurd `time`) leaves a valid unarmed entry that shows
+    /// in `timer_info`, never fires, and still stops cleanly.
+    armed: bool,
+    /// Callback invoked with the timer id on every firing.
+    callback: Typval,
+    /// Callback failures so far; three strikes stop the timer (upstream
+    /// `emsg_count` in `timer_due_cb`).
+    emsg_count: u32,
+    /// The `self` dictionary cloned into every firing's [`JobEvent`]. One
+    /// identity per timer, so [`JobManager::timer_id_for_event`] recognizes
+    /// timer firings by `Rc::ptr_eq` instead of by argument shape — a job
+    /// callback can never present this identity, however its arguments
+    /// happen to line up.
+    receiver: DictRef,
+}
+
+impl JobManager {
+    /// Start a Vimscript timer on the job loop, answering its monotonic id.
+    ///
+    /// `repeat == 0` means 1; negative repeats forever. The callback is
+    /// stored as given and cloned into one [`JobEvent`] per firing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loop handle error when no timer handle can be allocated.
+    pub fn timer_start(
+        &mut self,
+        timeout_ms: i64,
+        repeat: i64,
+        callback: Typval,
+    ) -> Result<u64, String> {
+        let id = self.next_timer_id;
+        self.next_timer_id = self.next_timer_id.wrapping_add(1).max(1);
+        let handle = Timer::new(&mut self.loop_).map_err(|error| error.to_string())?;
+        // Only handle exhaustion fails here; an unrepresentable timeout
+        // (negative or absurd `time`) keeps a valid unarmed entry that shows
+        // in `timer_info`, never fires, and still stops cleanly.
+        let armed = Self::arm_timer(
+            &mut self.loop_,
+            &self.timer_fired,
+            &handle,
+            id,
+            timeout_ms,
+        );
+        let receiver = match Typval::dict(Vec::new()) {
+            Typval::Dict(reference) => reference,
+            _ => unreachable!("Typval::dict builds a Dict"),
+        };
+        self.timers.insert(
+            id,
+            VimTimer {
+                handle,
+                timeout_ms,
+                repeat_remaining: if repeat == 0 { 1 } else { repeat },
+                paused: false,
+                armed,
+                callback,
+                emsg_count: 0,
+                receiver,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Stop the timer, silently ignoring unknown ids (upstream `f_timer_stop`
+    /// returns without touching `rettv` when the id is unknown).
+    pub fn timer_stop(&mut self, id: u64) {
+        if let Some(timer) = self.timers.remove(&id) {
+            let _ignored = timer.handle.stop(&mut self.loop_);
+            let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
+        }
+    }
+
+    /// Stop every timer (upstream `timer_stop_all`).
+    pub fn timer_stop_all(&mut self) {
+        let timers = std::mem::take(&mut self.timers);
+        for (_, timer) in timers {
+            let _ignored = timer.handle.stop(&mut self.loop_);
+            let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
+        }
+    }
+
+    /// Pause or resume the timer, silently ignoring unknown ids. Resuming
+    /// re-arms the handle with the original timeout (upstream `f_timer_pause`
+    /// restarts the watcher with `(timeout, timeout)`).
+    pub fn timer_pause(&mut self, id: u64, paused: bool) {
+        let JobManager {
+            loop_,
+            timers,
+            timer_fired,
+            ..
+        } = self;
+        let Some(timer) = timers.get_mut(&id) else {
+            return;
+        };
+        if timer.paused == paused {
+            return;
+        }
+        timer.paused = paused;
+        if paused {
+            let _ignored = timer.handle.stop(loop_);
+        } else if timer.armed {
+            timer.armed = Self::arm_timer(loop_, timer_fired, &timer.handle, id, timer.timeout_ms);
+        }
+    }
+
+    /// Render `timer_info([id])` (upstream `add_timer_info`): one dict per
+    /// live timer with `id`, `time`, `paused`, `repeat`, and `callback`
+    /// entries, in that order; empty when no timer matches.
+    #[must_use]
+    pub fn timer_info(&self, id: Option<u64>) -> Typval {
+        let mut ids: Vec<u64> = self.timers.keys().copied().collect();
+        ids.sort_unstable();
+        let mut items = Vec::with_capacity(ids.len());
+        for timer_id in ids {
+            if id.is_some_and(|wanted| wanted != timer_id) {
+                continue;
+            }
+            // The id came from the live key set, so the entry exists.
+            let Some(timer) = self.timers.get(&timer_id) else {
+                continue;
+            };
+            items.push(Typval::dict(vec![
+                (
+                    OxStr::from("id"),
+                    Typval::Number(timer_id.cast_signed()),
+                ),
+                (OxStr::from("time"), Typval::Number(timer.timeout_ms)),
+                (
+                    OxStr::from("paused"),
+                    Typval::Number(i64::from(timer.paused)),
+                ),
+                (
+                    OxStr::from("repeat"),
+                    Typval::Number(if timer.repeat_remaining < 0 {
+                        -1
+                    } else {
+                        timer.repeat_remaining
+                    }),
+                ),
+                (
+                    OxStr::from("callback"),
+                    timer.callback.clone(),
+                ),
+            ]));
+        }
+        Typval::list(items)
+    }
+
+    /// Identify a live timer firing among delivered [`JobEvent`]s by
+    /// receiver identity: every firing carries its timer's [`VimTimer`]
+    /// dictionary, and no other event can present that `Rc`. Stopped timers
+    /// leave the table, so their stale in-flight firings no longer match.
+    /// Delivery sites call this before the event is consumed, then
+    /// [`Self::record_timer_error`].
+    #[must_use]
+    pub fn timer_id_for_event(&self, event: &JobEvent) -> Option<u64> {
+        self.timers.iter().find_map(|(id, timer)| {
+            Rc::ptr_eq(&timer.receiver, &event.receiver).then_some(*id)
+        })
+    }
+
+    /// Record one failed timer-callback delivery: counts the failure and
+    /// returns whether the event was a live timer firing. Delivery sites
+    /// (the `jobwait` flush, the server tick, direct invokes) call this
+    /// with the event when its callback fails, before the event is
+    /// consumed; job events pass through untouched.
+    pub fn record_timer_event_error(&mut self, event: &JobEvent) -> bool {
+        if let Some(id) = self.timer_id_for_event(event) {
+            self.record_timer_error(id);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record one failed timer-callback invocation; three strikes stop the
+    /// timer (upstream `emsg_count` in `timer_due_cb`). The shared job-event
+    /// delivery reports the failure itself; this only does the counting.
+    pub fn record_timer_error(&mut self, id: u64) {
+        let mut stop = false;
+        if let Some(timer) = self.timers.get_mut(&id) {
+            timer.emsg_count = timer.emsg_count.saturating_add(1);
+            stop = timer.emsg_count >= 3;
+        }
+        if stop {
+            self.timer_stop(id);
+        }
+    }
+
+    /// Arm (or re-arm) one timer handle with the firing record closure.
+    /// Returns whether the handle is armed; an unrepresentable timeout
+    /// reports false instead of failing, so the entry stays valid but idle.
+    fn arm_timer(
+        loop_: &mut UvLoop,
+        fired: &Arc<Mutex<Vec<u64>>>,
+        handle: &Timer,
+        id: u64,
+        timeout_ms: i64,
+    ) -> bool {
+        let Ok(timeout) = u64::try_from(timeout_ms) else {
+            return false;
+        };
+        let queue = Arc::clone(fired);
+        handle
+            .start(loop_, timeout, timeout, move |_, _| {
+                // Blockable like upstream's `time_watcher` (`tw.blockable`):
+                // while the loop is blocked, at most one firing waits per
+                // timer instead of one per elapsed period.
+                if let Ok(mut queue) = queue.lock() {
+                    if !queue.contains(&id) {
+                        queue.push(id);
+                    }
+                }
+                Ok(())
+            })
+            .is_ok()
+    }
+
+    /// Turn loop-handle firings recorded since the last poll into [`JobEvent`]s.
+    ///
+    /// Repeat bookkeeping happens here, at fire time (upstream `timer_due_cb`
+    /// decrements `repeat_count` and stops the timer before `callback_call`):
+    /// the final firing still delivers its callback, and a finished timer
+    /// leaves the table so `timer_info` no longer lists it. A zero-timeout
+    /// repeater re-arms every turn (upstream's `timeout == 0` restart); a
+    /// nonzero repeater rides the handle's own repeat.
+    fn drain_timers(&mut self) -> Vec<JobEvent> {
+        let fired: Vec<u64> = self
+            .timer_fired
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default();
+        if fired.is_empty() {
+            return Vec::new();
+        }
+        let mut events = Vec::with_capacity(fired.len());
+        for id in fired {
+            let (callback, receiver) = match self.timers.get_mut(&id) {
+                Some(timer) if !timer.paused => {
+                    if timer.repeat_remaining >= 0 {
+                        timer.repeat_remaining -= 1;
+                    }
+                    (timer.callback.clone(), timer.receiver.clone())
+                }
+                _ => continue,
+            };
+            let finished = self
+                .timers
+                .get(&id)
+                .is_some_and(|timer| timer.repeat_remaining == 0);
+            if finished {
+                self.timer_stop(id);
+            } else if self
+                .timers
+                .get(&id)
+                .is_some_and(|timer| timer.armed && timer.timeout_ms == 0)
+            {
+                let JobManager {
+                    loop_,
+                    timers,
+                    timer_fired,
+                    ..
+                } = self;
+                if let Some(timer) = timers.get_mut(&id) {
+                    let queue = Arc::clone(timer_fired);
+                    timer.armed = timer
+                        .handle
+                        .start(loop_, 0, 0, move |_, _| {
+                            if let Ok(mut queue) = queue.lock() {
+                                if !queue.contains(&id) {
+                                    queue.push(id);
+                                }
+                            }
+                            Ok(())
+                        })
+                        .is_ok();
+                }
+            }
+            events.push(JobEvent {
+                callback,
+                receiver,
+                args: vec![Typval::Number(id.cast_signed())],
+            });
+        }
+        events
     }
 }
 

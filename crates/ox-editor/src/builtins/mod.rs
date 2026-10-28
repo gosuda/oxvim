@@ -91,33 +91,32 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "prompt_setprompt" | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
         "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
-        | "swapname" => Family::Environment,
+        | "state" | "swapname" => Family::Environment,
         "call" | "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand"
         | "funcref" | "function" | "luaeval" | "submatch" | "uniq" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
-        "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
+        "foldclosed" | "foldclosedend" | "foldlevel" | "diff_filler" => Family::Fold,
         "confirm" | "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => {
             Family::Input
         }
-        "maparg" | "mapcheck" | "hasmapto" => Family::Mapping,
+        "maparg" | "mapcheck" | "hasmapto" | "mapset" => Family::Mapping,
         "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
         | "getpos" | "getregion" | "getregionpos" | "line" | "line2byte" | "setcharpos"
         | "setcursorcharpos" | "setpos" | "virtcol" => Family::Position,
         "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" | "system"
         | "systemlist" | "jobclose" | "chanclose" | "rpcnotify" | "rpcrequest" | "sockconnect"
-        | "termopen" => {
-            Family::Process
-        }
+        | "termopen" | "timer_info" | "timer_pause" | "timer_start" | "timer_stop"
+        | "timer_stopall" => Family::Process,
         "search" | "searchpair" | "searchpairpos" | "searchcount" => Family::Search,
         "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
         | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
         | "win_gettype" | "win_findbuf" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
         | "winrestview" | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout"
-        | "getwininfo" => Family::Window,
+        | "getwininfo" | "win_execute" | "win_screenpos" | "screenpos" => Family::Window,
 
         "getreg" | "getregtype" | "setreg" | "getreginfo" => Family::Register,
-        "complete" | "complete_info" | "getcompletion" => Family::Completion,
+        "complete" | "complete_check" | "complete_info" | "getcompletion" => Family::Completion,
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
         "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdwintype" | "getcmdprompt" | "pumvisible"
@@ -170,16 +169,14 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .access
             .with_ex_editor(|editor| crate::quickfix::call(editor, name, args)),
         Family::Register => register::call(host, name, args, scope),
-        Family::Completion => host
-            .access
-            .with_ex_editor(|editor| completion::call(editor, name, args)),
+        Family::Completion => completion::call_host(host, name, args, scope),
         Family::Server => server::call(host, name, args, scope),
         Family::Match => host
             .access
             .with_ex_editor(|editor| matches::call(editor, name, args)),
         Family::Cmdline => cmdline::call(host, name, args),
         Family::Tag => tag::call(host, name, args),
-        Family::Window => window::call(host, name, args),
+        Family::Window => window::call(host, name, args, scope),
     }
 }
 

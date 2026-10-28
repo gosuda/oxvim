@@ -40,6 +40,7 @@ pub mod shada;
 pub mod tags;
 pub mod terminal_screen;
 pub mod textobject;
+pub(crate) mod timers;
 pub mod typeahead;
 pub mod userfunc;
 pub mod visual;

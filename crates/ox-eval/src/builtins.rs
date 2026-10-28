@@ -4089,6 +4089,7 @@ pub(crate) const FEATURES: &[&str] = &[
     "quickfix",            // ox-editor/quickfix.rs: setqflist/getqflist and :cnext
     "startuptime",         // oxvim/cli.rs implements `--startuptime`
     "textobjects",         // ox-editor: `daw` deletes a word with its white space
+    "timers",              // ox-editor/timers.rs: timer_start/pause/stop/info/stopall
     "user-commands",       // the spelling upstream keeps for 5.4 compatibility
     "user_commands",       // ox-editor/excmd_exec.rs: `:command! -nargs=1` plus `<f-args>`
     "vertsplit",           // ox-editor/layout.rs: `:vsplit` yields two windows

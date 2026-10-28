@@ -44,6 +44,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .access
             .with_ex_editor(|editor| call_shellescape_builtin(editor, args)),
         "mode" => call_mode_builtin(host, args),
+        "state" => call_state_builtin(host, args),
         "swapname" => {
             if args.len() > 1 {
                 return Err(EvalError::new(
@@ -438,6 +439,71 @@ fn call_mode_builtin<F: FileIO, E: ExEditorAccess>(
     Ok(Typval::String(OxStr::from(text.as_str())))
 }
 
+/// `state([{what}])` (`eval/funcs.c:4385-4416`): flag characters for the
+/// editor's current busyness, filtered to `{what}` when given.
+///
+/// Each character reads live session state: `m` while typeahead waits,
+/// `o` for a pending operator, `a` while insert completion is active, `x`
+/// while an autocommand plan runs, and `c` per callback nesting level.
+/// `S` marks a non-safe state, which is exactly when one of the other
+/// conditions holds. `s` (messages scrolled off screen) has no counterpart
+/// in this port's message model and is never emitted.
+fn call_state_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: state",
+        ));
+    }
+    // `may_add_state_char` (`eval/funcs.c:4372`): an empty `{what}` matches
+    // no flag, so `state('')` is always `""`; only a missing `{what}` lifts
+    // the filter.
+    let include = match args.first() {
+        None => None,
+        Some(value) => Some(input_string_arg(value)?.to_string_lossy().into_owned()),
+    };
+    let completion_active = host
+        .runtime
+        .mode_machine
+        .as_ref()
+        .is_some_and(|machine| machine.borrow().completion.is_active());
+    let typeahead_busy = host
+        .access
+        .with_ex_editor(|editor| !editor.typeahead().is_empty());
+    let autocmd_busy = host.runtime.autocmd_busy > 0;
+    // `o` is `op_pending()` (`normal.c:505-512`), which is true whenever no
+    // clean Normal-mode operator context exists — including `current_oap ==
+    // NULL`, which is every context this port can be in: there is no
+    // `normal_enter` lifecycle and no operator argument block, so a pending
+    // operator is indistinguishable from no operator context at all. A real
+    // `OperatorPending` mode reads the same.
+    // `S` is `!get_was_safe_state()` (`state.c:326-329`): safe state is only
+    // entered by an idle main loop (`may_trigger_safestate`), which this
+    // port never runs, so every builtin evaluation happens outside it.
+    // `c` counts `Callback` invocations (`eval.c:call_callback`: funcref and
+    // expression callbacks from timers, jobs, and `sort()`/`map()` — never
+    // plain `:call` frames), which this port does not track, so it is never
+    // emitted rather than invented from the user-function call stack.
+    // `s` (messages scrolled off screen) has no counterpart in this port's
+    // message model and is never emitted.
+    let mut state = String::new();
+    let push = |state: &mut String, flag: char, on: bool| {
+        if on && include.as_ref().is_none_or(|filter| filter.contains(flag)) {
+            state.push(flag);
+        }
+    };
+    push(&mut state, 'm', typeahead_busy);
+    push(&mut state, 'o', true);
+    push(&mut state, 'a', completion_active);
+    push(&mut state, 'x', autocmd_busy);
+    push(&mut state, 'S', true);
+    Ok(Typval::String(OxStr::from(state.as_str())))
+}
+
 #[cfg(test)]
 mod tests {
     use ox_eval::Scope;
@@ -634,5 +700,40 @@ mod api_and_highlight_tests {
         assert!(known > 0, "hlID('NonText') = {known}, want > 0");
         assert_eq!(global_number(&exec, "unknown"), Some(0));
         assert_eq!(global_number(&exec, "exists"), Some(1));
+    }
+
+    /// Reads a global string set by a probe script.
+    fn global_string(exec: &ExExecutor, name: &str) -> Option<String> {
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::String(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        }
+    }
+
+    /// `state()` (`eval/funcs.c:4385-4416`).
+    ///
+    /// Oracle ground truth (headless `nvim -u NONE -S`): a bare call answers
+    /// `'oS'` — `op_pending()` with no Normal-mode operator context and no
+    /// idle safe state; `state('o')` and `state('S')` select those flags;
+    /// `state('')` is always `""`; and an autocommand body observes `'oxS'`.
+    #[test]
+    fn state_reports_busy_flags_and_filter() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        run(
+            &editor,
+            &mut exec,
+            "let g:bare = state()\nlet g:o = state('o')\nlet g:s = state('S')\nlet g:none = state('')\nlet g:idle = state('xa')\nautocmd BufEnter * let g:au = state()\nenew",
+        );
+        assert_eq!(global_string(&exec, "bare").as_deref(), Some("oS"));
+        assert_eq!(global_string(&exec, "o").as_deref(), Some("o"));
+        assert_eq!(global_string(&exec, "s").as_deref(), Some("S"));
+        assert_eq!(global_string(&exec, "none").as_deref(), Some(""));
+        assert_eq!(global_string(&exec, "idle").as_deref(), Some(""));
+        assert_eq!(global_string(&exec, "au").as_deref(), Some("oxS"));
     }
 }

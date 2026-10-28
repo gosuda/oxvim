@@ -288,6 +288,97 @@ pub fn diffupdate(editor: &mut Editor) {
 /// Recomputes the current tabpage's blocks unless every participating buffer
 /// still has the changedtick the last computation saw (`tp_diff_invalid`,
 /// diff.c:3555-3559).
+/// `diff_check_fill` (`diff.c:2414`) through `diff_check_with_linestatus`
+/// (`diff.c:2289-2412`): the filler lines shown above buffer line `lnum` in
+/// `window`, or 0.
+///
+/// Only the line just below a hunk carries filler: `num_fill` accumulates
+/// `maxcount - count` (the longest side minus this buffer's side) while
+/// `lnum` equals a hunk's end line, chaining through adjacent hunks, and a
+/// line strictly inside a hunk answers what accumulated so far (nothing,
+/// unless an adjacent hunk ended exactly there). Upstream returns 0 without
+/// `'diff'` on the window, without `filler` in `'diffopt'`, for `lnum` outside
+/// `1..=line_count + 1`, and on a closed fold; the fold and conceal legs have
+/// no counterpart in this port's window model and are not checked.
+///
+/// `DiffBlock` pairs one reference-buffer range with one compared-buffer
+/// range, while upstream's `diff_T` carries every buffer at once, so the
+/// longest side is the max over this buffer's count and every paired block
+/// touching the same line (the two-buffer case, which is all the block
+/// computation produces, makes this exact).
+pub(crate) fn diff_filler_for(editor: &mut Editor, window: WinHandle, lnum: i64) -> i64 {
+    if !filler_enabled(editor) {
+        return 0;
+    }
+    let Ok(tab) = editor.window_tabpage(window) else {
+        return 0;
+    };
+    let Ok(state) = editor.window(window) else {
+        return 0;
+    };
+    let buffer = state.buffer;
+    let Ok(lines) = crate::excmd_exec::buffer_lines(editor, buffer) else {
+        return 0;
+    };
+    let line_count = i64::try_from(lines.len().max(1)).unwrap_or(i64::MAX);
+    if lnum < 1 || lnum > line_count + 1 {
+        return 0;
+    }
+    ensure_blocks(editor);
+    let Some(entry) = editor.diff.blocks.get(&tab) else {
+        return 0;
+    };
+    let reference = entry.ticks.first().map(|&(buffer, _)| buffer);
+    // This buffer's (start, count) per block, in 1-based lines, for blocks
+    // that touch it; the longest side is the max over the block's own sides.
+    let mut ranges: Vec<((usize, usize), usize)> = Vec::new();
+    for block in &entry.blocks {
+        if Some(buffer) == reference {
+            ranges.push((block.base, block.base.1.max(block.other.1)));
+        } else if block.other_buffer == buffer {
+            ranges.push((block.other, block.base.1.max(block.other.1)));
+        }
+    }
+    if ranges.is_empty() {
+        return 0;
+    }
+    ranges.sort();
+    let Ok(target) = usize::try_from(lnum) else {
+        return 0;
+    };
+    let mut filler: i64 = 0;
+    for ((start, count), longest) in ranges {
+        let end = start.saturating_add(count);
+        if end < target {
+            continue;
+        }
+        if start > target {
+            break;
+        }
+        if end == target {
+            filler += i64::try_from(longest.saturating_sub(count)).unwrap_or(0);
+        } else {
+            // Strictly inside the hunk: upstream's interior leg returns what
+            // adjacent hunks accumulated, which is `filler` here.
+            return filler;
+        }
+    }
+    filler.max(0)
+}
+
+/// Whether `'diffopt'` enables filler display (`DIFF_FILLER`,
+/// `diff.c:2418-2421`). Upstream's default carries `filler`; this port does
+/// not declare the option, so an unreadable value means the default.
+fn filler_enabled(editor: &Editor) -> bool {
+    match editor.options().get_global("diffopt") {
+        Ok(OptionValue::String(value)) => value.split(',').any(|item| item.trim() == "filler"),
+        // The option is undeclared in this port, which is the default setup
+        // upstream ships `filler` in; only an explicit value without the item
+        // disables filler.
+        _ => true,
+    }
+}
+
 pub fn ensure_blocks(editor: &mut Editor) {
     let Some(tab) = editor.current_tabpage() else {
         return;

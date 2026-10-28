@@ -723,6 +723,7 @@ case!(has_nvim, "has", [text("nvim")], number(1));
 case!(has_startuptime, "has", [text("startuptime")], number(1));
 case!(has_quickfix_present, "has", [text("quickfix")], number(1));
 case!(has_diff_present, "has", [text("diff")], number(1));
+case!(has_timers_present, "has", [text("timers")], number(1));
 
 // Subsystems upstream always compiles in that this build does not have. Each
 // name stays 0 because a test that stopped skipping would run against a
@@ -733,7 +734,6 @@ case!(has_conceal_absent, "has", [text("conceal")], number(0));
 case!(has_spell_absent, "has", [text("spell")], number(0));
 case!(has_syntax_absent, "has", [text("syntax")], number(0));
 case!(has_signs_absent, "has", [text("signs")], number(0));
-case!(has_timers_absent, "has", [text("timers")], number(0));
 case!(has_reltime_absent, "has", [text("reltime")], number(0));
 case!(has_profile_absent, "has", [text("profile")], number(0));
 case!(has_menu_absent, "has", [text("menu")], number(0));
