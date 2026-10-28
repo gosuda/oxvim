@@ -52,9 +52,12 @@ Criteria 1 to 3 are green. Criteria 4 and 5 are measured and still red.
 
 ## Defects found and not yet fixed
 
-1. A Lua to Vimscript builtin call costs about 0.5 ms against a few microseconds upstream. Filetype detection
-   over one file name makes about 13 500 `vim.fn.fnamemodify` calls, so `:edit` on an unknown name takes tens
-   of seconds. This is why `test_substitute.vim` times out: its child process runs `:next 0`.
+1. `:edit <name>` in headless mode does not finish within three minutes on this host. The builtin bridge was
+   the first cause and is fixed: the option and register mirrors are now version-gated, so `vim.fn.abs` costs
+   3 microseconds instead of 620 and the workspace suite runs in 17 seconds instead of 29. What remains is a
+   loop that makes about 1.4 million `vim.fn.fnamemodify` calls in fifteen seconds while `vim.filetype.match`
+   is never entered, so the caller is still unidentified. This is why `test_substitute.vim` times out: its
+   child process runs `:next 0`.
 2. `:terminal` and the upstream oldtest Makefile path need terminal output parsed into buffer cells.
 3. `call()` is unimplemented although `exists('*call')` answers 1, and `uniq()` ignores its comparator.
 4. `:match`, `:compiler`, `:checktime`, `:doautocmd`, `:badd`, `recover`, `defer`, `win_execute`, and

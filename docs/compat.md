@@ -56,7 +56,7 @@ Known divergences are recorded in `tests/differential/SKIPS.md` and admitted onl
 ## Known gaps
 
 - Terminal channels connect and route data, but parsing terminal VT escape sequences into buffer cells is not implemented, so `:terminal` and the upstream Makefile's oldtest path produce no visible buffer text.
-- A call from Lua into a Vimscript builtin costs about half a millisecond, against a few microseconds for upstream's C function. Filetype detection over one file name makes about thirteen thousand such calls, which makes `:edit` on an unknown name take seconds instead of milliseconds.
+- `:edit <name>` in headless mode did not finish within three minutes on this host, with about 1.4 million `vim.fn.fnamemodify` calls in fifteen seconds and `vim.filetype.match` never entered. The builtin bridge itself is no longer the cause: it dropped from 620 to 3 microseconds per call once the option and register mirrors were version-gated.
 - Unsetting a local option value with `nil` is not yet supported in the editor options store.
 - Advanced `vim.uv` features (custom polling priorities, non-standard file descriptor redirection, and platform system metrics) return typed `Unsupported` errors.
 - Windows is untested; verification runs on Linux and POSIX-compliant systems.
