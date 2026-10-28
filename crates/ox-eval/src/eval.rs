@@ -951,14 +951,30 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             // A Funcref/Partial variable is callable (`g:Xsetlist()`). A
             // Number argument named `line` must not steal `line('.')`
             // (test_goto.vim `XTest_goto_decl`).
-            match Self::eval_variable(name, callee.span.start, scope) {
+            let variable = Self::eval_variable(name, callee.span.start, scope);
+            // `deref_func_name` (`eval/userfunc.c:445-460`) reports through
+            // `found_var` whether a variable of this name exists. A variable
+            // holding no callable is `E1085`, not `E117` — but only for the
+            // lookup failure itself; an `E117` raised inside a resolved
+            // function's body keeps its own text (`userfunc.c:1612`).
+            let found_var = variable.is_ok();
+            let missing = format!("Unknown function: {}", name.to_string_lossy());
+            match variable {
                 Ok(value) if matches!(value.value, Typval::Funcref(_) | Typval::Partial(_)) => {
                     return self.call_value(value.value, values, scope, depth);
                 }
                 Err(error) if error.code != "E121" => return Err(error),
                 Ok(_) | Err(_) => {}
             }
-            return self.call_named(name, values, scope, callee.span.start, depth);
+            return self
+                .call_named(name, values, scope, callee.span.start, depth)
+                .map_err(|mut error| {
+                    if found_var && error.code == "E117" && error.message == missing {
+                        error.code = "E1085";
+                        error.message = format!("Not a callable type: {}", name.to_string_lossy());
+                    }
+                    error
+                });
         }
         let callee = self.eval_at(callee, scope, depth)?;
         self.call_value(callee.value, values, scope, depth)
@@ -995,12 +1011,31 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         offset: usize,
         _depth: usize,
     ) -> Result<Evaluated> {
+        // `call_func` skips a leading `g:` before it resolves the function
+        // (`eval/userfunc.c:1732`): global functions share one namespace, so
+        // `g:Name()` reaches `Name` while `string()` and the error messages
+        // keep the prefix. A builtin keeps the name as written, because
+        // `call_func` picks the internal table from the *stripped* name and
+        // then calls it with the original: `g:printf()` is E117.
+        let stripped = global_stripped_name(name);
+        let target = stripped.as_ref().unwrap_or(name);
+        // `user_func_error` reports the lookup failure under the *original*
+        // spelling (`eval/userfunc.c:1610-1616`), so `g:Nope()` says
+        // `Unknown function: g:Nope` even though the lookup used `Nope`.
+        // Only that exact lookup failure is relabelled; an error raised
+        // inside a function keeps its own text.
+        let missing = stripped
+            .as_ref()
+            .map(|target| format!("Unknown function: {}", target.to_string_lossy()));
         self.host
-            .call(name, args, scope)
+            .call(target, args, scope)
             .map(Evaluated::plain)
             .map_err(|mut error| {
                 if error.code == "E117" {
                     error.offset = offset;
+                    if missing.as_deref() == Some(error.message.as_str()) {
+                        error.message = format!("Unknown function: {}", name.to_string_lossy());
+                    }
                 }
                 error
             })
@@ -1119,6 +1154,23 @@ fn identity_type(value: &Typval) -> bool {
             | Typval::Funcref(_)
             | Typval::Partial(_)
     )
+}
+
+/// The name a `g:`-prefixed call dispatches under, or `None` when the name
+/// must be used verbatim.
+///
+/// `call_func` (`eval/userfunc.c:1732-1735`) strips `g:` into `rfname` and
+/// takes the builtin branch from *that*, then calls the internal table with
+/// the name as written — so a builtin reached through `g:` still fails:
+/// `g:printf('%d', 3)` is `E117: Unknown function: g:printf`. Every other
+/// name resolves as a user function under the stripped spelling, because
+/// global functions share a single namespace.
+fn global_stripped_name(name: &OxStr) -> Option<OxStr> {
+    let rest = name.as_bytes().strip_prefix(b"g:")?;
+    if rest.is_empty() || crate::builtins::builtin_spec(&String::from_utf8_lossy(rest)).is_some() {
+        return None;
+    }
+    Some(OxStr(rest.to_vec()))
 }
 
 /// Parses the local index out of a `<lambda>N` closure name.

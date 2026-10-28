@@ -1055,14 +1055,7 @@ impl<F: FileIO> ScriptCtx<F> {
     /// `current_context()` all observe that script while it executes. A
     /// user command passes the caller's `seq` to keep `sc_seq` unchanged,
     /// while a function call passes the function's own `seq`.
-    pub fn push_alias_source(
-        &mut self,
-        sid: Sid,
-        seq: u64,
-        lnum: usize,
-        name: String,
-        order: u64,
-    ) {
+    pub fn push_alias_source(&mut self, sid: Sid, seq: u64, lnum: usize, name: String, order: u64) {
         self.source_stack.push(SourceFrame {
             sid,
             seq,
@@ -1343,6 +1336,28 @@ impl<F: FileIO> ScriptCtx<F> {
     pub fn store_script_scope(&mut self, sid: Sid, scope: &Scope) {
         if let Some(vars) = self.script_vars_mut(sid) {
             vars.clone_from(&scope.script);
+        }
+    }
+
+    /// Switches the visible `s:` scope from one script to another, keeping
+    /// the per-SID registry live at every hop.
+    ///
+    /// The plain load/store pair only reconciles the registry when a sourced
+    /// script starts and finishes, so a script that is still executing keeps
+    /// its only copy of `s:` in `scope.script`. Entering a function whose
+    /// defining script differs — while the defining script is mid-execution
+    /// further down the stack — must not overwrite that live map with the
+    /// registry's stale copy (`:h E121` on `s:` reads such as
+    /// `runtest.vim`'s `s:has_ffi`). Flushing the outgoing frame first and
+    /// reading the incoming frame back from the registry keeps every SID's
+    /// stored map current, exactly like upstream's per-script `svars` dict,
+    /// which reads and writes mutate in place.
+    pub fn switch_script_scope(&mut self, from: Option<Sid>, to: Sid, scope: &mut Scope) {
+        if from != Some(to) {
+            if let Some(from) = from {
+                self.store_script_scope(from, scope);
+            }
+            self.load_script_scope(to, scope);
         }
     }
 

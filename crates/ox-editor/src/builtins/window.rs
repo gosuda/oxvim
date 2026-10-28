@@ -11,7 +11,7 @@ use ox_eval::scope::{ScopeKind, scope_var_entry};
 use ox_types::{OxStr, Typval};
 
 use crate::builtins::position::{cursor_vcol, number_value, tabstop as position_tabstop};
-use crate::excmd_exec::{EvalHost, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, SetLayer, option_value, typval_number, typval_to_text};
 use crate::layout::Frame;
 use ox_types::WinHandle;
 
@@ -691,20 +691,35 @@ fn call_screenrow(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     Ok(Typval::Number(i64::try_from(row).unwrap_or(i64::MAX)))
 }
 
-/// Resolves one screen cell to the character the covering window shows.
+/// Resolves one screen cell to the character the composed screen shows.
 ///
 /// Only the current tabpage is on screen, so only its windows can own a cell.
 /// Windows in other tabpages have overlapping geometries and would otherwise
 /// win this search and return a character from something invisible.
+///
+/// Blank cells are spaces, not missing cells: a coordinate inside the
+/// `&lines`/`&columns` grid that no window covers (the status-line and
+/// message rows beneath the windows, or a window row past the buffer's last
+/// line) still displays the background, exactly like upstream's default grid
+/// whose every in-range cell has a character (`eval/funcs.c:5711-5729`).
+/// Only coordinates outside the grid have no cell at all, which upstream
+/// reports as -1. Callers must not feed that -1 to `nr2char()`: the resulting
+/// `E5070` is what `Screenline(&lines - 1)` in the oldtest suite trips over
+/// when the grid reports holes instead of blanks.
 fn screen_cell(editor: &Editor, row: i64, column: i64) -> Option<String> {
     let row = usize::try_from(row.checked_sub(1)?).ok()?;
     let column = usize::try_from(column.checked_sub(1)?).ok()?;
+    if row >= screen_size(editor, "lines") || column >= screen_size(editor, "columns") {
+        return None;
+    }
     let windows = editor
         .current_tabpage()
         .and_then(|tab| editor.tabpage_windows(tab).ok())
         .unwrap_or_default();
     for window in windows {
-        let geometry = editor.window_geometry(window).ok()?;
+        let Ok(geometry) = editor.window_geometry(window) else {
+            continue;
+        };
         if row < geometry.row
             || row >= geometry.row + geometry.height
             || column < geometry.col
@@ -712,23 +727,38 @@ fn screen_cell(editor: &Editor, row: i64, column: i64) -> Option<String> {
         {
             continue;
         }
-        let state = editor.window(window).ok()?;
+        let Ok(state) = editor.window(window) else {
+            continue;
+        };
         let line = state.topline + row - geometry.row;
-        let bytes = editor
+        let cell = editor
             .buffer(state.buffer)
-            .ok()?
-            .text()
-            .ok()?
-            .line(line)
-            .ok()?;
-        let text = String::from_utf8_lossy(&bytes);
-        let cell = text
-            .chars()
-            .nth(column - geometry.col)
-            .map_or_else(|| " ".to_owned(), |character| character.to_string());
+            .ok()
+            .and_then(|buffer| buffer.text().ok())
+            .and_then(|text| text.line(line).ok())
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .and_then(|text| {
+                text.chars()
+                    .nth(column - geometry.col)
+                    .map(|character| character.to_string())
+            })
+            .unwrap_or_else(|| " ".to_owned());
         return Some(cell);
     }
-    None
+    // In-grid but uncovered: the background shows through.
+    Some(" ".to_owned())
+}
+
+/// The screen grid extent in cells for `&lines`/`&columns`, mirroring
+/// `screen_number_option` (`excmd_exec.rs`): the upstream default grid always
+/// exists, so an unreadable option degrades to unbounded rather than empty.
+fn screen_size(editor: &Editor, name: &str) -> usize {
+    match option_value(editor, name, SetLayer::Effective) {
+        Some(OptionValue::Number(value)) if *value > 0 => {
+            usize::try_from(*value).unwrap_or(usize::MAX)
+        }
+        _ => usize::MAX,
+    }
 }
 
 /// `winsaveview()` (`eval/window.c:f_winsaveview`): returns a dict with

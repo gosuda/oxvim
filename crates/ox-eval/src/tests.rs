@@ -115,6 +115,18 @@ fn error(source: &[u8]) -> EvalError {
     }
 }
 
+/// The `(code, message)` pair an expression fails with when evaluated against
+/// a caller-supplied scope.
+fn in_scope_error(source: &[u8], scope: &mut Scope) -> (String, String) {
+    let expression = Parser::new(source).parse().unwrap();
+    let mut host = Host;
+    let regex = Regex;
+    let failure = Evaluator::new(&mut host, &regex)
+        .eval(&expression, scope)
+        .unwrap_err();
+    (failure.code.to_owned(), failure.message)
+}
+
 macro_rules! eval_cases {
     ($(($name:ident, $source:expr, $expected:expr, $citation:expr)),+ $(,)?) => {$(
         #[test]
@@ -1624,4 +1636,77 @@ fn unparsable_expression_boundaries_keep_specific_diagnostics() {
     assert_eq!(error(b"").code, "E15");
     assert_eq!(error(b"").message, "Invalid expression: \"\"");
     assert_eq!(error(b"1 ? 2").code, "E109");
+}
+
+// ---------------------------------------------------------------------------
+// `g:`-prefixed call names
+// Upstream: `call_func` strips a leading `g:` into `rfname` and resolves the
+// user function under that stripped spelling (`eval/userfunc.c:1732-1735`),
+// while the builtin branch still calls the internal table with the name as
+// written, so `g:printf('%d', 3)` stays `E117: Unknown function: g:printf`.
+// `deref_func_name`'s `found_var` turns a resolved non-callable variable into
+// `E1085` instead of `E117` (`eval/userfunc.c:445-460,1610-1616`).
+// ---------------------------------------------------------------------------
+
+/// A function registered under its bare name is reachable through `g:`.
+/// `first` is served by this module's host and is deliberately not a real
+/// builtin, so the `g:` stripping — not the builtin table — answers the call.
+#[test]
+fn call_strips_the_global_prefix_from_a_user_function_name() {
+    assert_eq!(value(b"first(7)"), Typval::Number(7));
+    assert_eq!(value(b"g:first(7)"), Typval::Number(7));
+}
+
+/// The `g:` prefix cannot reach a builtin, because `call_func` keeps the
+/// written name for the internal dispatch.
+#[test]
+fn call_does_not_strip_the_global_prefix_for_builtins() {
+    let failure = error(b"g:printf('%d', 3)");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:printf");
+}
+
+/// An unknown `g:`-prefixed name reports the spelling the caller wrote, not
+/// the one the lookup used.
+#[test]
+fn call_reports_unknown_global_prefixed_names_verbatim() {
+    let failure = error(b"g:NoSuchFunction()");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:NoSuchFunction");
+}
+
+/// An existing variable that holds no callable is a type error, not a missing
+/// function: upstream keeps `E1085` for every namespace and quotes the
+/// spelling the caller used.
+#[test]
+fn call_to_a_non_callable_variable_reports_e1085() {
+    // Unqualified resolution reaches `g:`, so the bare form names `Fn`.
+    let mut bare = Scope::new();
+    bare.global.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"Fn(1)", &mut bare),
+        ("E1085".to_owned(), "Not a callable type: Fn".to_owned())
+    );
+
+    let mut global = Scope::new();
+    global.global.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"g:Fn(1)", &mut global),
+        ("E1085".to_owned(), "Not a callable type: g:Fn".to_owned())
+    );
+
+    let mut script = Scope::new();
+    script.script.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"s:Fn(1)", &mut script),
+        ("E1085".to_owned(), "Not a callable type: s:Fn".to_owned())
+    );
+}
+
+/// A missing name keeps `E117`: only a variable that *exists* becomes E1085.
+#[test]
+fn call_to_a_missing_name_stays_e117() {
+    let failure = error(b"g:NoSuchVariable(1)");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:NoSuchVariable");
 }

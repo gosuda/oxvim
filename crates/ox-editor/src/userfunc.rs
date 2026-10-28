@@ -409,7 +409,6 @@ impl UserFunctions {
     pub fn call_stack(&self) -> &[CallFrame] {
         &self.call_stack
     }
-
 }
 
 /// Parses the parameter list between the signature parentheses into

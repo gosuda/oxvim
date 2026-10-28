@@ -256,10 +256,13 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
             editor
                 .current_buffer()
                 .and_then(|buffer| editor.buffer(buffer).ok())
-                .map_or_else(|| OxStr(Vec::new()), |buffer| {
-                    let name = buffer.name().to_string_lossy();
-                    OxStr::from(name.as_ref())
-                })
+                .map_or_else(
+                    || OxStr(Vec::new()),
+                    |buffer| {
+                        let name = buffer.name().to_string_lossy();
+                        OxStr::from(name.as_ref())
+                    },
+                )
         }),
         "<SID>" => runtime.scripts.current_sid().map_or_else(
             || OxStr(Vec::new()),
@@ -270,10 +273,13 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
         ),
         "<amatch>" => runtime.active_autocmd.matched.clone(),
         "<afile>" => runtime.active_autocmd.file.clone(),
-        "<abuf>" => runtime.active_autocmd.buffer.map_or_else(|| OxStr(Vec::new()), |buffer| {
-            let number = i64::from(buffer).to_string();
-            OxStr::from(number.as_str())
-        }),
+        "<abuf>" => runtime.active_autocmd.buffer.map_or_else(
+            || OxStr(Vec::new()),
+            |buffer| {
+                let number = i64::from(buffer).to_string();
+                OxStr::from(number.as_str())
+            },
+        ),
         _ => OxStr(Vec::new()),
     }
 }
@@ -371,11 +377,22 @@ fn resolve_function_reference<F: FileIO>(
                     }
                 }
             } else {
+                // `common_function` validates the *translated* name
+                // (`funcs.c:1573-1577` → `translated_function_exists`), and
+                // `save_function_name` strips a leading `g:` for a plain
+                // string (`eval/userfunc.c:2117`). A script-local `s:` (or
+                // `<SID>`) is expanded to its `<SNR>{sid}_` spelling so the
+                // reference stays callable from other scripts
+                // (`get_scriptlocal_funcname`, `userfunc.c:1559`); anything
+                // else keeps the spelling the caller wrote, as upstream
+                // stores `s`, not `trans_name`: `function('g:Fn')` prints
+                // `function('g:Fn')`.
+                let lookup = text.strip_prefix("g:").unwrap_or(&text);
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
-                let known = builtin_spec(&text).is_some()
-                    || runtime.functions.contains(&text, sid)
-                    || text.contains('#')
-                    || crate::builtins::route(&text).is_some();
+                let known = builtin_spec(lookup).is_some()
+                    || runtime.functions.contains(lookup, sid)
+                    || lookup.contains('#')
+                    || crate::builtins::route(lookup).is_some();
                 if !known {
                     return Err(EvalError::new(
                         "E700",
@@ -383,6 +400,21 @@ fn resolve_function_reference<F: FileIO>(
                         format!("Unknown function: {text}"),
                     ));
                 }
+                let stored = if sid == 0 {
+                    name.clone()
+                } else if let Some(local) = text.strip_prefix("s:") {
+                    OxStr::from(format!("<SNR>{sid}_{local}").as_str())
+                } else if let Some(local) = text.strip_prefix("<SID>") {
+                    OxStr::from(format!("<SNR>{sid}_{local}").as_str())
+                } else {
+                    name.clone()
+                };
+                return Ok(Funcref {
+                    name: stored,
+                    args: Vec::new(),
+                    dict: None,
+                    registry: lambda_registry,
+                });
             }
             Ok(Funcref {
                 name: name.clone(),
@@ -739,7 +771,9 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "rshada",
     "rviminfo",
     "scriptencoding",
+    "scriptnames",
     "set",
+    "setfiletype",
     "setglobal",
     "setlocal",
     "sleep",
