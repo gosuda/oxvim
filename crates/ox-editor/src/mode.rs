@@ -1987,6 +1987,26 @@ impl ModeMachine {
                 } else {
                     PutDirection::Before
                 };
+                // `do_put` refuses a count whose multiplication overflows
+                // before it allocates anything: characterwise text checks
+                // `count > INT_MAX / yanklen` (register.c:1979) and a block
+                // checks the same against its row width plus padding
+                // (register.c:1854). Without the guard `999999999p` builds a
+                // plan of a billion rows and never returns.
+                let width = editor
+                    .registers()
+                    .get(name)
+                    .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
+                    .map_or(0, |content| content.to_bytes().len());
+                if width > 0
+                    && count > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
+                        .unwrap_or(usize::MAX)
+                {
+                    return Err(ModeError::Vim(
+                        "E1240",
+                        "Resulting text too long".to_owned(),
+                    ));
+                }
                 let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
                 Ok(Some(Mode::default()))
             }
