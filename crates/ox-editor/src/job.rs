@@ -1495,10 +1495,12 @@ impl JobManager {
 
     /// Stop every timer (upstream `timer_stop_all`).
     pub fn timer_stop_all(&mut self) {
-        let timers = std::mem::take(&mut self.timers);
-        for (_, timer) in timers {
-            let _ignored = timer.handle.stop(&mut self.loop_);
-            let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
+        let ids: Vec<u64> = self.timers.keys().copied().collect();
+        for id in ids {
+            // Same rule as `timer_stop`: a timer whose firing is in flight
+            // stays listed until the delivery ends, so a callback that stops
+            // every timer still sees itself (`eval.c:5074-5078, 5153-5180`).
+            self.timer_stop(id);
         }
     }
 
