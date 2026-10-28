@@ -280,6 +280,128 @@ fn edit_empty_path_raises_e32() {
     assert_vim_error(result, "E32");
 }
 
+/// `:edit {dir}` opens a directory view instead of failing with E484
+/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`).
+/// Oracle (`dir_spec.lua` startup listing): an empty directory shows one
+/// empty line, a directory with files lists `subdir/` first, then hidden
+/// names in byte order; the buffer name carries a trailing `/` and the
+/// filetype is `directory`.
+#[test]
+fn edit_directory_opens_listing_buffer() {
+    let root = std::env::temp_dir().join(format!("oxvim-edit-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("subdir")).unwrap();
+    std::fs::write(root.join("alpha.txt"), "alpha").unwrap();
+    std::fs::write(root.join(".hidden"), "hidden").unwrap();
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let mut raw = Editor::new();
+    let scratch = raw.create_buffer(true).unwrap();
+    raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(raw);
+    let mut executor = ExExecutor::new();
+
+    executor
+        .execute_line(&editor, &format!("edit {}", empty.display()))
+        .unwrap();
+    {
+        let current = editor.editor().current_buffer().unwrap();
+        let guard = editor.editor();
+        let state = guard.buffer(current).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", empty.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
+        assert!(matches!(
+            editor.editor().options().get_buffer(current, "filetype"),
+            Ok(crate::OptionValue::String(value)) if value == "directory"
+        ));
+    }
+
+    executor
+        .execute_line(&editor, &format!("edit {}", root.display()))
+        .unwrap();
+    let current = {
+        let current = editor.editor().current_buffer().unwrap();
+        let guard = editor.editor();
+        let state = guard.buffer(current).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", root.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<String> = (1..=text.line_count())
+            .map(|line| String::from_utf8(text.line(line).unwrap()).unwrap())
+            .collect();
+        assert_eq!(lines, vec!["empty/", "subdir/", ".hidden", "alpha.txt"]);
+        assert!(matches!(
+            editor.editor().options().get_buffer(current, "filetype"),
+            Ok(crate::OptionValue::String(value)) if value == "directory"
+        ));
+        current
+    };
+    // A bare `:edit` refreshes a directory buffer in place
+    // (`dir_spec.lua` "reloads directory buffers").
+    std::fs::write(root.join("beta.txt"), "beta").unwrap();
+    executor.execute_line(&editor, "edit").unwrap();
+    {
+        let reloaded = editor.editor().current_buffer().unwrap();
+        assert_eq!(reloaded, current);
+        let guard = editor.editor();
+        let state = guard.buffer(reloaded).unwrap();
+        let text = state.text().unwrap();
+        let lines: Vec<String> = (1..=text.line_count())
+            .map(|line| String::from_utf8(text.line(line).unwrap()).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec!["empty/", "subdir/", ".hidden", "alpha.txt", "beta.txt"]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `:checkhealth {missing}` reports the missing provider in a `health://`
+/// buffer instead of raising (`runtime/lua/vim/health.lua` `func == ''`
+/// branch; `ex_docmd.c` `ex_checkhealth`).
+/// Oracle (`health_spec.lua` "gracefully handles invalid healthcheck"):
+/// the buffer shows the `===...` rule and
+/// `- ❌ ERROR No healthcheck found for "..." plugin.`
+#[test]
+fn checkhealth_missing_provider_reports_in_health_buffer() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "checkhealth nonexistent")
+        .unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let guard = editor.editor();
+    let state = guard.buffer(current).unwrap();
+    assert_eq!(state.name().to_string_lossy(), "health://");
+    let text = state.text().unwrap();
+    let lines: Vec<String> = (1..=text.line_count())
+        .map(|line| String::from_utf8_lossy(&text.line(line).unwrap()).into_owned())
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "=============================================================================="),
+        "missing rule, got {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains(
+            "No healthcheck found for \"nonexistent\" plugin."
+        )),
+        "missing provider report, got {lines:?}"
+    );
+}
+
 /// `:write {file}` persists the current buffer's text through the `FileIO`
 /// seam, matching `ex_write` → `buf_write` in `bufwrite.c`.
 /// Upstream: `ex_docmd.c` `ex_write`.
@@ -2544,10 +2666,12 @@ fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
-/// A non-`NotFound` reload failure preserves the cycle-one contract: the
-/// switch reports E86, leaves the target unloaded, and keeps the old buffer.
+/// A directory entered through the switch path opens the directory view
+/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`) instead of failing the
+/// read: the `:buffer` switch succeeds, the buffer keeps the directory name
+/// with a trailing `/`, and its lines list the directory.
 #[test]
-fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+fn autocmd_buffer_switch_directory_opens_listing() {
     let dir = std::env::temp_dir().join(format!("oxvim-excmd-unloaded-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -2564,6 +2688,53 @@ fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
         (TestEditorAccess::new(raw), ExExecutor::new())
     };
     let target = editor.editor().buffers()[1];
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+    {
+        assert_eq!(editor.editor().current_buffer(), Some(target));
+        let guard = editor.editor();
+        let state = guard.buffer(target).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", dir.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
+        assert!(matches!(
+            guard.options().get_buffer(target, "filetype"),
+            Ok(crate::OptionValue::String(value)) if value == "directory"
+        ));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A genuinely failed read preserves the cycle-one contract through the
+/// switch path: the switch reports E86, leaves the target unloaded, and keeps
+/// the old buffer. Directories are views now (`NOTDONE`, above), not
+/// failures, so this uses an unreadable file as the failure case.
+#[test]
+fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+    let (editor, mut executor) = {
+        let mut raw = Editor::new();
+        let scratch = raw.create_buffer(true).unwrap();
+        raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let target = raw.create_buffer(true).unwrap();
+        raw.buffer_mut(target)
+            .unwrap()
+            .set_name(ox_types::OxStr::from("unreadable.txt"));
+        raw.unload_buffer(target).unwrap();
+        (
+            TestEditorAccess::new(raw),
+            ExExecutor::with_io(UnreadableFileIO),
+        )
+    };
+    let target = editor.editor().buffers()[1];
     let scratch = editor.editor().buffers()[0];
 
     assert_vim_error(
@@ -2572,7 +2743,6 @@ fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
     );
     assert_eq!(editor.editor().current_buffer(), Some(scratch));
     assert!(editor.editor().buffer(target).unwrap().text().is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `:bnext` runs the same sequence; a wrapping `:bnext` on the only listed

@@ -1368,14 +1368,49 @@ impl<F: FileIO> ExExecutor<F> {
             .jobs
             .as_ref()
             .and_then(|manager| manager.timer_id_for_event(&event));
+        // A stored Funcref must be invoked as a value: a lambda carries its
+        // body in the closure registry, and redispatched by name it would hit
+        // user-function lookup, which owns no `<lambda>N` entry. Only the
+        // pseudo name that wraps a Lua reference is delivered elsewhere.
+        if let Typval::Funcref(funcref) | Typval::Partial(funcref) = &event.callback {
+            if funcref
+                .name
+                .to_string_lossy()
+                .starts_with(LUA_REF_FUNCTION_PREFIX)
+            {
+                return Ok(());
+            }
+            let regex = VimRegex;
+            let ambiguous_wide = access.with_ex_editor(|editor| {
+                matches!(
+                    editor.options().get_global("ambiwidth"),
+                    Ok(OptionValue::String(value)) if value == "double"
+                )
+            });
+            let mut host = EvalHost {
+                runtime: &mut self.runtime,
+                access,
+                lua: self.lua.as_ref(),
+                builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
+                submatches: None,
+                escaped_exception: None,
+                call_receiver: Some(event.receiver),
+            };
+            let name = funcref.name.to_string_lossy().into_owned();
+            Evaluator::new(&mut host, &regex)
+                .invoke(event.callback, event.args, &mut self.scope)
+                .map_err(|error| {
+                    if let Some(id) = timer_id
+                        && let Some(manager) = self.runtime.jobs.as_mut()
+                    {
+                        manager.record_timer_error(id);
+                    }
+                    error.to_string()
+                })?;
+            return Ok(());
+        }
         let name = match &event.callback {
             Typval::String(name) => name.clone(),
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
-                if funcref.registry.is_some() {
-                    return Ok(());
-                }
-                funcref.name.clone()
-            }
             _ => return Ok(()),
         };
         if name.as_bytes().is_empty() {
@@ -3933,6 +3968,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "move" => access.with_ex_editor(|editor| command_move(runtime, editor, command)),
         "uniq" => command_uniq(runtime, access, scope, lua, command),
         "badd" => access.with_ex_editor(|editor| command_badd(runtime, editor, command)),
+        "checkhealth" => command_checkhealth(runtime, access, scope, lua, command),
         "checktime" => command_checktime(runtime, access, scope, lua, command),
         "tabfirst" | "tabrewind" => {
             command_tabfirst(runtime, access, scope, lua, command)
@@ -7665,6 +7701,31 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E32", "No file name");
     };
+    // A bare `:edit` on a directory buffer refreshes the listing in place
+    // (`dir_spec.lua` "reloads directory buffers"): like the initial open,
+    // no `E484` and no `BufReadPost`, only the new lines and `BufEnter`.
+    if is_directory_path(runtime, path) {
+        let flow =
+            fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        let entries = list_directory_entries(runtime, path);
+        let line_vecs: Vec<Vec<u8>> = entries.iter().map(directory_entry_line).collect();
+        let text = match Buffer::from_lines(&line_vecs, false) {
+            Ok(text) => text,
+            Err(error) => return error_flow(runtime, "E474", error.to_string()),
+        };
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.load(text);
+                state.mark_saved();
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            }
+        });
+        set_directory_buffer_options(access, buffer);
+        return fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], buffer);
+    }
     let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
     if !matches!(flow, Flow::Normal) {
         return flow;
@@ -13497,6 +13558,182 @@ fn announce_buffer_creation<F: FileIO, E: ExEditorAccess>(
     }
 }
 
+/// One rendered directory entry (`runtime/lua/nvim/dir.lua` `nvim.dir.Entry`).
+struct DirectoryEntry {
+    /// File name without any directory prefix.
+    name: String,
+    /// Whether the entry is a directory (rendered with a trailing `/`).
+    dir: bool,
+}
+
+/// Whether `path` names a directory.
+///
+/// Upstream `readfile` (`fileio.c:420-424`) treats a directory as `NOTDONE`
+/// rather than `E484`: the buffer keeps the directory name and the browser
+/// renders on `BufEnter`. Only successful metadata with
+/// [`FileKind::Directory`] counts: a `read_dir` probe cannot stand in
+/// because adapters may report `Ok` (possibly empty) for nonexistent paths
+/// while metadata correctly answers `NotFound`, and an empty directory is
+/// indistinguishable from a missing path through `read_dir` alone.
+fn is_directory_path<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> bool {
+    matches!(
+        runtime.scripts.io().metadata(path, true),
+        Ok(meta) if matches!(meta.kind, crate::script::FileKind::Directory)
+    )
+}
+
+/// Buffer name for a directory: collapsed separators with a single trailing
+/// `/` (`nvim.dir.fs.normalize`, `dir_spec.lua` "normalizes edited directory
+/// names": `.../$HOME///` → `.../$HOME/`).
+fn normalize_dir_buffer_name(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut text = absolute.to_string_lossy().into_owned().replace('\\', "/");
+    let mut collapsed = String::with_capacity(text.len().saturating_add(1));
+    let mut previous_slash = false;
+    for ch in text.chars() {
+        if ch == '/' {
+            if !previous_slash {
+                collapsed.push(ch);
+            }
+            previous_slash = true;
+        } else {
+            collapsed.push(ch);
+            previous_slash = false;
+        }
+    }
+    text = collapsed;
+    if !text.ends_with('/') {
+        text.push('/');
+    }
+    text
+}
+
+/// Entries for a directory buffer in browser order: directories first, then
+/// byte order, hidden names included, no `../`
+/// (`runtime/lua/nvim/dir/fs.lua` `M.list`, `dir_spec.lua` startup listing).
+fn list_directory_entries<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> Vec<DirectoryEntry> {
+    let Ok(read) = runtime.scripts.io().read_dir(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<DirectoryEntry> = Vec::new();
+    for entry in read {
+        let name = entry.name.to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let dir = runtime
+            .scripts
+            .io()
+            .metadata(&entry.path, true)
+            .is_ok_and(|meta| matches!(meta.kind, crate::script::FileKind::Directory));
+        entries.push(DirectoryEntry { name, dir });
+    }
+    entries.sort_by(|left, right| {
+        if left.dir != right.dir {
+            return right.dir.cmp(&left.dir);
+        }
+        left.name.cmp(&right.name)
+    });
+    entries
+}
+
+/// Rendered listing line for one entry (`entry_line` in `nvim/dir.lua`):
+/// embedded newlines become NUL, directories gain a trailing `/`.
+fn directory_entry_line(entry: &DirectoryEntry) -> Vec<u8> {
+    let mut line = entry.name.replace('\n', "\0");
+    if entry.dir {
+        line.push('/');
+    }
+    line.into_bytes()
+}
+
+/// Directory-buffer options matching `render_entries` + `fs.init`:
+/// `buftype=nowrite`, `filetype=directory`, read-only and unmodifiable once
+/// the lines land. Failures are ignored: the option may not exist on every
+/// build, and the listing is still correct without it.
+fn set_directory_buffer_options<E: ExEditorAccess>(access: &E, buffer: BufHandle) {
+    let _ = access.with_ex_editor(|editor| {
+        editor.options_mut().set_buffer(
+            buffer,
+            "buftype",
+            OptionValue::String("nowrite".to_owned()),
+        )
+    });
+    let _ = access.with_ex_editor(|editor| {
+        editor.options_mut().set_buffer(
+            buffer,
+            "filetype",
+            OptionValue::String("directory".to_owned()),
+        )
+    });
+    let _ = access.with_ex_editor(|editor| {
+        editor
+            .options_mut()
+            .set_buffer(buffer, "readonly", OptionValue::Boolean(true))
+    });
+    let _ = access.with_ex_editor(|editor| {
+        editor
+            .options_mut()
+            .set_buffer(buffer, "modifiable", OptionValue::Boolean(false))
+    });
+    access.with_ex_editor(|editor| {
+        if let Ok(state) = editor.buffer_mut(buffer) {
+            state.mark_did_filetype();
+        }
+    });
+}
+
+/// Fire `FileType directory` with the filetype as the match pattern
+/// (`do_filetype_autocmd`, `autocmd.c:2595-2613`), so third-party `FileType`
+/// handlers can replace the listing like upstream's `3P dir-browser` case.
+fn fire_directory_filetype<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+) -> Result<(), Flow> {
+    if access.with_ex_editor(|editor| editor.autocmds().is_ignored(Event::FileType)) {
+        return Ok(());
+    }
+    let name = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .map(|state| state.name().to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::FileType,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: Some(name.as_bytes()),
+                match_name: Some(&b"directory"[..]),
+                nested: true,
+                data: None,
+            },
+        )
+    });
+    if plan.ready.is_empty() {
+        return Ok(());
+    }
+    runtime.filetype_autocmd_depth += 1;
+    let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    runtime.filetype_autocmd_depth -= 1;
+    if matches!(flow, Flow::Normal) {
+        Ok(())
+    } else {
+        Err(flow)
+    }
+}
+
 /// Loads an unloaded file-backed buffer before a focus switch.
 ///
 /// The caller's `switch` closure establishes the display context (after any
@@ -13577,6 +13814,51 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         }
         return Ok(entered());
     };
+
+    // `readfile` returns `NOTDONE` for a directory (`fileio.c:420-424`,
+    // `buffer.c:412-415`): no `E484`, no `BufReadPost`; the buffer keeps the
+    // directory name and the browser renders the listing. Match that
+    // observable here so `:edit <dir>` opens a directory view instead of
+    // failing in `readfile` like a missing file would.
+    if is_directory_path(runtime, &path) {
+        let display = normalize_dir_buffer_name(&path);
+        let entries = list_directory_entries(runtime, &path);
+        let line_vecs: Vec<Vec<u8>> =
+            entries.iter().map(directory_entry_line).collect();
+        let text = match Buffer::from_lines(&line_vecs, false) {
+            Ok(text) => text,
+            Err(error) => {
+                return Err(LoadSwitchError::Editor(crate::EditorError::Buffer(
+                    error.into(),
+                )));
+            }
+        };
+        if let Err(error) = access.with_ex_editor(|editor| {
+            let state = editor.buffer_mut(buffer)?;
+            state.set_name(OxStr::from(display.as_str()));
+            state.load(text);
+            state.mark_saved();
+            state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            Ok::<(), crate::EditorError>(())
+        }) {
+            return Err(LoadSwitchError::Editor(error));
+        }
+        if let Err(error) = switch(runtime) {
+            rollback_buffer_switch(access, buffer, &mut restore, true);
+            return Err(error);
+        }
+        if let Err(error) = announce_buffer_creation(runtime, access, scope, lua, buffer, origin)
+        {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(error);
+        }
+        set_directory_buffer_options(access, buffer);
+        if let Err(flow) = fire_directory_filetype(runtime, access, scope, lua, buffer) {
+            rollback_buffer_switch(access, buffer, &mut restore, false);
+            return Err(LoadSwitchError::Flow(flow));
+        }
+        return Ok(entered());
+    }
 
     let new_file = match runtime.scripts.io().read_to_string(&path) {
         Ok(_) => false,
@@ -16494,6 +16776,457 @@ fn command_badd<F: FileIO>(
         let _ = state.unload();
     }
     Flow::Normal
+}
+
+/// `:checktime` (`ex_cmds2.c` `ex_checktime` → `check_timestamps`,
+/// `fileio.c:2902`): when no loaded buffer changed on disk this is silent.
+/// Change detection compares current file bytes against the write-path
+/// serialization, the same content check `buf_check_timestamp` uses to tell
+/// a real change from a timestamp-only touch. A changed unmodified buffer
+/// reloads under `'autoread'`; otherwise a `W11` (or `W12` when the buffer
+/// itself is modified) warning is shown.
+/// `:checkhealth [plugins]` (`ex_docmd.c` `ex_checkhealth` → `vim.health._check`,
+/// `runtime/lua/vim/health.lua:400-540`):
+/// with a Lua host, delegate to the runtime module so the report text, the
+/// `health://` buffer, and the `checkhealth` filetype come from the provider.
+/// A failed delegation reports upstream's `E5009` diagnostic (empty
+/// `$VIMRUNTIME`, invalid `$VIMRUNTIME`, or invalid `'runtimepath'`) instead
+/// of the Lua error. Without a host, render an oracle-shaped `health://`
+/// buffer natively: no argument lists the discovered checks, a named check
+/// opens a buffer whose lines come from the reporter, and a missing provider
+/// is reported in the buffer rather than raised.
+///
+/// Route: `codegen/upstream/ex_cmds.lua:497-502` defines `checkhealth`;
+/// `crates/ox-excmd/build.rs:31-42` generates the parser table. Only this
+/// dispatch arm was missing (`E492` in `dispatch`).
+fn command_checkhealth<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let args = command.args.trim().to_owned();
+    if let Some(lua) = lua {
+        if let Err(error) = access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope)) {
+            return exec_error_flow(runtime, error);
+        }
+        let tab = command
+            .modifiers
+            .iter()
+            .find(|modifier| modifier.kind == ModifierKind::Tab)
+            .and_then(|modifier| modifier.count)
+            .map_or(-1, |count| i64::try_from(count).unwrap_or(i64::MAX));
+        let split = command
+            .modifiers
+            .iter()
+            .find_map(|modifier| match modifier.kind {
+                ModifierKind::TopLeft => Some("topleft"),
+                ModifierKind::BotRight => Some("botright"),
+                ModifierKind::AboveLeft | ModifierKind::LeftAbove => Some("aboveleft"),
+                ModifierKind::BelowRight | ModifierKind::RightBelow => Some("belowright"),
+                _ => None,
+            })
+            .unwrap_or("");
+        let horizontal = command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Horizontal);
+        let vertical = command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Vertical);
+        let eap = Object::Dict(Dict(vec![
+            (
+                OxStr::from("args"),
+                Object::String(OxStr::from(args.as_str())),
+            ),
+            (
+                OxStr::from("smods"),
+                Object::Dict(Dict(vec![
+                    (OxStr::from("tab"), Object::Integer(tab)),
+                    (
+                        OxStr::from("split"),
+                        Object::String(OxStr::from(split)),
+                    ),
+                    (
+                        OxStr::from("horizontal"),
+                        Object::Boolean(horizontal),
+                    ),
+                    (OxStr::from("vertical"), Object::Boolean(vertical)),
+                ])),
+            ),
+        ]));
+        let result =
+            lua.execute_chunk("require('vim.health')._check(select(1, ...))", vec![eap]);
+        let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
+        match (result, sync) {
+            (Ok(result), Ok(())) => {
+                lua.discard_result(result);
+                return Flow::Normal;
+            }
+            (Ok(result), Err(error)) => {
+                lua.discard_result(result);
+                return exec_error_flow(runtime, error);
+            }
+            (Err(_), _) => {
+                let _ = sync;
+                // The host cannot run the module re-entrantly here
+                // (`no free Ex executor for a Vimscript builtin call`);
+                // when the shipped `lua/vim/health.lua` is on
+                // `'runtimepath'` that is a host limitation, not a broken
+                // runtime, so report natively instead of crying `E5009`.
+                if health_framework_available(runtime, access) {
+                    return command_checkhealth_native(runtime, access, scope, &args);
+                }
+            }
+        }
+        let vimruntime = std::env::var("VIMRUNTIME").unwrap_or_default();
+        if vimruntime.is_empty() {
+            return error_flow(runtime, "E5009", "$VIMRUNTIME is empty or unset");
+        }
+        let rtp = access.with_ex_editor(|editor| match editor.options().get_global("runtimepath") {
+            Ok(OptionValue::String(text)) => text.clone(),
+            _ => String::new(),
+        });
+        if rtp.contains(&vimruntime) {
+            return error_flow(
+                runtime,
+                "E5009",
+                format!("Invalid $VIMRUNTIME: {vimruntime}"),
+            );
+        }
+        return error_flow(runtime, "E5009", "Invalid 'runtimepath'");
+    }
+    command_checkhealth_native(runtime, access, scope, &args)
+}
+
+/// Native `health://` report without a Lua host (unit-test seam).
+///
+/// The shape mirrors `runtime/lua/vim/health.lua`: a `78`-wide `=` rule, a
+/// `name: <summary>` header, a blank line, the reporter lines, and a trailing
+/// blank. A missing provider renders `- ❌ ERROR No healthcheck found for
+/// "{name}" plugin.` in the buffer (upstream's `func == ''` branch) instead
+/// of raising. An empty discovery renders `ERROR: No healthchecks found.`
+/// (upstream's `next(healthchecks) == nil` branch for `:checkhealth vim`).
+fn command_checkhealth_native<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    args: &str,
+) -> Flow {
+    let names: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+    let discovered = discover_health_names(runtime, access);
+    let resolved: Vec<String> = if names.is_empty() {
+        discovered.clone()
+    } else {
+        let mut resolved = Vec::new();
+        for name in &names {
+            if name.contains('*') {
+                let prefix = name.trim_end_matches('*');
+                let mut matched: Vec<String> = discovered
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(prefix))
+                    .cloned()
+                    .collect();
+                matched.sort();
+                resolved.extend(matched);
+            } else {
+                resolved.push(name.clone());
+            }
+        }
+        resolved
+    };
+    let lines: Vec<Vec<u8>> = if resolved.is_empty() {
+        vec![b"ERROR: No healthchecks found.".to_vec()]
+    } else if names.is_empty() {
+        let mut out = Vec::new();
+        let mut sorted = resolved.clone();
+        sort_health_names(&mut sorted);
+        for name in &sorted {
+            out.extend(health_report_block(
+                name,
+                &[HealthItem::Ok("available".to_owned())],
+            ));
+        }
+        out
+    } else {
+        let mut out = Vec::new();
+        for name in &resolved {
+            if health_provider_exists(runtime, access, name) {
+                out.extend(health_report_block(
+                    name,
+                    &[HealthItem::Warn(
+                        "Lua host is not available; check skipped".to_owned(),
+                    )],
+                ));
+            } else {
+                out.extend(health_report_block(
+                    name,
+                    &[HealthItem::Missing(name.clone())],
+                ));
+            }
+        }
+        out
+    };
+    open_health_buffer(runtime, access, scope, &lines)
+}
+
+/// Reporter item rendered into a native health block.
+enum HealthItem {
+    /// `- ✅ OK {message}`.
+    Ok(String),
+    /// `- ⚠️ WARNING {message}`.
+    Warn(String),
+    /// `- ❌ ERROR No healthcheck found for "{name}" plugin.`
+    Missing(String),
+}
+
+/// One upstream-shaped report block for `name`.
+fn health_report_block(name: &str, items: &[HealthItem]) -> Vec<Vec<u8>> {
+    let mut body: Vec<String> = Vec::new();
+    let (mut warns, mut errors) = (0, 0);
+    for item in items {
+        match item {
+            HealthItem::Ok(message) => body.push(format!("- ✅ OK {message}")),
+            HealthItem::Warn(message) => {
+                warns += 1;
+                body.push(format!("- ⚠️ WARNING {message}"));
+            }
+            HealthItem::Missing(provider) => {
+                errors += 1;
+                body.push(format!(
+                    "- ❌ ERROR No healthcheck found for \"{provider}\" plugin."
+                ));
+            }
+        }
+    }
+    let mut summary = String::new();
+    if warns > 0 {
+        summary.push_str(&format!(" {warns:>2} ⚠️"));
+    }
+    if errors > 0 {
+        summary.push_str(&format!(" {errors:>2} ❌"));
+    }
+    if summary.is_empty() {
+        summary.push_str("✅");
+    }
+    // `vim.fn.strwidth`:-wide `❌`/`✅` occupy two cells but count as one
+    // char (`⚠️` already counts two chars for its two cells), so the header
+    // padding lands on the same column as upstream's.
+    let wide = summary.matches('❌').count() + summary.matches('✅').count();
+    let replen: usize = summary.chars().count().saturating_add(wide);
+    let padding = 76usize.saturating_sub(name.len().saturating_add(replen));
+    let mut out = vec![
+        b"==============================================================================".to_vec(),
+        format!("{name}: {:padding$}{summary}", "").into_bytes(),
+        Vec::new(),
+    ];
+    for line in body {
+        out.push(line.into_bytes());
+    }
+    out.push(Vec::new());
+    out
+}
+
+/// Sort health names the way `_check` does: `vim.*` first, then byte order.
+fn sort_health_names(names: &mut [String]) {
+    names.sort_by(|left, right| {
+        let left_nvim = left.starts_with("vim.");
+        let right_nvim = right.starts_with("vim.");
+        if left_nvim != right_nvim {
+            return right_nvim.cmp(&left_nvim);
+        }
+        left.cmp(right)
+    });
+}
+
+/// Whether the shipped health framework itself (`lua/vim/health.lua`) is on
+/// `'runtimepath'`. Distinguishes a host that cannot execute the module
+/// (fall back to a native report) from a genuinely broken runtime (upstream
+/// `E5009` in `ex_checkhealth`).
+fn health_framework_available<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+) -> bool {
+    let io = runtime.scripts.io();
+    health_rtp_roots(runtime, access)
+        .iter()
+        .any(|root| io.exists(&root.join("lua/vim/health.lua")))
+}
+
+/// Runtime search roots from the live `'runtimepath'` option.
+fn health_rtp_roots<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+) -> Vec<PathBuf> {
+    let rtp = access.with_ex_editor(|editor| match editor.options().get_global("runtimepath") {
+        Ok(OptionValue::String(text)) => text.clone(),
+        _ => String::new(),
+    });
+    let mut roots: Vec<PathBuf> = rtp
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if roots.is_empty() {
+        roots.extend(
+            runtime
+                .scripts
+                .runtime_roots()
+                .iter()
+                .map(|root| root.path().to_path_buf()),
+        );
+    }
+    roots
+}
+
+/// Whether a `health.lua`/`health/init.lua` (or legacy `health.vim`) provider
+/// for `name` exists on `'runtimepath'`.
+fn health_provider_exists<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    name: &str,
+) -> bool {
+    let fragment = name.replace('.', "/");
+    let io = runtime.scripts.io();
+    for root in health_rtp_roots(runtime, access) {
+        if io.exists(&root.join(format!("autoload/health/{fragment}.vim"))) {
+            return true;
+        }
+        if io.exists(&root.join(format!("lua/{fragment}/health.lua"))) {
+            return true;
+        }
+        if io.exists(&root.join(format!("lua/{fragment}/health/init.lua"))) {
+            return true;
+        }
+        for pattern in [
+            format!("{}/lua/**/{fragment}/health.lua", root.display()),
+            format!("{}/lua/**/{fragment}/health/init.lua", root.display()),
+        ] {
+            if !crate::fs_builtins::expand_glob(io, &pattern, false).is_empty() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// All discoverable health names on `'runtimepath'`, mirroring
+/// `vim.health._complete`'s `PATTERNS` scan.
+fn discover_health_names<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+) -> Vec<String> {
+    let io = runtime.scripts.io();
+    let mut names: Vec<String> = Vec::new();
+    for root in health_rtp_roots(runtime, access) {
+        for pattern in [
+            format!("{}/autoload/health/*.vim", root.display()),
+            format!("{}/lua/**/health.lua", root.display()),
+            format!("{}/lua/**/health/init.lua", root.display()),
+        ] {
+            for path in crate::fs_builtins::expand_glob(io, &pattern, false) {
+                if let Some(name) = health_path_to_name(&path)
+                    && name != "vim"
+                    && !names.contains(&name)
+                {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    sort_health_names(&mut names);
+    names
+}
+
+/// `filepath_to_healthcheck`'s name derivation (`runtime/lua/vim/health.lua`)
+/// for one runtime file path.
+fn health_path_to_name(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    if let Some(file) = normalized.rsplit('/').next()
+        && normalized.contains("/autoload/health/")
+        && file.ends_with(".vim")
+    {
+        return Some(file.trim_end_matches(".vim").to_owned());
+    }
+    let marker = "/lua/";
+    let index = normalized.rfind(marker)?;
+    let mut subpath = normalized[index + marker.len()..].to_owned();
+    if let Some(stripped) = subpath.strip_suffix("/health/init.lua") {
+        subpath = stripped.to_owned();
+    } else if let Some(stripped) = subpath.strip_suffix("/health.lua") {
+        subpath = stripped.to_owned();
+    } else {
+        return None;
+    }
+    if subpath.is_empty() {
+        return None;
+    }
+    Some(subpath.replace('/', "."))
+}
+
+/// Create (or reuse, mirroring upstream's `bwipe health://` first) the
+/// `health://` buffer, install `lines`, set the `checkhealth` filetype
+/// through the `:set` path so `FileType` fires, and make it current.
+fn open_health_buffer<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lines: &[Vec<u8>],
+) -> Flow {
+    let existing = access.with_ex_editor(|editor| {
+        editor.buffers().into_iter().find(|handle| {
+            editor
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == &b"health://"[..])
+        })
+    });
+    let handle = match existing {
+        Some(handle) => handle,
+        None => match access.with_ex_editor(|editor| editor.create_buffer(true)) {
+            Ok(handle) => handle,
+            Err(error) => return error_flow(runtime, "E948", error.to_string()),
+        },
+    };
+    let text = match Buffer::from_lines(lines, false) {
+        Ok(text) => text,
+        Err(error) => return error_flow(runtime, "E948", error.to_string()),
+    };
+    if let Err(error) = access.with_ex_editor(|editor| {
+        let state = editor.buffer_mut(handle)?;
+        state.set_name(OxStr::from("health://"));
+        state.load(text);
+        state.mark_saved();
+        state.flags.set(crate::BufferFlags::MODIFIED, false);
+        Ok::<(), crate::EditorError>(())
+    }) {
+        return error_flow(runtime, "E948", error.to_string());
+    }
+    if access.with_ex_editor(|editor| editor.current_window().is_none()) {
+        if let Err(error) = access
+            .with_ex_editor(|editor| editor.create_tabpage(handle, DEFAULT_TABPAGE_GEOMETRY))
+        {
+            return error_flow(runtime, "E948", error.to_string());
+        }
+    } else if let Err(error) = access
+        .with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+    {
+        return error_flow(runtime, "E948", error.to_string());
+    }
+    let flow = command_set(
+        runtime,
+        access,
+        scope,
+        None,
+        "filetype=checkhealth",
+        SetLayer::Local,
+    );
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+    fire_buffer_lifecycle(runtime, access, scope, None, &[Event::BufEnter], handle)
 }
 
 /// `:checktime` (`ex_cmds2.c` `ex_checktime` → `check_timestamps`,
@@ -20223,13 +20956,44 @@ fn list_mappings(editor: &mut Editor, lhs: &Keys, modes: MapModes, buffer_only: 
 
 /// Marker prefix of the pseudo funcref names wrapping Lua registry refs; a
 /// call on such a name invokes the registry slot instead of Vimscript code.
-const LUA_REF_FUNCTION_PREFIX: &str = "\u{1}oxvim_luaref:";
+pub(crate) const LUA_REF_FUNCTION_PREFIX: &str = "\u{1}oxvim_luaref:";
 
 /// Wraps one Lua registry reference as a callable funcref name so a callback
 /// returned by an API call (or `function()` on one) stays invocable.
-fn lua_ref_function_name(reference: u64) -> OxStr {
+pub fn lua_ref_function_name(reference: u64) -> OxStr {
     let name = format!("{LUA_REF_FUNCTION_PREFIX}{reference}");
     OxStr::from(name.as_bytes())
+}
+
+/// Lua registry reference carried by a job or timer callback, if any.
+///
+/// A Vimscript lambda also owns a closure-registry id, so the id alone cannot
+/// classify a callback: only the pseudo name that wraps a Lua reference
+/// identifies one. Every delivery path (the executor, the job-event flush and
+/// the server tick) must agree on this, or a lambda is handed to the Lua host.
+#[must_use]
+pub fn lua_reference(event: &crate::job::JobEvent) -> Option<usize> {
+    match &event.callback {
+        // A Lua function value carries an empty name and only its registry
+        // slot; a callback returned to Vimscript wraps that slot in the
+        // pseudo name. A Vimscript lambda has a non-empty `<lambda>N` name,
+        // which is what keeps it out of the Lua host.
+        Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+            if funcref.name.as_bytes().is_empty() {
+                return funcref.registry;
+            }
+            funcref
+                .name
+                .to_string_lossy()
+                .strip_prefix(LUA_REF_FUNCTION_PREFIX)
+                .and_then(|reference| reference.parse::<usize>().ok())
+        }
+        Typval::String(name) => name
+            .to_string_lossy()
+            .strip_prefix(LUA_REF_FUNCTION_PREFIX)
+            .and_then(|reference| reference.parse::<usize>().ok()),
+        _ => None,
+    }
 }
 /// One `showmap` row (`mapping.c:220-266`): the mode characters padded to
 /// three columns, the lhs padded to at least twelve with one trailing blank

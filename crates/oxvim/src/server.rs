@@ -127,10 +127,9 @@ fn report_job_callback_error(session: &ApiSession, error: &str) {
 /// Extracts a Lua registry reference from a deferred job callback, returning
 /// `None` for Vimscript funcrefs and plain string callbacks.
 fn lua_job_reference(event: &JobEvent) -> Option<usize> {
-    match &event.callback {
-        Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.registry,
-        _ => None,
-    }
+    // A Vimscript lambda carries a closure-registry id too, so the shared
+    // predicate keys on the pseudo name that wraps a Lua reference.
+    ox_editor::excmd_exec::lua_reference(event)
 }
 
 /// Consecutive hostless Lua callback passes are bounded so an executor
@@ -7459,7 +7458,7 @@ mod tests {
         };
         let event = JobEvent {
             callback: Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(42),
@@ -7544,7 +7543,7 @@ mod tests {
         };
         let event = JobEvent {
             callback: Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(42),

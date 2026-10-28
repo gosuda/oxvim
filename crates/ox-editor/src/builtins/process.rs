@@ -12,8 +12,8 @@ use ox_types::{OxStr, Special, Typval};
 use ox_uv::process::PtySize;
 
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error,
-    object_to_typval,
+    EvalHost, ExEditorAccess, ExRuntime, LUA_REF_FUNCTION_PREFIX, LuaExec,
+    call_user_function_with_self, flow_to_eval_error, object_to_typval,
 };
 use crate::job::DEFAULT_PTY_SIZE;
 use crate::options::OptionValue;
@@ -1326,9 +1326,44 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             lua_deferred = true;
             continue;
         }
+        // A stored Funcref is a value: a lambda keeps its body in the closure
+        // registry, and a name redispatch would look for `<lambda>N` among
+        // user functions, where it does not exist.
+        if matches!(
+            event.callback,
+            Typval::Funcref(_) | Typval::Partial(_)
+        ) {
+            let regex = crate::excmd_exec::VimRegex;
+            let ambiguous_wide = access.with_ex_editor(|editor| {
+                matches!(
+                    editor.options().get_global("ambiwidth"),
+                    Ok(OptionValue::String(value)) if value == "double"
+                )
+            });
+            let mut host = EvalHost {
+                runtime,
+                access,
+                lua,
+                builtins: ox_eval::Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
+                submatches: None,
+                escaped_exception: None,
+                call_receiver: Some(event.receiver),
+            };
+            if let Err(error) =
+                ox_eval::Evaluator::new(&mut host, &regex).invoke(event.callback, event.args, scope)
+            {
+                if let Some(id) = timer_id
+                    && let Some(manager) = host.runtime.jobs.as_mut()
+                {
+                    manager.record_timer_error(id);
+                }
+                redefer_job_events(host.runtime, batch.collect());
+                return Err(error);
+            }
+            continue;
+        }
         let name = match event.callback {
             Typval::String(name) => name,
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.name,
             _ => continue,
         };
         if let Err(flow) = call_user_function_with_self(
@@ -1368,11 +1403,13 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
 /// re-enters the executor through the Lua host, which is what the
 /// in-user-code delivery must not run; the server's outer driver
 /// keeps the same classification in `lua_job_reference`.
+/// Lua registry reference carried by a callback, if any.
+///
+/// Delegates to the shared predicate: a Lua function value has an empty name
+/// and only a registry slot, a callback returned to Vimscript carries the
+/// pseudo name, and a Vimscript lambda has a non-empty `<lambda>N` name.
 fn event_lua_reference(event: &JobEvent) -> Option<usize> {
-    match &event.callback {
-        Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.registry,
-        _ => None,
-    }
+    crate::excmd_exec::lua_reference(event)
 }
 
 /// Puts events this stack must not deliver back on the installed manager's
@@ -1447,6 +1484,7 @@ fn value_bool(value: &Typval) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use crate::excmd_exec::LUA_REF_FUNCTION_PREFIX;
 
     use std::cell::Cell;
     use std::path::Path;
@@ -1695,9 +1733,12 @@ mod tests {
                 Typval::String(OxStr::from(event)),
             ]
         };
+        // A Lua callback is recognised by the pseudo name that wraps its
+        // registry slot (`lua_ref_function_name`); a Vimscript lambda also
+        // owns a registry id, so the registry alone cannot classify it.
         let lua_event = JobEvent {
             callback: Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(42),
@@ -1813,7 +1854,7 @@ mod tests {
         exec.defer_job_events(vec![
             event(Typval::String(OxStr::from("VimCb"))),
             event(Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(7),

@@ -828,6 +828,7 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "cd",
     "cexpr",
     "cfirst",
+    "checkhealth",
     "clearjumps",
     "close",
     "cmap",
