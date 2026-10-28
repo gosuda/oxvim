@@ -1,4 +1,4 @@
-//! Mapping query builtins: `maparg`.
+//! Mapping and abbreviation query builtins: `maparg`, `mapcheck`, `hasmapto`.
 //!
 //! `f_maparg` is `get_maparg(argvars, rettv, exact = 1)` (`mapping.c:2148-2227`),
 //! which resolves the left-hand side through `replace_termcodes`, finds the
@@ -10,6 +10,13 @@
 //! side simplified and `desc`/`callback` when the mapping carries them. `buf`
 //! is deliberately absent: `mapblock_fill_dict` adds it only when `compatible`
 //! is false, which is the `nvim_get_keymap` path and not this one.
+//!
+//! With `abbr` set the same entry points read the abbreviation table instead
+//! (`check_map`'s `abbr` leg, `mapping.c:2030-2061`): the trigger replaces the
+//! left-hand side, `mode` still reports `map_mode_to_chars`, and `abbr` is 1.
+//! [`crate::mapping::Abbreviation`] now carries the mode set, `nowait`,
+//! `silent` and original right-hand side those answers need, because the
+//! `:abbreviate` family in this module writes through it.
 //!
 //! Named gaps, each one a thing that would have to exist first:
 //!
@@ -24,27 +31,26 @@
 //!    (`<C-I>` and `<Tab>`). This port has no `m_simplified` model and no
 //!    `REPTERM_NO_SIMPLIFY` pass, so it never emits the key — which is also
 //!    what upstream does for every left-hand side that does not simplify.
-//!  * **`abbr = 1`** needs the abbreviation table to be script-reachable and to
-//!    carry mapping flags. `:abbreviate` is not an executed Ex command here, so
-//!    no script can add an entry, and [`crate::mapping::Abbreviation`] records
-//!    no mode set, `nowait`, `silent` or original right-hand side. The query
-//!    therefore answers nothing rather than filling a dictionary from data that
-//!    does not exist.
 //!
 //! `sid`, `lnum`, `script` and `replace_keycodes` are *not* gaps. The first two
 //! come from the script stack, which [`crate::script::Scripts`] tracks; `script`
-//! comes from the `<script>` flag [`crate::mapping::MappingOptions`] now
-//! records; and `replace_keycodes` is only settable through
-//! `nvim_set_keymap`'s option table, so upstream reports 0 for every mapping a
-//! `:map` command can create, which is every mapping here.
+//! comes from the `<script>` flag the options now record; and
+//! `replace_keycodes` is only settable through `nvim_set_keymap`'s option
+//! table, so upstream reports 0 for every mapping a `:map` or `:abbreviate`
+//! command can create, which is every entry here.
 
-use crate::excmd_exec::ExEditorAccess;
 use ox_eval::EvalError;
 use ox_eval::Scope;
-use ox_types::{OxStr, Typval};
+use ox_excmd::ExCommand;
+use ox_types::{BufHandle, OxStr, Typval};
 
-use crate::excmd_exec::{EvalHost, map_leader};
-use crate::mapping::{MapModes, Mapping, MappingAction};
+use crate::excmd_exec::{
+    EvalHost, ExEditorAccess, ExRuntime, Flow, map_leader, push_info_text_message,
+};
+use crate::mapping::{
+    AbbrevCommandKind, AbbrevOptions, Abbreviation, MapFlags, MapModes, MapScope, Mapping,
+    MappingAction, abbrev_modes_for_command, classify_abbrev_command,
+};
 use crate::script::FileIO;
 use crate::typeahead::{Keys, special_notation};
 
@@ -94,9 +100,35 @@ fn maparg<F: FileIO, E: ExEditorAccess>(
             Typval::String(OxStr::from(""))
         }
     };
-    // See this module's header: the abbreviation table cannot answer.
+    // `get_maparg`'s `abbr` leg reads the abbreviation table the same way.
     if abbr {
-        return Ok(empty());
+        let lhs = Keys::parse_notation(
+            &keys.to_string_lossy(),
+            &map_leader(scope, "mapleader"),
+            &map_leader(scope, "maplocalleader"),
+        );
+        let trigger = String::from_utf8_lossy(lhs.as_bytes()).into_owned();
+        let found = host.access.with_ex_editor(|editor| {
+            editor
+                .mappings()
+                .find_abbrev_exact(&trigger, modes, editor.current_buffer())
+                .map(|(entry, local)| (entry.clone(), local))
+        });
+        let Some((entry, local)) = found else {
+            return Ok(empty());
+        };
+        // A callback abbreviation has no key string, like a callback mapping.
+        let Some(replaced) = entry.action.replaced_keys() else {
+            return Ok(empty());
+        };
+        if want_dict {
+            return Ok(abbrev_fill_dict(&entry, local));
+        }
+        return Ok(Typval::String(if replaced.is_empty() {
+            OxStr::from("<Nop>")
+        } else {
+            OxStr::from(special_notation(replaced, false, false).as_str())
+        }));
     }
     // `replace_termcodes` on the queried keys, the same translation `:map`
     // applied when the mapping was stored, so `maparg('<Esc>x')` finds what
@@ -152,10 +184,32 @@ fn mapcheck<F: FileIO, E: ExEditorAccess>(
             .into_owned(),
         None => String::new(),
     };
-    if args.get(2).is_some_and(Typval::is_truthy) {
-        return Ok(Typval::String(OxStr::from("")));
-    }
     let modes = MapModes::from_mode_string(&which);
+    // `f_mapcheck` with `abbr` set prefix-matches the abbreviation table.
+    if args.get(2).is_some_and(Typval::is_truthy) {
+        let lhs = Keys::parse_notation(
+            &keys.to_string_lossy(),
+            &map_leader(scope, "mapleader"),
+            &map_leader(scope, "maplocalleader"),
+        );
+        let trigger = String::from_utf8_lossy(lhs.as_bytes()).into_owned();
+        let found = host.access.with_ex_editor(|editor| {
+            editor
+                .mappings()
+                .abbrev_matching(&trigger, modes, editor.current_buffer())
+                .into_iter()
+                .filter(|(entry, _)| entry.lhs.as_bytes().starts_with(lhs.as_bytes()))
+                // `map_check` prefers the exact lhs over any longer one.
+                .min_by_key(|(entry, _)| entry.lhs.as_bytes().len())
+                .and_then(|(entry, _)| entry.action.replaced_keys().map(<[u8]>::to_vec))
+        });
+        let Some(replaced) = found else {
+            return Ok(Typval::String(OxStr::from("")));
+        };
+        return Ok(Typval::String(OxStr::from(
+            special_notation(&replaced, false, false).as_str(),
+        )));
+    }
     let lhs = Keys::parse_notation(
         &keys.to_string_lossy(),
         &map_leader(scope, "mapleader"),
@@ -194,10 +248,28 @@ fn hasmapto<F: FileIO, E: ExEditorAccess>(
             .into_owned(),
         None => String::new(),
     };
-    if args.get(2).is_some_and(Typval::is_truthy) {
-        return Ok(Typval::Number(0));
-    }
     let modes = MapModes::from_mode_string(&which);
+    // `f_hasmapto` with `abbr` set scans abbreviation right-hand sides.
+    if args.get(2).is_some_and(Typval::is_truthy) {
+        let needle = Keys::parse_notation(
+            &what.to_string_lossy(),
+            &map_leader(scope, "mapleader"),
+            &map_leader(scope, "maplocalleader"),
+        );
+        let found = host.access.with_ex_editor(|editor| {
+            editor
+                .mappings()
+                .abbrev_matching("", modes, editor.current_buffer())
+                .into_iter()
+                .any(|(entry, _)| {
+                    entry
+                        .action
+                        .replaced_keys()
+                        .is_some_and(|rhs| windows_contains(rhs, needle.as_bytes()))
+                })
+        });
+        return Ok(Typval::Number(i64::from(found)));
+    }
     let needle = Keys::parse_notation(
         &what.to_string_lossy(),
         &map_leader(scope, "mapleader"),
@@ -321,4 +393,322 @@ fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// `mapblock_fill_dict` with `compatible` true over an abbreviation
+/// (`mapping.c:2090-2146`): the trigger answers `lhs`/`lhsraw`, `rhs` is the
+/// right-hand side as written, `mode` still reports `map_mode_to_chars`, and
+/// `abbr` is 1.
+fn abbrev_fill_dict(entry: &Abbreviation, local: bool) -> Typval {
+    let context = entry.script_context;
+    let entries = vec![
+        (
+            OxStr::from("rhs"),
+            Typval::String(OxStr::from(entry.orig_rhs.as_str())),
+        ),
+        (
+            OxStr::from("lhs"),
+            Typval::String(OxStr::from(
+                special_notation(entry.lhs.as_bytes(), true, false).as_str(),
+            )),
+        ),
+        (
+            OxStr::from("lhsraw"),
+            Typval::String(OxStr(entry.lhs.as_bytes().to_vec())),
+        ),
+        // The compatible form cannot distinguish `<script>`, so `noremap` is
+        // just "does not remap" (`mapping.c:2101-2104`).
+        (
+            OxStr::from("noremap"),
+            Typval::Number(i64::from(!entry.flags.contains(MapFlags::REMAP))),
+        ),
+        (
+            OxStr::from("script"),
+            Typval::Number(i64::from(entry.flags.contains(MapFlags::SCRIPT))),
+        ),
+        (
+            OxStr::from("silent"),
+            Typval::Number(i64::from(entry.flags.contains(MapFlags::SILENT))),
+        ),
+        (
+            OxStr::from("expr"),
+            Typval::Number(i64::from(matches!(entry.action, MappingAction::Expr(_)))),
+        ),
+        // Hard-coded upstream too (`mapping.c:2133`).
+        (OxStr::from("scriptversion"), Typval::Number(1)),
+        (
+            OxStr::from("sid"),
+            Typval::Number(i64::try_from(context.sid).unwrap_or(0)),
+        ),
+        (
+            OxStr::from("lnum"),
+            Typval::Number(i64::try_from(context.lnum).unwrap_or(0)),
+        ),
+        (OxStr::from("buffer"), Typval::Number(i64::from(local))),
+        (
+            OxStr::from("nowait"),
+            Typval::Number(i64::from(entry.flags.contains(MapFlags::NOWAIT))),
+        ),
+        // Only `nvim_set_keymap`'s option table sets `m_replace_keycodes`, and
+        // this port has no such surface, so every abbreviation reports
+        // upstream's value for a `:abbreviate`-created one.
+        (OxStr::from("replace_keycodes"), Typval::Number(0)),
+        (
+            OxStr::from("mode"),
+            Typval::String(OxStr::from(entry.modes.to_chars().as_str())),
+        ),
+        (OxStr::from("abbr"), Typval::Number(1)),
+        (
+            OxStr::from("mode_bits"),
+            Typval::Number(i64::from(entry.modes.bits())),
+        ),
+    ];
+    Typval::dict(entries)
+}
+
+/// The `:abbreviate` family: `do_exmap` with `isabbrev` (`mapping.c:2673-2679`)
+/// for the define/undefine forms, and `do_mapclear`'s abbreviation leg
+/// (`mapping.c:1066-1073`) for the `abclear` forms.
+///
+/// All twelve canonical names share this path. Dispatch routes ten of them
+/// here through the `:map` family arm; `"iabbrev"` and `"abclear"` keep their
+/// historic arms and delegate here too. Bang is meaningless (no `BANG` flag in
+/// `ex_cmds.lua`'s abbreviation entries) and ignored, and a range never
+/// reaches here: those commands carry no `RANGE` flag, so the parser reports
+/// `E481` first.
+pub(crate) fn command_abbrev<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    command: &ExCommand,
+) -> Flow {
+    let name = command.command.name();
+    let kind = classify_abbrev_command(name);
+    let modes = abbrev_modes_for_command(name);
+    let (modifiers, rest) = split_abbrev_modifiers(&command.args);
+    let leader = map_leader(scope, "mapleader");
+    let local_leader = map_leader(scope, "maplocalleader");
+    let map_scope = access.with_ex_editor(|editor| {
+        if modifiers.buffer {
+            MapScope::Buffer(editor.current_buffer().unwrap_or(BufHandle::CURRENT))
+        } else {
+            MapScope::Global
+        }
+    });
+
+    if matches!(kind, AbbrevCommandKind::Clear) {
+        // `do_mapclear`: anything but bare or `<buffer>` is `E474`.
+        if !rest.trim().is_empty() {
+            return Flow::Exception(runtime.exception("E474", "Invalid argument"));
+        }
+        access.with_ex_editor(|editor| {
+            editor.mappings_mut().abbrevclear_modes(modes, map_scope);
+        });
+        return Flow::Normal;
+    }
+
+    if matches!(kind, AbbrevCommandKind::Undefine) {
+        // Like `:unmap`, the whole tail is the trigger, whitespace included.
+        if rest.is_empty() {
+            return Flow::Exception(runtime.exception("E474", "Invalid argument"));
+        }
+        let lhs = Keys::parse_notation(rest, &leader, &local_leader);
+        let trigger = String::from_utf8_lossy(lhs.as_bytes()).into_owned();
+        if trigger.is_empty() {
+            return Flow::Exception(runtime.exception("E474", "Invalid argument"));
+        }
+        let stripped = access.with_ex_editor(|editor| {
+            editor
+                .mappings_mut()
+                .unabbreviate_modes(&trigger, modes, map_scope)
+        });
+        return if stripped == 0 {
+            Flow::Exception(runtime.exception("E24", "No such abbreviation"))
+        } else {
+            Flow::Normal
+        };
+    }
+
+    let AbbrevCommandKind::Define { noremap } = kind else {
+        unreachable!("abbreviation command classification is exhaustive");
+    };
+    // `str_to_mapargs` (`mapping.c:463-475`): the trigger runs to the next
+    // space or tab, with CTRL-V or backslash pulling the following byte in;
+    // the right-hand side is `skipwhite(lhs_end)` to the end of the argument.
+    let bytes = rest.as_bytes();
+    let mut lhs_end = 0;
+    while lhs_end < bytes.len() && !matches!(bytes[lhs_end], b' ' | b'\t') {
+        if matches!(bytes[lhs_end], 0x16 | b'\\') && lhs_end + 1 < bytes.len() {
+            lhs_end += 1;
+        }
+        lhs_end += 1;
+    }
+    // A CTRL-V escape can strand `lhs_end` inside a multi-byte character;
+    // floor to the boundary instead of slicing invalid UTF-8.
+    while !rest.is_char_boundary(lhs_end) {
+        lhs_end -= 1;
+    }
+    let lhs = Keys::parse_notation(&rest[..lhs_end], &leader, &local_leader);
+    let trigger = String::from_utf8_lossy(lhs.as_bytes()).into_owned();
+    let rhs = &rest[lhs_end
+        + rest[lhs_end..]
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count()..];
+    // `do_map` prints instead of defining whenever the rhs is missing
+    // (`mapping.c:873-883`).
+    if rhs.is_empty() {
+        return list_abbreviations(access, &trigger, modes, modifiers.buffer);
+    }
+    if modifiers.unique {
+        let exists = access.with_ex_editor(|editor| {
+            editor
+                .mappings()
+                .abbrev_conflicts(&trigger, modes, map_scope)
+        });
+        if exists {
+            return Flow::Exception(
+                runtime.exception("E226", format!("Abbreviation already exists for {trigger}")),
+            );
+        }
+        if matches!(map_scope, MapScope::Buffer(_)) {
+            let global = access.with_ex_editor(|editor| {
+                editor
+                    .mappings()
+                    .abbrev_conflicts(&trigger, modes, MapScope::Global)
+            });
+            if global {
+                return Flow::Exception(runtime.exception(
+                    "E224",
+                    format!("Global abbreviation already exists for {trigger}"),
+                ));
+            }
+        }
+    }
+    let action = if modifiers.expr {
+        MappingAction::Expr(rhs.to_owned())
+    } else {
+        match MappingAction::parse_rhs(rhs, &leader, &local_leader) {
+            Ok(action) => action,
+            Err(error) => return Flow::Exception(runtime.exception("E474", error.to_string())),
+        }
+    };
+    // `buf_do_map`'s `noremap` (`mapping.c:612-618`): `<script>` restricts
+    // remapping to `<SID>` mappings, and with no script-local mappings here
+    // that behaves as no-remap — but the flag is recorded, because
+    // `maparg()`'s `script` key is the only thing that tells `<script>` apart
+    // from `:noreabbrev`.
+    let mut flags = MapFlags::default();
+    flags.set(MapFlags::REMAP, !noremap && !modifiers.script);
+    flags.set(MapFlags::NOWAIT, modifiers.nowait);
+    flags.set(MapFlags::SILENT, modifiers.silent);
+    flags.set(MapFlags::SCRIPT, modifiers.script);
+    let script_context = runtime.scripts.current_context();
+    let defined = access.with_ex_editor(|editor| {
+        editor
+            .mappings_mut()
+            .abbreviate_full(
+                &trigger,
+                action,
+                AbbrevOptions {
+                    modes,
+                    scope: map_scope,
+                    flags,
+                    orig_rhs: rhs.to_owned(),
+                    script_context,
+                },
+            )
+            .is_ok()
+    });
+    if defined {
+        Flow::Normal
+    } else {
+        // `buf_do_map`'s `retval = 1`: an empty, overlong, whitespace-bearing
+        // or keyword-mixed trigger is `E474` (`mapping.c:646-681`).
+        Flow::Exception(runtime.exception("E474", "Invalid argument"))
+    }
+}
+
+/// Front modifiers the `:abbreviate` family accepts, in any order
+/// (`str_to_mapargs`, `mapping.c:425-460`).
+#[derive(Clone, Copy, Default)]
+struct AbbrevModifiers {
+    buffer: bool,
+    nowait: bool,
+    silent: bool,
+    script: bool,
+    expr: bool,
+    unique: bool,
+}
+
+/// Mirror of the Ex dispatcher's front-modifier split: the same six modifiers
+/// the `:map` family strips before the left-hand side, with obsolete
+/// `<special>` accepted and ignored. Kept beside the abbreviation command so
+/// both dispatch arms share it without reaching into the dispatcher; keep the
+/// two in sync.
+fn split_abbrev_modifiers(args: &str) -> (AbbrevModifiers, &str) {
+    let mut modifiers = AbbrevModifiers::default();
+    let mut rest = args.trim_start();
+    loop {
+        let next = if let Some(tail) = rest.strip_prefix("<buffer>") {
+            modifiers.buffer = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<nowait>") {
+            modifiers.nowait = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<silent>") {
+            modifiers.silent = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<special>") {
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<script>") {
+            modifiers.script = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<expr>") {
+            modifiers.expr = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("<unique>") {
+            modifiers.unique = true;
+            Some(tail)
+        } else {
+            None
+        };
+        match next {
+            Some(tail) => rest = tail.trim_start(),
+            None => return (modifiers, rest),
+        }
+    }
+}
+
+/// `do_map`'s listing passes for abbreviations (`mapping.c:698-793`): every
+/// matching trigger, buffer-local table first, or `No abbreviation found`.
+fn list_abbreviations<E: ExEditorAccess>(
+    access: &E,
+    filter: &str,
+    modes: MapModes,
+    buffer_only: bool,
+) -> Flow {
+    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+    let rows: Vec<String> = access.with_ex_editor(|editor| {
+        editor
+            .mappings()
+            .abbrev_matching(filter, modes, buffer)
+            .into_iter()
+            .filter(|(entry, local)| {
+                !buffer_only || (*local && matches!(entry.scope, MapScope::Buffer(_)))
+            })
+            .map(|(entry, local)| entry.listing_row(local))
+            .collect()
+    });
+    access.with_ex_editor(|editor| {
+        push_info_text_message(editor, String::new());
+        if rows.is_empty() {
+            push_info_text_message(editor, "No abbreviation found".to_owned());
+        } else {
+            for row in rows {
+                push_info_text_message(editor, row);
+            }
+        }
+    });
+    Flow::Normal
 }
