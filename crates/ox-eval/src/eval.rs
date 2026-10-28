@@ -1072,9 +1072,9 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         depth: usize,
     ) -> Result<Evaluated> {
         match callee {
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+            Typval::Funcref(mut funcref) | Typval::Partial(mut funcref) => {
                 if !funcref.args.is_empty() {
-                    let mut bound = funcref.args;
+                    let mut bound = std::mem::take(&mut funcref.args);
                     bound.append(&mut args);
                     args = bound;
                 }
@@ -1092,16 +1092,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     self.host.set_call_receiver(receiver);
                 }
                 let result = match funcref.registry {
-                    Some(registry_id) => {
-                        let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
-                            EvalError::new(
-                                "E117",
-                                0,
-                                format!("Unknown function: {}", funcref.name.to_string_lossy()),
-                            )
-                        })?;
-                        self.call_closure(&funcref.name, registry_id, id, &args, depth, 0)
-                    }
+                    Some(_) => self.call_closure(&funcref, &args, scope, depth, 0),
                     None => self.call_named(&funcref.name, args, scope, 0, depth),
                 };
                 if funcref.dict.is_some() {
@@ -1115,18 +1106,34 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
 
     fn call_closure(
         &mut self,
-        name: &OxStr,
-        registry_id: usize,
-        id: usize,
+        funcref: &Funcref,
         args: &[Typval],
+        caller: &mut Scope,
         depth: usize,
         offset: usize,
     ) -> Result<Evaluated> {
+        // The registry nonce lives on the Funcref, not in the `<lambda>N`
+        // name, so a stored Partial resolves to its own closure even when an
+        // unrelated registry holds a same-index closure.
+        let registry_id = funcref.registry.ok_or_else(|| {
+            EvalError::new(
+                "E117",
+                offset,
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
+            )
+        })?;
+        let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
+            EvalError::new(
+                "E117",
+                offset,
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
+            )
+        })?;
         let closure = self.closures.resolve_any(registry_id, id).ok_or_else(|| {
             EvalError::new(
                 "E117",
                 offset,
-                format!("Unknown function: {}", name.to_string_lossy()),
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
             )
         })?;
         if args.len() < closure.params.len() {
@@ -1137,6 +1144,32 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             ));
         }
         let mut scope = closure.captured;
+        // A closure body runs against the caller's live `g:` state. The
+        // capture above is a snapshot from lambda creation: evaluating in it
+        // untouched would strand the body's global assignments in the clone
+        // (`execute('let g:x = 1')` runs, then its write is dropped with the
+        // scope) and read stale globals. Locals stay captured — that is the
+        // closure — but the editor-synced global map, with the mirror and
+        // stamps the differential sync reasons about, is borrowed from the
+        // caller for the call and handed back afterwards, so writes land
+        // directly in the caller's scope and its dirty marks survive.
+        std::mem::swap(&mut scope.global, &mut caller.global);
+        std::mem::swap(&mut scope.global_mirror, &mut caller.global_mirror);
+        std::mem::swap(&mut scope.synced, &mut caller.synced);
+        // `b:`, `w:`, `t:`, `v:` and `s:` are live shared tables upstream
+        // (`eval/vars.c`: `b_bufvar`, `w_vars`, `tp_vars`, `vimvarht`, the
+        // current `sc_sid` dict), never per-call state. A lambda that read
+        // the creation-time snapshot answered fossil values and its writes
+        // died with the invocation scope, so each map is borrowed from the
+        // caller for the call exactly like `g:`. `synced` travels with them
+        // wholesale: it holds the stamps the differential sync compares, and
+        // pairing the caller's stamps with a capture's map would pin the
+        // staleness instead of refreshing it.
+        std::mem::swap(&mut scope.buffer, &mut caller.buffer);
+        std::mem::swap(&mut scope.window, &mut caller.window);
+        std::mem::swap(&mut scope.tab, &mut caller.tab);
+        std::mem::swap(&mut scope.vim, &mut caller.vim);
+        std::mem::swap(&mut scope.script, &mut caller.script);
         for (param, value) in closure.params.iter().zip(args) {
             // Named parameters resolve both unqualified and as `a:name`.
             scope.local.retain(|(name, _)| name != param);
@@ -1157,7 +1190,21 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             let name = OxStr(format!("{}", index + 1).into_bytes());
             bind_argument(&mut scope, &name, value.clone());
         }
-        self.eval_at(&closure.body, &mut scope, depth)
+        let result = self.eval_at(&closure.body, &mut scope, depth);
+        // Hand the borrowed global state back: the body's assignments and
+        // dirty marks already sit in the caller's maps, and the capture's
+        // locals stay with the dropped invocation scope. Swapping back on
+        // both paths keeps Vim's no-rollback semantics — a body that errors
+        // after `:let g:x = 1` still leaves `g:x` set.
+        std::mem::swap(&mut scope.global, &mut caller.global);
+        std::mem::swap(&mut scope.global_mirror, &mut caller.global_mirror);
+        std::mem::swap(&mut scope.synced, &mut caller.synced);
+        std::mem::swap(&mut scope.buffer, &mut caller.buffer);
+        std::mem::swap(&mut scope.window, &mut caller.window);
+        std::mem::swap(&mut scope.tab, &mut caller.tab);
+        std::mem::swap(&mut scope.vim, &mut caller.vim);
+        std::mem::swap(&mut scope.script, &mut caller.script);
+        result
     }
 }
 

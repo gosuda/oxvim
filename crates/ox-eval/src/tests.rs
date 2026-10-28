@@ -14,7 +14,7 @@ use crate::{EvalError, Result};
 struct Host;
 
 impl BuiltinHost for Host {
-    fn call(&mut self, name: &OxStr, mut args: Vec<Typval>, _scope: &mut Scope) -> Result<Typval> {
+    fn call(&mut self, name: &OxStr, mut args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         match name.as_bytes() {
             b"id" => args
                 .into_iter()
@@ -44,6 +44,17 @@ impl BuiltinHost for Host {
                     }
                 }
                 Ok(Typval::Number(total))
+            }
+            b"bump" => {
+                // Stands in for `execute('let g:count += 1')`: a builtin the
+                // closure body calls that assigns a global in the scope it is
+                // handed, the way `:let` marks the map dirty for write-back.
+                let next = match scope.get_scoped(ScopeKind::Global, b"count", 0) {
+                    Ok(Typval::Number(n)) => n + 1,
+                    _ => 1,
+                };
+                scope.set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(next))?;
+                Ok(Typval::Number(next))
             }
             b"append" => {
                 if args.len() != 2 {
@@ -920,6 +931,96 @@ fn lambda_resolves_across_separate_evaluators() {
     // Too few arguments is an arity error, not unknown-function.
     let arity = caller.invoke(lambda, Vec::new(), &mut scope).unwrap_err();
     assert_eq!(arity.code, "E119");
+}
+
+#[test]
+fn stored_lambda_called_through_invoke_runs_body_against_caller_globals() {
+    // Probe 1 (`let F = {-> execute('let g:x = 1')}` then `call(F, [])`):
+    // the stored Partial must run its body against the caller's live `g:`
+    // map, not the creation-time capture, so global assignments survive.
+    // `bump()` stands in for `execute()`: a builtin the body calls that
+    // assigns a global in the scope it is handed.
+    let lambda = {
+        let expression = Parser::new(b"{-> bump()}").parse().unwrap();
+        let mut host = Host;
+        let regex = Regex;
+        let mut define_scope = Scope::new();
+        define_scope
+            .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+            .unwrap();
+        Evaluator::new(&mut host, &regex)
+            .eval(&expression, &mut define_scope)
+            .unwrap()
+    };
+    assert!(matches!(lambda, Typval::Partial(_)));
+
+    // `:let F = ...` stores the Partial; the variable outlives the defining
+    // scope, and `call(F, [])` dispatches through `Evaluator::invoke`.
+    let mut caller_scope = Scope::new();
+    caller_scope.set(b"F", lambda).unwrap();
+    caller_scope
+        .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+        .unwrap();
+    let call = Parser::new(b"F()").parse().unwrap();
+    let mut call_host = Host;
+    let regex = Regex;
+    let mut caller = Evaluator::new(&mut call_host, &regex);
+    let returned = caller.eval(&call, &mut caller_scope).unwrap();
+    assert_eq!(returned, Typval::Number(1));
+    assert_eq!(
+        caller_scope
+            .get_scoped(ScopeKind::Global, b"count", 0)
+            .unwrap(),
+        &Typval::Number(1)
+    );
+    // A later `g:` read still sees the caller's map, not the capture: the
+    // borrowed global state was handed back after the call.
+    caller_scope
+        .set_scoped(ScopeKind::Global, b"after", 0, Typval::Number(7))
+        .unwrap();
+    assert_eq!(
+        caller_scope
+            .get_scoped(ScopeKind::Global, b"after", 0)
+            .unwrap(),
+        &Typval::Number(7)
+    );
+}
+
+#[test]
+fn lambda_callback_fires_through_fresh_evaluator() {
+    // Probe 2 (`timer_start(20, {-> ...})` then `:sleep`): the callback value
+    // is stored and delivered later through an evaluator that did not create
+    // it — a fresh registry, like the sleep pump's — and the body's global
+    // write must land in the delivery scope.
+    let stored = {
+        let expression = Parser::new(b"{-> bump()}").parse().unwrap();
+        let mut host = Host;
+        let regex = Regex;
+        let mut define_scope = Scope::new();
+        Evaluator::new(&mut host, &regex)
+            .eval(&expression, &mut define_scope)
+            .unwrap()
+        // The defining evaluator (and its registry handle) drops here, the
+        // way the `:sleep` pump outlives the `timer_start()` expression; the
+        // stored Partial keeps the closure alive through the live registries.
+    };
+    let mut delivery_host = Host;
+    let regex = Regex;
+    let mut delivery_scope = Scope::new();
+    delivery_scope
+        .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+        .unwrap();
+    let mut delivery = Evaluator::new(&mut delivery_host, &regex);
+    let fired = delivery
+        .invoke(stored, Vec::new(), &mut delivery_scope)
+        .unwrap();
+    assert_eq!(fired, Typval::Number(1));
+    assert_eq!(
+        delivery_scope
+            .get_scoped(ScopeKind::Global, b"count", 0)
+            .unwrap(),
+        &Typval::Number(1)
+    );
 }
 
 #[test]
