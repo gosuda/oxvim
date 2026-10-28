@@ -1008,65 +1008,6 @@ impl Editor {
             .ok_or(EditorError::UnknownBuffer(resolved))
     }
 
-    /// Places a multicursor at `position` in `buffer` (`mc_add`,
-    /// src/nvim/mcursor.c): the cursor rides the extmark store so it tracks
-    /// later edits and dies with the buffer, and an existing cursor at the
-    /// position is left alone rather than duplicated. The namespace is the
-    /// session-global `nvim.multicursor` id (`mc_ns`): one id shared by
-    /// every buffer, so a buffer store only `ensure`s it locally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EditorError::NoCurrentTabpage`] or
-    /// [`EditorError::UnknownBuffer`] like [`Self::buffer`], plus extmark
-    /// store failures.
-    ///
-    /// Returns whether a cursor was placed.
-    pub fn add_mcursor(
-        &mut self,
-        buffer: BufHandle,
-        position: Position,
-        namespace: NamespaceId,
-    ) -> Result<bool, EditorError> {
-        let state = self.buffer_mut(buffer)?;
-        state.extmarks.ensure_namespace(namespace)?;
-        let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
-        if !state
-            .extmarks
-            .query(namespace, point, point, Some(1))?
-            .is_empty()
-        {
-            return Ok(false);
-        }
-        state
-            .extmarks
-            .set(namespace, None, crate::ExtmarkPlacement::new(point))?;
-        Ok(true)
-    }
-
-    /// Counts multicursors across every live buffer (`mc_count`,
-    /// src/nvim/mcursor.c) under the session-global `nvim.multicursor`
-    /// namespace id.
-    #[must_use]
-    pub fn mcursor_count(&self, namespace: NamespaceId) -> usize {
-        self.buffers()
-            .iter()
-            .filter_map(|handle| self.buffer(*handle).ok())
-            .filter_map(|state| {
-                state
-                    .extmarks
-                    .query(
-                        namespace,
-                        ExtmarkPosition::new(0, 0),
-                        ExtmarkPosition::new(usize::MAX, usize::MAX),
-                        None,
-                    )
-                    .ok()
-            })
-            .map(|marks| marks.len())
-            .sum()
-    }
-
     /// Renames a live buffer and preserves its old name as the alternate buffer.
     ///
     /// # Errors

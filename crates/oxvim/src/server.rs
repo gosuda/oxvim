@@ -2862,7 +2862,6 @@ fn method_is_mutating(method: &str) -> bool {
                 | "nvim_input_mouse"
                 | "nvim_feedkeys"
                 | "nvim_paste"
-                | "nvim_mcursor"
                 | "nvim_put"
                 | "nvim_ui_set_option"
         )
@@ -5740,13 +5739,9 @@ fn dispatch_scoped_nvim_command(
 ) -> Result<(), ApiError> {
     let command = std::str::from_utf8(command.as_bytes())
         .map_err(|_| ApiError::validation("Command must be valid UTF-8"))?;
-    execute_scoped_ex(
-        session,
-        context,
-        ex,
-        nested_ex,
-        |executor| executor.execute_line(session, command),
-    )
+    execute_scoped_ex(session, context, ex, nested_ex, |executor| {
+        executor.execute_line(session, command)
+    })
     .map(|_| ())
 }
 
@@ -5780,13 +5775,9 @@ fn dispatch_scoped_nvim_exec2(
     let source = std::str::from_utf8(source.as_bytes())
         .map_err(|_| ApiError::validation("Command must be valid UTF-8"))?;
     let message_start = session.with_editor(|editor| editor.messages().len());
-    let result = execute_scoped_ex(
-        session,
-        context,
-        ex,
-        nested_ex,
-        |executor| executor.execute_script(session, "<nvim>", source),
-    );
+    let result = execute_scoped_ex(session, context, ex, nested_ex, |executor| {
+        executor.execute_script(session, "<nvim>", source)
+    });
     let captured = result.map(|_| {
         session.with_editor(|editor| {
             editor.messages()[message_start..]
@@ -5863,9 +5854,6 @@ fn with_scoped_editor_api<T>(
     // exec_lua harness never observe an mlua `WrappedFailure` userdata.
     let shim: Function =
         error_shim(lua).map_err(|error| LuaExecError::Runtime(error.to_string()))?;
-    // Shared by reference so every scope closure copies the borrow instead
-    // of the first closure moving the shim away from the rest.
-    let shim = &shim;
     let context = lua
         .app_data_ref::<ApiDispatchContext>()
         .map(|context| context.clone())
@@ -5877,19 +5865,22 @@ fn with_scoped_editor_api<T>(
     // Every scoped Lua chunk/callback is an in-process API call, even when
     // the surrounding request arrived over RPC.
     let _caller = session.enter_internal_call();
-    // The caller's real session drives every scoped binding: scope closures
-    // accept the non-'static `&ApiSession` borrow, and no throwaway session
-    // is ever constructed here.
-    let result = lua.scope(|scope| {
+    // The caller's real session drives every scoped binding through the
+    // owned dispatch context: every installed function is `'static`, so Lua
+    // code that captures `vim.fn`, `vim.call`, or a `vim.api` entry during
+    // the scoped window (a module top level's `local fn = vim.fn`) keeps a
+    // working binding after the originals are restored.
+    let result = (|| -> mlua::Result<Result<T, LuaExecError>> {
+        let getvar_ctx = context.clone();
         vim.set(
             "_getvar",
-            shim.call::<Function>(scope.create_function_mut(
+            shim.call::<Function>(lua.create_function(
                 move |lua, (scope, handle, name): (mlua::LuaString, i64, mlua::LuaString)| {
                     let Ok(scope) = parse_variable_scope(&scope) else {
                         return scoped_failure(lua, "unknown variable scope");
                     };
                     let name = OxStr(name.as_bytes().to_vec());
-                    session.with_editor(|editor| {
+                    getvar_ctx.session().with_editor(|editor| {
                         let values = match variables(editor, scope, handle) {
                             Ok(values) => values,
                             Err(error) => return scoped_failure(lua, error),
@@ -5905,9 +5896,10 @@ fn with_scoped_editor_api<T>(
                 },
             )?)?,
         )?;
+        let setvar_ctx = context.clone();
         vim.set(
             "_setvar",
-            shim.call::<Function>(scope.create_function_mut(
+            shim.call::<Function>(lua.create_function(
                 move |lua,
                       (scope, handle, name, value): (
                     mlua::LuaString,
@@ -5936,7 +5928,7 @@ fn with_scoped_editor_api<T>(
                             Err(error) => return scoped_failure(lua, error),
                         }
                     };
-                    session.with_editor_mut(|editor| {
+                    setvar_ctx.session().with_editor_mut(|editor| {
                         let variables = match variables_mut(editor, scope, handle) {
                             Ok(variables) => variables,
                             Err(error) => return scoped_failure(lua, error),
@@ -5959,13 +5951,14 @@ fn with_scoped_editor_api<T>(
         // Ex code can never be running inside a fast callback.
         let call_ex = ex.clone();
         let call_nested = nested_ex.clone();
+        let call_ctx = context.clone();
         vim.set(
             "call",
-            shim.call::<Function>(scope.create_function_mut(
+            shim.call::<Function>(lua.create_function(
                 move |lua, (name, args): (mlua::LuaString, Variadic<Value>)| {
                     dispatch_scoped_builtin(
                         lua,
-                        session,
+                        call_ctx.session(),
                         &call_ex,
                         &call_nested,
                         &name.as_bytes(),
@@ -5978,16 +5971,26 @@ fn with_scoped_editor_api<T>(
         let fn_nested = nested_ex.clone();
         let fn_table = lua.create_table()?;
         let fn_metatable = lua.create_table()?;
+        let fn_shim = shim.clone();
+        let fn_ctx = context.clone();
         fn_metatable.set(
             "__index",
-            scope.create_function_mut(move |_lua, (_table, name): (Table, mlua::LuaString)| {
+            lua.create_function(move |lua, (_table, name): (Table, mlua::LuaString)| {
                 let ex = fn_ex.clone();
                 let nested_ex = fn_nested.clone();
                 let name = name.as_bytes().to_vec();
-                let native = scope.create_function_mut(move |lua, args: Variadic<Value>| {
-                    dispatch_scoped_builtin(lua, session, &ex, &nested_ex, &name, args.as_slice())
+                let native_ctx = fn_ctx.clone();
+                let native = lua.create_function(move |lua, args: Variadic<Value>| {
+                    dispatch_scoped_builtin(
+                        lua,
+                        native_ctx.session(),
+                        &ex,
+                        &nested_ex,
+                        &name,
+                        args.as_slice(),
+                    )
                 })?;
-                shim.call::<Function>(native)
+                fn_shim.call::<Function>(native)
             })?,
         )?;
         fn_table.set_metatable(Some(fn_metatable))?;
@@ -5999,7 +6002,7 @@ fn with_scoped_editor_api<T>(
                 let command_context = context.clone();
                 api.set(
                     metadata.name,
-                    shim.call::<Function>(scope.create_function_mut(
+                    shim.call::<Function>(lua.create_function(
                         move |lua, args: Variadic<Value>| {
                             let mut converted = Vec::with_capacity(args.len());
                             for value in args.iter() {
@@ -6024,7 +6027,7 @@ fn with_scoped_editor_api<T>(
                                 );
                             };
                             if let Err(error) = dispatch_scoped_nvim_command(
-                                session,
+                                command_context.session(),
                                 &command_context,
                                 &command_ex,
                                 &command_nested,
@@ -6048,7 +6051,7 @@ fn with_scoped_editor_api<T>(
                 let params = metadata.params;
                 api.set(
                     metadata.name,
-                    shim.call::<Function>(scope.create_function_mut(
+                    shim.call::<Function>(lua.create_function(
                         move |lua, args: Variadic<Value>| {
                             let mut converted = Vec::with_capacity(args.len());
                             for value in args.iter() {
@@ -6073,7 +6076,7 @@ fn with_scoped_editor_api<T>(
                                 );
                             };
                             let result = match dispatch_scoped_nvim_exec2(
-                                session,
+                                exec_context.session(),
                                 &exec_context,
                                 &exec_ex,
                                 &exec_nested,
@@ -6098,9 +6101,10 @@ fn with_scoped_editor_api<T>(
             if metadata.name == "nvim_cmd" {
                 let cmd_ex = ex.clone();
                 let nested_ex = nested_ex.clone();
+                let cmd_ctx = context.clone();
                 api.set(
                     metadata.name,
-                    shim.call::<Function>(scope.create_function_mut(
+                    shim.call::<Function>(lua.create_function(
                         move |lua, args: Variadic<Value>| {
                             let mut converted = Vec::with_capacity(args.len());
                             for value in args.iter() {
@@ -6114,7 +6118,11 @@ fn with_scoped_editor_api<T>(
                                 Err(error) => return scoped_failure_multi(lua, error),
                             };
                             let result = match dispatch_scoped_nvim_cmd(
-                                session, &cmd_ex, &nested_ex, cmd, opts,
+                                cmd_ctx.session(),
+                                &cmd_ex,
+                                &nested_ex,
+                                cmd,
+                                opts,
                             ) {
                                 Ok(result) => result,
                                 Err(error) => return scoped_failure_multi(lua, error),
@@ -6134,9 +6142,10 @@ fn with_scoped_editor_api<T>(
                 // it for the server's redraw pass. A well-formed call keeps
                 // the level-15 success even with no eligible UI; a malformed
                 // one fails with the generated dispatcher's validation error.
+                let ui_send_ctx = context.clone();
                 api.set(
                     metadata.name,
-                    shim.call::<Function>(scope.create_function_mut(
+                    shim.call::<Function>(lua.create_function(
                         move |lua, args: Variadic<Value>| {
                             let mut converted = Vec::with_capacity(args.len());
                             for value in args.iter() {
@@ -6145,7 +6154,7 @@ fn with_scoped_editor_api<T>(
                                     Err(error) => return scoped_failure_multi(lua, error),
                                 }
                             }
-                            match queue_ui_send(session, &converted) {
+                            match queue_ui_send(ui_send_ctx.session(), &converted) {
                                 Ok(_) => Ok(MultiValue::new()),
                                 Err(error) => scoped_failure_multi(lua, error),
                             }
@@ -6157,9 +6166,10 @@ fn with_scoped_editor_api<T>(
             let textlock = metadata.textlock;
             let context = context.clone();
             let params = metadata.params;
+            let name = metadata.name;
             api.set(
                 metadata.name,
-                shim.call::<Function>(scope.create_function_mut(
+                shim.call::<Function>(lua.create_function(
                     move |lua, args: Variadic<Value>| {
                         if textlock
                             && let Err(error) = context.ensure_textlock_allows()
@@ -6180,12 +6190,12 @@ fn with_scoped_editor_api<T>(
                             }
                             converted.push(Object::Dict(Dict(Vec::new())));
                         }
-                        let result = if metadata.name == "nvim_echo" {
+                        let result = if name == "nvim_echo" {
                             // `nvim_echo` brackets the frozen handler so the
                             // returned message-id reaches the editor sink.
-                            dispatch_echo(session, dispatch, &converted)
+                            dispatch_echo(context.session(), dispatch, &converted)
                         } else {
-                            dispatch(session, &converted)
+                            dispatch(context.session(), &converted)
                         };
                         let result = match result {
                             Ok(result) => result,
@@ -6196,7 +6206,7 @@ fn with_scoped_editor_api<T>(
                         // Object::Array result is the multi-value marker and
                         // expands; every other function keeps single-value
                         // returns untouched.
-                        if matches!(metadata.name, "nvim_buf_call" | "nvim_win_call") {
+                        if matches!(name, "nvim_buf_call" | "nvim_win_call") {
                             let items: &[Object] = match &result {
                                 Object::Array(items) => items,
                                 _ => std::slice::from_ref(&result),
@@ -6229,7 +6239,7 @@ fn with_scoped_editor_api<T>(
             )?;
         }
         Ok(run())
-    });
+    })();
     let run_result = match result {
         Ok(run_result) => run_result,
         Err(error) => Err(LuaExecError::Runtime(error.to_string())),
