@@ -3917,6 +3917,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "cfirst" | "lfirst" | "crewind" | "lrewind" => {
             access.with_ex_editor(|editor| command_quickfix_next(runtime, editor, command, 0))
         }
+        "cpfile" | "lpfile" => {
+            access.with_ex_editor(|editor| command_quickfix_pfile(runtime, editor, command))
+        }
         "clast" | "llast" => {
             access.with_ex_editor(|editor| command_quickfix_last(runtime, editor, command))
         }
@@ -9678,6 +9681,7 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
             "No write since last change (add ! to override)",
         );
     }
+    let previous_buffer = access.with_ex_editor(|editor| editor.current_buffer());
     let handle = match access.with_ex_editor(|editor| editor.create_buffer(true)) {
         Ok(handle) => handle,
         Err(error) => return error_flow(runtime, "E948", error.to_string()),
@@ -9714,6 +9718,10 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
     {
         return error_flow(runtime, "E948", error.to_string());
     }
+    // A forced abandon discards the old buffer's changes and unloads it
+    // (`do_ecmd` closing the old buffer with `DOBUF_UNLOAD`, ex_cmds.c);
+    // without the bang the E37 gate above already kept it intact.
+    unload_forced_abandon(access, command, previous_buffer, Some(handle));
     // `win_enter` (`window.c:2722`).
     fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], handle)
 }
@@ -14908,6 +14916,61 @@ fn qf_listdo_range(
     Ok((start.max(1), end))
 }
 
+/// Forced-abandon unload for `ex_listdo` switches (`do_ecmd` closing the
+/// old buffer with `DOBUF_UNLOAD`, ex_cmds.c:2595-2601): abandoning a
+/// modified buffer with `!` discards the in-memory changes and unloads it
+/// (a later visit reloads from disk), unless it can hide (`'hidden'`,
+/// `:hide`, `'bufhidden=hide'`) or another window still shows it.
+fn unload_forced_abandon<E: ExEditorAccess>(
+    access: &E,
+    command: &ExCommand,
+    old: Option<BufHandle>,
+    current: Option<BufHandle>,
+) {
+    if !command.bang || old == current {
+        return;
+    }
+    let Some(old) = old else {
+        return;
+    };
+    let should = access.with_ex_editor(|editor| {
+        if !editor
+            .buffer(old)
+            .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        {
+            return false;
+        }
+        if matches!(
+            editor.options().get_global("hidden"),
+            Ok(OptionValue::Boolean(true))
+        ) || command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Hide)
+            || matches!(
+                editor.options().get_buffer(old, "bufhidden"),
+                Ok(OptionValue::String(value)) if value == "hide"
+            )
+        {
+            return false;
+        }
+        let shown = editor
+            .windows()
+            .into_iter()
+            .filter(|window| {
+                editor
+                    .window(*window)
+                    .is_ok_and(|state| state.buffer == old)
+            })
+            .take(1)
+            .count();
+        shown == 0
+    });
+    if should {
+        let _ = access.with_ex_editor(|editor| editor.unload_buffer(old));
+    }
+}
+
 /// `:bufdo` (`ex_listdo` `CMD_bufdo`, ex_cmds2.c:465-723): switch the
 /// current window through each listed buffer in the range and run the
 /// nested command. Unlisted buffers are skipped; a buffer wiped mid-loop
@@ -14981,6 +15044,7 @@ fn command_bufdo<F: FileIO, E: ExEditorAccess>(
             if access.with_ex_editor(|editor| editor.current_buffer()) != Some(target) {
                 break;
             }
+            unload_forced_abandon(access, command, current, Some(target));
         }
         let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
         if !matches!(flow, Flow::Normal) {
@@ -15102,6 +15166,7 @@ fn listdo_quickfix<F: FileIO, E: ExEditorAccess>(
         }) {
             return flow;
         }
+        let previous = access.with_ex_editor(|editor| editor.current_buffer());
         let jumped = access.with_ex_editor(|editor| {
             crate::quickfix::jump(
                 editor,
@@ -15115,6 +15180,8 @@ fn listdo_quickfix<F: FileIO, E: ExEditorAccess>(
         if !jumped {
             break;
         }
+        let landed = access.with_ex_editor(|editor| editor.current_buffer());
+        unload_forced_abandon(access, command, previous, landed);
         let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
         if !matches!(flow, Flow::Normal) {
             return flow;
@@ -23347,6 +23414,66 @@ fn command_quickfix_next<F: FileIO>(
         runtime.scripts.io(),
         quickfix_scope(editor, command.command.name()),
         movement,
+        command.bang,
+    ) {
+        Ok(()) => Flow::Normal,
+        Err(error) => error_flow(runtime, error.code, error.message),
+    }
+}
+
+/// `:cpfile [count]` / `:lpfile [count]`: jump to the first entry of the
+/// previous file's group (`ex_cnext` with `BACKWARD_FILE`, quickfix.c).
+/// Only the file grouping is new here; the jump itself reuses the shared
+/// quickfix jumper so `'winfixbuf'` and list-window handling match `:cc`.
+fn command_quickfix_pfile<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let count = match command.count.map_or(Ok(1), |count| {
+        usize::try_from(count).map_err(|_| error_flow(runtime, "E475", "Invalid argument"))
+    }) {
+        Ok(count) => count,
+        Err(flow) => return flow,
+    };
+    let scope = quickfix_scope(editor, command.command.name());
+    let Some(stack) = scope.stack(editor) else {
+        return error_flow(runtime, "E776", "No location list");
+    };
+    let Some(list) = stack.current() else {
+        return error_flow(runtime, "E42", "No Errors");
+    };
+    if list.items().is_empty() {
+        return error_flow(runtime, "E42", "No Errors");
+    }
+    let mut index = list
+        .idx()
+        .saturating_sub(1)
+        .min(list.items().len() - 1);
+    let mut remaining = count.max(1);
+    loop {
+        let group = list.items()[index].bufnr;
+        while index > 0 && list.items()[index - 1].bufnr == group {
+            index -= 1;
+        }
+        if index == 0 {
+            return error_flow(runtime, "E553", "No more items");
+        }
+        index -= 1;
+        remaining -= 1;
+        if remaining == 0 {
+            let group = list.items()[index].bufnr;
+            while index > 0 && list.items()[index - 1].bufnr == group {
+                index -= 1;
+            }
+            break;
+        }
+    }
+    match crate::quickfix::jump(
+        editor,
+        runtime.scripts.io(),
+        scope,
+        QuickfixMove::Absolute(index),
         command.bang,
     ) {
         Ok(()) => Flow::Normal,
