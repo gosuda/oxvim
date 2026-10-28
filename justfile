@@ -117,59 +117,19 @@ functional: _guard_binary _parser_fixtures _functional_fixtures
       xargs -P 4 -n 1 bash -c 'run_group "$1"' _
     TEST_FILE=test/functional/example_spec.lua bash -c 'run_group example_spec'
 
-# Run upstream Neovim oldtests against oxvim via NVIM_PRG.
+# Run upstream Neovim oldtests against oxvim.
 #
-# The suite deletes whatever $HOME points to. setup.vim sandboxes it with
+# The suite deletes whatever $HOME points to: setup.vim sandboxes it with
 # `let $HOME = .../XfakeHOME`, and runtest.vim cleans up with `rm -rf` over
 # names the shell word-splits, one of which expands `~`. Running with an
 # inherited HOME once destroyed this checkout, ~/.cargo, ~/.rustup and
-# ~/.local, so this recipe allocates its own HOME and never trusts the
-# caller's. It also runs against a copied testdir, because the suite writes
-# into its own directory and .references is read-only. The copy needs the
-# sibling src/ and runtime/ the Makefile reaches for, so they are symlinked.
+# ~/.local. tests/oldtest/run.sh gives every file its own scratch copy of
+# testdir and its own HOME, so no run can reach the caller's home or another
+# run's state. It drives runtest.vim directly instead of the upstream
+# Makefile, whose `%.res` rule needs terminal-buffer rendering that oxvim does
+# not implement yet; that path reports an empty screen and no results.
 oldtest *targets: _guard_binary
-    #!/usr/bin/env bash
-    set -euo pipefail
-    ref="{{justfile_directory()}}/.references/neovim"
-    out="{{justfile_directory()}}/.outline/evidence/oldtest"
-    scratch="$(mktemp -d)"
-    mkdir -p "${scratch:?}/test/old" "${scratch:?}/home" "${out:?}"
-    cp -a "${ref:?}/src" "${scratch:?}/src"
-    ln -s "${ref:?}/runtime" "${scratch:?}/runtime"
-    cp -a "${ref:?}/test/old/testdir" "${scratch:?}/test/old/testdir"
-    rm -f -- "${scratch:?}/test/old/testdir/messages" \
-             "${scratch:?}/test/old/testdir/test.log" \
-             "${scratch:?}/test/old/testdir/test.res"
-    # runnvim.sh:83 guards its `cp -a test.log messages` clobber with a typo
-    # (`test -f message`, no s): without this sentinel any test whose runner
-    # exits nonzero replaces the accumulated census with the errors-only log.
-    touch "${scratch:?}/test/old/testdir/message"
-    set +e
-    HOME="${scratch:?}/home" make -k -C "${scratch:?}/test/old/testdir" \
-        NVIM_PRG="{{justfile_directory()}}/target/release/oxvim" {{targets}}
-    set -e
-    msg="${scratch:?}/test/old/testdir/messages"
-    if [[ ! -s "${msg}" ]]; then
-      echo "oldtest produced no messages file: the harness never reported." >&2
-      cp -a "${scratch:?}/test/old/testdir" "${out:?}/failed-run" 2>/dev/null || true
-      rm -rf -- "${scratch:?}"
-      exit 1
-    fi
-    cp -f "${msg}" "${out:?}/messages"
-    cp -f "${scratch:?}/test/old/testdir/test.log" "${out:?}/test.log" 2>/dev/null || true
-    rm -rf -- "${scratch:?}"
-    # grep exits 1 when it finds nothing, and a clean run has no FAILED line,
-    # so each capture must tolerate no match or `set -e` aborts the summary.
-    executed=$(grep -aoE '^Executed [0-9]+ tests?' "${out:?}/messages" | grep -oE '[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
-    failed=$(grep -aoE '^[0-9]+ FAILED:' "${out:?}/messages" | grep -oE '^[0-9]+' | awk '{s+=$1} END{print s+0}' || true)
-    skipped=$(grep -ac '^SKIPPED' "${out:?}/messages" || true)
-    echo "oldtest: executed=${executed:-0} failed=${failed:-0} skipped=${skipped:-0}"
-    echo "results: ${out:?}/messages"
-    if [[ "${executed:-0}" -eq 0 ]]; then
-      printf '%s\n' "oldtest executed no tests: the harness result is invalid." >&2
-      exit 1
-    fi
-    [[ "${failed:-0}" -eq 0 ]] || exit 1
+    tests/oldtest/run.sh {{targets}}
 
 # Diff oxvim --api-info schema against upstream.
 apidiff: _guard_binary
