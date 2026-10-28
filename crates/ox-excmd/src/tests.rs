@@ -4,7 +4,7 @@ use crate::{
     AddressBase, COMMANDS, CmdlineContext, CmdlineSpecial, CommandFlags, ErrorCode, ExpansionPart,
     ModifierKind, Parser, PreviewMagic, RangeKind, RangeSeparator, ResolvedCommand,
     UserCommandInfo, UserCommandMatch, UserCommandProvider, command_spec, expand_with,
-    parse_preview_pattern, resolve_command, scan_expansions,
+    parse_preview_pattern, resolve_command, scan_expansions, split_vimgrep_args,
 };
 
 fn parse_one(input: &str) -> crate::ExCommand {
