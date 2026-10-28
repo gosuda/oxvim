@@ -908,6 +908,7 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "ounmap",
     "previous",
     "print",
+    "iput",
     "put",
     "qall",
     "quit",

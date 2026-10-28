@@ -3621,6 +3621,597 @@ fn getchar_returns_full_multibyte_modified_character() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Family: channel/terminal builtins (channel.c f_chansend/f_chanclose,
+// f_sockconnect, f_rpcnotify, f_rpcrequest; terminal.c termopen;
+// channel.txt, job_control.txt)
+// ---------------------------------------------------------------------------
+
+/// `jobstart` fixtures share one process-state lock: the reactor-backed
+/// `JobManager` is process-global through the test host.
+#[cfg(unix)]
+fn channel_suite() -> (
+    TestEditorAccess,
+    ExExecutor<MemoryFileIO>,
+    crate::ProcessStateGuard,
+) {
+    let guard = crate::lock_process_state();
+    let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
+    let exec = ExExecutor::with_io(MemoryFileIO::new());
+    (editor, exec, guard)
+}
+
+/// Unique socket path per test: parallel `nextest` workers share `/tmp`.
+#[cfg(unix)]
+fn unique_socket_path(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "oxvim-chan-{tag}-{}-{id}.sock",
+        std::process::id()
+    ));
+    let _ignored = std::fs::remove_file(&path);
+    path
+}
+
+/// Bind a peer listener synchronously so `sockconnect` cannot race it: the
+/// bound socket exists before the script connects.
+#[cfg(unix)]
+fn bind_peer(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("peer binds its socket")
+}
+
+/// Accept one peer, record the first RPC notification, then hang up.
+#[cfg(unix)]
+fn spawn_notify_peer(
+    listener: std::os::unix::net::UnixListener,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<(String, Vec<Object>)>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut decoder = ox_rpc::IncrementalDecoder::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            use std::io::Read as _;
+            let read = stream
+                .read(&mut chunk)
+                .expect("peer reads the notification");
+            if read == 0 {
+                // The test closed its side without notifying: done.
+                return;
+            }
+            let feed = decoder.feed(&chunk[..read]).expect("peer decodes frames");
+            for message in feed {
+                if let ox_rpc::Message::Notification { method, params } = message {
+                    tx.send((method.to_string_lossy().into_owned(), params))
+                        .expect("peer reports the notification");
+                    return;
+                }
+            }
+        }
+    });
+    (handle, rx)
+}
+
+/// Accept one peer, answer the first RPC request with `answer`, then hang up.
+#[cfg(unix)]
+fn spawn_request_peer(
+    listener: std::os::unix::net::UnixListener,
+    answer: Result<Object, ox_types::ApiError>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut decoder = ox_rpc::IncrementalDecoder::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            use std::io::Read as _;
+            use std::io::Write as _;
+            let read = stream.read(&mut chunk).expect("peer reads the request");
+            if read == 0 {
+                // The test went away without asking: done.
+                return;
+            }
+            let feed = decoder.feed(&chunk[..read]).expect("peer decodes frames");
+            for message in feed {
+                if let ox_rpc::Message::Request {
+                    msgid, method: _method, params: _params,
+                } = message
+                {
+                    let frame = ox_rpc::Message::Response {
+                        msgid,
+                        result: match answer {
+                            Ok(ref object) => Ok(object.clone()),
+                            Err(ref error) => Err(error.clone()),
+                        },
+                    }
+                    .encode_bytes()
+                    .expect("peer encodes its reply");
+                    stream.write_all(&frame).expect("peer answers");
+                    stream.flush().expect("peer flushes");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Accept one peer, read exactly `want` bytes, report them.
+#[cfg(unix)]
+fn spawn_byte_peer(
+    listener: std::os::unix::net::UnixListener,
+    want: usize,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut bytes = vec![0_u8; want];
+        {
+            use std::io::Read as _;
+            stream.read_exact(&mut bytes).expect("peer reads raw bytes");
+        }
+        tx.send(bytes).expect("peer reports raw bytes");
+    });
+    (handle, rx)
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_spawns_a_terminal_and_names_it() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid = termopen(['sh', '-c', 'echo term-hi-marker'])\ncall jobwait([g:tid], 5000)\nlet g:tbuf = bufnr('%')\nlet g:tbtype = getbufvar('%', '&buftype')\nlet g:tlines = join(getbufline('%', 1, '$'), \"\\n\")\nlet g:tname = bufname('%')\n",
+    );
+    assert!(global_number(exec.scope(), "tid") > Some(0));
+    assert!(global_number(exec.scope(), "tbuf") > Some(0));
+    // `termopen` marks the current buffer, like `terminal_open` does.
+    assert_eq!(global_string(exec.scope(), "tbtype"), Some("terminal".to_owned()));
+    let lines = global_string(exec.scope(), "tlines").unwrap_or_default();
+    assert!(lines.contains("term-hi-marker"), "terminal output missing: {lines:?}");
+    assert!(
+        global_string(exec.scope(), "tname")
+            .is_some_and(|name| name.starts_with("term://")),
+        "terminal buffer must carry a term:// name"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_a_relative_program_outside_the_process_cwd() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (editor, mut exec, _guard) = channel_suite();
+    // Upstream checks executability with `os_can_exe` against the process
+    // working directory, not the requested `cwd` option, so `./tool` present
+    // only under `{'cwd': ...}` is refused with E475 (`eval/funcs.c`).
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-termrel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock runs forward")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test stages a cwd");
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "#!/bin/sh\necho rel-marker\n").expect("test stages a tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+        .expect("tool is executable");
+    let error = exec
+        .execute_script(
+            &editor,
+            "<test>",
+            &format!(
+                "let g:tid = termopen(['./tool'], {{'cwd': '{}'}})\n",
+                dir.display()
+            ),
+        )
+        .unwrap_err();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        error_code(&error),
+        "E475",
+        "a relative program outside the process cwd must be refused"
+    );
+}
+
+/// With the program resolvable from the process working directory, upstream
+/// stores the absolute form in the `term://` name (`save_abs_path`), not the
+/// word as typed.
+#[cfg(unix)]
+#[test]
+fn termopen_absolutizes_a_relative_program_the_process_cwd_resolves() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (editor, mut exec, _guard) = channel_suite();
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-termabs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock runs forward")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test stages a cwd");
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "#!/bin/sh\necho abs-marker\n").expect("test stages a tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+        .expect("tool is executable");
+    let previous = std::env::current_dir().expect("cwd is readable");
+    std::env::set_current_dir(&dir).expect("test enters the staged cwd");
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid = termopen(['./tool'], {'cwd': getcwd()})\ncall jobwait([g:tid], 5000)\nlet g:absname = bufname('%')\n",
+    );
+    std::env::set_current_dir(&previous).expect("test restores the cwd");
+    let name = global_string(exec.scope(), "absname").unwrap_or_default();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        name.ends_with(&format!(":{}/tool", dir.display())),
+        "a resolvable relative program must be stored absolute, got {name:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_a_busy_terminal_buffer() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid1 = termopen(['sh', '-c', 'sleep 5'])\nlet g:tid2 = termopen(['sh', '-c', 'echo late'])\ncall jobstop(g:tid1)\n",
+    );
+    assert!(global_number(exec.scope(), "tid1") > Some(0));
+    // The current buffer already runs a terminal job: no double attach.
+    assert_eq!(global_number(exec.scope(), "tid2"), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_bad_arguments() {
+    let (editor, mut exec, _guard) = channel_suite();
+    for (line, code) in [
+        ("call termopen(123)", "E475"),
+        ("call termopen()", "E119"),
+        ("call termopen(['true'], [1])", "E475"),
+        (
+            "call termopen(['true'], {'cwd': '/no/such/oxvim-dir'})",
+            "E475",
+        ),
+        (
+            "call jobstart(['cat'], {'pty': v:true, 'rpc': v:true})",
+            "E475",
+        ),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+        if line.contains("[1]") {
+            assert!(
+                error.to_string().contains("expected dictionary"),
+                "{line}: got {error}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn jobclose_defaults_to_stdin_and_chanclose_closes_all() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:closed = jobclose(g:job)\nlet g:exit = jobwait([g:job], 5000)[0]\nlet g:job2 = jobstart(['cat'])\nlet g:closed2 = chanclose(g:job2)\nlet g:again = chanclose(g:job2)\n",
+    );
+    assert_eq!(global_number(exec.scope(), "closed"), Some(1));
+    // Closing stdin gives `cat` its EOF, so it exits cleanly.
+    assert_eq!(global_number(exec.scope(), "exit"), Some(0));
+    assert_eq!(global_number(exec.scope(), "closed2"), Some(1));
+    assert_eq!(
+        global_number(exec.scope(), "again"),
+        Some(1),
+        "upstream allows double close"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chanclose_rejects_unknown_channels_and_streams() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:rj = jobstart(['cat'], {'rpc': v:true})\n",
+    );
+    for (line, code, message) in [
+        ("call chanclose(999998)", "E900", "Invalid channel id"),
+        ("call chanclose(g:job, 'bogus')", "E906", "Invalid channel stream"),
+        (
+            "call chanclose(g:job, 'rpc')",
+            "E906",
+            "invalid stream for channel",
+        ),
+        ("call jobclose('x')", "E475", "Invalid argument"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+        assert!(error.to_string().contains(message), "{line}: got {error}");
+    }
+    // `jobclose` is the obsolete name for `chanclose`: an omitted stream
+    // closes every part, even on an RPC job.
+    script(
+        &mut exec,
+        &editor,
+        "let g:rk = jobstart(['cat'], {'rpc': v:true})\nlet g:job_closed = jobclose(g:rk)\n",
+    );
+    assert_eq!(global_number(exec.scope(), "job_closed"), Some(1));
+    // Closing the RPC half answers 1 and retires the RPC channel.
+    script(&mut exec, &editor, "let g:rpc_closed = chanclose(g:rj, 'rpc')\n");
+    assert_eq!(global_number(exec.scope(), "rpc_closed"), Some(1));
+    let error = exec.execute_line(&editor, "call rpcrequest(g:rj, 'm')").unwrap_err();
+    assert_eq!(error_code(&error), "E475");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_notify_reaches_a_socket_peer() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("notify");
+    let (peer, rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:sent = rpcnotify(g:sock, 'hello', 1, 2)\n",
+            path.display()
+        ),
+    );
+    assert!(global_number(exec.scope(), "sock") > Some(0));
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+    let (method, params) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("peer receives the notification");
+    assert_eq!(method, "hello");
+    assert_eq!(
+        params,
+        vec![Object::Integer(1), Object::Integer(2)],
+        "notification params must cross the socket untouched"
+    );
+    peer.join().expect("peer exits after one notification");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_blocks_for_a_socket_reply() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("request");
+    let peer = spawn_request_peer(bind_peer(&path), Ok(Object::Integer(3)));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:answer = rpcrequest(g:sock, 'sum', 1, 2)\n",
+            path.display()
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "answer"), Some(3));
+    peer.join().expect("peer exits after answering");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_reports_remote_errors() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("remote-err");
+    let peer = spawn_request_peer(
+        bind_peer(&path),
+        Err(ox_types::ApiError::Exception("boom".to_owned())),
+    );
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\n",
+            path.display()
+        ),
+    );
+    let error = exec
+        .execute_line(&editor, "let g:bad = rpcrequest(g:sock, 'nope')")
+        .unwrap_err();
+    assert_eq!(error_code(&error), "E605");
+    assert!(error.to_string().contains("boom"), "got {error}");
+    peer.join().expect("peer exits after answering");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_answers_over_a_job_channel() {
+    // No msgpack helper ships with the shell, so the peer is a canned byte
+    // exchange: the request `[0,1,"ping",[]]` is exactly 9 bytes, and the
+    // reply `[1,1,nil,"pong"]` is written back verbatim.
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:rj = jobstart(['sh', '-c', 'head -c 9 >/dev/null; printf \"\\224\\001\\001\\300\\244pong\"'], {'rpc': v:true})\nlet g:pong = rpcrequest(g:rj, 'ping')\n",
+    );
+    assert_eq!(global_string(exec.scope(), "pong"), Some("pong".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_notify_writes_to_a_job_channel() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:rj = jobstart(['cat'], {'rpc': v:true})\nlet g:sent = rpcnotify(g:rj, 'hello')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_broadcast_reaches_every_open_channel() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("broadcast");
+    let (peer, rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:sent = rpcnotify(0, 'leaving')\n",
+            path.display()
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+    let (method, _) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("peer receives the broadcast");
+    assert_eq!(method, "leaving");
+    peer.join().expect("peer exits after one notification");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_rejects_bad_channels_and_methods() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:sock = sockconnect('pipe', '/no/such/oxvim-test.sock')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "sock"), Some(0));
+    for (line, code) in [
+        ("call rpcnotify('x', 'e')", "E475"),
+        ("call rpcnotify(-1, 'e')", "E475"),
+        ("call rpcnotify(g:job, 'e')", "E475"),
+        ("call rpcnotify(999998, 'e')", "E475"),
+        ("call rpcrequest(g:job, 'm')", "E475"),
+        ("call rpcrequest(999998, 'm')", "E475"),
+        ("call rpcrequest(g:job)", "E475"),
+        ("call rpcnotify(g:job)", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // A non-string event/method is E475 even on a live channel.
+    let path = unique_socket_path("rpc-types");
+    let (types_peer, _rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:rsock = sockconnect('pipe', '{}', {{'rpc': v:true}})\n",
+            path.display()
+        ),
+    );
+    for (line, code) in [
+        ("call rpcnotify(g:rsock, 42)", "E475"),
+        ("call rpcrequest(g:rsock, 42)", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // Closing the RPC half of an RPC socket shuts it down, like `chanclose()`.
+    script(&mut exec, &editor, "let g:rsock_rpc = chanclose(g:rsock, 'rpc')\n");
+    assert_eq!(global_number(exec.scope(), "rsock_rpc"), Some(1));
+    types_peer.join().expect("types peer exits on EOF");
+}
+
+#[cfg(unix)]
+#[test]
+fn sockconnect_opens_pipes_and_tcp() {
+    let (editor, mut exec, _guard) = channel_suite();
+    // Raw pipe socket: `chansend` writes bytes the peer reads.
+    let pipe_path = unique_socket_path("bytes");
+    let (byte_peer, bytes) = spawn_byte_peer(bind_peer(&pipe_path), 5);
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:raw = sockconnect('pipe', '{}')\nlet g:wrote = chansend(g:raw, 'hello')\nlet g:raw_closed = chanclose(g:raw)\n",
+            pipe_path.display()
+        ),
+    );
+    assert!(global_number(exec.scope(), "raw") > Some(0));
+    assert_eq!(global_number(exec.scope(), "wrote"), Some(1));
+    assert_eq!(
+        bytes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("peer reads raw bytes"),
+        b"hello".to_vec()
+    );
+    byte_peer.join().expect("byte peer exits");
+    assert_eq!(global_number(exec.scope(), "raw_closed"), Some(1));
+    // Raw TCP socket over loopback.
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = tcp.local_addr().expect("loopback port").port();
+    let tcp_peer = std::thread::spawn(move || {
+        let (mut stream, _) = tcp.accept().expect("accept tcp");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("tcp read timeout");
+        let mut bytes = [0_u8; 3];
+        {
+            use std::io::Read as _;
+            stream.read_exact(&mut bytes).expect("read tcp bytes");
+        }
+        bytes
+    });
+    script(
+        &mut exec,
+        &editor,
+        &format!("let g:tcp = sockconnect('tcp', '127.0.0.1:{port}')\nlet g:twrote = chansend(g:tcp, 'bye')\n"),
+    );
+    assert!(global_number(exec.scope(), "tcp") > Some(0));
+    assert_eq!(global_number(exec.scope(), "twrote"), Some(1));
+    assert_eq!(
+        tcp_peer.join().expect("tcp peer exits"),
+        *b"bye",
+        "tcp bytes must cross the socket"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sockconnect_rejects_bad_modes_and_reports_refusals() {
+    let (editor, mut exec, _guard) = channel_suite();
+    for (line, code) in [
+        ("call sockconnect('bogus', 'x')", "E475"),
+        ("call sockconnect('pipe')", "E475"),
+        ("call sockconnect(42, 'x')", "E475"),
+        ("call sockconnect('pipe', 'x', [1])", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // Refused peers answer 0 instead of raising.
+    script(
+        &mut exec,
+        &editor,
+        "let g:refused_pipe = sockconnect('pipe', '/no/such/oxvim-test.sock')\nlet g:refused_tcp = sockconnect('tcp', '127.0.0.1:1')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "refused_pipe"), Some(0));
+    assert_eq!(global_number(exec.scope(), "refused_tcp"), Some(0));
+}
+
 /// Sourcing is not `:try`: upstream leaves `trylevel` alone in `do_source`,
 /// so an error inside a sourced script displays and `did_emsg` aborts the
 /// rest of the file — verified against the reference binary, where the

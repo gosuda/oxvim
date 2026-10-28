@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsString;
-#[cfg(not(unix))]
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(not(unix))]
 use std::process::ChildStdin;
@@ -12,7 +14,8 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ox_types::{DictRef, OxStr, Typval};
+use ox_rpc::{IncrementalDecoder, Message, MsgidCounter};
+use ox_types::{ApiError, DictRef, Object, OxStr, Typval};
 #[cfg(unix)]
 use ox_uv::NetEvent;
 use ox_uv::UvLoop;
@@ -107,6 +110,137 @@ struct StreamState {
     eof: bool,
 }
 
+/// Cap on bytes held for an unconsumed RPC reply (8 MiB): a peer that floods
+/// a channel nobody reads must not exhaust editor memory. Crossing it closes
+/// the RPC half instead of growing further.
+const MAX_RPC_BUFFER: usize = 8 << 20;
+
+/// Cap on replies stashed while waiting for a different `msgid`: a peer that
+/// answers anything but the awaited call must not grow the stash without
+/// bound. Crossing it fails the wait and drops the stash.
+const MAX_RPC_STASH: usize = 1024;
+
+/// One closable part of a channel (`ChannelPart`, `channel_defs.h`), as
+/// `chanclose(id[, stream])` names it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPart {
+    /// `"stdin"`.
+    Stdin,
+    /// `"stdout"`.
+    Stdout,
+    /// `"stderr"`.
+    Stderr,
+    /// `"rpc"`.
+    Rpc,
+    /// Omitted stream: every part.
+    All,
+}
+
+/// Failure of [`JobManager::close_job_stream`], mirroring the `const char
+/// *error` upstream `channel_close` reports: `e_invchan` for an unknown
+/// channel, `e_invstream` for a stream the channel does not have, and
+/// `e_invstreamrpc` for stdin/stdout of an RPC channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ChannelCloseError {
+    /// `E900: Invalid channel id`.
+    #[error("E900: Invalid channel id")]
+    UnknownChannel,
+    /// `E906: invalid stream for channel`.
+    #[error("E906: invalid stream for channel")]
+    InvalidStream,
+    /// `E906: invalid stream for rpc channel, use 'rpc'`.
+    #[error("E906: invalid stream for rpc channel, use 'rpc'")]
+    InvalidRpcStream,
+}
+
+/// Failure of [`JobManager::rpc_call`], typed so callers map variants to
+/// Vimscript errors without parsing message text.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RpcCallError {
+    /// The channel does not exist or does not carry msgpack-rpc.
+    #[error("E900: Invalid channel id")]
+    NotRpc,
+    /// The request frame could not be encoded.
+    #[error("E475: Invalid argument: {0}")]
+    Encode(String),
+    /// The frame could not be written to the transport.
+    #[error("E900: Invalid channel id ({0})")]
+    Transport(String),
+    /// The peer exited or the socket closed before answering.
+    #[error("E900: Invalid channel id (channel closed while waiting for reply)")]
+    PeerGone,
+    /// No reply arrived within the blocking budget.
+    #[error("E900: Invalid channel id (timed out waiting for rpc reply)")]
+    Timeout,
+    /// The peer answered with an error: the remote message text.
+    #[error("{0}")]
+    Remote(String),
+}
+
+/// One connected socket channel (`channel_connect`, `channel.c`), owned by
+/// [`JobManager`] next to its jobs under the same channel-id space.
+struct SocketChannel {
+    /// Whether the socket carries msgpack-rpc (`sockconnect(..., {'rpc': 1})`).
+    rpc: bool,
+    /// The peer went away or the editor closed it.
+    closed: bool,
+    /// The connected transport.
+    stream: SocketStream,
+    /// Staged decoder for replies split across reads.
+    decoder: IncrementalDecoder,
+    /// Bytes read from the transport but not yet fed to [`SocketChannel::decoder`].
+    read_buf: Vec<u8>,
+    /// Next outbound request id (upstream `rpc->next_request_id`, seeded 1).
+    msgid: MsgidCounter,
+    /// Replies that arrived while waiting for a different `msgid`.
+    stash: VecDeque<(u32, Result<Object, ApiError>)>,
+}
+
+/// A connected socket transport behind [`SocketChannel`].
+pub enum SocketStream {
+    /// Unix-domain socket (`sockconnect('pipe', path)`).
+    #[cfg(unix)]
+    Pipe(UnixStream),
+    /// TCP connection (`sockconnect('tcp', 'host:port')`).
+    Tcp(TcpStream),
+}
+
+impl SocketChannel {
+    /// Write the whole frame or report the transport error.
+    fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
+        match &mut self.stream {
+            #[cfg(unix)]
+            SocketStream::Pipe(stream) => stream.write_all(data).map_err(|error| error.to_string()),
+            SocketStream::Tcp(stream) => stream.write_all(data).map_err(|error| error.to_string()),
+        }
+    }
+
+    /// One bounded read; an empty read or any error but a timeout ends the
+    /// channel, the timeout only means no reply is ready yet.
+    fn read_chunk(&mut self, chunk: &mut [u8]) -> std::io::Result<usize> {
+        match &mut self.stream {
+            #[cfg(unix)]
+            SocketStream::Pipe(stream) => stream.read(chunk),
+            SocketStream::Tcp(stream) => stream.read(chunk),
+        }
+    }
+
+    /// Mark the channel closed and release the descriptor promptly, the way
+    /// `rstream_may_close` does for sockets.
+    fn shutdown(&mut self) {
+        self.closed = true;
+        match &mut self.stream {
+            #[cfg(unix)]
+            SocketStream::Pipe(stream) => {
+                let _ignored = stream.shutdown(std::net::Shutdown::Both);
+            }
+            SocketStream::Tcp(stream) => {
+                let _ignored = stream.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 enum JobInput {
     Pipe(ProcessPipe),
@@ -147,6 +281,21 @@ struct Job {
     stderr: StreamState,
     status: i64,
     rpc: bool,
+    /// The RPC half was closed (`chanclose(id, 'rpc')`): the job still runs
+    /// but no longer answers `rpcnotify`/`rpcrequest` (upstream `rpc_close`).
+    rpc_closed: bool,
+    /// Raw stdout bytes captured for the RPC request loop. `drain_raw` appends
+    /// here for every `rpc` job because unbuffered, callback-less output would
+    /// otherwise be discarded before `rpcrequest` could decode its reply.
+    rpc_buffer: Vec<u8>,
+    /// Staged RPC decoder for the request loop; drained together with
+    /// [`Job::rpc_buffer`] so a response split across polls still assembles.
+    rpc_decoder: IncrementalDecoder,
+    /// Replies that arrived while waiting for a different `msgid`, in wire
+    /// order; the next `rpcrequest` consults them before blocking.
+    rpc_stash: VecDeque<(u32, Result<Object, ApiError>)>,
+    /// Next outbound request id (upstream `rpc->next_request_id`, seeded 1).
+    rpc_msgid: MsgidCounter,
     /// PTY slave path the child is attached to, when spawned through a
     /// pseudoterminal. Mirrors upstream's `channel.pty` string populated for
     /// `jobstart(..., {'pty': v:true})` (`eval/funcs.c` `f_jobstart` →
@@ -184,6 +333,7 @@ impl Job {
 pub struct JobManager {
     loop_: UvLoop,
     jobs: HashMap<u64, Job>,
+    sockets: HashMap<u64, SocketChannel>,
     raw: Arc<Mutex<VecDeque<RawEvent>>>,
     /// Events polled on a path with no callback host; the next poll re-enters
     /// them (`channel.c` defers callbacks onto the main loop instead of
@@ -207,6 +357,7 @@ impl JobManager {
         Ok(Self {
             loop_,
             jobs: HashMap::new(),
+            sockets: HashMap::new(),
             raw: Arc::new(Mutex::new(VecDeque::new())),
             deferred: Vec::new(),
             lua_flush_pending: false,
@@ -358,6 +509,11 @@ impl JobManager {
                 },
                 status: -1,
                 rpc: options.rpc,
+                rpc_closed: false,
+                rpc_buffer: Vec::new(),
+                rpc_decoder: IncrementalDecoder::new(),
+                rpc_stash: VecDeque::new(),
+                rpc_msgid: MsgidCounter::new(),
                 pty_slave,
                 terminal_buffer: options.terminal_buffer,
                 pty_output: Vec::new(),
@@ -543,10 +699,12 @@ impl JobManager {
                 // queued write has flushed, which the child reads as EOF.
                 drop(sender);
             }
-            // A PTY has no separate write side to shut: closing the master is
-            // the child's hangup, which `stop`/teardown already performs.
+            // A PTY's master is also its stdin: deregister reads, then
+            // dropping the handle hangs the child up.
             #[cfg(unix)]
-            JobInput::Pty(_) => {}
+            JobInput::Pty(mut master) => {
+                let _ignored = master.read_stop(&mut self.loop_);
+            }
         }
         true
     }
@@ -582,9 +740,398 @@ impl JobManager {
     }
 
     #[must_use]
-    /// Report whether a registered job channel carries msgpack-rpc.
+    /// Report whether a registered channel carries msgpack-rpc: an `rpc` job
+    /// or an `rpc` socket.
     pub fn is_rpc(&self, id: u64) -> bool {
         self.jobs.get(&id).is_some_and(|job| job.rpc)
+            || self.sockets.get(&id).is_some_and(|socket| socket.rpc)
+    }
+
+    /// Every open RPC channel id, ascending: the `rpcnotify(0, ...)`
+    /// broadcast audience.
+    #[must_use]
+    pub fn rpc_channel_ids(&self) -> Vec<u64> {
+        let mut ids = self
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.rpc && !job.rpc_closed)
+            .map(|(id, _)| *id)
+            .chain(
+                self.sockets
+                    .iter()
+                    .filter(|(_, socket)| socket.rpc && !socket.closed)
+                    .map(|(id, _)| *id),
+            )
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// Whether `id` names the live RPC half of a channel: an `rpc` job whose
+    /// RPC side is still open, or an `rpc` socket that is still connected.
+    #[must_use]
+    pub fn rpc_channel_open(&self, id: u64) -> bool {
+        if let Some(job) = self.jobs.get(&id) {
+            return job.rpc && !job.rpc_closed;
+        }
+        self.sockets
+            .get(&id)
+            .is_some_and(|socket| socket.rpc && !socket.closed)
+    }
+
+    /// Close one job stream with upstream `channel_close` semantics
+    /// (`channel.c:89-201`): closing stdin on an `rpc` job is rejected with
+    /// `e_invstreamrpc` (only the `rpc` part may close it), closing `rpc` on
+    /// a job that is not an RPC channel is rejected with `e_invstream`, and
+    /// closing a stream of a socket channel is rejected the same way (a
+    /// socket has a single stream). Double closes succeed, and an unknown id
+    /// reports `e_invchan`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChannelCloseError`] for an unknown channel or a stream the
+    /// channel does not have.
+    pub fn close_job_stream(
+        &mut self,
+        id: u64,
+        part: ChannelPart,
+    ) -> Result<bool, ChannelCloseError> {
+        if let Some(socket) = self.sockets.get_mut(&id) {
+            // A socket has a single stream: closing all of it shuts it down,
+            // and closing `rpc` does the same on an RPC socket (`channel.c`
+            // `close_main` is set for `kChannelPartRpc` on every stream
+            // type — but only an RPC channel has that half, otherwise it is
+            // `e_invstream`). Anything else names no stream at all.
+            return match part {
+                ChannelPart::All => {
+                    socket.shutdown();
+                    Ok(true)
+                }
+                ChannelPart::Rpc if socket.rpc => {
+                    socket.shutdown();
+                    Ok(true)
+                }
+                _ => Err(ChannelCloseError::InvalidStream),
+            };
+        }
+        let (is_rpc_open, is_pty) = match self.jobs.get(&id) {
+            Some(job) => (job.rpc && !job.rpc_closed, job.pty),
+            None => return Err(ChannelCloseError::UnknownChannel),
+        };
+        match part {
+            ChannelPart::Stdin | ChannelPart::Stdout if is_rpc_open => {
+                return Err(ChannelCloseError::InvalidRpcStream);
+            }
+            ChannelPart::Rpc => {
+                let is_rpc = self.jobs.get(&id).is_some_and(|job| job.rpc);
+                if !is_rpc {
+                    return Err(ChannelCloseError::InvalidStream);
+                }
+            }
+            _ => {}
+        }
+        // Reuse the stdin pump drain for pipe inputs: queued writes flush
+        // before the descriptor closes, so the child reads them before EOF.
+        let close_stdin = matches!(
+            part,
+            ChannelPart::Stdin | ChannelPart::Rpc | ChannelPart::All
+        );
+        if close_stdin {
+            self.close_input(id);
+        }
+        // A PTY close hangs the child up, the way closing the master does
+        // upstream (`pty_proc_close_master`).
+        #[cfg(unix)]
+        if is_pty && !matches!(part, ChannelPart::Stdout | ChannelPart::Stderr) {
+            if let Some(job) = self.jobs.get(&id) {
+                let _ignored = job.process.kill(Some(1));
+            }
+        }
+        // Field-split borrows: the pipes close against the loop while the job
+        // entry itself is only flagged, never removed (upstream allows double
+        // close and the exit status stays answerable).
+        let JobManager { loop_, jobs, .. } = self;
+        let Some(job) = jobs.get_mut(&id) else {
+            return Err(ChannelCloseError::UnknownChannel);
+        };
+        match part {
+            ChannelPart::Stdin => {}
+            ChannelPart::Rpc => {
+                job.rpc_closed = true;
+            }
+            ChannelPart::Stdout => {
+                Self::close_pipe(loop_, job.stdout_pipe.take());
+                // No more output will arrive: the stream counts as drained
+                // without an EOF event.
+                job.stdout.eof = true;
+            }
+            ChannelPart::Stderr => {
+                Self::close_pipe(loop_, job.stderr_pipe.take());
+                job.stderr.eof = true;
+            }
+            ChannelPart::All => {
+                Self::close_pipe(loop_, job.stdout_pipe.take());
+                Self::close_pipe(loop_, job.stderr_pipe.take());
+                job.stdout.eof = true;
+                job.stderr.eof = true;
+                if job.rpc {
+                    job.rpc_closed = true;
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Deregister one stdio pump handle. The job-table entry stays: upstream
+    /// allows double close, and the exit status must remain answerable.
+    fn close_pipe(loop_: &mut UvLoop, pipe: Option<StdioPump>) {
+        if let Some(pipe) = pipe {
+            #[cfg(unix)]
+            let _ignored = ox_uv::Handle::close(&pipe, loop_);
+            #[cfg(not(unix))]
+            let _ignored = (pipe, loop_);
+        }
+    }
+
+    /// Register a connected socket channel under the already-allocated id.
+    pub fn add_socket(&mut self, id: u64, stream: SocketStream, rpc: bool) {
+        self.sockets.insert(
+            id,
+            SocketChannel {
+                rpc,
+                closed: false,
+                stream,
+                decoder: IncrementalDecoder::new(),
+                read_buf: Vec::new(),
+                msgid: MsgidCounter::new(),
+                stash: VecDeque::new(),
+            },
+        );
+    }
+
+    /// Write raw bytes to a socket channel, as `chansend` does for jobs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the transport write error; a missing or closed socket reports
+    /// `Ok(false)` like a missing job writer does.
+    pub fn socket_send(&mut self, id: u64, data: &[u8]) -> Result<bool, String> {
+        let Some(socket) = self.sockets.get_mut(&id) else {
+            return Ok(false);
+        };
+        if socket.closed {
+            return Ok(false);
+        }
+        socket.write_all(data).map(|()| true)
+    }
+
+    /// Next outbound request id for the channel (upstream
+    /// `rpc->next_request_id`, seeded 1). A closed RPC half issues no ids:
+    /// `chanclose(id, 'rpc')` retires the channel for `rpcrequest`.
+    pub fn rpc_next_msgid(&mut self, id: u64) -> Option<u32> {
+        if let Some(job) = self.jobs.get_mut(&id) {
+            return (job.rpc && !job.rpc_closed).then(|| job.rpc_msgid.next_id());
+        }
+        self.sockets.get_mut(&id).and_then(|socket| {
+            (socket.rpc && !socket.closed).then(|| socket.msgid.next_id())
+        })
+    }
+
+    /// Whether `id` names a `sockconnect` socket channel rather than a job.
+    #[must_use]
+    pub fn is_socket_channel(&self, id: u64) -> bool {
+        self.sockets.contains_key(&id)
+    }
+
+    /// Send an RPC notification frame over a job or socket channel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encode or transport error; a missing or non-RPC channel
+    /// reports `Ok(false)`.
+    pub fn rpc_notify(
+        &mut self,
+        id: u64,
+        method: &OxStr,
+        params: Vec<Object>,
+    ) -> Result<bool, String> {
+        let frame = Message::Notification {
+            method: method.clone(),
+            params,
+        }
+        .encode_bytes()
+        .map_err(|error| error.to_string())?;
+        if self.jobs.contains_key(&id) {
+            if !self.rpc_channel_open(id) {
+                return Ok(false);
+            }
+            return self.send(id, frame);
+        }
+        self.socket_send(id, &frame)
+    }
+
+    /// Send an RPC request and block until its reply arrives (upstream
+    /// `rpc_send_call`, which waits on the main loop). Responses for other
+    /// `msgid`s are stashed for the next call. Callback events that surface
+    /// while waiting are re-deferred, never delivered on this stack.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encode, transport, decode, or timeout error, or the
+    /// channel closing before its reply arrives.
+    pub fn rpc_call(
+        &mut self,
+        id: u64,
+        method: &OxStr,
+        params: Vec<Object>,
+        timeout: Duration,
+    ) -> Result<Object, RpcCallError> {
+        let Some(msgid) = self.rpc_next_msgid(id) else {
+            return Err(RpcCallError::NotRpc);
+        };
+        let frame = Message::Request {
+            msgid,
+            method: method.clone(),
+            params,
+        }
+        .encode_bytes()
+        .map_err(|error| RpcCallError::Encode(error.to_string()))?;
+        // A closed write side (`chanclose(id, 'stdin')`) answers `Ok(false)`
+        // instead of erroring: the peer is gone, so fail fast rather than
+        // waiting out the deadline for a reply that cannot arrive.
+        let sent = if self.jobs.contains_key(&id) {
+            self.send(id, frame)
+                .map_err(RpcCallError::Transport)?
+        } else {
+            self.socket_send(id, &frame)
+                .map_err(RpcCallError::Transport)?
+        };
+        if !sent {
+            return Err(RpcCallError::PeerGone);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(reply) = self.take_rpc_reply(id, msgid) {
+                return reply;
+            }
+            if self.rpc_peer_gone(id) {
+                return Err(RpcCallError::PeerGone);
+            }
+            if Instant::now() >= deadline {
+                return Err(RpcCallError::Timeout);
+            }
+            self.pump_rpc(id).map_err(RpcCallError::Transport)?;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Pop the reply for `msgid` off the channel, decoding newly arrived bytes
+    /// first. Non-matching responses are stashed in wire order.
+    fn take_rpc_reply(
+        &mut self,
+        id: u64,
+        msgid: u32,
+    ) -> Option<Result<Object, RpcCallError>> {
+        let (stashed, decoder, buffered) = if let Some(job) = self.jobs.get_mut(&id) {
+            (
+                &mut job.rpc_stash,
+                &mut job.rpc_decoder,
+                std::mem::take(&mut job.rpc_buffer),
+            )
+        } else if let Some(socket) = self.sockets.get_mut(&id) {
+            (
+                &mut socket.stash,
+                &mut socket.decoder,
+                std::mem::take(&mut socket.read_buf),
+            )
+        } else {
+            return Some(Err(RpcCallError::NotRpc));
+        };
+        let feed = decoder.feed(&buffered);
+        let (messages, decode_error) = match feed {
+            Ok(messages) => (messages, None),
+            Err(error) => (error.messages, Some(error.error.to_string())),
+        };
+        for message in messages {
+            if let Message::Response {
+                msgid: got,
+                result,
+            } = message
+            {
+                            if got == msgid {
+                return Some(result.map_err(|error| RpcCallError::Remote(error.to_string())));
+            }
+            if stashed.len() >= MAX_RPC_STASH {
+                stashed.clear();
+                return Some(Err(RpcCallError::Transport(
+                    "too many pending rpc responses".to_owned(),
+                )));
+            }
+            stashed.push_back((got, result));
+            }
+            // Requests and notifications addressed at us have no host on
+            // this stack; upstream dispatches them on the main loop, so
+            // they are dropped here rather than answered wrongly.
+        }
+        if let Some(error) = decode_error {
+            return Some(Err(RpcCallError::Transport(error)));
+        }
+        if let Some(position) = stashed.iter().position(|(got, _)| *got == msgid) {
+            return stashed.remove(position).map(|(_, reply)| {
+                reply.map_err(|error| RpcCallError::Remote(error.to_string()))
+            });
+        }
+        None
+    }
+
+    /// Whether the RPC peer is gone: the job exited and its output drained,
+    /// or the socket closed or errored.
+    fn rpc_peer_gone(&mut self, id: u64) -> bool {
+        if let Some(job) = self.jobs.get(&id) {
+            return job.status >= 0 && job.drained();
+        }
+        self.sockets.get(&id).is_none_or(|socket| socket.closed)
+    }
+
+    /// Pump one transport turn so a pending reply can arrive: one non-blocking
+    /// reactor turn for jobs (re-deferring callback events), one
+    /// timeout-bounded read for sockets.
+    fn pump_rpc(&mut self, id: u64) -> Result<(), String> {
+        if self.jobs.contains_key(&id) {
+            let events = self.poll()?;
+            self.defer_events(events);
+            return Ok(());
+        }
+        let Some(socket) = self.sockets.get_mut(&id) else {
+            return Ok(());
+        };
+        if socket.closed {
+            return Ok(());
+        }
+        let mut chunk = [0_u8; 8192];
+        match socket.read_chunk(&mut chunk) {
+            Ok(0) => {
+                socket.shutdown();
+            }
+            Ok(read) => {
+                if socket.read_buf.len() + read > MAX_RPC_BUFFER {
+                    socket.read_buf.clear();
+                    socket.shutdown();
+                } else {
+                    socket.read_buf.extend_from_slice(&chunk[..read]);
+                }
+            }
+            Err(error) => {
+                // A read timeout only means no reply yet; anything else ends
+                // the channel the way an EOF does.
+                if error.kind() != std::io::ErrorKind::TimedOut
+                    && error.kind() != std::io::ErrorKind::WouldBlock
+                {
+                    socket.shutdown();
+                }
+            }
+        }
+        Ok(())
     }
 
     /// PTY slave path behind a job channel that was spawned through one.
@@ -701,6 +1248,18 @@ impl JobManager {
                     // PTY output accumulates for the terminal buffer.
                     if job.terminal_buffer.is_some() && matches!(stream, StreamKind::Stdout) {
                         job.pty_output.extend_from_slice(&bytes);
+                    }
+                    // RPC output accumulates for the request loop: unbuffered,
+                    // callback-less bytes would otherwise be discarded before
+                    // `rpcrequest` decodes its reply. A flooded channel closes
+                    // its RPC half instead of growing without bound.
+                    if job.rpc && !job.rpc_closed && matches!(stream, StreamKind::Stdout) {
+                        if job.rpc_buffer.len() + bytes.len() > MAX_RPC_BUFFER {
+                            job.rpc_buffer.clear();
+                            job.rpc_closed = true;
+                        } else {
+                            job.rpc_buffer.extend_from_slice(&bytes);
+                        }
                     }
                     let (state, callback, name) = stream_parts(job, stream);
                     if state.buffered {

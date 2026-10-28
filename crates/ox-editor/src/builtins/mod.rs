@@ -104,7 +104,10 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "getpos" | "getregion" | "getregionpos" | "line" | "line2byte" | "setcharpos"
         | "setcursorcharpos" | "setpos" | "virtcol" => Family::Position,
         "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" | "system"
-        | "systemlist" => Family::Process,
+        | "systemlist" | "jobclose" | "chanclose" | "rpcnotify" | "rpcrequest" | "sockconnect"
+        | "termopen" => {
+            Family::Process
+        }
         "search" | "searchpair" | "searchpairpos" | "searchcount" => Family::Search,
         "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
@@ -118,7 +121,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
         "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdwintype" | "getcmdprompt" | "pumvisible"
-        | "wildmenumode" => Family::Cmdline,
+        | "wildmenumode" | "histadd" | "histdel" | "histget" | "histnr" => Family::Cmdline,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
         "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),

@@ -17,6 +17,7 @@ pub mod extmark;
 pub mod fold;
 pub mod fs_builtins;
 pub mod highlight_init;
+pub mod history;
 pub mod include_search;
 pub mod indent;
 pub mod insert;
@@ -76,7 +77,10 @@ pub use extmark::{
 };
 pub use fold::Folds;
 pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};
-pub use job::{JobCallbacks, JobEvent, JobManager, JobStartOptions};
+pub use job::{
+    ChannelCloseError, ChannelPart, JobCallbacks, JobEvent, JobManager, JobStartOptions,
+    RpcCallError, SocketStream,
+};
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
     Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,

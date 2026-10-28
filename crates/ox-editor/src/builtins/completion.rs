@@ -182,6 +182,7 @@ fn complete_commands(pat: &str) -> Vec<OxStr> {
         "print",
         "iabbrev",
         "abclear",
+        "iput",
         "put",
         "quit",
         "read",
