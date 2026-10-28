@@ -1396,17 +1396,26 @@ impl<F: FileIO> ExExecutor<F> {
                 escaped_exception: None,
                 call_receiver: Some(event.receiver),
             };
-            let name = funcref.name.to_string_lossy().into_owned();
-            Evaluator::new(&mut host, &regex)
-                .invoke(event.callback, event.args, &mut self.scope)
-                .map_err(|error| {
-                    if let Some(id) = timer_id
-                        && let Some(manager) = self.runtime.jobs.as_mut()
-                    {
-                        manager.record_timer_error(id);
-                    }
-                    error.to_string()
-                })?;
+            let outcome = Evaluator::new(&mut host, &regex).invoke(
+                event.callback,
+                event.args,
+                &mut self.scope,
+            );
+            let error = outcome.err().map(|error| error.to_string());
+            // One delivery is over on both paths: count a failure, then free a
+            // timer stopped from inside its own callback (upstream decref and
+            // `timer_close_cb`), so a stopped timer never leaks in flight.
+            if let Some(id) = timer_id
+                && let Some(manager) = self.runtime.jobs.as_mut()
+            {
+                if error.is_some() {
+                    manager.record_timer_error(id);
+                }
+                manager.timer_delivered(id);
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
             return Ok(());
         }
         let name = match &event.callback {
@@ -1416,7 +1425,7 @@ impl<F: FileIO> ExExecutor<F> {
         if name.as_bytes().is_empty() {
             return Ok(());
         }
-        call_user_function_with_self(
+        let outcome = call_user_function_with_self(
             &mut self.runtime,
             access,
             &mut self.scope,
@@ -1426,16 +1435,22 @@ impl<F: FileIO> ExExecutor<F> {
             1,
             1,
             Some(event.receiver),
-        )
-        .map_err(|flow| {
-            if let Some(id) = timer_id
-                && let Some(manager) = self.runtime.jobs.as_mut()
-            {
+        );
+        let error = outcome
+            .err()
+            .map(|flow| flow_to_eval_error(flow, &name.to_string_lossy()).to_string());
+        if let Some(id) = timer_id
+            && let Some(manager) = self.runtime.jobs.as_mut()
+        {
+            if error.is_some() {
                 manager.record_timer_error(id);
             }
-            flow_to_eval_error(flow, &name.to_string_lossy()).to_string()
-        })?;
-        Ok(())
+            manager.timer_delivered(id);
+        }
+        match error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Process exit requested since the last poll (`:cquit` / `:qall`).

@@ -1349,14 +1349,20 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
                 escaped_exception: None,
                 call_receiver: Some(event.receiver),
             };
-            if let Err(error) =
-                ox_eval::Evaluator::new(&mut host, &regex).invoke(event.callback, event.args, scope)
+            let outcome =
+                ox_eval::Evaluator::new(&mut host, &regex).invoke(event.callback, event.args, scope);
+            if let Err(error) = &outcome
+                && let Some(id) = timer_id
+                && let Some(manager) = host.runtime.jobs.as_mut()
             {
-                if let Some(id) = timer_id
-                    && let Some(manager) = host.runtime.jobs.as_mut()
-                {
-                    manager.record_timer_error(id);
-                }
+                manager.record_timer_error(id);
+            }
+            if let Some(id) = timer_id
+                && let Some(manager) = host.runtime.jobs.as_mut()
+            {
+                manager.timer_delivered(id);
+            }
+            if let Err(error) = outcome {
                 redefer_job_events(host.runtime, batch.collect());
                 return Err(error);
             }
@@ -1366,7 +1372,7 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             Typval::String(name) => name,
             _ => continue,
         };
-        if let Err(flow) = call_user_function_with_self(
+        let outcome = call_user_function_with_self(
             runtime,
             access,
             scope,
@@ -1376,14 +1382,21 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             1,
             Some(event.receiver),
-        ) {
-            if let Some(id) = timer_id
-                && let Some(manager) = runtime.jobs.as_mut()
-            {
+        );
+        let error = outcome
+            .err()
+            .map(|flow| flow_to_eval_error(flow, &name.to_string_lossy()));
+        if let Some(id) = timer_id
+            && let Some(manager) = runtime.jobs.as_mut()
+        {
+            if error.is_some() {
                 manager.record_timer_error(id);
             }
+            manager.timer_delivered(id);
+        }
+        if let Some(error) = error {
             redefer_job_events(runtime, batch.collect());
-            return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
+            return Err(error);
         }
     }
     if lua_deferred {

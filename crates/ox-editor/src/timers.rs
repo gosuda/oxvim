@@ -791,9 +791,15 @@ mod tests {
         {
             let (runtime, _) = exec.runtime_scope_mut();
             let manager = runtime.jobs.as_mut().expect("timer installed a manager");
-            assert!(manager.record_timer_event_error(&event));
-            assert!(manager.record_timer_event_error(&event));
-            assert!(manager.record_timer_event_error(&event));
+            // Each strike is one finished delivery: the callback fails, the
+            // firing is marked delivered, and a timer stopped on the third
+            // strike is freed only once that delivery completes. A stale
+            // firing for a freed timer is ignored.
+            let timer_id = u64::try_from(id).expect("timer ids are positive");
+            for _ in 0..3 {
+                assert!(manager.record_timer_event_error(&event));
+                manager.timer_delivered(timer_id);
+            }
             assert!(
                 !manager.record_timer_event_error(&event),
                 "stale post-stop firings are ignored"

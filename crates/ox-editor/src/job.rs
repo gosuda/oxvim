@@ -1396,6 +1396,15 @@ struct VimTimer {
     /// Callback failures so far; three strikes stop the timer (upstream
     /// `emsg_count` in `timer_due_cb`).
     emsg_count: u32,
+    /// Set by `timer_stop`. Upstream only marks the timer stopped and frees
+    /// it from `timer_close_cb`, so a stopped timer that still has a delivery
+    /// in flight keeps its entry (`eval.c:5153-5180`).
+    stopped: bool,
+    /// A firing of this timer is being delivered. Upstream's `refcount` is 2
+    /// for the duration of `timer_due_cb`, which is what keeps a stopped
+    /// timer visible to `timer_info` while its callback runs (`eval.c:5092`,
+    /// `5074-5078`).
+    in_flight: bool,
     /// The `self` dictionary cloned into every firing's [`JobEvent`]. One
     /// identity per timer, so [`JobManager::timer_id_for_event`] recognizes
     /// timer firings by `Rc::ptr_eq` instead of by argument shape — a job
@@ -1446,6 +1455,8 @@ impl JobManager {
                 armed,
                 callback,
                 emsg_count: 0,
+                stopped: false,
+                in_flight: false,
                 receiver,
             },
         );
@@ -1455,9 +1466,30 @@ impl JobManager {
     /// Stop the timer, silently ignoring unknown ids (upstream `f_timer_stop`
     /// returns without touching `rettv` when the id is unknown).
     pub fn timer_stop(&mut self, id: u64) {
-        if let Some(timer) = self.timers.remove(&id) {
-            let _ignored = timer.handle.stop(&mut self.loop_);
-            let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
+        let Some(timer) = self.timers.get_mut(&id) else {
+            return;
+        };
+        let _ignored = timer.handle.stop(&mut self.loop_);
+        let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
+        timer.armed = false;
+        timer.stopped = true;
+        // A timer stopped from inside its own callback stays listed until the
+        // delivery finishes, then `timer_delivered` frees it — upstream's
+        // async `timer_close_cb` (`eval.c:5165-5174`).
+        if !timer.in_flight {
+            self.timers.remove(&id);
+        }
+    }
+
+    /// Marks one timer firing as delivered, freeing a stopped timer whose
+    /// last reference has gone (upstream `timer_decref` -> `timer_close_cb`).
+    pub fn timer_delivered(&mut self, id: u64) {
+        let Some(timer) = self.timers.get_mut(&id) else {
+            return;
+        };
+        timer.in_flight = false;
+        if timer.stopped {
+            self.timers.remove(&id);
         }
     }
 
@@ -1504,6 +1536,15 @@ impl JobManager {
         let mut items = Vec::with_capacity(ids.len());
         for timer_id in ids {
             if id.is_some_and(|wanted| wanted != timer_id) {
+                continue;
+            }
+            // A stopped timer is listed only while a firing is in flight
+            // (upstream `!stopped || refcount > 1`).
+            if self
+                .timers
+                .get(&timer_id)
+                .is_some_and(|timer| timer.stopped && !timer.in_flight)
+            {
                 continue;
             }
             // The id came from the live key set, so the entry exists.
@@ -1626,6 +1667,13 @@ impl JobManager {
         }
         let mut events = Vec::with_capacity(fired.len());
         for id in fired {
+            // The firing is in flight before repeat bookkeeping runs: upstream
+            // raises `refcount` first, so the `timer_stop` a last repeat
+            // performs only marks the timer and the callback still sees it in
+            // `timer_info` (`eval.c:5092-5116`).
+            if let Some(timer) = self.timers.get_mut(&id) {
+                timer.in_flight = true;
+            }
             let (callback, receiver) = match self.timers.get_mut(&id) {
                 Some(timer) if !timer.paused => {
                     if timer.repeat_remaining >= 0 {
