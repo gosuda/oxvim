@@ -3926,6 +3926,7 @@ pub(crate) fn eval_text<F: FileIO, E: ExEditorAccess>(
         builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
         submatches: None,
         escaped_exception: None,
+        call_receiver: None,
     };
     let result = Evaluator::new(&mut host, &regex).eval(&expression, scope);
     if let Some(exception) = host.escaped_exception {
@@ -3955,6 +3956,7 @@ fn call_builtin_dispatch<F: FileIO, E: ExEditorAccess>(
         builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
         submatches: None,
         escaped_exception: None,
+        call_receiver: None,
     };
     let name_text = name.to_string_lossy();
     let result = if let Some(family) = crate::builtins::route(&name_text) {
@@ -3993,9 +3995,15 @@ pub(crate) struct EvalHost<'a, F: FileIO, E: ExEditorAccess> {
     pub(crate) builtins: Builtins<'a>,
     pub(crate) submatches: Option<Vec<String>>,
     pub(crate) escaped_exception: Option<VimException>,
+    /// Dictionary a Partial carried, bound as `self` for the next user call.
+    pub(crate) call_receiver: Option<ox_types::DictRef>,
 }
 
 impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
+    fn set_call_receiver(&mut self, receiver: Option<ox_types::DictRef>) {
+        self.call_receiver = receiver;
+    }
+
     fn call(
         &mut self,
         name: &OxStr,
@@ -4045,7 +4053,8 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
             let (first, last) = self
                 .access
                 .with_ex_editor(|editor| current_line_pair(editor));
-            return match call_user_function(
+            let receiver = self.call_receiver.take();
+            return match call_user_function_with_self(
                 self.runtime,
                 self.access,
                 scope,
@@ -4054,6 +4063,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 args,
                 first,
                 last,
+                receiver,
             ) {
                 Ok(value) => Ok(value),
                 Err(Flow::Exception(exception)) => {
@@ -6962,6 +6972,7 @@ fn eval_substitute_expression<F: FileIO, E: ExEditorAccess>(
         builtins: Builtins::new(&regex),
         submatches: Some(groups),
         escaped_exception: None,
+        call_receiver: None,
     };
     host.runtime.textlock += 1;
     let result = Evaluator::new(&mut host, &regex)

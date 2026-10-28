@@ -592,6 +592,7 @@ fn eval_expression<F: FileIO, E: ExEditorAccess>(
         builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
         submatches: None,
         escaped_exception: None,
+        call_receiver: None,
     };
     Evaluator::new(&mut host, &regex)
         .eval(expression, scope)

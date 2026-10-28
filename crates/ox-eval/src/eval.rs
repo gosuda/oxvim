@@ -41,6 +41,10 @@ pub trait BuiltinHost {
         self.call(name, args, scope)
     }
 
+    /// Records the dictionary a Partial carries, so a host that owns
+    /// user-function frames can bind it as `self` for the next call.
+    fn set_call_receiver(&mut self, _receiver: Option<ox_types::DictRef>) {}
+
     /// Registry shared with callback-capable builtins, when this host owns one.
     fn closure_registry(&self) -> Option<ClosureRegistry> {
         None
@@ -1074,7 +1078,20 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     bound.append(&mut args);
                     args = bound;
                 }
-                match funcref.registry {
+                let receiver = funcref.dict.as_ref().map(|entries| {
+                    let entries = entries
+                        .iter()
+                        .map(|(key, value)| ox_types::DictEntry::new(key.clone(), value.clone()))
+                        .collect();
+                    match Typval::dict_with_entries(entries) {
+                        Typval::Dict(reference) => reference,
+                        _ => unreachable!("a dictionary typval always holds a reference"),
+                    }
+                });
+                if receiver.is_some() {
+                    self.host.set_call_receiver(receiver);
+                }
+                let result = match funcref.registry {
                     Some(registry_id) => {
                         let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
                             EvalError::new(
@@ -1086,7 +1103,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                         self.call_closure(&funcref.name, registry_id, id, &args, depth, 0)
                     }
                     None => self.call_named(&funcref.name, args, scope, 0, depth),
+                };
+                if funcref.dict.is_some() {
+                    self.host.set_call_receiver(None);
                 }
+                result
             }
             _ => Err(EvalError::new("E1085", 0, "not a callable value")),
         }

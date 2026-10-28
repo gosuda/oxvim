@@ -92,8 +92,8 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
         | "swapname" => Family::Environment,
-        "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand" | "funcref"
-        | "function" | "luaeval" | "submatch" => Family::Eval,
+        "call" | "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand"
+        | "funcref" | "function" | "luaeval" | "submatch" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
         "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
         "confirm" | "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => {

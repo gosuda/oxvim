@@ -37,6 +37,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 ) -> ox_eval::Result<Typval> {
     match name {
         "eval" => call_eval_builtin(host, args, scope),
+        "call" => call_call_builtin(host, args, scope),
         "execute" => call_execute_builtin(host.runtime, host.access, scope, host.lua, args),
         "exists" => exists_with_editor(host.runtime, host.access, scope, args),
         "expand" => call_expand_builtin(host.runtime, host.access, args),
@@ -54,6 +55,58 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 
 /// `eval()`: parse the argument and evaluate it against this same host, so the
 /// editor seams stay reachable from the nested expression (`f_eval`).
+/// `call({func}, {arglist} [, {dict}])` (`eval/funcs.c` `f_call`).
+///
+/// The callee may be a Funcref or Partial, which goes through the evaluator's
+/// own invocation path, or a function name, which goes through the host so a
+/// user function and a builtin both resolve. A third argument binds `self`
+/// for the duration of the call, exactly as a dictionary method call does.
+fn call_call_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let callee = args[0].clone();
+    let Typval::List(reference) = &args[1] else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
+    let call_args = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .items
+        .clone();
+    // A third argument binds `self`: upstream turns the call into
+    // `function({func}, {dict})` and runs that partial, which is the only
+    // path whose frame the callee reads `self` from.
+    let callable = match args.get(2) {
+        None | Some(Typval::Special(Special::Null)) => callee,
+        Some(value @ Typval::Dict(_)) => match &callee {
+            Typval::String(_) => {
+                let function = resolve_function_reference(host.runtime, None, &callee)?;
+                let function = bind_function_arguments(function, std::slice::from_ref(value))?;
+                Typval::Partial(function)
+            }
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+                let function =
+                    bind_function_arguments(funcref.clone(), std::slice::from_ref(value))?;
+                Typval::Partial(function)
+            }
+            _ => return Err(EvalError::new("E1085", 0, "not a callable value")),
+        },
+        Some(_) => return Err(EvalError::new("E731", 0, "Using a List as a Dict")),
+    };
+    match callable {
+        Typval::Funcref(_) | Typval::Partial(_) => {
+            Evaluator::new(host, &VimRegex).invoke(callable, call_args, scope)
+        }
+        Typval::String(name) => {
+            let name = OxStr(name.as_bytes().into());
+            host.call(&name, call_args, scope)
+        }
+        _ => Err(EvalError::new("E1085", 0, "not a callable value")),
+    }
+}
+
 fn call_eval_builtin<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
     args: &[Typval],
