@@ -68,7 +68,7 @@ Measured on 2026-10-28 against the release binary at `c4520b0` plus the fixes in
 | Suite | Files | Pass | Fail | Skip | Error |
 |---|---|---|---|---|---|
 | `just functional` (Busted) | 484 | 1830 | 4076 | 58 | 1 |
-| `just oldtest` (legacy Vimscript) | 236 | - | 2365 of 3652 executed | 686 | 40 blocked, 5 timed out |
+| `just oldtest` (legacy Vimscript) | 236 | - | 2365 of 3654 executed | 686 | 40 blocked, 5 timed out |
 
 Neither suite passes yet. `just apidiff`, `cargo build --workspace --release`, and
 `cargo nextest run --workspace` do pass, and the workspace suite covers 3646 tests.

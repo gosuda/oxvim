@@ -11,7 +11,7 @@ build, workspace tests, api-info diff, functional suite, oldtest suite.
 | 2 | `cargo nextest run --workspace` | 3563/3564 | 3645/3645, one skipped |
 | 3 | `just apidiff` | fail, one function | pass, zero semantic differences |
 | 4 | `just functional` | never measured | 1830 pass, 4076 fail, 58 skip, 1 error over 484 files |
-| 5 | `just oldtest` | produced no results at all | 3652 executed, 2365 failed, 686 skipped, 40 blocked, 5 timed out over 236 files |
+| 5 | `just oldtest` | produced no results at all | 3654 executed, 2365 failed, 686 skipped, 40 blocked, 5 timed out over 236 files |
 
 Criteria 1 to 3 are green. Criteria 4 and 5 are measured and still red.
 
@@ -57,8 +57,8 @@ Criteria 1 to 3 are green. Criteria 4 and 5 are measured and still red.
    hang that used to head this list is fixed: `fnamemodify('foo', ':h')` answered an empty string instead of
    ".", so `vim.fs.parents` walked forever inside a buffer-lifecycle autocmd.
 2. `:terminal` and the upstream oldtest Makefile path need terminal output parsed into buffer cells.
-3. `uniq()` still ignores its comparator. `call()` is implemented and a Partial's dictionary now binds
-   `self`, which also fixed `function('Name', dict)()`.
+3. `call()` and the `uniq()` comparator are implemented, and a Partial's dictionary now binds `self`,
+   which also fixed `function('Name', dict)()`. The Ex commands listed below remain unimplemented.
 4. `:match`, `:compiler`, `:checktime`, `:doautocmd`, `:badd`, `recover`, `defer`, `win_execute`, and
    `getfperm` still report `not implemented`.
 5. Window creation copies the source window's local options; the oracle gives the new window global defaults.
