@@ -45,27 +45,60 @@ impl Keys {
         Self(encoded)
     }
 
-    /// Quotes a trailing literal [`K_SPECIAL`] while preserving complete
-    /// three-byte internal key codes.
+    /// Escapes literal [`K_SPECIAL`] bytes for the typeahead buffer
+    /// (`vim_strsave_escape_ks`, `keycodes.c:882-906`).
+    ///
+    /// At a character boundary a `K_SPECIAL` byte starts a complete
+    /// three-byte key code and is copied unmodified; otherwise the next
+    /// character is re-encoded byte by byte, escaping any literal
+    /// `K_SPECIAL` inside multi-byte characters as
+    /// `K_SPECIAL KS_SPECIAL KE_FILLER`. Stepping character by character is
+    /// what keeps a UTF-8 continuation byte (`0x80..=0xbf`) from ever being
+    /// mistaken for a key-code introducer.
     #[must_use]
     pub fn escape_ks(bytes: &[u8]) -> Self {
         let mut escaped = Vec::with_capacity(bytes.len().saturating_add(2));
         let mut offset = 0;
         while offset < bytes.len() {
-            if bytes[offset] != K_SPECIAL {
-                escaped.push(bytes[offset]);
-                offset += 1;
-                continue;
-            }
-            if bytes.len() - offset >= 3 {
+            if bytes[offset] == K_SPECIAL && bytes.len() - offset >= 3 {
                 escaped.extend_from_slice(&bytes[offset..offset + 3]);
                 offset += 3;
                 continue;
             }
-            escaped.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
-            offset += 1;
+            let width = utf_char_width(&bytes[offset..]);
+            for byte in &bytes[offset..offset + width] {
+                if *byte == K_SPECIAL {
+                    escaped.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
+                } else {
+                    escaped.push(*byte);
+                }
+            }
+            offset += width;
         }
         Self(escaped)
+    }
+
+    /// Removes `K_SPECIAL` quoting (`vim_unescape_ks`,
+    /// `keycodes.c:908-924`): only the `K_SPECIAL KS_SPECIAL KE_FILLER`
+    /// quoting form folds back to a literal `K_SPECIAL`; every other triple
+    /// passes through untouched, so real special keys survive.
+    #[must_use]
+    pub fn unescape_ks(bytes: &[u8]) -> Vec<u8> {
+        let mut unescaped = Vec::with_capacity(bytes.len());
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes[offset] == K_SPECIAL
+                && bytes.get(offset + 1) == Some(&KS_SPECIAL)
+                && bytes.get(offset + 2) == Some(&KE_FILLER)
+            {
+                unescaped.push(K_SPECIAL);
+                offset += 3;
+            } else {
+                unescaped.push(bytes[offset]);
+                offset += 1;
+            }
+        }
+        unescaped
     }
 
     /// Creates a key string from bytes already in internal form.
@@ -85,9 +118,11 @@ impl Keys {
     /// # Errors
     ///
     /// Returns [`KeyDecodeError::InvalidThirdByte`] when `third` is outside
-    /// the reserved `0x02..=0x7f` range.
+    /// the reserved `0x02..=0x7f` range. Modifier masks (`KS_MODIFIER`) are
+    /// bit combinations (`keycodes.h:467-474`) where the command-key bit
+    /// alone is already `0x80`, so any third byte is accepted for them.
     pub fn special(second: u8, third: u8) -> Result<Self, KeyDecodeError> {
-        if !(0x02..=0x7f).contains(&third) {
+        if second != KS_MODIFIER && !(0x02..=0x7f).contains(&third) {
             return Err(KeyDecodeError::InvalidThirdByte(third));
         }
         Ok(Self(vec![K_SPECIAL, second, third]))
@@ -681,6 +716,45 @@ impl Typeahead {
     }
 }
 
+/// Width of the UTF-8 character starting a fragment, mirroring
+/// `utf_ptr2len`: a complete multi-byte sequence counts whole, anything
+/// illegal counts one byte so escaping still makes progress.
+fn utf_char_width(fragment: &[u8]) -> usize {
+    let Some(first) = fragment.first().copied() else {
+        return 0;
+    };
+    match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            2
+        }
+        0xe0..=0xef
+            if fragment.get(1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(2)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            3
+        }
+        0xf0..=0xf4
+            if fragment.get(1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(2)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(3)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            4
+        }
+        _ => 1,
+    }
+}
+
 fn validate_encoded(bytes: &[u8]) -> Result<(), KeyDecodeError> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -705,7 +779,7 @@ fn decode_one(bytes: &[u8]) -> Result<(Key, usize), KeyDecodeError> {
     }
     let second = bytes[1];
     let third = bytes[2];
-    if !(0x02..=0x7f).contains(&third) {
+    if second != KS_MODIFIER && !(0x02..=0x7f).contains(&third) {
         return Err(KeyDecodeError::InvalidThirdByte(third));
     }
     match second {
