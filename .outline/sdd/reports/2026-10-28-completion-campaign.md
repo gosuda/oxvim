@@ -75,6 +75,31 @@ Criteria 1 to 3 are green. Criteria 4 and 5 are measured and still red.
 - `timeout -s TERM` does not stop a hung oxvim cleanly in the shared PTY; harness probes that
   need a hard cap use `start_new_session` and a kill.
 
+## Slices cut for the next wave, 2026-10-28
+
+Six read-only scouts grouped the remaining failures from the logs. Measured causes, with owners:
+
+| Suite | Cause | Tests | Owner |
+|---|---|---|---|
+| functional | assertion mismatch, no error code | 612 | diffuse; options, keymap, buffer, highlight |
+| functional | harness module `test.functional.testnvim.exec_lua` not found | 418 | harness search path, not the editor |
+| functional | `expect_msg_seq` got no messages | 187 | `ox-loop` notification path |
+| functional | `not implemented: sockconnect` | 96 | channel builtins in `builtins/process.rs` |
+| functional | server EOF or RPC failure at startup | 88 | `crates/oxvim/src/main.rs` |
+| functional | `not implemented: rpcnotify` / `rpcrequest` / `chanclose` / `jobclose` | 74 + 52 + 38 + 31 | same channel owner |
+| functional | `msgpackparse` / `msgpackdump` | 41 | `crates/ox-eval` typval dispatch |
+| functional | `Invalid method: nvim__stats` | 29 | `ox-api` registry |
+| oldtest | `E492: Not an editor command` | 380-450 | `excmd_exec.rs` dispatch table |
+| oldtest | `E117: not implemented: <func>` | 280-340 | builtin families |
+| oldtest | value mismatch, no error code | 700-900 | diffuse |
+
+Two more findings matter for the harness. Eight of the sixteen functional groups ended in `Process
+terminated due to timeout`, so the 4076-failure figure is a floor and the gate needs a longer or
+per-file run before its counts can be trusted. And the terminal surface is further along than
+`docs/compat.md` claims: `terminal_screen.rs` holds a VT emulator with scrollback, `job.rs` pumps pty
+output into it, and `editor.rs` projects rows into the buffer, so the oldtest Makefile path may work
+now and should be retried before any terminal work is scheduled.
+
 ## Evidence
 
 All logs live under `.outline/evidence/` (gitignored): `gates/`, `oldtest-final/`, `functional-*.log`,
