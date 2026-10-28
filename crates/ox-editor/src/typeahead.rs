@@ -733,7 +733,9 @@ fn utf_char_width(fragment: &[u8]) -> usize {
             2
         }
         0xe0..=0xef
-            if fragment.get(1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte))
                 && fragment
                     .get(2)
                     .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
@@ -741,7 +743,9 @@ fn utf_char_width(fragment: &[u8]) -> usize {
             3
         }
         0xf0..=0xf4
-            if fragment.get(1).is_some_and(|byte| (0x80..=0xbf).contains(byte))
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte))
                 && fragment
                     .get(2)
                     .is_some_and(|byte| (0x80..=0xbf).contains(byte))

@@ -2376,8 +2376,11 @@ fn tabdo_runs_nested_command_in_each_tabpage() {
     let mut exec = ExExecutor::new();
     exec.execute_line(&editor, "tabnew").unwrap();
     exec.execute_line(&editor, "tabnew").unwrap();
-    exec.execute_line(&editor, "tabdo let g:seen = get(g:, 'seen', []) + [tabpagenr()]")
-        .unwrap();
+    exec.execute_line(
+        &editor,
+        "tabdo let g:seen = get(g:, 'seen', []) + [tabpagenr()]",
+    )
+    .unwrap();
 
     let seen = exec.scope().get_scoped(ScopeKind::Global, b"seen", 0);
     let seen = match seen {

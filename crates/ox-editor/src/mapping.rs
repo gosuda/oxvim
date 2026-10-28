@@ -1228,24 +1228,15 @@ mod tests {
 
     #[test]
     fn abbrev_command_modes_cover_insert_cmdline_and_both() {
-        assert_eq!(
-            abbrev_modes_for_command("abbreviate"),
-            MapModes::MAP_BANG
-        );
-        assert_eq!(
-            abbrev_modes_for_command("noreabbrev"),
-            MapModes::MAP_BANG
-        );
-        assert_eq!(
-            abbrev_modes_for_command("unabbreviate"),
-            MapModes::MAP_BANG
-        );
-        assert_eq!(
-            abbrev_modes_for_command("abclear"),
-            MapModes::MAP_BANG
-        );
+        assert_eq!(abbrev_modes_for_command("abbreviate"), MapModes::MAP_BANG);
+        assert_eq!(abbrev_modes_for_command("noreabbrev"), MapModes::MAP_BANG);
+        assert_eq!(abbrev_modes_for_command("unabbreviate"), MapModes::MAP_BANG);
+        assert_eq!(abbrev_modes_for_command("abclear"), MapModes::MAP_BANG);
         for name in ["iabbrev", "iabclear", "inoreabbrev", "iunabbrev"] {
-            assert_eq!(abbrev_modes_for_command(name), MapModes::one(MapMode::Insert));
+            assert_eq!(
+                abbrev_modes_for_command(name),
+                MapModes::one(MapMode::Insert)
+            );
         }
         for name in ["cabbrev", "cabclear", "cnoreabbrev", "cunabbrev"] {
             assert_eq!(
@@ -1281,10 +1272,7 @@ mod tests {
             classify_abbrev_command("cunabbrev"),
             AbbrevCommandKind::Undefine
         );
-        assert_eq!(
-            classify_abbrev_command("abclear"),
-            AbbrevCommandKind::Clear
-        );
+        assert_eq!(classify_abbrev_command("abclear"), AbbrevCommandKind::Clear);
         assert_eq!(
             classify_abbrev_command("iabclear"),
             AbbrevCommandKind::Clear
@@ -1341,12 +1329,16 @@ mod tests {
             1
         );
         // The command-line half survives an insert-only undefine.
-        assert!(mappings
-            .find_abbrev_exact("teh", MapModes::one(MapMode::CommandLine), None)
-            .is_some());
-        assert!(mappings
-            .find_abbrev_exact("teh", MapModes::one(MapMode::Insert), None)
-            .is_none());
+        assert!(
+            mappings
+                .find_abbrev_exact("teh", MapModes::one(MapMode::CommandLine), None)
+                .is_some()
+        );
+        assert!(
+            mappings
+                .find_abbrev_exact("teh", MapModes::one(MapMode::Insert), None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1428,12 +1420,7 @@ mod tests {
             .unwrap();
         let buffer = BufHandle::try_from(7i64).unwrap();
         mappings
-            .abbreviate(
-                "local",
-                MappingAction::Nop,
-                MapScope::Buffer(buffer),
-                false,
-            )
+            .abbreviate("local", MappingAction::Nop, MapScope::Buffer(buffer), false)
             .unwrap();
         let rows: Vec<String> = mappings
             .abbrev_matching("", MapModes::MAP_BANG, Some(buffer))
@@ -1457,12 +1444,16 @@ mod tests {
                 cmdline_only("teh", "the"),
             )
             .unwrap();
-        assert!(mappings
-            .lookup_abbreviation_in_mode("teh", ' ', MapMode::CommandLine, None)
-            .is_some());
-        assert!(mappings
-            .lookup_abbreviation_in_mode("teh", ' ', MapMode::Insert, None)
-            .is_none());
+        assert!(
+            mappings
+                .lookup_abbreviation_in_mode("teh", ' ', MapMode::CommandLine, None)
+                .is_some()
+        );
+        assert!(
+            mappings
+                .lookup_abbreviation_in_mode("teh", ' ', MapMode::Insert, None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1470,12 +1461,7 @@ mod tests {
         let mut mappings = Mappings::new();
         let long = "a".repeat(51);
         assert!(matches!(
-            mappings.abbreviate(
-                &long,
-                MappingAction::Nop,
-                MapScope::Global,
-                true,
-            ),
+            mappings.abbreviate(&long, MappingAction::Nop, MapScope::Global, true,),
             Err(MappingError::InvalidAbbreviation(_))
         ));
     }

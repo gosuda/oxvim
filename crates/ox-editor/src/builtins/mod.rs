@@ -117,8 +117,8 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         "complete" | "complete_info" | "getcompletion" => Family::Completion,
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
-        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdprompt"
-        | "pumvisible" | "wildmenumode" => Family::Cmdline,
+        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdprompt" | "pumvisible"
+        | "wildmenumode" => Family::Cmdline,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
         "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),

@@ -160,7 +160,11 @@ fn getreg<F: FileIO, E: ExEditorAccess>(
             return Ok(empty_getreg(as_list));
         };
         if expression_source {
-            return Ok(getreg_value(vec![source], RegisterKind::CharacterWise, as_list));
+            return Ok(getreg_value(
+                vec![source],
+                RegisterKind::CharacterWise,
+                as_list,
+            ));
         }
         let source = String::from_utf8_lossy(&source);
         let value = eval_text(host.runtime, host.access, scope, host.lua, &source)
@@ -175,14 +179,9 @@ fn getreg<F: FileIO, E: ExEditorAccess>(
 
     // Invalid names read as empty (`get_reg_contents` answers NULL for
     // them, `register.c:2485-2497`); only argument type errors propagate.
-    let content = host.access.with_ex_editor(|editor| {
-        editor
-            .registers()
-            .get(name)
-            .ok()
-            .flatten()
-            .cloned()
-    });
+    let content = host
+        .access
+        .with_ex_editor(|editor| editor.registers().get(name).ok().flatten().cloned());
     let Some(content) = content else {
         return Ok(empty_getreg(as_list));
     };
@@ -223,10 +222,9 @@ fn getreg_value(lines: Vec<Vec<u8>>, kind: RegisterKind, as_list: bool) -> Typva
 
 /// Reads the `%` register: the current buffer's name, or empty when the
 /// buffer is unnamed (`get_spec_reg`, `register.c:855-860`).
-fn percent_reg_name<F: FileIO, E: ExEditorAccess>(
-    host: &mut EvalHost<'_, F, E>,
-) -> OxStr {
-    host.access.with_ex_editor(|editor| current_buffer_name(editor))
+fn percent_reg_name<F: FileIO, E: ExEditorAccess>(host: &mut EvalHost<'_, F, E>) -> OxStr {
+    host.access
+        .with_ex_editor(|editor| current_buffer_name(editor))
 }
 
 /// Reads the `#` register: staged `#` text resolved against live buffers,
@@ -235,8 +233,7 @@ fn percent_reg_name<F: FileIO, E: ExEditorAccess>(
 fn alternate_reg_name<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
 ) -> Option<OxStr> {
-    host
-        .access
+    host.access
         .with_ex_editor(|editor| alternate_buffer_content(editor).and_then(|mut lines| lines.pop()))
         .map(OxStr)
 }
@@ -283,13 +280,12 @@ fn alternate_buffer_name(editor: &crate::Editor) -> Option<OxStr> {
 /// number (`buflist_findnr`), else the first buffer whose name contains the
 /// text (`buflist_findpat`). Returns `None` when nothing matches.
 fn resolve_alternate_buffer(editor: &crate::Editor, text: &[u8]) -> Option<ox_types::BufHandle> {
-    let digits = text
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
+    let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
     if digits > 0 {
         let number: i64 = text[..digits].iter().fold(0, |value, byte| {
-            value.saturating_mul(10).saturating_add(i64::from(byte - b'0'))
+            value
+                .saturating_mul(10)
+                .saturating_add(i64::from(byte - b'0'))
         });
         return ox_types::BufHandle::try_from(number)
             .ok()
@@ -377,8 +373,9 @@ fn getreginfo<F: FileIO, E: ExEditorAccess>(
                 (!current.as_bytes().is_empty())
                     .then(|| (vec![current.0], RegisterKind::CharacterWise))
             }
-            '#' => alternate_buffer_content(editor)
-                .map(|lines| (lines, RegisterKind::CharacterWise)),
+            '#' => {
+                alternate_buffer_content(editor).map(|lines| (lines, RegisterKind::CharacterWise))
+            }
             _ => registers
                 .get(name)
                 .ok()
@@ -448,14 +445,19 @@ fn setreg<F: FileIO, E: ExEditorAccess>(
             "Search pattern and expression register may not contain two or more lines",
         ));
     }
-    let (kind, append, unnamed) = parse_register_type(third.as_deref().unwrap_or(""), &rows, inferred);
+    let (kind, append, unnamed) =
+        parse_register_type(third.as_deref().unwrap_or(""), &rows, inferred);
     let content = RegisterContent::from_binary_lines(kind, rows);
     if name == '#' {
         setreg_alternate(host, scope, &content)?;
         return Ok(Typval::Number(0));
     }
     host.access
-        .with_ex_editor(|editor| editor.registers_mut().set_from_setreg(name, content, append))
+        .with_ex_editor(|editor| {
+            editor
+                .registers_mut()
+                .set_from_setreg(name, content, append)
+        })
         .map_err(|error| EvalError::new("E354", 0, error.to_string()))?;
     // `setreg(..., 'u'/'"')` points the unnamed register at the written slot
     // rather than cloning the content into an independent `"` copy
@@ -503,7 +505,9 @@ fn sync_scope_register<F: FileIO, E: ExEditorAccess>(
     if name == '#' {
         let alternate = host
             .access
-            .with_ex_editor(|editor| alternate_buffer_content(editor).and_then(|mut lines| lines.pop()))
+            .with_ex_editor(|editor| {
+                alternate_buffer_content(editor).and_then(|mut lines| lines.pop())
+            })
             .map_or_else(|| OxStr::from(""), OxStr);
         scope.set_register(b"#", Typval::String(alternate));
         return Ok(());
@@ -520,7 +524,9 @@ fn sync_scope_register<F: FileIO, E: ExEditorAccess>(
         return Ok(());
     }
     let stored_name = name.to_ascii_lowercase();
-    if stored_name.is_ascii_alphabetic() || matches!(stored_name, '0'..='9' | '"' | '-' | '/' | '*' | '+') {
+    if stored_name.is_ascii_alphabetic()
+        || matches!(stored_name, '0'..='9' | '"' | '-' | '/' | '*' | '+')
+    {
         if let Some(stored_bytes) = host.access.with_ex_editor(|editor| {
             editor
                 .registers()
@@ -528,8 +534,9 @@ fn sync_scope_register<F: FileIO, E: ExEditorAccess>(
                 .map_err(|error| EvalError::new("E354", 0, error.to_string()))
                 .map(|content| content.map(RegisterContent::getreg_bytes))
         })? {
-            let byte = u8::try_from(stored_name)
-                .map_err(|_| EvalError::new("E354", 0, format!("invalid register name {stored_name:?}")))?;
+            let byte = u8::try_from(stored_name).map_err(|_| {
+                EvalError::new("E354", 0, format!("invalid register name {stored_name:?}"))
+            })?;
             scope.set_register(&[byte], Typval::String(OxStr(stored_bytes)));
         }
     }
@@ -558,13 +565,12 @@ fn setreg_alternate<F: FileIO, E: ExEditorAccess>(
         scope.set_register(b"#", Typval::String(OxStr::from("")));
         return Ok(());
     }
-    let digits = text
-        .iter()
-        .take_while(|byte| byte.is_ascii_digit())
-        .count();
+    let digits = text.iter().take_while(|byte| byte.is_ascii_digit()).count();
     let found = if digits > 0 {
         let number: i64 = text[..digits].iter().fold(0, |value, byte| {
-            value.saturating_mul(10).saturating_add(i64::from(byte - b'0'))
+            value
+                .saturating_mul(10)
+                .saturating_add(i64::from(byte - b'0'))
         });
         let found = host.access.with_ex_editor(|editor| {
             ox_types::BufHandle::try_from(number)

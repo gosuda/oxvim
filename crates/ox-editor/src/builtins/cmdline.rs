@@ -70,32 +70,17 @@ fn tv_get_number(value: &Typval) -> ox_eval::Result<i64> {
             // f64` rounds up to 2^63, which does not fit, while every
             // `f64` below it truncates exactly. The lower bound is
             // inclusive: -2^63 is exactly representable.
-            if value.is_finite()
-                && *value >= i64::MIN as f64
-                && *value < i64::MAX as f64
-            {
+            if value.is_finite() && *value >= i64::MIN as f64 && *value < i64::MAX as f64 {
                 Ok(value.trunc() as i64)
             } else {
-                Err(EvalError::new(
-                    "E729",
-                    0,
-                    "Using invalid value as a Number",
-                ))
+                Err(EvalError::new("E729", 0, "Using invalid value as a Number"))
             }
         }
         Typval::Bool(value) => Ok(i64::from(*value)),
         Typval::String(value) => Ok(number_prefix(&value.to_string_lossy())),
         Typval::List(_) => Err(EvalError::new("E730", 0, "Using a List as a Number")),
-        Typval::Dict(_) => Err(EvalError::new(
-            "E728",
-            0,
-            "Using a Dictionary as a Number",
-        )),
-        _ => Err(EvalError::new(
-            "E729",
-            0,
-            "Using invalid value as a Number",
-        )),
+        Typval::Dict(_) => Err(EvalError::new("E728", 0, "Using a Dictionary as a Number")),
+        _ => Err(EvalError::new("E729", 0, "Using invalid value as a Number")),
     }
 }
 
@@ -104,7 +89,10 @@ fn tv_get_number(value: &Typval) -> ox_eval::Result<i64> {
 fn number_prefix(text: &str) -> i64 {
     let bytes = text.trim_start().as_bytes();
     let mut end = 0;
-    if bytes.first().is_some_and(|byte| matches!(byte, b'+' | b'-')) {
+    if bytes
+        .first()
+        .is_some_and(|byte| matches!(byte, b'+' | b'-'))
+    {
         end = 1;
     }
     while bytes.get(end).is_some_and(u8::is_ascii_digit) {
@@ -175,12 +163,10 @@ fn cmdline_snapshot<F: FileIO, E: ExEditorAccess>(
         return (text, cursor, true);
     }
     if let Some((reply, cursor)) = host.access.with_ex_editor(|editor| {
-        editor.prompt_dialog.as_ref().map(|dialog| {
-            (
-                dialog.reply.to_string_lossy().into_owned(),
-                dialog.cursor,
-            )
-        })
+        editor
+            .prompt_dialog
+            .as_ref()
+            .map(|dialog| (dialog.reply.to_string_lossy().into_owned(), dialog.cursor))
     }) {
         return (reply, cursor, true);
     }
@@ -246,9 +232,12 @@ fn cmdline_prompt<F: FileIO, E: ExEditorAccess>(host: &EvalHost<'_, F, E>) -> St
         };
     }
     host.access.with_ex_editor(|editor| {
-        editor.prompt_dialog.as_ref().map_or(String::new(), |dialog| {
-            dialog.prompt.to_string_lossy().into_owned()
-        })
+        editor
+            .prompt_dialog
+            .as_ref()
+            .map_or(String::new(), |dialog| {
+                dialog.prompt.to_string_lossy().into_owned()
+            })
     })
 }
 
