@@ -12,7 +12,7 @@ use ox_types::{OxStr, Special, Typval};
 use ox_uv::process::PtySize;
 
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, LUA_REF_FUNCTION_PREFIX, LuaExec,
+    EvalHost, ExEditorAccess, ExRuntime, LuaExec,
     call_user_function_with_self, flow_to_eval_error, object_to_typval,
 };
 use crate::job::DEFAULT_PTY_SIZE;
@@ -1351,7 +1351,7 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             };
             let outcome =
                 ox_eval::Evaluator::new(&mut host, &regex).invoke(event.callback, event.args, scope);
-            if let Err(error) = &outcome
+            if outcome.is_err()
                 && let Some(id) = timer_id
                 && let Some(manager) = host.runtime.jobs.as_mut()
             {
@@ -1497,7 +1497,6 @@ fn value_bool(value: &Typval) -> bool {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use crate::excmd_exec::LUA_REF_FUNCTION_PREFIX;
 
     use std::cell::Cell;
     use std::path::Path;
