@@ -14717,10 +14717,12 @@ fn listdo_winfixbuf_preamble<F: FileIO, E: ExEditorAccess>(
     ))
 }
 
-/// `buf_hide(curbuf) || !check_changed(...)` gate at the top of `ex_listdo`:
-/// a modified current buffer aborts the whole iteration unless `'hidden'`
-/// is set or the command bangs. Returns the error flow when the switch
-/// away from `current` must not happen.
+/// Abandon gate for `ex_listdo` buffer switches (`can_abandon`,
+/// ex_cmds2.c:283-293, via `buflist_getfile` → `do_ecmd`): leaving a
+/// modified current buffer for another one fails with `E37` unless the
+/// command bangs, the buffer can hide (`'hidden'`, `:hide`, or
+/// `'bufhidden=hide'`), or it stays visible in another window. Returns
+/// the error flow when the switch away from `current` must not happen.
 fn listdo_modified_gate<F: FileIO>(
     runtime: &ExRuntime<F>,
     editor: &Editor,
@@ -14743,8 +14745,28 @@ fn listdo_modified_gate<F: FileIO>(
     let hidden = matches!(
         editor.options().get_global("hidden"),
         Ok(OptionValue::Boolean(true))
-    );
+    ) || command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::Hide)
+        || matches!(
+            editor.options().get_buffer(current, "bufhidden"),
+            Ok(OptionValue::String(value)) if value == "hide"
+        );
     if hidden {
+        return None;
+    }
+    let visible_elsewhere = editor
+        .windows()
+        .into_iter()
+        .filter(|window| {
+            editor
+                .window(*window)
+                .is_ok_and(|state| state.buffer == current)
+        })
+        .take(2)
+        .count();
+    if visible_elsewhere > 1 {
         return None;
     }
     Some(error_flow(

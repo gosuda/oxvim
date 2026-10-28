@@ -740,8 +740,13 @@ pub fn parse_modifiers(
         // A modifier must not be a prefix of a longer identifier. "filter"
         // is exempt because probe has advanced past its pattern, where a
         // following identifier is the nested command, not a word extension
-        // (":filter /pat/delete" has no separating space).
+        // (":filter /pat/delete" has no separating space). A consumed `!`
+        // also ends the modifier word upstream (`checkforcmd` only checks
+        // the byte after the name, which is the `!`, then `skipwhite`s past
+        // it), so `:silent!cdo` is the modifier plus a command with no
+        // separating space.
         if !is_filter
+            && !bang
             && input
                 .as_bytes()
                 .get(probe)
