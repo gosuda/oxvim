@@ -1024,3 +1024,159 @@ fn is_executed_command(name: &str) -> bool {
         || PROGRAM_COMMANDS.contains(&name)
         || COMMAND_MODIFIERS.contains(&name)
 }
+
+#[cfg(test)]
+mod tests {
+    use ox_types::{OxStr, Typval};
+
+    use crate::script::RealFileIO;
+    use crate::{Editor, ExExecutor, ExecError, TestEditorAccess};
+
+    fn text(value: &str) -> Typval {
+        Typval::String(OxStr::from(value))
+    }
+
+    fn executor() -> ExExecutor<RealFileIO> {
+        ExExecutor::with_io(RealFileIO)
+    }
+
+    fn script(exec: &mut ExExecutor<RealFileIO>, editor: &TestEditorAccess, source: &str) {
+        exec.execute_script(editor, "<test>", source)
+            .expect("script runs");
+    }
+
+    fn eval(
+        exec: &mut ExExecutor<RealFileIO>,
+        editor: &TestEditorAccess,
+        expression: &str,
+    ) -> Typval {
+        exec.evaluate_expression(editor, expression)
+            .expect("expression evaluates")
+    }
+
+    fn failure(
+        exec: &mut ExExecutor<RealFileIO>,
+        editor: &TestEditorAccess,
+        expression: &str,
+    ) -> String {
+        match exec.evaluate_expression(editor, expression) {
+            Err(ExecError::Vim(exception)) => exception.message(),
+            other => panic!("expected a Vim error, got {other:?}"),
+        }
+    }
+
+    /// `call()` reaches a builtin by name, a Funcref, and a lambda, which are
+    /// the three callee shapes `f_call` accepts (`eval/funcs.c`).
+    #[test]
+    fn call_dispatches_names_funcrefs_and_lambdas() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(&mut exec, &editor, "let g:a = call('toupper', ['a'])");
+        script(
+            &mut exec,
+            &editor,
+            "let g:b = call(function('toupper'), ['abc'])",
+        );
+        script(&mut exec, &editor, "let g:c = call({x -> x * 2}, [21])");
+        assert_eq!(eval(&mut exec, &editor, "g:a"), text("A"));
+        assert_eq!(eval(&mut exec, &editor, "g:b"), text("ABC"));
+        assert_eq!(eval(&mut exec, &editor, "g:c"), Typval::Number(42));
+    }
+
+    /// A dictionary argument binds `self`, both through `call()` and through a
+    /// Partial built by `function({name}, {dict})`.
+    #[test]
+    fn a_dictionary_argument_binds_self() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let d = {'v': 5}\nfunction! Get() dict abort\nreturn self.v\nendfunction",
+        );
+        script(&mut exec, &editor, "let g:direct = call('Get', [], d)");
+        script(&mut exec, &editor, "let g:partial = function('Get', d)()");
+        assert_eq!(eval(&mut exec, &editor, "g:direct"), Typval::Number(5));
+        assert_eq!(eval(&mut exec, &editor, "g:partial"), Typval::Number(5));
+    }
+
+    /// The argument errors `f_call` reports: unknown callee, too few
+    /// arguments for the callee, and a third argument that is not a
+    /// dictionary.
+    #[test]
+    fn call_reports_upstream_argument_errors() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "function! Add(a, b) abort\nreturn a:a + a:b\nendfunction",
+        );
+        assert!(failure(&mut exec, &editor, "call('Nosuch', [])").contains("E117"));
+        assert!(failure(&mut exec, &editor, "call('Add', [1])").contains("E119"));
+        assert!(failure(&mut exec, &editor, "call('Add', [1, 2], [3])").contains("E731"));
+    }
+
+    /// `uniq()` without a comparator drops adjacent equal items.
+    #[test]
+    fn uniq_without_a_comparator_drops_adjacent_duplicates() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([1, 1, 2, 2, 1])"),
+            eval(&mut exec, &editor, "[1, 2, 1]")
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq(['a', 'a'])"),
+            eval(&mut exec, &editor, "['a']")
+        );
+    }
+
+    /// With a comparator, the walk compares the last kept item with the next
+    /// original one, and the item is dropped when the comparator is false.
+    /// These six cases are the oracle's answers.
+    #[test]
+    fn uniq_honours_the_comparator() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        let cases = [
+            ("[1,1,2]", "{a,b -> a == b}", "[1, 1]"),
+            ("[3,1,2]", "{a,b -> b > a}", "[3]"),
+            ("[1,2,1]", "{a,b -> a == b}", "[1, 1]"),
+            ("[1,2,3]", "{a,b -> a < b}", "[1, 2, 3]"),
+            ("[1,2,3]", "{a,b -> a > b}", "[1]"),
+        ];
+        for (list, comparator, expected) in cases {
+            assert_eq!(
+                eval(&mut exec, &editor, &format!("uniq({list}, {comparator})")),
+                eval(&mut exec, &editor, expected),
+                "uniq({list}, {comparator})"
+            );
+        }
+    }
+
+    /// A comparator can be a named function bound to a dictionary, which is
+    /// the `uniq(list, 'Name', dict)` form.
+    #[test]
+    fn uniq_comparator_can_be_a_dictionary_method() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let g:d = {'same': 1}\nfunction! Same(a, b) dict abort\nreturn self.same && a:a == a:b\nendfunction",
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([5, 5, 5], 'Same', g:d)"),
+            eval(&mut exec, &editor, "[5, 5, 5]")
+        );
+    }
+
+    /// `uniq()` refuses a non-list argument with upstream's error.
+    #[test]
+    fn uniq_rejects_a_non_list() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert!(failure(&mut exec, &editor, "uniq(1)").contains("E686"));
+    }
+}
