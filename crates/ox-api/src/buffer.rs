@@ -1518,7 +1518,6 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-
     use super::*;
 
     #[test]
@@ -1527,16 +1526,15 @@ mod tests {
         let buffer = editor.borrow_mut().create_buffer(true).unwrap();
         let session = ApiSession::new(editor);
 
-        assert!(nvim_buf_attach(
-            &session,
-            buffer,
-            false,
-            Dict(vec![(
-                OxStr::from("on_bytes"),
-                Object::LuaRef(41),
-            )]),
-        )
-        .unwrap());
+        assert!(
+            nvim_buf_attach(
+                &session,
+                buffer,
+                false,
+                Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(41),)]),
+            )
+            .unwrap()
+        );
         assert!(nvim_buf_detach(&session, buffer).unwrap());
 
         session.with_editor_mut(|editor| {

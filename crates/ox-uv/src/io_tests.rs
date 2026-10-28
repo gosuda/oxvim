@@ -7,11 +7,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::fs_watch::{FsEvent, FsEventOptions, FsPoll};
 use crate::UvLoop;
 use crate::dns::{self, AddrInfoHints};
 use crate::fs::{self, OpenFlags};
@@ -21,7 +22,6 @@ use crate::pool::{LoopPoster, Pool};
 use crate::process::StdioConfig;
 use crate::process::{self, SpawnOptions};
 use crate::work;
-use super::fs_watch::{FsEvent, FsEventOptions, FsPoll};
 use crate::{Handle, HandleId};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -884,21 +884,16 @@ fn fs_event_fires_on_file_creation() {
     let seen: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let fired = Arc::new(AtomicBool::new(false));
     let mut uv_loop = UvLoop::new().expect("create loop");
-    let event = FsEvent::start(
-        &mut uv_loop,
-        temp.path(),
-        FsEventOptions::default(),
-        {
-            let seen = Arc::clone(&seen);
-            let fired = Arc::clone(&fired);
-            move |_uv_loop: &mut UvLoop, result| {
-                if let Ok(record) = result {
-                    seen.lock().expect("record lock").push(record.filename);
-                    fired.store(true, Ordering::Relaxed);
-                }
+    let event = FsEvent::start(&mut uv_loop, temp.path(), FsEventOptions::default(), {
+        let seen = Arc::clone(&seen);
+        let fired = Arc::clone(&fired);
+        move |_uv_loop: &mut UvLoop, result| {
+            if let Ok(record) = result {
+                seen.lock().expect("record lock").push(record.filename);
+                fired.store(true, Ordering::Relaxed);
             }
-        },
-    )
+        }
+    })
     .expect("start watcher");
     // `start` captures the baseline before returning, so this immediate
     // mutation must be reported rather than absorbed into it.
@@ -910,10 +905,7 @@ fn fs_event_fires_on_file_creation() {
         }
         uv_loop.run_nowait().expect("pump loop");
     }
-    assert!(
-        fired.load(Ordering::Relaxed),
-        "no fs event within deadline"
-    );
+    assert!(fired.load(Ordering::Relaxed), "no fs event within deadline");
     assert!(
         seen.lock()
             .expect("read lock")
@@ -934,23 +926,18 @@ fn fs_poll_reports_stat_change() {
     let fired = Arc::new(AtomicBool::new(false));
     let changed = Arc::new(AtomicBool::new(false));
     let mut uv_loop = UvLoop::new().expect("create loop");
-    let poll = FsPoll::start(
-        &mut uv_loop,
-        &file,
-        Duration::from_millis(50),
-        {
-            let fired = Arc::clone(&fired);
-            let changed = Arc::clone(&changed);
-            move |_uv_loop: &mut UvLoop, result| {
-                if let Ok(record) = result {
-                    fired.store(true, Ordering::Relaxed);
-                    if record.previous != record.current && record.current.is_some() {
-                        changed.store(true, Ordering::Relaxed);
-                    }
+    let poll = FsPoll::start(&mut uv_loop, &file, Duration::from_millis(50), {
+        let fired = Arc::clone(&fired);
+        let changed = Arc::clone(&changed);
+        move |_uv_loop: &mut UvLoop, result| {
+            if let Ok(record) = result {
+                fired.store(true, Ordering::Relaxed);
+                if record.previous != record.current && record.current.is_some() {
+                    changed.store(true, Ordering::Relaxed);
                 }
             }
-        },
-    )
+        }
+    })
     .expect("start poll");
     // Settle the baseline snapshot, then change the size (not just mtime,
     // which can be too coarse to observe) before polling for the flip.

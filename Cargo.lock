@@ -213,6 +213,7 @@ dependencies = [
  "sha2",
  "similar",
  "sonic-rs",
+ "vt100",
 ]
 
 [[package]]

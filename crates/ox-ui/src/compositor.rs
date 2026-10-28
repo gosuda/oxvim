@@ -542,10 +542,8 @@ impl Compositor {
                 let line_start_row = screen_row;
                 let available_rows = text_height.saturating_sub(screen_row);
                 let truncated = wrapped.len().saturating_sub(skip) > available_rows;
-                for (segment, segment_cell_start) in wrapped
-                    .iter()
-                    .skip(skip)
-                    .take(text_height - screen_row)
+                for (segment, segment_cell_start) in
+                    wrapped.iter().skip(skip).take(text_height - screen_row)
                 {
                     if number_width != 0 {
                         // Wrapped continuation rows keep an empty number

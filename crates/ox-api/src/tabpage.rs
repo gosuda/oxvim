@@ -165,14 +165,13 @@ pub fn nvim_open_tabpage(
         Some(_) => return Err(invalid_config("after", "expected Integer")),
         None => 0,
     };
-    let (original, original_buffer, caller_window) =
-        session.with_editor(|editor| {
-            (
-                editor.current_tabpage(),
-                editor.current_buffer(),
-                editor.current_window(),
-            )
-        });
+    let (original, original_buffer, caller_window) = session.with_editor(|editor| {
+        (
+            editor.current_tabpage(),
+            editor.current_buffer(),
+            editor.current_window(),
+        )
+    });
     let original_buffer =
         original_buffer.ok_or_else(|| ApiError::exception("No current buffer"))?;
     if enter {

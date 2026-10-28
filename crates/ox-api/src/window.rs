@@ -807,9 +807,7 @@ where
         Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => {
-            return Err(exception(
-                ox_editor::buffer::BufferStateError::Unloaded,
-            ));
+            return Err(exception(ox_editor::buffer::BufferStateError::Unloaded));
         }
     };
 
@@ -848,9 +846,7 @@ where
         Ok(content) => content,
         Err(_) => {
             finish_buffer_switch(session, buffer, &mut restore, false, true);
-            return Err(exception(
-                ox_editor::buffer::BufferStateError::Unloaded,
-            ));
+            return Err(exception(ox_editor::buffer::BufferStateError::Unloaded));
         }
     };
     let text = match Buffer::from_bytes(content.as_bytes()) {
@@ -918,16 +914,10 @@ pub fn nvim_win_set_buf(
         move |session, succeeded| {
             session.with_editor_mut(|editor| {
                 if !succeeded
-                    && editor
-                        .window(win)
-                        .is_ok_and(|window| window.buffer == buf)
+                    && editor.window(win).is_ok_and(|window| window.buffer == buf)
                     && editor.buffer(original).is_ok()
                 {
-                    let _ = editor.set_window_buffer(
-                        win,
-                        original,
-                        BufferRelease::KeepLoaded,
-                    );
+                    let _ = editor.set_window_buffer(win, original, BufferRelease::KeepLoaded);
                 }
                 if caller != win && editor.window(caller).is_ok() {
                     let _ = editor.set_current_window(caller);
@@ -1303,17 +1293,13 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
                 events.push(Event::BufDelete);
                 events.push(Event::BufWipeout);
             }
-            BufferClosePolicy::Hide
-            | BufferClosePolicy::Default
-            | BufferClosePolicy::Unload => {}
+            BufferClosePolicy::Hide | BufferClosePolicy::Default | BufferClosePolicy::Unload => {}
         }
     }
     for event in events {
         fire_buffer_event(session, event, buffer)?;
         let target_live = session.with_editor(|editor| {
-            editor
-                .window(win)
-                .is_ok_and(|state| state.buffer == buffer)
+            editor.window(win).is_ok_and(|state| state.buffer == buffer)
                 && editor.buffer(buffer).is_ok()
         });
         if !target_live {
@@ -1325,10 +1311,7 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
         // An event may have attached the buffer elsewhere or closed this
         // window without deleting the buffer. Revalidate before committing
         // the structural removal and its policy-specific state change.
-        if !editor
-            .window(win)
-            .is_ok_and(|state| state.buffer == buffer)
-        {
+        if !editor.window(win).is_ok_and(|state| state.buffer == buffer) {
             return Ok(());
         }
         editor
@@ -2894,7 +2877,10 @@ mod tests {
         );
         let (loaded, line) = session.with_editor(|editor| {
             let state = editor.buffer(target).unwrap();
-            (state.residency.is_loaded(), state.text().unwrap().line(1).unwrap())
+            (
+                state.residency.is_loaded(),
+                state.text().unwrap().line(1).unwrap(),
+            )
         });
         assert!(loaded);
         assert!(line.is_empty());

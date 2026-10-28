@@ -421,7 +421,6 @@ impl SwapFile {
         } else {
             stored_pid == 0 || !process_is_running(stored_pid)
         }
-
     }
 
     /// Metadata omitted by a caller means this process and host. That keeps
@@ -842,8 +841,11 @@ mod tests {
         let path = dir.join("buffer.swp");
         // A live foreign writer whose truncated block-zero name equals this
         // buffer's: only the pid must keep it out.
-        let foreign = SwapFile::new(long_name.as_str(), Buffer::from_bytes(b"foreign\n").unwrap())
-            .with_meta(identity(live_foreign_pid()));
+        let foreign = SwapFile::new(
+            long_name.as_str(),
+            Buffer::from_bytes(b"foreign\n").unwrap(),
+        )
+        .with_meta(identity(live_foreign_pid()));
         foreign
             .write_to(&path, SwapOwnership::for_session(true))
             .unwrap();
@@ -875,16 +877,15 @@ mod tests {
         // the competing reservation a real process identity without making
         // the test depend on a second test binary.
         let winner_pid = live_foreign_pid();
-        let mut winner_file =
-            SwapFile::reserve_swapfile(
-                &path,
-                FILE_NAME,
-                winner_pid,
-                &host,
-                SwapFile::process_is_running,
-                true,
-            )
-            .unwrap();
+        let mut winner_file = SwapFile::reserve_swapfile(
+            &path,
+            FILE_NAME,
+            winner_pid,
+            &host,
+            SwapFile::process_is_running,
+            true,
+        )
+        .unwrap();
         assert!(fs::read(&path).unwrap().is_empty());
 
         let loser = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"loser\n").unwrap())
@@ -940,10 +941,7 @@ mod tests {
 
         ours.write_to(&path, SwapOwnership::new(process_probe_dead, false))
             .unwrap();
-        assert_eq!(
-            read_snapshot(&path).buffer.to_bytes(),
-            b"ours\n"
-        );
+        assert_eq!(read_snapshot(&path).buffer.to_bytes(), b"ours\n");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -956,7 +954,9 @@ mod tests {
         let path = dir.join("buffer.swp");
         let stale = SwapFile::new(FILE_NAME, Buffer::from_bytes(b"stale\n").unwrap())
             .with_meta(identity(u32::MAX));
-        stale.write_to(&path, SwapOwnership::for_session(true)).unwrap();
+        stale
+            .write_to(&path, SwapOwnership::for_session(true))
+            .unwrap();
 
         SwapFile::new(
             FILE_NAME,

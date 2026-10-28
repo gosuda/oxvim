@@ -487,9 +487,10 @@ fn open_startup_files(
                 .current_buffer()
                 .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
             if flags.binary {
-                let _ = editor
-                    .options_mut()
-                    .set_buffer(current, "binary", OptionValue::Boolean(true));
+                let _ =
+                    editor
+                        .options_mut()
+                        .set_buffer(current, "binary", OptionValue::Boolean(true));
             }
             let read = startup_file_read(editor, Some(current), &bytes);
             let text = startup_file_buffer(&read)?;
@@ -521,9 +522,10 @@ fn open_startup_files(
             "fileformat",
             OptionValue::String(read.fileformat.to_owned()),
         );
-        let _ = editor
-            .options_mut()
-            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
+        let _ =
+            editor
+                .options_mut()
+                .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
