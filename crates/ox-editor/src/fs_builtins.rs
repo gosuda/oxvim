@@ -30,6 +30,7 @@ pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
             | "isdirectory"
             | "getftime"
             | "getfsize"
+            | "getfperm"
             | "getftype"
             | "filewritable"
             | "setfperm"
@@ -995,6 +996,32 @@ mod tests {
     use super::*;
     use crate::script::RealFileIO;
     use crate::{Editor, ExExecutor, TestEditorAccess};
+
+    /// Every name the dispatcher serves must also be claimed by the predicate
+    /// that routes it, or the builtin answers `E117: not implemented` while a
+    /// working implementation sits unreachable. `getfperm` was routed that way.
+    #[test]
+    fn every_dispatched_name_is_routed() {
+        for name in [
+            "delete",
+            "rename",
+            "filecopy",
+            "readblob",
+            "glob",
+            "globpath",
+            "readfile",
+            "filereadable",
+            "isdirectory",
+            "getftime",
+            "getfsize",
+            "getfperm",
+            "getftype",
+            "filewritable",
+            "setfperm",
+        ] {
+            assert!(is_filesystem_builtin(name), "{name} is not routed");
+        }
+    }
 
     struct TempRoot(PathBuf);
 
