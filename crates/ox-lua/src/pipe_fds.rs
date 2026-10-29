@@ -47,6 +47,10 @@ impl Registry {
     pub(crate) fn register_pair(&mut self, reader: OwnedFd, writer: OwnedFd) -> (i64, i64) {
         let read = reader.as_raw_fd();
         let write = writer.as_raw_fd();
+        // The operating system reuses numbers: a marker left by an earlier
+        // spawn must not outlive the new live entry for the same number.
+        self.awaiting_close.remove(&read);
+        self.awaiting_close.remove(&write);
         self.owned.insert(read, reader);
         self.owned.insert(write, writer);
         (i64::from(read), i64::from(write))
@@ -54,6 +58,7 @@ impl Registry {
 
     /// Takes a stored descriptor out, for a handle or a child slot to own.
     pub(crate) fn take(&mut self, descriptor: i32) -> Option<OwnedFd> {
+        self.awaiting_close.remove(&descriptor);
         self.owned.remove(&descriptor)
     }
 
@@ -69,9 +74,57 @@ impl Registry {
     /// retired; both count as a successful close. Anything else is not ours,
     /// and the caller keeps its existing `EBADF`.
     pub(crate) fn close(&mut self, descriptor: i32) -> bool {
-        if self.owned.remove(&descriptor).is_some() {
-            return true;
-        }
-        self.awaiting_close.remove(&descriptor)
+        let live = self.owned.remove(&descriptor);
+        // Drop any marker for the same number either way: a reused number
+        // must not keep a stale success path.
+        self.awaiting_close.remove(&descriptor);
+        live.is_some()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::fd::OwnedFd;
+
+    use super::Registry;
+
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+        (reader.into(), writer.into())
+    }
+
+    /// A number can be both live and marked as spawned. Closing it must retire
+    /// the live entry once and never report a second success from the marker.
+    #[test]
+    fn stale_marker_never_reports_a_second_close() {
+        let (reader, writer) = pair();
+        let mut registry = Registry::default();
+        let (read, write) = registry.register_pair(reader, writer);
+        let read = i32::try_from(read).expect("descriptor fits i32");
+        let write = i32::try_from(write).expect("descriptor fits i32");
+        registry.mark_spawned(read);
+
+        assert!(registry.close(read), "first close retires the live half");
+        assert!(!registry.close(read), "second close answers EBADF");
+        assert!(registry.close(write), "the other half closes once");
+        assert!(!registry.close(write), "and only once");
+    }
+
+    /// Taking a half for a handle or a child slot drops any marker for that
+    /// number, so the later `fs_close` cannot succeed without an owner.
+    #[test]
+    fn taking_a_number_clears_its_marker() {
+        let (reader, writer) = pair();
+        let mut registry = Registry::default();
+        let (_read, write) = registry.register_pair(reader, writer);
+        let write = i32::try_from(write).expect("descriptor fits i32");
+
+        registry.mark_spawned(write);
+        let taken = registry.take(write);
+        assert!(taken.is_some(), "the half came out");
+        assert!(
+            !registry.close(write),
+            "a number already taken has no close to answer"
+        );
     }
 }
