@@ -12,10 +12,11 @@ use ox_types::{DictEntry, DictEntryFlags, DictRef, ListRef, OxStr, Typval};
 use crate::editor::Editor;
 use crate::excmd_exec::{
     DictWatchEvent, EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option,
-    eval_text, read_option, typval_to_text,
+    eval_text, push_scope_watch_event, read_option, typval_to_text,
 };
 use crate::register::RegisterContent;
 use crate::script::FileIO;
+use crate::userfunc::WatchTarget;
 
 /// `parse_expression_prefix`: parse one leading expression and report how
 /// many bytes it consumed.
@@ -236,9 +237,12 @@ pub(crate) fn assign_lvalue<F: FileIO, E: ExEditorAccess>(
             // `g:['k'] = v` writes the scope variable itself. `scope_dict`
             // hands back a per-read snapshot, so assigning into that would
             // drop the value; the scope setter is the live path.
+            let old = scope.get_scoped(kind, key.as_bytes(), 0).ok().cloned();
             scope
-                .set_scoped(kind, key.as_bytes(), 0, value)
-                .map_err(|error| eval_error(runtime, error))
+                .set_scoped(kind, key.as_bytes(), 0, value.clone())
+                .map_err(|error| eval_error(runtime, error))?;
+            push_scope_watch_event(runtime, kind, key.as_bytes(), old, Some(value));
+            Ok(())
         }
         Lvalue::Variable {
             name,
@@ -277,7 +281,12 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             name,
             scope_kind,
             subs,
-        } if subs.is_empty() => Ok(remove_root_variable(scope, name.as_bytes(), *scope_kind)),
+        } if subs.is_empty() => Ok(remove_root_variable(
+            runtime,
+            scope,
+            name.as_bytes(),
+            *scope_kind,
+        )),
         Lvalue::Variable {
             name,
             scope_kind,
@@ -291,14 +300,22 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             // `scope_dict` hands back would remove it from a copy. A missing
             // key is E716 quoting the key, not the E108 a bare name gets
             // (`ex_unlet`, ex_docmds.c:5544-5560).
+            let old = scope.get_scoped(kind, key.as_bytes(), 0).ok().cloned();
             let removed = scope.remove_pair(kind, key.as_bytes());
-            if removed || bang {
-                return Ok(removed);
+            if removed {
+                push_scope_watch_event(runtime, kind, key.as_bytes(), old, None);
+                return Ok(true);
+            }
+            if bang {
+                return Ok(false);
             }
             Err(lvalue_error(
                 runtime,
                 "E716",
-                format!("Key not present in Dictionary: \"{}\"", key.to_string_lossy()),
+                format!(
+                    "Key not present in Dictionary: \"{}\"",
+                    key.to_string_lossy()
+                ),
             ))
         }
         Lvalue::Variable {
@@ -958,7 +975,8 @@ fn dict_write_key<F: FileIO>(
             .push(DictEntry::new(key.clone(), value.clone()));
     }
     let event = DictWatchEvent {
-        dict: Typval::Dict(Rc::clone(dict)),
+        target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
+        dict: Some(Typval::Dict(Rc::clone(dict))),
         key: key.as_bytes().to_vec(),
         old,
         new: Some(value),
@@ -1010,7 +1028,8 @@ fn dict_remove_key<F: FileIO>(
     }
     let removed = data.entries.remove(index);
     let event = DictWatchEvent {
-        dict: Typval::Dict(Rc::clone(dict)),
+        target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
+        dict: Some(Typval::Dict(Rc::clone(dict))),
         key: key.as_bytes().to_vec(),
         old: Some(removed.value),
         new: None,
@@ -1285,13 +1304,19 @@ fn assign_root_variable<F: FileIO>(
         if kind == ScopeKind::Vim {
             return assign_vim_variable(runtime, scope, name, value);
         }
+        let old = scope.get_scoped(kind, name, 0).ok().cloned();
         scope
-            .set_scoped(kind, name, 0, value)
-            .map_err(|error| eval_error(runtime, error))
+            .set_scoped(kind, name, 0, value.clone())
+            .map_err(|error| eval_error(runtime, error))?;
+        push_scope_watch_event(runtime, kind, name, old, Some(value));
+        Ok(())
     } else {
+        let old = scope.get_scoped(ScopeKind::Local, name, 0).ok().cloned();
         scope
-            .set(name, value)
-            .map_err(|error| eval_error(runtime, error))
+            .set(name, value.clone())
+            .map_err(|error| eval_error(runtime, error))?;
+        push_scope_watch_event(runtime, ScopeKind::Local, name, old, Some(value));
+        Ok(())
     }
 }
 
@@ -1352,21 +1377,35 @@ fn assign_register<F: FileIO, E: ExEditorAccess>(
 /// `ex_let_env` (`eval/vars.c`:1349-1351): the assignment *is*
 /// `vim_setenv_ext`, a process-environment change that children inherit.
 fn assign_environment(name: &str, value: &Typval) {
-    let text = typval_to_text(value);
+    let text = typval_to_text(&value);
     ox_sys::set_env(name, &text);
 }
 
-fn remove_root_variable(scope: &mut Scope, name: &[u8], scope_kind: Option<ScopeKind>) -> bool {
+fn remove_root_variable<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    scope: &mut Scope,
+    name: &[u8],
+    scope_kind: Option<ScopeKind>,
+) -> bool {
+    let previous = |scope: &Scope, kind: ScopeKind| scope.get_scoped(kind, name, 0).ok().cloned();
+    let remove = |runtime: &mut ExRuntime<F>, scope: &mut Scope, kind: ScopeKind| {
+        let old = previous(scope, kind);
+        let removed = scope.remove_pair(kind, name);
+        if removed {
+            push_scope_watch_event(runtime, kind, name, old, None);
+        }
+        removed
+    };
     match scope_kind {
-        Some(ScopeKind::Global) => scope.remove_pair(ScopeKind::Global, name),
-        Some(ScopeKind::Buffer) => scope.remove_pair(ScopeKind::Buffer, name),
-        Some(ScopeKind::Window) => scope.remove_pair(ScopeKind::Window, name),
-        Some(ScopeKind::Tab) => scope.remove_pair(ScopeKind::Tab, name),
-        Some(ScopeKind::Script) => scope.remove_pair(ScopeKind::Script, name),
-        Some(ScopeKind::Local) => scope.remove_pair(ScopeKind::Local, name),
+        Some(ScopeKind::Global) => remove(runtime, scope, ScopeKind::Global),
+        Some(ScopeKind::Buffer) => remove(runtime, scope, ScopeKind::Buffer),
+        Some(ScopeKind::Window) => remove(runtime, scope, ScopeKind::Window),
+        Some(ScopeKind::Tab) => remove(runtime, scope, ScopeKind::Tab),
+        Some(ScopeKind::Script) => remove(runtime, scope, ScopeKind::Script),
+        Some(ScopeKind::Local) => remove(runtime, scope, ScopeKind::Local),
         Some(ScopeKind::Argument | ScopeKind::Vim) => false,
         None => {
-            scope.remove_pair(ScopeKind::Local, name) || scope.remove_pair(ScopeKind::Global, name)
+            remove(runtime, scope, ScopeKind::Local) || remove(runtime, scope, ScopeKind::Global)
         }
     }
 }

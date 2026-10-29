@@ -181,6 +181,27 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     }
 }
 
+/// Serves `name` with per-argument call-site identities.
+///
+/// Only the environment family resolves scope-namespace arguments; every
+/// other family runs through [`call`] with plain values (a `g:` snapshot
+/// that merely flows through a value is a Dict, not a Scope).
+pub(crate) fn call_with_identities<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    family: Family,
+    name: &str,
+    args: Vec<ox_eval::eval::CallArg>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    match family {
+        Family::Environment => environment::call_with_identities(host, name, args, scope),
+        _ => {
+            let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+            call(host, family, name, &values, scope)
+        }
+    }
+}
+
 pub(crate) fn input_string_arg(value: &Typval) -> ox_eval::Result<OxStr> {
     match value {
         Typval::String(value) => Ok(value.clone()),

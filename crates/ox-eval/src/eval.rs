@@ -41,6 +41,46 @@ pub trait BuiltinHost {
         self.call(name, args, scope)
     }
 
+    /// Invoke a named Vimscript function with per-argument identities.
+    ///
+    /// The default strips the identities and delegates to
+    /// [`call`](Self::call), so hosts without identity-sensitive builtins
+    /// keep working unchanged. A host that resolves scope-namespace
+    /// arguments (like `dictwatcheradd`'s bare `g:`) overrides this and
+    /// matches the identities against the live `scope` maps.
+    ///
+    /// # Errors
+    ///
+    /// See [`call`](Self::call).
+    fn call_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call(name, values, scope)
+    }
+
+    /// Invoke a named function through `receiver->name(...)` with identities.
+    ///
+    /// The default strips the identities and delegates to
+    /// [`call_method`](Self::call_method); see
+    /// [`call_with_identities`](Self::call_with_identities).
+    ///
+    /// # Errors
+    ///
+    /// See [`call`](Self::call).
+    fn call_method_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call_method(name, values, scope)
+    }
+
     /// Records the dictionary a Partial carries, so a host that owns
     /// user-function frames can bind it as `self` for the next call.
     fn set_call_receiver(&mut self, _receiver: Option<ox_types::DictRef>) {}
@@ -357,6 +397,19 @@ impl Evaluated {
     }
 }
 
+/// One evaluated call argument: the value the builtin receives plus the
+/// source identity [`Evaluated`] carried for it (the same identity the
+/// `is` operator compares). A bare `g:`/`b:`/`w:`/`t:` argument keeps the
+/// live scope map's identity, so an identity-sensitive host can resolve it
+/// against the same maps in `scope` instead of a dead snapshot pointer.
+#[derive(Clone, Debug)]
+pub struct CallArg {
+    /// The argument value handed to the builtin.
+    pub value: Typval,
+    /// The identity of the argument expression, when it had one.
+    pub identity: Option<usize>,
+}
+
 /// A reusable evaluator with host seams and a shared closure registry.
 pub struct Evaluator<'a, H: BuiltinHost, R: RegexEngine> {
     host: &'a mut H,
@@ -640,7 +693,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 let receiver = self.eval_at(receiver, scope, next)?;
                 let mut values = Vec::with_capacity(args.len() + 1);
                 for arg in args {
-                    values.push(self.eval_at(arg, scope, next)?.value);
+                    let evaluated = self.eval_at(arg, scope, next)?;
+                    values.push(CallArg {
+                        value: evaluated.value,
+                        identity: evaluated.identity,
+                    });
                 }
                 let slot = match &method.kind {
                     ExprKind::Variable(name) => crate::builtin_spec(&name.to_string_lossy())
@@ -648,7 +705,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     _ => 1,
                 };
                 let index = slot.saturating_sub(1).min(values.len());
-                values.insert(index, receiver.value);
+                values.insert(
+                    index,
+                    CallArg {
+                        value: receiver.value,
+                        identity: receiver.identity,
+                    },
+                );
                 self.call_method(method, values, scope, next)
             }
             ExprKind::Lambda { params, body, .. } => {
@@ -949,7 +1012,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     ) -> Result<Evaluated> {
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            values.push(self.eval_at(arg, scope, depth)?.value);
+            let evaluated = self.eval_at(arg, scope, depth)?;
+            values.push(CallArg {
+                value: evaluated.value,
+                identity: evaluated.identity,
+            });
         }
         if let ExprKind::Variable(name) = &callee.kind {
             // A Funcref/Partial variable is callable (`g:Xsetlist()`). A
@@ -987,13 +1054,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_method(
         &mut self,
         method: &Expr,
-        args: Vec<Typval>,
+        args: Vec<CallArg>,
         scope: &mut Scope,
         depth: usize,
     ) -> Result<Evaluated> {
         if let ExprKind::Variable(name) = &method.kind {
             self.host
-                .call_method(name, args, scope)
+                .call_method_with_identities(name, args, scope)
                 .map(Evaluated::plain)
                 .map_err(|mut error| {
                     if error.code == "E117" {
@@ -1010,7 +1077,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_named(
         &mut self,
         name: &OxStr,
-        args: Vec<Typval>,
+        args: Vec<CallArg>,
         scope: &mut Scope,
         offset: usize,
         _depth: usize,
@@ -1032,7 +1099,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             .as_ref()
             .map(|target| format!("Unknown function: {}", target.to_string_lossy()));
         self.host
-            .call(target, args, scope)
+            .call_with_identities(target, args, scope)
             .map(Evaluated::plain)
             .map_err(|mut error| {
                 if error.code == "E117" {
@@ -1060,6 +1127,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         args: Vec<Typval>,
         scope: &mut Scope,
     ) -> Result<Typval> {
+        let args = args
+            .into_iter()
+            .map(|value| CallArg {
+                value,
+                identity: None,
+            })
+            .collect();
         self.call_value(callee, args, scope, 0)
             .map(|evaluated| evaluated.value)
     }
@@ -1067,14 +1141,20 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_value(
         &mut self,
         callee: Typval,
-        mut args: Vec<Typval>,
+        mut args: Vec<CallArg>,
         scope: &mut Scope,
         depth: usize,
     ) -> Result<Evaluated> {
         match callee {
             Typval::Funcref(mut funcref) | Typval::Partial(mut funcref) => {
                 if !funcref.args.is_empty() {
-                    let mut bound = std::mem::take(&mut funcref.args);
+                    let mut bound: Vec<CallArg> = std::mem::take(&mut funcref.args)
+                        .into_iter()
+                        .map(|value| CallArg {
+                            value,
+                            identity: None,
+                        })
+                        .collect();
                     bound.append(&mut args);
                     args = bound;
                 }
@@ -1107,7 +1187,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_closure(
         &mut self,
         funcref: &Funcref,
-        args: &[Typval],
+        args: &[CallArg],
         caller: &mut Scope,
         depth: usize,
         offset: usize,
@@ -1173,7 +1253,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         for (param, value) in closure.params.iter().zip(args) {
             // Named parameters resolve both unqualified and as `a:name`.
             scope.local.retain(|(name, _)| name != param);
-            bind_argument(&mut scope, param, value.clone());
+            bind_argument(&mut scope, param, value.value.clone());
         }
         // Any extra arguments behave like a variadic `...`: `a:0` is their
         // count, `a:000` is the List, and `a:1`, `a:2`, ... index them. Vim
@@ -1184,11 +1264,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         bind_argument(
             &mut scope,
             &OxStr::from("000"),
-            Typval::list(extras.to_vec()),
+            Typval::list(extras.iter().map(|arg| arg.value.clone()).collect()),
         );
         for (index, value) in extras.iter().enumerate() {
             let name = OxStr(format!("{}", index + 1).into_bytes());
-            bind_argument(&mut scope, &name, value.clone());
+            bind_argument(&mut scope, &name, value.value.clone());
         }
         let result = self.eval_at(&closure.body, &mut scope, depth);
         // Hand the borrowed global state back: the body's assignments and

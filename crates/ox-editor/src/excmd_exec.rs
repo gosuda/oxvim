@@ -741,9 +741,17 @@ pub(crate) enum DeferredOp {
 /// change here instead and the executor drains the queue after the borrow is
 /// released, at the end of `:let`/`:unlet` (`tv_dict_watcher_notify` runs
 /// synchronously in upstream, but this port cannot re-enter the borrow).
+/// Scope-namespace writes (`:let g:x = 1`, `:unlet g:x`, the `g:['k']`
+/// subscript forms, and the multi-key `:unlet` path) record a
+/// `WatchTarget::Scope` event instead: the scope map has no live `Dict`
+/// identity, so the drain builds its callback argument from
+/// [`Scope::scope_dict`] the way the read path does.
 pub(crate) struct DictWatchEvent {
+    /// Who the change notifies: a live `Dict` identity or a scope namespace.
+    pub(crate) target: WatchTarget,
     /// The mutated dictionary, as a `Typval::Dict` holding its live identity.
-    pub(crate) dict: Typval,
+    /// `None` for scope targets, whose argument the drain builds fresh.
+    pub(crate) dict: Option<Typval>,
     /// The mutated key, in wire bytes.
     pub(crate) key: Vec<u8>,
     /// The previous value: `None` when the key is newly added.
@@ -4329,12 +4337,72 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
         self.builtins.call(name, args, scope)
     }
 
+    /// Identity-carrying entry point the evaluator uses for every call: only
+    /// the environment family resolves scope-namespace arguments, so it
+    /// forwards there with identities intact. Everything else runs through
+    /// [`call`](BuiltinHost::call) with plain values — a `g:` snapshot that
+    /// merely flows through a value (a List element, a `call()`-builtin list)
+    /// is a Dict, not a Scope.
+    fn call_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<ox_eval::eval::CallArg>,
+        scope: &mut Scope,
+    ) -> ox_eval::Result<Typval> {
+        if let Some(family) = Self::environment_route(name) {
+            return self.env_call_with_identities(name, family, args, scope);
+        }
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call(name, values, scope)
+    }
+
+    /// Identity-carrying `receiver->name(...)` entry point: same environment
+    /// interception as [`call_with_identities`](BuiltinHost::call_with_identities).
+    fn call_method_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<ox_eval::eval::CallArg>,
+        scope: &mut Scope,
+    ) -> ox_eval::Result<Typval> {
+        if let Some(family) = Self::environment_route(name) {
+            return self.env_call_with_identities(name, family, args, scope);
+        }
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call_method(name, values, scope)
+    }
+
     fn closure_registry(&self) -> Option<ox_eval::eval::ClosureRegistry> {
         Some(self.runtime.closures.clone())
     }
 }
 
 impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
+    /// The environment route for `name`, when it has one: the only family
+    /// that resolves scope-namespace arguments. Shared by both
+    /// identity-carrying entry points so the routing decision lives in one
+    /// place; the family travels into the dispatch, so the route is looked
+    /// up once per call.
+    fn environment_route(name: &OxStr) -> Option<crate::builtins::Family> {
+        match crate::builtins::route(&name.to_string_lossy()) {
+            Some(family @ crate::builtins::Family::Environment) => Some(family),
+            _ => None,
+        }
+    }
+
+    /// Identity-aware environment dispatch for both call entry points, on
+    /// the route the caller resolved with
+    /// [`environment_route`](Self::environment_route).
+    fn env_call_with_identities(
+        &mut self,
+        name: &OxStr,
+        family: crate::builtins::Family,
+        args: Vec<ox_eval::eval::CallArg>,
+        scope: &mut Scope,
+    ) -> ox_eval::Result<Typval> {
+        let name_text = name.to_string_lossy();
+        crate::builtins::call_with_identities(self, family, &name_text, args, scope)
+    }
+
     /// Calls one `nvim_*` API function through the installed Lua host, the
     /// same way a `function('nvim_…')` reaches upstream's C dispatch.
     fn api_call(
@@ -5429,12 +5497,15 @@ fn list_scoped_variables(editor: &mut Editor, scope: &Scope, args: &str) -> bool
 /// [`UserFunctions::dictwatcher_begin`], dispatches each still-live watcher by
 /// callback form — names through [`call_user_function_with_self`],
 /// `Funcref`/`Partial` through the evaluator path the timer delivery uses —
-/// and closes with [`UserFunctions::dictwatcher_finish`]. Scope-namespace
-/// targets (`WatchTarget::Scope`) have no producer yet: only `Dict` events are
-/// recorded, so only that form can fire here. A watcher failure displays like
-/// `emsg` and never stops the rest of the round, matching upstream's
-/// continue-on-error loop; the `:let`/`:unlet` itself still succeeds. Fire per
-/// command: a `|` chain runs separate commands, so one write means one fire.
+/// and closes with [`UserFunctions::dictwatcher_finish`]. A scope-namespace
+/// event (`WatchTarget::Scope`) builds its dict argument from
+/// [`Scope::scope_dict`], the same snapshot the read path hands out, then
+/// runs the same round as a dict event. Events fire in recorded order, so a
+/// command's mutations notify in the order they happened. A watcher failure
+/// displays like `emsg` and never stops the rest of the round, matching
+/// upstream's continue-on-error loop; the `:let`/`:unlet` itself still
+/// succeeds. Fire per command: a `|` chain runs separate commands, so one
+/// write means one fire.
 fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -5447,19 +5518,27 @@ fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
     }
     let events = std::mem::take(&mut runtime.dict_watch_events);
     for event in events {
-        let Typval::Dict(reference) = &event.dict else {
-            continue;
+        // A scope namespace has no live `Dict` identity to pass along, so its
+        // callback argument is the same snapshot a bare `g:` read gets.
+        let dict = match event.target {
+            WatchTarget::Scope(kind) => scope.scope_dict(kind),
+            WatchTarget::Dict(_) => match event.dict {
+                Some(dict) => dict,
+                None => continue,
+            },
         };
-        let target = WatchTarget::Dict(Rc::as_ptr(reference) as usize);
-        let Some(round) = runtime.functions.dictwatcher_begin(&target, &event.key) else {
+        let Some(round) = runtime
+            .functions
+            .dictwatcher_begin(&event.target, &event.key)
+        else {
             continue;
         };
         for (id, _pattern, callback) in &round.pending {
-            if !runtime.functions.dictwatcher_is_live(&target, *id) {
+            if !runtime.functions.dictwatcher_is_live(&event.target, *id) {
                 continue;
             }
             let args = UserFunctions::dictwatcher_arguments(
-                event.dict.clone(),
+                dict.clone(),
                 &event.key,
                 event.new.clone(),
                 event.old.clone(),
@@ -5494,8 +5573,30 @@ fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
                 display_error_message(runtime, access, &flow);
             }
         }
-        runtime.functions.dictwatcher_finish(&target);
+        runtime.functions.dictwatcher_finish(&event.target);
     }
+}
+
+/// Queues one scope-namespace mutation for watcher notification.
+///
+/// Callers read the previous value before the write and pass it as `old`
+/// (`None` for a newly added key); the queue holds the event until the
+/// command drains it. Only successful writes reach here — a refused write
+/// changed nothing, so it notifies nothing.
+pub(crate) fn push_scope_watch_event<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    kind: ScopeKind,
+    key: &[u8],
+    old: Option<Typval>,
+    new: Option<Typval>,
+) {
+    runtime.dict_watch_events.push(DictWatchEvent {
+        target: WatchTarget::Scope(kind),
+        dict: None,
+        key: key.to_vec(),
+        old,
+        new,
+    });
 }
 
 /// Invokes one `Funcref`/`Partial` watcher callback through the evaluator, the
@@ -5808,7 +5909,7 @@ fn command_unlet<F: FileIO, E: ExEditorAccess>(
                 }
             }
         } else {
-            remove_target(scope, target)
+            remove_target(runtime, scope, target)
         };
         // Fire per target, like the synchronous upstream notify: an earlier
         // removal's watchers observe it even when a later target fails, and
@@ -22257,19 +22358,37 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
         return Ok(());
     }
     if let Some(kind) = kind {
+        let old = scope.get_scoped(kind, name.as_bytes(), 0).ok().cloned();
         scope
-            .set_scoped(kind, name.as_bytes(), 0, value)
+            .set_scoped(kind, name.as_bytes(), 0, value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
+        push_scope_watch_event(runtime, kind, name.as_bytes(), old, Some(value));
     } else if runtime.can_add_defer() {
         // `get_var_ht_dict` (eval/vars.c:2505-2512): inside a function a
         // bare name is function-local; outside one it is global.
+        let old = scope
+            .get_scoped(ScopeKind::Local, name.as_bytes(), 0)
+            .ok()
+            .cloned();
         scope
-            .set(name.as_bytes(), value)
+            .set(name.as_bytes(), value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
+        push_scope_watch_event(runtime, ScopeKind::Local, name.as_bytes(), old, Some(value));
     } else {
+        let old = scope
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .ok()
+            .cloned();
         scope
-            .set_scoped(ScopeKind::Global, name.as_bytes(), 0, value)
+            .set_scoped(ScopeKind::Global, name.as_bytes(), 0, value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
+        push_scope_watch_event(
+            runtime,
+            ScopeKind::Global,
+            name.as_bytes(),
+            old,
+            Some(value),
+        );
     }
     Ok(())
 }
@@ -22379,7 +22498,7 @@ fn env_name_len(text: &str) -> usize {
         .unwrap_or(text.len())
 }
 
-fn remove_target(scope: &mut Scope, target: &str) -> bool {
+fn remove_target<F: FileIO>(runtime: &mut ExRuntime<F>, scope: &mut Scope, target: &str) -> bool {
     if let Some(environment) = target.strip_prefix('$') {
         // `do_unlet_var` (`eval/vars.c`:1653-1654) is `vim_unsetenv_ext`, the
         // process-wide unset, for the same reason the assignment is a
@@ -22390,18 +22509,27 @@ fn remove_target(scope: &mut Scope, target: &str) -> bool {
         ox_sys::unset_env(environment);
         return true;
     }
+    let previous =
+        |scope: &Scope, kind: ScopeKind, name: &[u8]| scope.get_scoped(kind, name, 0).ok().cloned();
     let (kind, name) = parse_scope_name(target);
+    let removed = |runtime: &mut ExRuntime<F>, scope: &mut Scope, kind: ScopeKind| {
+        let old = previous(scope, kind, name.as_bytes());
+        let removed = scope.remove_pair(kind, name.as_bytes());
+        if removed {
+            push_scope_watch_event(runtime, kind, name.as_bytes(), old, None);
+        }
+        removed
+    };
     match kind {
-        Some(ScopeKind::Global) => scope.remove_pair(ScopeKind::Global, name.as_bytes()),
-        Some(ScopeKind::Buffer) => scope.remove_pair(ScopeKind::Buffer, name.as_bytes()),
-        Some(ScopeKind::Window) => scope.remove_pair(ScopeKind::Window, name.as_bytes()),
-        Some(ScopeKind::Tab) => scope.remove_pair(ScopeKind::Tab, name.as_bytes()),
-        Some(ScopeKind::Script) => scope.remove_pair(ScopeKind::Script, name.as_bytes()),
-        Some(ScopeKind::Local) => scope.remove_pair(ScopeKind::Local, name.as_bytes()),
+        Some(ScopeKind::Global) => removed(runtime, scope, ScopeKind::Global),
+        Some(ScopeKind::Buffer) => removed(runtime, scope, ScopeKind::Buffer),
+        Some(ScopeKind::Window) => removed(runtime, scope, ScopeKind::Window),
+        Some(ScopeKind::Tab) => removed(runtime, scope, ScopeKind::Tab),
+        Some(ScopeKind::Script) => removed(runtime, scope, ScopeKind::Script),
+        Some(ScopeKind::Local) => removed(runtime, scope, ScopeKind::Local),
         Some(ScopeKind::Argument | ScopeKind::Vim) => false,
         None => {
-            scope.remove_pair(ScopeKind::Local, name.as_bytes())
-                || scope.remove_pair(ScopeKind::Global, name.as_bytes())
+            removed(runtime, scope, ScopeKind::Local) || removed(runtime, scope, ScopeKind::Global)
         }
     }
 }

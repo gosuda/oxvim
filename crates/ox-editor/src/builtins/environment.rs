@@ -11,6 +11,9 @@ use crate::userfunc::{WatchCallback, WatchTarget};
 use crate::visual::VisualKind;
 use crate::{DirectoryScope, Editor};
 use ox_eval::EvalError;
+use ox_eval::Scope;
+use ox_eval::ScopeKind;
+use ox_eval::eval::CallArg;
 use ox_types::{OxStr, Typval};
 
 use super::input_string_arg;
@@ -75,6 +78,29 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "dictwatcheradd" => call_dictwatcher_add_builtin(host, args),
         "dictwatcherdel" => call_dictwatcher_del_builtin(host, args),
         _ => unreachable!("environment builtin route and dispatcher disagree"),
+    }
+}
+
+/// Routes one ambient-environment builtin with per-argument identities.
+///
+/// Only `dictwatcheradd()`/`dictwatcherdel()` read identities: a bare
+/// `g:`/`b:`/`w:`/`t:` argument keeps the live scope map's identity, which
+/// resolves to [`WatchTarget::Scope`], while a Dict-valued variable like
+/// `g:d` keeps its slot identity and stays [`WatchTarget::Dict`]. Every
+/// other builtin runs through [`call`] with plain values.
+pub(crate) fn call_with_identities<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    name: &str,
+    args: Vec<CallArg>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    match name {
+        "dictwatcheradd" => call_dictwatcher_add_scoped(host, &args, scope),
+        "dictwatcherdel" => call_dictwatcher_del_scoped(host, &args, scope),
+        _ => {
+            let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+            call(host, name, &values)
+        }
     }
 }
 /// `f_defer` through `add_defer` (`eval/userfunc.c` 3390-3484): register `{fn}`
@@ -781,6 +807,121 @@ fn dictwatcher_add_target(argument: &Typval) -> ox_eval::Result<WatchTarget> {
         ));
     }
     dictwatcher_target(argument)
+}
+
+/// Resolves a bare scope-namespace argument (`g:`, `b:`, `w:`, `t:`) to its
+/// [`WatchTarget::Scope`]: the evaluator records the live map's identity for
+/// exactly these expressions, so matching it against the same maps in `scope`
+/// tells them apart from a Dict-valued variable like `g:d`, whose identity is
+/// its variable slot's instead. Anything else is not a scope namespace.
+fn scope_target(identity: Option<usize>, scope: &Scope) -> Option<WatchTarget> {
+    let identity = identity?;
+    if identity == std::ptr::from_ref(&scope.global) as usize {
+        Some(WatchTarget::Scope(ScopeKind::Global))
+    } else if identity == std::ptr::from_ref(&scope.buffer) as usize {
+        Some(WatchTarget::Scope(ScopeKind::Buffer))
+    } else if identity == std::ptr::from_ref(&scope.window) as usize {
+        Some(WatchTarget::Scope(ScopeKind::Window))
+    } else if identity == std::ptr::from_ref(&scope.tab) as usize {
+        Some(WatchTarget::Scope(ScopeKind::Tab))
+    } else {
+        None
+    }
+}
+
+/// The scoped `dictwatcheradd()`/`dictwatcherdel()` target: a bare scope
+/// namespace keeps [`WatchTarget::Scope`]; every other argument validates
+/// exactly like the values-only path.
+fn dictwatcher_target_scoped(argument: &CallArg, scope: &Scope) -> ox_eval::Result<WatchTarget> {
+    if let Some(target) = scope_target(argument.identity, scope) {
+        return Ok(target);
+    }
+    dictwatcher_target(&argument.value)
+}
+
+/// The scoped add-path target: same `v:_null_dict` refusal as the
+/// values-only path, with scope namespaces resolved first.
+fn dictwatcher_add_target_scoped(
+    argument: &CallArg,
+    scope: &Scope,
+) -> ox_eval::Result<WatchTarget> {
+    if let Some(target) = scope_target(argument.identity, scope) {
+        return Ok(target);
+    }
+    dictwatcher_add_target(&argument.value)
+}
+
+/// Validates scoped `dictwatcheradd()` arguments: same pattern/callback
+/// checks as [`dictwatcher_add_args`], with the target resolved against the
+/// live `scope` maps.
+fn dictwatcher_add_args_scoped(
+    args: &[CallArg],
+    scope: &Scope,
+) -> ox_eval::Result<(WatchTarget, Option<OxStr>, WatchCallback)> {
+    check_arity("dictwatcheradd", args.len())?;
+    let target = dictwatcher_add_target_scoped(&args[0], scope)?;
+    let pattern = dictwatcher_pattern(&args[1].value)?;
+    let callback = dictwatcher_add_callback(&args[2].value)?;
+    Ok((target, pattern, callback))
+}
+
+/// Validates scoped `dictwatcherdel()` arguments: same pattern/callback
+/// checks as [`dictwatcher_del_args`], with the target resolved against the
+/// live `scope` maps.
+fn dictwatcher_del_args_scoped(
+    args: &[CallArg],
+    scope: &Scope,
+) -> ox_eval::Result<(WatchTarget, Option<OxStr>, WatchCallback)> {
+    check_arity("dictwatcherdel", args.len())?;
+    let target = dictwatcher_target_scoped(&args[0], scope)?;
+    let pattern = dictwatcher_pattern(&args[1].value)?;
+    let callback = dictwatcher_del_callback(&args[2].value)?;
+    Ok((target, pattern, callback))
+}
+
+/// Scoped `f_dictwatcheradd` (`eval/funcs.c:965`): same registry round as
+/// [`call_dictwatcher_add_builtin`], with the target resolved against `scope`.
+fn call_dictwatcher_add_scoped<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[CallArg],
+    scope: &Scope,
+) -> ox_eval::Result<Typval> {
+    let (target, pattern, callback) = dictwatcher_add_args_scoped(args, scope)?;
+    let Some(pattern) = pattern else {
+        return Ok(Typval::Number(0));
+    };
+    host.runtime
+        .functions
+        .dictwatcher_add(target, pattern, callback);
+    Ok(Typval::Number(0))
+}
+
+/// Scoped `f_dictwatcherdel` (`eval/funcs.c:1003`): same match-all-or-miss
+/// round as [`call_dictwatcher_del_builtin`], with the target resolved
+/// against `scope`.
+fn call_dictwatcher_del_scoped<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[CallArg],
+    scope: &Scope,
+) -> ox_eval::Result<Typval> {
+    let (target, pattern, callback) = dictwatcher_del_args_scoped(args, scope)?;
+    let removed = match pattern {
+        Some(pattern) => host.runtime.functions.dictwatcher_remove(
+            &target,
+            pattern.as_bytes(),
+            &callback,
+        ),
+        // A null pattern never matches an added watcher.
+        None => false,
+    };
+    if removed {
+        return Ok(Typval::Number(0));
+    }
+    Err(EvalError::new(
+        "",
+        0,
+        "Couldn't find a watcher matching key and callback",
+    ))
 }
 
 /// Coerces a dictwatcher key pattern: upstream accepts `VAR_STRING` and

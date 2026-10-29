@@ -11909,3 +11909,73 @@ fn dictwatcher_callback_write_does_not_reenter_busy_watcher() {
         other => panic!("expected g:d to stay a Dict, got {other:?}"),
     }
 }
+
+/// A `g:`-namespace watcher fires when plain scope variables change:
+/// `let g:x = 1` notifies with `new` and no `old`, and a later `unlet g:x`
+/// notifies with `old` and no `new` — the same three-argument
+/// `(dict, key, {new, old})` round as a dict target
+/// (`tv_dict_watcher_notify`, `eval/typval.c:2054`).
+#[test]
+fn dictwatcher_fires_on_scope_variable_set() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope.vim",
+            "function! WatchScopeCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:, '*', 'WatchScopeCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("x".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "unlet g:x").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("x".to_owned(), 1, 0), ("x".to_owned(), 0, 1)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+/// The `g:['k']` subscript spelling writes the scope variable itself (not a
+/// snapshot), so its watcher round matches the plain spelling: an add
+/// carries `new` only and the removal carries `old` only.
+#[test]
+fn dictwatcher_fires_on_scope_dict_subscript() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_sub.vim",
+            "function! WatchScopeSubCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:changes = []\ncall dictwatcheradd(g:, '*', 'WatchScopeSubCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:['k'] = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "unlet g:['k']").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 0, 1)]
+    );
+}
