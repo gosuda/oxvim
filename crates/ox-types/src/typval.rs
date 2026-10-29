@@ -343,6 +343,200 @@ impl Typval {
     }
 }
 
+/// Format a float exactly as `:echo` stringifies it.
+///
+/// This mirrors `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c`): finite values
+/// render with `vim_snprintf` `%g` handling (`strings.c`), which rewrites
+/// `%g` to plain `%f` or `%e` — so six digits after the point (the C default
+/// precision), not six significant digits: `%f`-style for `abs` in
+/// `[0.001, 1e7)` (and zero), `%e`-style elsewhere, trailing zeroes stripped
+/// while keeping the `.0` suffix — and
+/// NaN and the infinities render as re-readable `str2float()` calls, since
+/// `%g` cannot round-trip them. `string()` shares this spelling
+/// (`vim_float_string` in `ox-eval`); plain `Float`-to-`String` coercion
+/// (`tv_get_string_buf_chk`) instead prints bare `nan`/`inf`.
+#[must_use]
+pub fn vim_float_text(value: f64) -> String {
+    if value.is_nan() {
+        return "str2float('nan')".to_owned();
+    }
+    if value.is_infinite() {
+        let sign = if value > 0.0 { "" } else { "-" };
+        return format!("{sign}str2float('inf')");
+    }
+    let abs = value.abs();
+    if abs == 0.0 || (abs >= 0.001 && abs < 10_000_000.0) {
+        let mut text = format!("{value:.6}");
+        strip_float_zeros(&mut text);
+        text
+    } else {
+        let rendered = format!("{value:.6e}");
+        let (mantissa, exponent) =
+            rendered.split_once('e').expect("exponential format always has an exponent");
+        let mut mantissa = mantissa.to_owned();
+        strip_float_zeros(&mut mantissa);
+        let exponent = normalize_float_exponent(exponent);
+        format!("{mantissa}e{exponent}")
+    }
+}
+
+/// Strip trailing mantissa zeroes the way `%g` does, keeping the lone digit
+/// after the dot (`1.000000` becomes `1.0`, never `1`). One condition covers
+/// every input: stop once the trailing zero is the kept digit after the dot.
+/// Callers pass a mantissa that always contains a dot, and `ends_with` is
+/// total, so no length guard is needed.
+fn strip_float_zeros(text: &mut String) {
+    while text.ends_with('0') && !text.ends_with(".0") {
+        text.pop();
+    }
+}
+
+/// Drop the `+` and leading exponent zeroes `vim_snprintf` removes
+/// (`1.0e+07` becomes `1.0e7`). Rust never emits either, so this is a
+/// defensive mirror of the `STRMOVE` cleanup rather than live behavior.
+fn normalize_float_exponent(exponent: &str) -> String {
+    let (sign, digits) = match exponent.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", exponent.strip_prefix('+').unwrap_or(exponent)),
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    format!("{sign}{digits}")
+}
+
+impl Typval {
+    /// `:echo` spelling of this value: top-level strings render raw, nested
+    /// strings render single-quoted, matching `typval_to_display(value,
+    /// false)` in `excmd_exec.rs`. Container cycles render as `[...]`/`{...}`
+    /// instead of recursing forever.
+    fn fmt_echo(
+        &self,
+        formatter: &mut fmt::Formatter<'_>,
+        quoted_strings: bool,
+        seen: &mut Vec<(u8, *const ())>,
+    ) -> fmt::Result {
+        match self {
+            Self::Number(value) => write!(formatter, "{value}"),
+            Self::Float(value) => formatter.write_str(&vim_float_text(*value)),
+            Self::String(value) => {
+                if quoted_strings {
+                    formatter.write_str("'")?;
+                    formatter.write_str(&value.to_string_lossy().replace('\'', "''"))?;
+                    formatter.write_str("'")
+                } else {
+                    formatter.write_str(&value.to_string_lossy())
+                }
+            }
+            Self::Blob(bytes) => {
+                formatter.write_str("0z")?;
+                for byte in bytes {
+                    write!(formatter, "{byte:02X}")?;
+                }
+                Ok(())
+            }
+            Self::List(list) => {
+                let identity = (VAR_LIST, Rc::as_ptr(list).cast::<()>());
+                if seen.contains(&identity) {
+                    return formatter.write_str("[...]");
+                }
+                let items = list
+                    .try_borrow()
+                    .map_err(|_| fmt::Error)?
+                    .items
+                    .clone();
+                seen.push(identity);
+                formatter.write_str("[")?;
+                for (index, item) in items.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    item.fmt_echo(formatter, true, seen)?;
+                }
+                seen.pop();
+                formatter.write_str("]")
+            }
+            Self::Dict(dict) => {
+                let identity = (VAR_DICT, Rc::as_ptr(dict).cast::<()>());
+                if seen.contains(&identity) {
+                    return formatter.write_str("{...}");
+                }
+                let entries = dict
+                    .try_borrow()
+                    .map_err(|_| fmt::Error)?
+                    .entries
+                    .clone();
+                seen.push(identity);
+                formatter.write_str("{")?;
+                for (index, entry) in entries.iter().enumerate() {
+                    if index != 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(
+                        formatter,
+                        "'{}': ",
+                        entry.key.to_string_lossy().replace('\'', "''")
+                    )?;
+                    entry.value.fmt_echo(formatter, true, seen)?;
+                }
+                seen.pop();
+                formatter.write_str("}")
+            }
+            Self::Funcref(function) | Self::Partial(function) => write!(
+                formatter,
+                "function('{}')",
+                function.name.to_string_lossy()
+            ),
+            Self::Bool(value) => formatter.write_str(if *value { "v:true" } else { "v:false" }),
+            Self::Special(Special::Null) => formatter.write_str("v:null"),
+            Self::Channel(id) | Self::Job(id) => write!(formatter, "{id}"),
+        }
+    }
+}
+
+impl fmt::Display for Typval {
+    /// `:echo` spelling; see [`Typval::fmt_echo`].
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_echo(formatter, false, &mut Vec::new())
+    }
+}
+
+/// One echo renderer shared by both string-quoting modes below.
+struct Echo<'a> {
+    value: &'a Typval,
+    quoted_strings: bool,
+}
+
+impl fmt::Display for Echo<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value
+            .fmt_echo(formatter, self.quoted_strings, &mut Vec::new())
+    }
+}
+
+/// `:echo` spelling of `value`: top-level strings render raw, exactly what
+/// `:echo` prints. See [`echo_text_quoted`] for the container-nested mode.
+/// Together these let the editor lane delete its own renderer.
+#[must_use]
+pub fn echo_text(value: &Typval) -> String {
+    Echo {
+        value,
+        quoted_strings: false,
+    }
+    .to_string()
+}
+
+/// `:echo` spelling of `value` with strings single-quoted: what `:echo`
+/// prints for strings nested in containers, matching
+/// `typval_to_display(value, true)` in `excmd_exec.rs`.
+#[must_use]
+pub fn echo_text_quoted(value: &Typval) -> String {
+    Echo {
+        value,
+        quoted_strings: true,
+    }
+    .to_string()
+}
+
 impl PartialEq for Typval {
     fn eq(&self, other: &Self) -> bool {
         fn equal(left: &Typval, right: &Typval, seen: &mut HashSet<(usize, usize, u8)>) -> bool {
@@ -524,5 +718,72 @@ mod tests {
         assert_eq!(Typval::Funcref(function.clone()).vartype(), super::VAR_FUNC);
         assert_eq!(Typval::Partial(function).vartype(), super::VAR_PARTIAL);
         assert_eq!(Typval::Special(Special::Null).vartype(), super::VAR_SPECIAL);
+    }
+
+    #[test]
+    fn float_special_values_follow_vim_spelling() {
+        // `echo_spec.lua` dumps NaN/infinities as re-readable `str2float()`
+        // calls (`TYPVAL_ENCODE_CONV_FLOAT`, `encode.c`), not bare `%g` text.
+        assert_eq!(Typval::Float(f64::NAN).to_string(), "str2float('nan')");
+        assert_eq!(Typval::Float(-f64::NAN).to_string(), "str2float('nan')");
+        assert_eq!(
+            Typval::Float(f64::INFINITY).to_string(),
+            "str2float('inf')"
+        );
+        assert_eq!(
+            Typval::Float(f64::NEG_INFINITY).to_string(),
+            "-str2float('inf')"
+        );
+    }
+
+    #[test]
+    fn float_echo_uses_six_fraction_digits() {
+        assert_eq!(Typval::Float(0.0).to_string(), "0.0");
+        assert_eq!(Typval::Float(-0.0).to_string(), "-0.0");
+        assert_eq!(Typval::Float(1.5).to_string(), "1.5");
+        assert_eq!(Typval::Float(-1.5).to_string(), "-1.5");
+        assert_eq!(Typval::Float(0.001).to_string(), "0.001");
+        assert_eq!(Typval::Float(0.0009).to_string(), "9.0e-4");
+        assert_eq!(Typval::Float(10_000_000.0).to_string(), "1.0e7");
+        assert_eq!(
+            Typval::Float(1_234_567.891_234_567_9).to_string(),
+            "1234567.891235"
+        );
+        assert_eq!(Typval::Float(1.234_568e-20).to_string(), "1.234568e-20");
+    }
+
+    #[test]
+    fn float_echo_trims_but_keeps_dot_zero() {
+        assert_eq!(Typval::Float(5.0).to_string(), "5.0");
+        assert_eq!(Typval::Float(2.000_000_1).to_string(), "2.0");
+        assert_eq!(Typval::Float(1.999_999_999_9).to_string(), "2.0");
+        assert_eq!(Typval::Float(9_999_999.5).to_string(), "9999999.5");
+    }
+
+    #[test]
+    fn display_echo_scalars_match_upstream() {
+        assert_eq!(Typval::Number(41).to_string(), "41");
+        assert_eq!(
+            Typval::String(OxStr::from("hi")).to_string(),
+            "hi"
+        );
+        assert_eq!(Typval::Bool(true).to_string(), "v:true");
+        assert_eq!(Typval::Bool(false).to_string(), "v:false");
+        assert_eq!(Typval::Special(Special::Null).to_string(), "v:null");
+    }
+
+    #[test]
+    fn echo_text_modes_quote_nested_strings() {
+        let list = Typval::list(vec![Typval::String(OxStr::from("it's"))]);
+        assert_eq!(super::echo_text(&list), "['it''s']");
+        assert_eq!(super::echo_text_quoted(&list), "['it''s']");
+        assert_eq!(
+            super::echo_text(&Typval::String(OxStr::from("it's"))),
+            "it's"
+        );
+        assert_eq!(
+            super::echo_text_quoted(&Typval::String(OxStr::from("it's"))),
+            "'it''s'"
+        );
     }
 }
