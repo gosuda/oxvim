@@ -457,3 +457,15 @@ Two attempts were measured and reverted rather than left in the tree: an extra
 zero-length poll after the deadline, and a two-millisecond margin on the wake
 timer. Neither changed the outcome, and both touched the hot wait path without
 proof. The fix belongs in timer expiry precision, not in `vim.wait`.
+
+
+### keyparse coverage
+
+`vim._core.keyparse` (the Lua table `vim.keycode(keys, true)` builds on) now has
+its own test, `keyparse_reports_modifiers_and_both_spellings`
+(`crates/ox-lua/tests/uv_core.rs`), pinning the shape for a lowercase key, an
+uppercase letter (which the oracle reports as `S`), and a control key. The
+Rust-side oracle comparison is `keyparse_reports_the_oracle_chords`
+(`crates/ox-eval/src/builtins_tests.rs`) with seven notations. There is no
+upstream functional spec for `keyparse`; the reference test tree has none, so
+the Lua group cannot carry this coverage.
