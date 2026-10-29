@@ -1247,3 +1247,19 @@ failures, and `:echon` continuations gained a spurious newline. The remaining 22
 are grouped in the commit body: float rendering, funcref/partial display and
 index counts, cycle-marker shape, control-character translation, and the `<SNR>`
 numbering offset.
+
+
+### Functional gate: what each remaining cluster is blocked on
+
+| Spec | Status | Blocked on |
+|---|---|---|
+| `ex_cmds/cd_spec.lua` | 31 of 36 | `:bcd` stickiness, two temp-context cases, `getcwd()` with `'autochdir'` |
+| `ex_cmds/echo_spec.lua` | 19 of 41 | float rendering, funcref/partial display and index counts, cycle-marker shape, control-character translation, `<SNR>` offset |
+| `ex_cmds/swapfile_preserve_recover_spec.lua` | 2 of 16 | `vim.uv.kill` (ox-lua), TUI exit rendering and grid truncation (ox-ui), the modal ATTENTION dialog |
+| `plugin/dir_spec.lua` | 8 of 38 | `:edit <dir>` is a Rust renderer where upstream drives `nvim.dir` from Lua |
+| `ex_cmds/mksession_spec.lua` | 0 of 18 | no session writer |
+| `ex_cmds/pack_spec.lua`, `menu_spec.lua`, `lsp_spec.lua` | 0 of 15, 0 of 14, 0 of 13 | `:packadd`/`:packloadall` state, the `:menu` tree, the LSP client |
+
+`8a99bd9` fixed a real defect on the swapfile path (`SwapFile::read` dropped the
+block-zero metadata, so a live owner looked stale and W325 could not fire), which
+moved one test; the rest of that spec needs the dialog and display layers.
