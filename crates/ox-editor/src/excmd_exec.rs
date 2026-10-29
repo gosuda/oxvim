@@ -4166,6 +4166,28 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
+    // `:browse` with empty args opens the current directory (`.`) for
+    // `:edit`, `:split`, `:vsplit`, `:tabedit`, and `:tabnew`
+    // (`set_browse_edit_arg`, `ex_docmd.c:5652-5662`).
+    let browse_rewritten;
+    let command = if (command.args.is_empty() || command.args.trim().is_empty())
+        && command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Browse)
+        && matches!(
+            command.command.name(),
+            "edit" | "split" | "vsplit" | "tabedit" | "tabnew"
+        ) {
+        browse_rewritten = {
+            let mut rewritten = command.clone();
+            rewritten.args = ".".to_string();
+            rewritten
+        };
+        &browse_rewritten
+    } else {
+        command
+    };
     // `:noautocmd` suppresses every event for the command (upstream sets
     // `eventignore` to all). The guard restores on drop, covering early
     // exits below.
@@ -14193,8 +14215,16 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
                 return error_flow(runtime, "E948", error.to_string());
             }
         };
-        if !matches!(outcome, LoadSwitchOutcome::Resident) || origin.is_created() {
-            return Flow::Normal;
+        match outcome {
+            LoadSwitchOutcome::Resident => {}
+            LoadSwitchOutcome::Abandoned => return Flow::Normal,
+            LoadSwitchOutcome::Entered => {
+                return if origin.is_created() {
+                    fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], buffer)
+                } else {
+                    Flow::Normal
+                };
+            }
         }
     }
 
@@ -16325,7 +16355,30 @@ fn normalize_dir_buffer_name(path: &Path) -> String {
     } else {
         path.to_path_buf()
     };
-    let mut text = absolute.to_string_lossy().into_owned().replace('\\', "/");
+    let mut components = Vec::new();
+    let mut anchored = false;
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if matches!(components.last(), Some(Component::Normal(_))) => {
+                components.pop();
+            }
+            Component::ParentDir if !anchored => components.push(component),
+            Component::ParentDir => {}
+            Component::Prefix(_) | Component::RootDir => {
+                anchored = true;
+                components.push(component);
+            }
+            component => components.push(component),
+        }
+    }
+    let cleaned = components
+        .into_iter()
+        .fold(PathBuf::new(), |mut path, component| {
+            path.push(component.as_os_str());
+            path
+        });
+    let text = cleaned.to_string_lossy().into_owned().replace('\\', "/");
     let mut collapsed = String::with_capacity(text.len().saturating_add(1));
     let mut previous_slash = false;
     for ch in text.chars() {
@@ -16339,11 +16392,10 @@ fn normalize_dir_buffer_name(path: &Path) -> String {
             previous_slash = false;
         }
     }
-    text = collapsed;
-    if !text.ends_with('/') {
-        text.push('/');
+    if !collapsed.ends_with('/') {
+        collapsed.push('/');
     }
-    text
+    collapsed
 }
 
 /// Stages a startup directory argument: the buffer keeps the directory name

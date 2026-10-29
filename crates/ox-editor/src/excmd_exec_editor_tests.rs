@@ -13365,3 +13365,84 @@ fn checkpath_lists_includes_missing_from_path() {
         ]
     );
 }
+
+/// `:browse` without an argument opens the current directory (`.`) for
+/// `:edit`, `:split`, `:vsplit`, `:tabedit`, and `:tabnew`
+/// (`set_browse_edit_arg`, `ex_docmd.c:5652-5662`).
+#[test]
+fn browse_modifier_without_file_opens_current_directory() {
+    let mut raw = Editor::new();
+    let scratch = raw.create_buffer(true).unwrap();
+    raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(raw);
+    let mut executor = ExExecutor::new();
+    let expected = format!("{}/", std::env::current_dir().unwrap().display());
+
+    // Bare `:edit` without an argument on an unnamed buffer fails with E32.
+    assert_vim_error(executor.execute_line(&editor, "edit"), "E32");
+
+    // `:browse edit` rewrites argument to "." and opens the current directory buffer.
+    executor.execute_line(&editor, "browse edit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+    assert!(matches!(
+        editor.editor().options().get_buffer(current, "filetype"),
+        Ok(crate::OptionValue::String(value)) if value == "directory"
+    ));
+
+    // `:browse split` opens the current directory in a split.
+    executor.execute_line(&editor, "browse split").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse vsplit` opens the current directory in a vertical split.
+    executor.execute_line(&editor, "browse vsplit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse tabedit` opens the current directory in a new tabpage.
+    executor.execute_line(&editor, "browse tabedit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse tabnew` opens the current directory in a new tabpage.
+    executor.execute_line(&editor, "browse tabnew").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+}
