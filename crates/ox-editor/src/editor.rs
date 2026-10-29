@@ -4796,17 +4796,23 @@ impl Editor {
         let first = *windows
             .first()
             .ok_or(EditorError::UnknownWindow(WinHandle::CURRENT))?;
+        let tabpage = self
+            .tabpages
+            .get(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
         let (cursor, local_directory, previous_directory) = {
-            let state = self
-                .tabpages
-                .get(&tab)
-                .ok_or(EditorError::UnknownTabpage(tab))?
-                .window(first)?;
+            let state = tabpage.window(first)?;
             (
                 state.cursor,
                 state.local_directory.clone(),
                 state.previous_directory.clone(),
             )
+        };
+        // The columns lose height, so the first window's view keeps its cursor
+        // on screen with the same fraction arithmetic a ordinary split uses.
+        let (old_topline, old_height) = {
+            let state = tabpage.window(first)?;
+            (state.topline, tabpage.tiled_window_text_height(first)?)
         };
         let previous = self.current_window();
         let window = allocate_window_handle(&mut self.next_window)?;
@@ -4827,6 +4833,17 @@ impl Editor {
             }
             return Err(error.into());
         }
+        let new_height = tabpage.tiled_window_text_height(first)?;
+        let old_row = cursor
+            .lnum
+            .saturating_sub(old_topline)
+            .min(old_height.saturating_sub(1));
+        let new_row = old_row.saturating_mul(new_height) / old_height;
+        let fraction_topline = cursor.lnum.saturating_sub(new_row).max(1);
+        let target_state = tabpage.window_mut(first)?;
+        target_state.topline =
+            cursor_visible_topline(fraction_topline, target_state.cursor.lnum, new_height);
+        target_state.skiprows = 0;
         if enter {
             self.previous_window = previous.filter(|current| *current != window);
         }
