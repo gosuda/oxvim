@@ -820,3 +820,26 @@ Ordering is per command rather than per mutation. For `:let d.a = 1 | let
 d.b = 2` that is still one fire per write, because the `|` separator runs two
 commands; the divergence appears only if a single command writes one dictionary
 twice, and that case needs a test before this lands.
+
+
+### Scope-dict subscripts: the first failure in `dict_notifications_spec`
+
+Reproduced outside the harness:
+
+```vim
+let g:["probe"] = 42
+call writefile([string(get(g:, "probe", "missing"))], "/tmp/scope.txt")
+```
+
+The reference writes `42`. This port aborts line 1 with
+`E121: Undefined variable: g:`, so none of the spec's 70 tests can reach its
+assertions, and the watcher hook is not what fixes that cluster first.
+
+One attempt was made and reverted rather than left half-wired: teaching
+`bind_lvalue` (`lvalue.rs:531`) to accept `g:`/`b:`/`w:`/`t:` with subscripts by
+resolving the scope dictionary. The binary still reported E121, so the binder at
+`lvalue.rs:531` is not the one the `:let` path uses for this spelling. The
+remaining candidates are the `:let` target resolution in `command_let`
+(`excmd_exec.rs:5402`) and its `split_assignment` (`excmd_exec.rs:22412`), and
+the E121 text renders the name as `g` rather than `g:`, which points at the
+name-handling step before either.
