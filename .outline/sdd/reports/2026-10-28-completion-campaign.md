@@ -1228,3 +1228,22 @@ window keeps `check_changed_any`, so a modified buffer still blocks `:q`.
 |---|---|---|
 | OK | 0 (34 run, killed at 300 s) | 70 |
 | FAIL | 33 | 0 |
+
+
+### Functional gate progress: `cd_spec` and `echo_spec`
+
+| Spec | Before | After | Commit |
+|---|---|---|---|
+| `ex_cmds/cd_spec.lua` | 4 of 36 | 31 of 36 | `5625bfb` |
+| `ex_cmds/echo_spec.lua` | 2 of 41 | 19 of 41 | `b550a51` |
+
+`cd_spec` needed the four directory scopes modelled separately (buffer < window <
+tabpage < global); the port had collapsed them into two. Five remain: `:bcd`
+stickiness, two temp-context cases, and `getcwd()` with `'autochdir'`.
+
+`echo_spec` had two dominant causes: a cyclic value stack-overflowed the daemon
+during encoding, which also produced 16 spurious `RPC request after Nvim EOF`
+failures, and `:echon` continuations gained a spurious newline. The remaining 22
+are grouped in the commit body: float rendering, funcref/partial display and
+index counts, cycle-marker shape, control-character translation, and the `<SNR>`
+numbering offset.
