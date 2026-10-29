@@ -8,12 +8,14 @@ mod byte_str;
 mod error;
 mod handle;
 mod object;
+mod path;
 mod typval;
 
 pub use byte_str::OxStr;
 pub use error::ApiError;
 pub use handle::{BufHandle, HandleError, TabHandle, WinHandle};
 pub use object::{Dict, EXT_TYPE_BUFFER, EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW, Object};
+pub use path::{has_drive_letter, path_with_url};
 pub use typval::{
     DictData, DictEntry, DictEntryFlags, DictRef, EntryValueLock, Funcref, ListData, ListRef,
     LockScope, LockState, Special, Typval, VAR_BLOB, VAR_BOOL, VAR_DICT, VAR_FLOAT, VAR_FUNC,
