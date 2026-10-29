@@ -635,9 +635,12 @@ it can borrow (`crates/oxvim/src/server.rs:6318-6360`). When both slots are
 held by the enclosing frames, nothing can be drained, because the bytes live in
 `ExRuntime.jobs` and `flush_pty_output` (`excmd_exec.rs:1733`) needs `&mut
 ExExecutor`. The editor itself is reachable from the session at that point, so
-the blocker is ownership, not access: the PTY output queue has to move out of
-the executors into session-owned state before the pump can serve a fully busy
-editor.
+the blocker is ownership, not access. The bytes live in a private
+`Job.pty_output: Vec<u8>` (`job.rs:309`) and leave it only through
+`take_all_pty_output`, which needs `&mut JobManager` (`job.rs:1230`). A second
+drain would fork the queue, so this state has to move out of the executors into
+session-owned state before the pump can serve a fully busy editor, and that move
+needs its own regression test.
 
 **Dict watchers.** The registry and the firing round are complete
 (`userfunc.rs`), and nothing calls them. The delete path is threaded as
