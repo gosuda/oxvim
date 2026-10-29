@@ -11784,3 +11784,128 @@ fn autocmd_nested_flag_parses_and_duplicates_are_e983() {
         }
     );
 }
+// ---------------------------------------------------------------------------
+// dictwatcheradd(): the `:let`/`:unlet` mutation routes fire registered
+// Vimscript watchers. Upstream: `tv_dict_watcher_notify` (`eval/typval.c:2054`)
+// passes the dict, the key, and a change dict carrying `new` and/or `old`
+// (`old` omitted for a newly added key, `new` omitted for a removal).
+// ---------------------------------------------------------------------------
+
+/// Reads back a `g:` list recorded by a watcher handler.
+fn global_list(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<ox_types::Typval> {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::List(list)) => list.borrow().items.clone(),
+        other => panic!("expected a List in g:{name}, got {other:?}"),
+    }
+}
+
+/// Projects `[[key, has_new, has_old], ...]` rows recorded with `has_key()`.
+fn change_rows(values: &[ox_types::Typval]) -> Vec<(String, i64, i64)> {
+    values
+        .iter()
+        .map(|row| match row {
+            ox_types::Typval::List(list) => {
+                let items = &list.borrow().items;
+                let [
+                    ox_types::Typval::String(key),
+                    ox_types::Typval::Number(has_new),
+                    ox_types::Typval::Number(has_old),
+                ] = items.as_slice()
+                else {
+                    panic!("expected [key, has_new, has_old], got {items:?}");
+                };
+                (key.to_string_lossy().into_owned(), *has_new, *has_old)
+            }
+            other => panic!("expected a List row, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn dictwatcher_fires_on_let_add_and_change() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch.vim",
+            "function! WatchCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {}\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:d, '*', 'WatchCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    executor.execute_line(&editor, "let g:d.k = 2").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 1, 1),]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+#[test]
+fn dictwatcher_fires_on_unlet_with_old_only() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_unlet.vim",
+            "function! WatchUnletCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:e = {'k': 1}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:e, '*', 'WatchUnletCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "unlet g:e.k").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("k".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+/// A watcher callback that writes the same dictionary does not re-enter its
+/// own round: the nested mutation drains while the outer round still holds
+/// the watcher `busy`, and upstream skips busy watchers
+/// (`eval/typval.c:2090`). Exactly one fire; the nested write itself lands.
+#[test]
+fn dictwatcher_callback_write_does_not_reenter_busy_watcher() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_reenter.vim",
+            "function! WatchReenter(d, k, c)\n  call add(g:fires, a:k)\n  if g:armed\n    let g:armed = 0\n    let g:d.y = 1\n  endif\nendfunction\nlet g:d = {}\nlet g:fires = []\nlet g:armed = 1\ncall dictwatcheradd(g:d, '*', 'WatchReenter')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.x = 1").unwrap();
+    let fires = global_list(&executor, "fires");
+    assert!(
+        matches!(&fires[..], [ox_types::Typval::String(key)] if key.as_bytes() == b"x"),
+        "busy watcher must fire once, got: {fires:?}"
+    );
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            let value = dict.borrow().get(b"y").cloned();
+            assert!(
+                matches!(value, Some(ox_types::Typval::Number(1))),
+                "nested write must land, got: {value:?}"
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}

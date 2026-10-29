@@ -11,8 +11,8 @@ use ox_types::{DictEntry, DictEntryFlags, DictRef, ListRef, OxStr, Typval};
 
 use crate::editor::Editor;
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option, eval_text,
-    read_option, typval_to_text,
+    DictWatchEvent, EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option,
+    eval_text, read_option, typval_to_text,
 };
 use crate::register::RegisterContent;
 use crate::script::FileIO;
@@ -861,7 +861,7 @@ fn assign_leaf_subscript<F: FileIO>(
 }
 
 fn remove_subscript_chain<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     container: Typval,
     subs: &[BoundSub],
     index: usize,
@@ -874,12 +874,12 @@ fn remove_subscript_chain<F: FileIO>(
     if index + 1 == subs.len() {
         return remove_leaf_subscript(runtime, container, &subs[index], bang, target);
     }
-    let next = read_one_subscript(runtime, container, &subs[index])?;
+    let next = read_one_subscript(runtime, container.clone(), &subs[index])?;
     remove_subscript_chain(runtime, next, subs, index + 1, bang, target)
 }
 
 fn remove_leaf_subscript<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     container: Typval,
     sub: &BoundSub,
     bang: bool,
@@ -937,6 +937,7 @@ fn dict_write_key<F: FileIO>(
     if data.lock.locked {
         return Err(lvalue_error(runtime, "E741", "Value is locked"));
     }
+    let old = data.get(key.as_bytes()).cloned();
     if let Some(entry) = data
         .entries
         .iter_mut()
@@ -951,15 +952,24 @@ fn dict_write_key<F: FileIO>(
                 format!("Cannot change read-only variable \"{target}\""),
             ));
         }
-        entry.value = value;
+        entry.value = value.clone();
     } else {
-        data.entries.push(DictEntry::new(key.clone(), value));
+        data.entries
+            .push(DictEntry::new(key.clone(), value.clone()));
     }
+    let event = DictWatchEvent {
+        dict: Typval::Dict(Rc::clone(dict)),
+        key: key.as_bytes().to_vec(),
+        old,
+        new: Some(value),
+    };
+    drop(data);
+    runtime.dict_watch_events.push(event);
     Ok(())
 }
 
 fn dict_remove_key<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     dict: &DictRef,
     key: &OxStr,
     bang: bool,
@@ -998,7 +1008,15 @@ fn dict_remove_key<F: FileIO>(
             format!("Cannot change read-only variable \"{target}\""),
         ));
     }
-    data.entries.remove(index);
+    let removed = data.entries.remove(index);
+    let event = DictWatchEvent {
+        dict: Typval::Dict(Rc::clone(dict)),
+        key: key.as_bytes().to_vec(),
+        old: Some(removed.value),
+        new: None,
+    };
+    drop(data);
+    runtime.dict_watch_events.push(event);
     Ok(true)
 }
 

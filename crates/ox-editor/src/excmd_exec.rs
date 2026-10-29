@@ -60,7 +60,7 @@ use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext, SourceFormat};
 use crate::search::{SearchDirection, SearchError, SearchState, pattern_with_case};
 use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
-use crate::userfunc::{UserFuncError, UserFunctions};
+use crate::userfunc::{UserFuncError, UserFunctions, WatchCallback, WatchTarget};
 use crate::{
     BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError, Geometry,
     JobEvent, JobManager, Message, MessageKind, Mode, ModeMachine, ServerHost,
@@ -734,7 +734,23 @@ pub(crate) enum DeferredOp {
     /// Remove one path the way deferred `delete()` would.
     Delete(PathBuf, crate::fs_builtins::DeleteMode),
 }
-
+/// One recorded dictionary-key mutation awaiting watcher notification.
+///
+/// The `lvalue` mutation leaves hold `try_borrow_mut` on the dictionary while
+/// they write, so a watcher callback cannot run there. `lvalue` records the
+/// change here instead and the executor drains the queue after the borrow is
+/// released, at the end of `:let`/`:unlet` (`tv_dict_watcher_notify` runs
+/// synchronously in upstream, but this port cannot re-enter the borrow).
+pub(crate) struct DictWatchEvent {
+    /// The mutated dictionary, as a `Typval::Dict` holding its live identity.
+    pub(crate) dict: Typval,
+    /// The mutated key, in wire bytes.
+    pub(crate) key: Vec<u8>,
+    /// The previous value: `None` when the key is newly added.
+    pub(crate) old: Option<Typval>,
+    /// The new value: `None` when the key was removed.
+    pub(crate) new: Option<Typval>,
+}
 pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) scripts: ScriptCtx<F>,
     pub(crate) functions: UserFunctions,
@@ -844,6 +860,10 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// frame a push order; `throwpoint` merges both stacks through it,
     /// matching upstream's single `estack` list.
     pub(crate) frame_order: Cell<u64>,
+    /// Dictionary-key mutations recorded by the `lvalue` write/remove
+    /// leaves while they hold the dictionary borrow. Drained (and fired)
+    /// by the executor at the end of `:let`/`:unlet`, once per command.
+    pub(crate) dict_watch_events: Vec<DictWatchEvent>,
 }
 
 impl<F: FileIO> ExRuntime<F> {
@@ -879,6 +899,7 @@ impl<F: FileIO> ExRuntime<F> {
             swap_written: Rc::new(RefCell::new(BTreeSet::new())),
             preserve_exit: Rc::new(RefCell::new(false)),
             frame_order: Cell::new(0),
+            dict_watch_events: Vec::new(),
         }
     }
 
@@ -3703,7 +3724,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "luafile" => command_luafile(runtime, access, scope, lua, command),
         "let" => command_let(runtime, access, scope, lua, command, false),
         "const" => command_let(runtime, access, scope, lua, command, true),
-        "unlet" => command_unlet(runtime, access, scope, &command.args, command.bang),
+        "unlet" => command_unlet(runtime, access, scope, lua, &command.args, command.bang),
         "delfunction" => command_delfunction(runtime, command),
         "set" => command_set(
             runtime,
@@ -5398,6 +5419,117 @@ fn list_scoped_variables(editor: &mut Editor, scope: &Scope, args: &str) -> bool
     true
 }
 
+/// Fires queued dictionary-watcher notifications for one command's mutations.
+///
+/// Upstream's `tv_dict_watcher_notify` (`eval/typval.c:2054`) runs
+/// synchronously inside the mutation with `(dict, key, {new, old})` arguments
+/// (only present values get an entry) and skips no watcher but a busy one.
+/// Here the mutation leaves cannot run callbacks under their borrow, so this
+/// runs after it is released: for each recorded event it opens a round with
+/// [`UserFunctions::dictwatcher_begin`], dispatches each still-live watcher by
+/// callback form — names through [`call_user_function_with_self`],
+/// `Funcref`/`Partial` through the evaluator path the timer delivery uses —
+/// and closes with [`UserFunctions::dictwatcher_finish`]. Scope-namespace
+/// targets (`WatchTarget::Scope`) have no producer yet: only `Dict` events are
+/// recorded, so only that form can fire here. A watcher failure displays like
+/// `emsg` and never stops the rest of the round, matching upstream's
+/// continue-on-error loop; the `:let`/`:unlet` itself still succeeds. Fire per
+/// command: a `|` chain runs separate commands, so one write means one fire.
+fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+) {
+    if !runtime.functions.has_dictwatchers() {
+        runtime.dict_watch_events.clear();
+        return;
+    }
+    let events = std::mem::take(&mut runtime.dict_watch_events);
+    for event in events {
+        let Typval::Dict(reference) = &event.dict else {
+            continue;
+        };
+        let target = WatchTarget::Dict(Rc::as_ptr(reference) as usize);
+        let Some(round) = runtime.functions.dictwatcher_begin(&target, &event.key) else {
+            continue;
+        };
+        for (id, _pattern, callback) in &round.pending {
+            if !runtime.functions.dictwatcher_is_live(&target, *id) {
+                continue;
+            }
+            let args = UserFunctions::dictwatcher_arguments(
+                event.dict.clone(),
+                &event.key,
+                event.new.clone(),
+                event.old.clone(),
+            );
+            let outcome = match &callback {
+                WatchCallback::Name(name) => {
+                    let name = name.to_string_lossy().into_owned();
+                    call_user_function_with_self(
+                        runtime, access, scope, lua, &name, args, 1, 1, None,
+                    )
+                    .map(|_| ())
+                }
+                WatchCallback::Funcref(function) => invoke_dict_watcher_value(
+                    runtime,
+                    access,
+                    scope,
+                    lua,
+                    Typval::Funcref(function.clone()),
+                    args,
+                ),
+                WatchCallback::Partial(function) => invoke_dict_watcher_value(
+                    runtime,
+                    access,
+                    scope,
+                    lua,
+                    Typval::Partial(function.clone()),
+                    args,
+                ),
+                WatchCallback::None => continue,
+            };
+            if let Err(flow) = outcome {
+                display_error_message(runtime, access, &flow);
+            }
+        }
+        runtime.functions.dictwatcher_finish(&target);
+    }
+}
+
+/// Invokes one `Funcref`/`Partial` watcher callback through the evaluator, the
+/// same path the timer delivery uses for stored callables.
+fn invoke_dict_watcher_value<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    callee: Typval,
+    args: Vec<Typval>,
+) -> Result<(), Flow> {
+    let regex = VimRegex;
+    let ambiguous_wide = access.with_ex_editor(|editor| {
+        matches!(
+            editor.options().get_global("ambiwidth"),
+            Ok(OptionValue::String(value)) if value == "double"
+        )
+    });
+    let mut host = EvalHost {
+        runtime,
+        access,
+        lua,
+        builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
+        submatches: None,
+        escaped_exception: None,
+        call_receiver: None,
+    };
+    Evaluator::new(&mut host, &regex)
+        .invoke(callee, args, scope)
+        .map(|_| ())
+        .map_err(|error| eval_error_flow(&*host.runtime, error))
+}
+
 fn command_let<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -5582,6 +5714,9 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
     if let Err(flow) = assigned_flow {
         return flow;
     }
+    // The mutation leaves recorded their watcher events while holding the
+    // dictionary borrow; the borrow is released now, so fire them.
+    drain_dict_watchers(runtime, access, scope, lua);
     if constant {
         runtime.const_vars.insert(key);
     }
@@ -5592,6 +5727,7 @@ fn command_unlet<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &str,
     bang: bool,
 ) -> Flow {
@@ -5661,13 +5797,24 @@ fn command_unlet<F: FileIO, E: ExEditorAccess>(
             match parse_and_bind_lvalue(runtime, access, scope, None, target) {
                 Ok(lvalue) => match remove_lvalue(runtime, access, scope, &lvalue, bang) {
                     Ok(removed) => removed,
-                    Err(flow) => return flow,
+                    Err(flow) => {
+                        drain_dict_watchers(runtime, access, scope, lua);
+                        return flow;
+                    }
                 },
-                Err(flow) => return flow,
+                Err(flow) => {
+                    drain_dict_watchers(runtime, access, scope, lua);
+                    return flow;
+                }
             }
         } else {
             remove_target(scope, target)
         };
+        // Fire per target, like the synchronous upstream notify: an earlier
+        // removal's watchers observe it even when a later target fails, and
+        // a nested firing round from a callback still runs under this
+        // command's busy flags.
+        drain_dict_watchers(runtime, access, scope, lua);
         if !removed && !bang {
             return error_flow(runtime, "E108", format!("No such variable: \"{target}\""));
         }

@@ -480,7 +480,12 @@ impl UserFunctions {
         let watchers = self.watchers.get_mut(target)?;
         let mut pending = Vec::new();
         for watcher in watchers.iter_mut() {
+            // Upstream's notify loop fires only `!watcher->busy`
+            // (`eval/typval.c:2090`): a callback that writes the same
+            // dictionary re-enters through a nested round while the outer
+            // round still holds `busy`, and must not fire again there.
             if watcher.needs_free
+                || watcher.busy
                 || !watcher.matches(key)
                 || matches!(watcher.callback, WatchCallback::None)
             {
@@ -490,9 +495,9 @@ impl UserFunctions {
             pending.push((watcher.id, watcher.pattern.clone(), watcher.callback.clone()));
         }
         if pending.is_empty() {
-            for watcher in watchers.iter_mut() {
-                watcher.busy = false;
-            }
+            // No flags to clear here: any `busy` still set belongs to an
+            // outer round in progress, and clearing it would reopen the
+            // re-entrant fire this skip just closed.
             return None;
         }
         Some(WatchRound {
