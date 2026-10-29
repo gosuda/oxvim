@@ -602,3 +602,26 @@ listing, this dispatch is what makes its `buftype` write visible.
 (`excmd_exec.rs:5702-5712`) carries the committed value and whether it changed,
 but not the old effective, local, and global values the event publishes. That
 change has to widen the record first.
+
+
+### OptionSet: all three setters now publish it
+
+| Path | Where | Test |
+|---|---|---|
+| `nvim_set_option_value` | `ox-api/src/global.rs` | `set_option_value_fires_optionset_with_the_new_value` |
+| `nvim_set_option` (deprecated) | `ox-api/src/global.rs` | covered by the same seam |
+| `:set`, `:setlocal`, `:setglobal` | `excmd_exec.rs` `fire_optionset_autocmd` | `set_fires_optionset_with_the_new_value` |
+
+Two details the implementation had to get right, both found by the tests:
+
+- the handlers read `v:` through the scope mirror, so the published values are
+  synced into the scope before the dispatch runs. Without that sync the handler
+  saw the previous, empty values;
+- the assignment record had to carry the layer and both old values, because
+  `v:option_command`, `v:option_type`, `v:option_oldlocal`, and
+  `v:option_oldglobal` differ per scope (`option.c:2115-2129`).
+
+`dir_spec` is unchanged by this: 7 of 38 pass. Its T3 and T4 tests wait for
+`buftype` to be written through the option API by `nvim.dir`, and this port
+still renders the listing in Rust, so that write never happens. The listing
+cutover is the change that makes those two tests reachable.
