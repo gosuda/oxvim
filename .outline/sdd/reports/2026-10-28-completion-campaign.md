@@ -513,3 +513,39 @@ Two designs follow, and the faithful one costs more than it looks:
 Design 2 is the one to build; design 1 is cheaper and observably different, so
 it is not a shortcut worth taking. The Lua-side `lua/stdlib.c` sites also need
 the Lua-to-dict conversion path, which is separate work again.
+
+
+### Plugin group: what the measurement now says
+
+Three specs were run alone, with the rebuilt binary:
+
+| Spec | Before | After |
+|---|---|---|
+| `plugin/cfilter_spec.lua` | 16 of 18 failed | 18 of 18 pass |
+| `plugin/dir_spec.lua` | 32 of 38 failed | 31 of 38 failed |
+| `plugin/editorconfig_spec.lua` | 11 of 12 failed | 11 of 12 failed |
+
+Two causes were found and fixed:
+
+- `<q-bang>` was left literal. `uc_check_code` (usercmd.c:1563) expands it to
+  `"!"` or `""`, and `pack/dist/opt/cfilter/plugin/cfilter.vim:61` builds a
+  `:call` expression from it, so every cfilter test died on E15.
+- A URL was treated as a relative name. `vim_isAbsName` (path.c:1750) counts
+  one as absolute, so `nvim_buf_set_name` and `fnamemodify(':p')` must not
+  prepend the working directory. `dir_spec` T2 passes now.
+
+The remaining `dir_spec` cluster has one structural cause: `:edit <dir>` is
+implemented in Rust (`crates/ox-editor/src/excmd_exec.rs:13625-13740`, a port of
+`runtime/lua/nvim/dir.lua`), while upstream calls the Lua module. So
+`package.loaded['nvim.dir']` stays nil ("does not load the module until opening
+a directory"), and the module's own nested autocmd behaviour around listings
+never runs. Patching the Rust copy to imitate those three cases would add a
+second owner for the same behaviour. The move that removes the divergence is to
+delete the Rust listing and call `nvim.dir.try_open` (and
+`nvim.dir.handle_startup_dirs` for a startup directory) through the existing Lua
+host, which is what upstream does.
+
+`editorconfig_spec` fails for a different reason and is unmeasured beyond its
+first assertions: `indent_size = 3` leaves `'shiftwidth'` at 8, so
+`runtime/lua/editorconfig.lua` never applies. These specs run under the
+functional harness, not `-u NONE`, so the probe has to go through the harness.
