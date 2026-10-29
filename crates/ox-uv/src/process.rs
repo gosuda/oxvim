@@ -888,6 +888,62 @@ impl ProcessError {
             source: source.into(),
         }
     }
+
+    /// Stable POSIX/libuv-compatible error name and message (`"{name}: {strerror}"`).
+    #[must_use]
+    pub fn luv_error_parts(&self) -> (&'static str, String) {
+        match self {
+            Self::Io { source, .. } => {
+                let raw = source.raw_os_error();
+                #[cfg(unix)]
+                if let Some(raw) = raw {
+                    use rustix::io::Errno;
+                    if raw == Errno::SRCH.raw_os_error() {
+                        return ("ESRCH", "ESRCH: no such process".to_string());
+                    }
+                    if raw == Errno::PERM.raw_os_error() {
+                        return ("EPERM", "EPERM: operation not permitted".to_string());
+                    }
+                    if raw == Errno::INVAL.raw_os_error() {
+                        return ("EINVAL", "EINVAL: invalid argument".to_string());
+                    }
+                    if raw == Errno::ACCESS.raw_os_error() {
+                        return ("EACCES", "EACCES: permission denied".to_string());
+                    }
+                }
+                match source.kind() {
+                    io::ErrorKind::PermissionDenied => {
+                        ("EPERM", "EPERM: operation not permitted".to_string())
+                    }
+                    io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+                        ("EINVAL", "EINVAL: invalid argument".to_string())
+                    }
+                    _ => {
+                        let name = match raw {
+                            Some(3) => "ESRCH",
+                            Some(1) => "EPERM",
+                            Some(22) => "EINVAL",
+                            _ => "EIO",
+                        };
+                        let desc = match name {
+                            "ESRCH" => "no such process",
+                            "EPERM" => "operation not permitted",
+                            "EINVAL" => "invalid argument",
+                            _ => "unknown error",
+                        };
+                        (name, format!("{name}: {desc}"))
+                    }
+                }
+            }
+            Self::InvalidPid(_) | Self::InvalidSignal(_) | Self::InvalidPriority(_) => {
+                ("EINVAL", "EINVAL: invalid argument".to_string())
+            }
+            Self::Unsupported { feature, reason } => {
+                ("ENOSYS", format!("ENOSYS: {feature} is unsupported: {reason}"))
+            }
+            Self::Handle(err) => ("EINVAL", format!("EINVAL: {err}")),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1222,6 +1278,14 @@ pub fn process_kill(process: &Process, signal: Option<i32>) -> Result<(), Proces
 #[must_use]
 pub fn getpid() -> u32 {
     crate::misc::getpid()
+}
+
+/// Returns the current process user ID.
+///
+/// See `luvref.txt`, `uv.getuid()` (lines 4208-4215).
+#[must_use]
+pub fn getuid() -> u32 {
+    crate::misc::getuid()
 }
 
 /// Returns the parent process ID, or zero when the platform exposes no parent.

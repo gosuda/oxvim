@@ -93,6 +93,22 @@ pub fn getpid() -> u32 {
     std::process::id()
 }
 
+/// Returns the current process user ID.
+///
+/// See `luvref.txt`, `uv.getuid()` (lines 4208-4215).
+#[must_use]
+pub fn getuid() -> u32 {
+    #[cfg(unix)]
+    {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
 /// Returns the current working directory.
 ///
 /// # Errors

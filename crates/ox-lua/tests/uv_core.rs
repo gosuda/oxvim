@@ -1400,6 +1400,7 @@ fn misc_surface_reports_process_and_system_state() {
         assert(type(uname.sysname) == 'string' and type(uname.release) == 'string'
           and type(uname.version) == 'string' and type(uname.machine) == 'string')
         assert(uv.getpid() > 0 and uv.os_getpid() == uv.getpid())
+        assert(type(uv.getuid()) == 'number' and uv.getuid() >= 0)
         local before = uv.hrtime()
         assert(uv.hrtime() >= before)
         local sec, usec = uv.gettimeofday()
@@ -1479,4 +1480,114 @@ fn chdir_round_trips_through_the_process_working_directory() {
     );
     assert!(host.lua().globals().get::<bool>("chdir_ok").unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn getuid_reports_current_process_user_id() {
+    let (host, scheduler) = host();
+    #[cfg(unix)]
+    // SAFETY: getuid takes no arguments, dereferences no pointers, and cannot fail.
+    let expected_uid = unsafe { libc::getuid() };
+    #[cfg(unix)]
+    host.lua()
+        .globals()
+        .set("expected_uid", expected_uid)
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r"
+        local uv = vim.uv
+        local uid = uv.getuid()
+        assert(type(uid) == 'number')
+        assert(uid >= 0)
+        if expected_uid ~= nil then
+          assert(uid == expected_uid, 'expected ' .. tostring(expected_uid) .. ' but got ' .. tostring(uid))
+        end
+        getuid_ok = true
+        ",
+    );
+    assert!(host.lua().globals().get::<bool>("getuid_ok").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_delivers_signals_and_reports_luv_failures() {
+    let (host, scheduler) = host();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local my_pid = uv.getpid()
+
+        -- Probing self with signal 0 returns 0 on success
+        assert(uv.kill(my_pid, 0) == 0)
+
+        -- Killing a definitely non-existent PID fails with ESRCH
+        local ok, err, name = uv.kill(99999999, 'sigterm')
+        assert(ok == nil, 'expected nil on failure')
+        assert(name == 'ESRCH', 'expected ESRCH but got ' .. tostring(name))
+        assert(err == 'ESRCH: no such process', 'expected matching error message but got ' .. tostring(err))
+
+        -- Signal 0 on non-existent PID also fails with ESRCH
+        local ok0, err0, name0 = uv.kill(99999999, 0)
+        assert(ok0 == nil and name0 == 'ESRCH' and err0 == 'ESRCH: no such process')
+
+        -- Invalid signal names fail with EINVAL
+        local bad_ok, bad_err, bad_name = uv.kill(my_pid, 'invalid_signal_name')
+        assert(bad_ok == nil and bad_name == 'EINVAL')
+        assert(bad_err == 'EINVAL: invalid argument')
+
+        -- Invalid PID (<= 0 or out of range) fails with EINVAL
+        local neg_ok, neg_err, neg_name = uv.kill(-1, 'sigterm')
+        assert(neg_ok == nil and neg_name == 'EINVAL')
+        assert(neg_err == 'EINVAL: invalid argument')
+
+        kill_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("kill_ok").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_terminates_spawned_child_process() {
+    let (host, scheduler) = host();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local exited = false
+        local exit_code, exit_sig
+        local child
+        child = assert(uv.spawn('/bin/sleep', { args = { '10' } }, function(code, signal)
+            exited = true
+            exit_code = code
+            exit_sig = signal
+            child:close()
+        end))
+
+        local pid = child:get_pid()
+        assert(type(pid) == 'number' and pid > 0)
+
+        -- Signal 0 confirms process exists
+        assert(uv.kill(pid, 0) == 0)
+
+        -- Kill with default signal (sigterm) or sigkill
+        assert(uv.kill(pid, 'sigkill') == 0)
+
+        vim.uv.run('default')
+        assert(exited, 'child process should have exited')
+        assert(exit_sig == 9 or exit_code ~= 0)
+
+        -- Once dead, killing it fails with ESRCH
+        local ok, err, name = uv.kill(pid, 0)
+        assert(ok == nil and name == 'ESRCH' and err == 'ESRCH: no such process')
+
+        child_kill_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("child_kill_ok").unwrap());
 }

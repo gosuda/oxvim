@@ -13,7 +13,7 @@ use mlua::{
 use ox_uv::fs::{
     self as uvfs, DirEntryType, FileHandle, FsError, FsResult, FsTime, OpenFlags, Stat, StatFs,
 };
-use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop, misc};
+use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop, misc, process};
 
 use crate::host::RuntimeRoot;
 use crate::uv_handles::LoopAccess;
@@ -449,6 +449,26 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
     uv.set(
         "os_getpid",
         lua.create_function(|_, ()| Ok(misc::getpid()))?,
+    )?;
+    uv.set("getuid", lua.create_function(|_, ()| Ok(misc::getuid()))?)?;
+    uv.set(
+        "kill",
+        lua.create_function(|lua, (pid, signal): (i64, Option<Value>)| {
+            let signal = match parse_signal(signal) {
+                Ok(sig) => sig,
+                Err((name, msg)) => return kill_fail(lua, name, msg),
+            };
+            let Ok(pid_u32) = u32::try_from(pid) else {
+                return kill_fail(lua, "EINVAL", "EINVAL: invalid argument".to_string());
+            };
+            match process::kill(pid_u32, signal) {
+                Ok(()) => single_value(lua, 0_i64),
+                Err(error) => {
+                    let (name, message) = error.luv_error_parts();
+                    kill_fail(lua, name, message)
+                }
+            }
+        })?,
     )?;
 
     uv.set(
@@ -1263,6 +1283,98 @@ fn fs_fail(lua: &Lua, error: &FsError) -> mlua::Result<MultiValue> {
         Value::Nil,
         Value::String(lua.create_string(error.message.as_str())?),
         Value::String(lua.create_string(error.name)?),
+    ]))
+}
+
+#[cfg(unix)]
+const SIGNALS: &[(&str, i32)] = &[
+    ("sighup", signal_hook::consts::SIGHUP),
+    ("sigint", signal_hook::consts::SIGINT),
+    ("sigquit", signal_hook::consts::SIGQUIT),
+    ("sigill", signal_hook::consts::SIGILL),
+    ("sigtrap", signal_hook::consts::SIGTRAP),
+    ("sigabrt", signal_hook::consts::SIGABRT),
+    ("sigbus", signal_hook::consts::SIGBUS),
+    ("sigfpe", signal_hook::consts::SIGFPE),
+    ("sigkill", signal_hook::consts::SIGKILL),
+    ("sigusr1", signal_hook::consts::SIGUSR1),
+    ("sigsegv", signal_hook::consts::SIGSEGV),
+    ("sigusr2", signal_hook::consts::SIGUSR2),
+    ("sigpipe", signal_hook::consts::SIGPIPE),
+    ("sigalrm", signal_hook::consts::SIGALRM),
+    ("sigterm", signal_hook::consts::SIGTERM),
+    ("sigchld", signal_hook::consts::SIGCHLD),
+    ("sigcont", signal_hook::consts::SIGCONT),
+    ("sigstop", signal_hook::consts::SIGSTOP),
+    ("sigtstp", signal_hook::consts::SIGTSTP),
+    ("sigttin", signal_hook::consts::SIGTTIN),
+    ("sigttou", signal_hook::consts::SIGTTOU),
+    ("sigurg", signal_hook::consts::SIGURG),
+    ("sigxcpu", signal_hook::consts::SIGXCPU),
+    ("sigxfsz", signal_hook::consts::SIGXFSZ),
+    ("sigvtalrm", signal_hook::consts::SIGVTALRM),
+    ("sigprof", signal_hook::consts::SIGPROF),
+    ("sigwinch", signal_hook::consts::SIGWINCH),
+    ("sigio", signal_hook::consts::SIGIO),
+    ("sigsys", signal_hook::consts::SIGSYS),
+    ("sigiot", signal_hook::consts::SIGABRT),
+    ("sigpoll", signal_hook::consts::SIGIO),
+];
+
+fn parse_signal(value: Option<Value>) -> Result<Option<i32>, (&'static str, String)> {
+    let Some(value) = value else {
+        #[cfg(unix)]
+        return Ok(Some(signal_hook::consts::SIGTERM));
+        #[cfg(not(unix))]
+        return Ok(Some(15));
+    };
+
+    match value {
+        Value::Nil => {
+            #[cfg(unix)]
+            {
+                Ok(Some(signal_hook::consts::SIGTERM))
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(Some(15))
+            }
+        }
+        Value::Integer(number) => {
+            if number == 0 {
+                return Ok(Some(0));
+            }
+            i32::try_from(number)
+                .map(Some)
+                .map_err(|_| ("EINVAL", "EINVAL: invalid argument".to_string()))
+        }
+        Value::String(name) => {
+            let name_bytes = name.as_bytes();
+            let name_str = std::str::from_utf8(&name_bytes)
+                .map_err(|_| ("EINVAL", "EINVAL: invalid argument".to_string()))?
+                .to_ascii_lowercase();
+            #[cfg(unix)]
+            {
+                if let Some((_, number)) = SIGNALS.iter().find(|(candidate, _)| {
+                    *candidate == name_str
+                        || candidate.strip_prefix("sig") == Some(name_str.as_str())
+                }) {
+                    return Ok(Some(*number));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = name_str;
+            Err(("EINVAL", "EINVAL: invalid argument".to_string()))
+        }
+        _ => Err(("EINVAL", "EINVAL: invalid argument".to_string())),
+    }
+}
+
+fn kill_fail(lua: &Lua, name: &'static str, message: String) -> mlua::Result<MultiValue> {
+    Ok(MultiValue::from_vec(vec![
+        Value::Nil,
+        Value::String(lua.create_string(message.as_str())?),
+        Value::String(lua.create_string(name)?),
     ]))
 }
 
