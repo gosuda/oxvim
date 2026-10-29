@@ -947,11 +947,11 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     crate::server::seed_executor_from(&mut nested, &primary, &channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(crate::server::EditorBuiltins {
-            session: session.clone(),
-            ex: Rc::new(RefCell::new(primary)),
-            nested_ex: Rc::new(RefCell::new(nested)),
-        }),
+        Rc::new(crate::server::EditorBuiltins::new(
+            session.clone(),
+            Rc::new(RefCell::new(primary)),
+            Rc::new(RefCell::new(nested)),
+        )),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;

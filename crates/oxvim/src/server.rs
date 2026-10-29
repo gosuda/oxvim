@@ -455,13 +455,14 @@ pub(crate) fn build_embedded_core(
         seed_executor_from(&mut seed, &ex.borrow(), &channel_ids);
         seed
     }));
+    let builtins = Rc::new(EditorBuiltins::new(
+        session.clone(),
+        ex.clone(),
+        nested_ex.clone(),
+    ));
     let mut lua = LuaHost::new(
         LuaRuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(EditorBuiltins {
-            session: session.clone(),
-            ex: ex.clone(),
-            nested_ex: nested_ex.clone(),
-        }),
+        builtins.clone(),
         Rc::new(LuaScheduler {
             queue: lua_work.clone(),
             session: session.clone(),
@@ -571,6 +572,13 @@ pub(crate) fn build_embedded_core(
         }),
     );
     let event_loop = lua.event_loop_pump();
+    builtins.set_fresh(FreshExecutorSource {
+        lua: lua.lua().clone(),
+        registry: registry.clone(),
+        fork_seed: fork_seed.clone(),
+        channel_ids: channel_ids.clone(),
+        event_loop: event_loop.clone(),
+    });
     ox_api::set_command_executor(
         &session,
         Box::new(ServerCommandHost {
@@ -4353,18 +4361,107 @@ fn live_mode_builtin(
             Some(name) => OxStr::from(name.to_string().as_str()),
             None => OxStr::from(""),
         }),
+        b"isdirectory" => {
+            let is_dir = match args.first() {
+                Some(Typval::String(path)) => {
+                    let raw = path.to_string_lossy();
+                    let expanded = ox_editor::script::expand_home(raw.as_ref());
+                    std::fs::metadata(&expanded).is_ok_and(|m| m.is_dir())
+                }
+                _ => false,
+            };
+            Typval::Number(if is_dir { 1 } else { 0 })
+        }
+        b"getcwd" => {
+            let is_global = matches!(args.first(), Some(Typval::Number(-1)));
+            let directory = session.with_editor(|editor| {
+                if is_global {
+                    editor
+                        .global_directory()
+                        .map(std::path::Path::to_path_buf)
+                        .or_else(|| std::env::current_dir().ok())
+                } else {
+                    editor
+                        .effective_directory()
+                        .or_else(|| std::env::current_dir().ok())
+                }
+            });
+            let text = directory
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Typval::String(OxStr::from(text.as_str()))
+        }
         _ => return Ok(None),
     };
     Ok(Some(value))
+}
+
+/// Everything [`fresh_executors`] needs to mint a depth-overflow pair.
+/// Cloned into hosts that must keep serving past the primary/nested pair, so
+/// arbitrarily deep Lua→Ex→autocmd→Lua reentry (a mapping that edits a
+/// directory whose `BufEnter` calls back into `vim.fn`) never fails with "no
+/// free Ex executor".
+#[derive(Clone)]
+pub(crate) struct FreshExecutorSource {
+    pub(crate) lua: Lua,
+    pub(crate) registry: Rc<Registry>,
+    pub(crate) fork_seed: Rc<RefCell<ExExecutor>>,
+    pub(crate) channel_ids: ChannelIds,
+    pub(crate) event_loop: EventLoopPump,
+}
+
+impl FreshExecutorSource {
+    /// Mint one overflow pair, refreshing the seed's runtime roots first like
+    /// [`ServerAutocmdHost::fresh_pair`].
+    fn pair(&self, session: &Rc<ApiSession>) -> Option<ExExecutorPair> {
+        if let Ok(OptionValue::String(rtp)) = session
+            .with_editor(|editor| editor.options().get_global("runtimepath").cloned())
+            && !rtp.is_empty()
+        {
+            self.fork_seed
+                .borrow_mut()
+                .scripts_mut()
+                .set_runtime_roots_from_rtp(&rtp);
+        }
+        fresh_executors(
+            &self.lua,
+            &self.registry,
+            session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
+    }
 }
 
 pub(crate) struct EditorBuiltins {
     pub(crate) session: Rc<ApiSession>,
     pub(crate) ex: Rc<RefCell<ExExecutor>>,
     pub(crate) nested_ex: Rc<RefCell<ExExecutor>>,
+    /// Overflow source for depth-three-plus `vim.fn` calls; `None` on hosts
+    /// without a fork seed (single-shot script runs), which keep the old
+    /// two-slot error.
+    pub(crate) fresh: RefCell<Option<FreshExecutorSource>>,
 }
 
 impl EditorBuiltins {
+    pub(crate) fn new(
+        session: Rc<ApiSession>,
+        ex: Rc<RefCell<ExExecutor>>,
+        nested_ex: Rc<RefCell<ExExecutor>>,
+    ) -> Self {
+        Self {
+            session,
+            ex,
+            nested_ex,
+            fresh: RefCell::new(None),
+        }
+    }
+
+    pub(crate) fn set_fresh(&self, fresh: FreshExecutorSource) {
+        *self.fresh.borrow_mut() = Some(fresh);
+    }
+
     /// Serve `name` through the primary executor and the live editor.
     ///
     /// This is the tier `vim.fn` reaches from a Lua config file, an RPC
@@ -4386,12 +4483,29 @@ impl EditorBuiltins {
         if let Ok(mut ex) = self.ex.try_borrow_mut() {
             return ex.call_builtin(&*self.session, name, args);
         }
-        let Ok(mut nested) = self.nested_ex.try_borrow_mut() else {
+        if let Ok(mut nested) = self.nested_ex.try_borrow_mut() {
+            return nested.call_builtin(&*self.session, name, args);
+        }
+        // Depth-three-plus reentry (a mapping that edits a directory whose
+        // `BufEnter` calls back into `vim.fn`): mint an overflow pair from
+        // the never-checked-out seed instead of failing the action.
+        let source = self.fresh.borrow().clone();
+        let Some(source) = source else {
             return Err(ExecError::Editor(
                 "no free Ex executor for a Vimscript builtin call".into(),
             ));
         };
-        nested.call_builtin(&*self.session, name, args)
+        let Some((fresh, _)) = source.pair(&self.session) else {
+            return Err(ExecError::Editor(
+                "no free Ex executor for a Vimscript builtin call".into(),
+            ));
+        };
+        let Ok(mut guard) = fresh.try_borrow_mut() else {
+            return Err(ExecError::Editor(
+                "no free Ex executor for a Vimscript builtin call".into(),
+            ));
+        };
+        guard.call_builtin(&*self.session, name, args)
     }
 }
 

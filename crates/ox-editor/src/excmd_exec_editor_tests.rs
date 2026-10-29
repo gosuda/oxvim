@@ -329,12 +329,11 @@ fn edit_empty_path_raises_e32() {
     assert_vim_error(result, "E32");
 }
 
-/// `:edit {dir}` opens a directory view instead of failing with E484
-/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`).
-/// Oracle (`dir_spec.lua` startup listing): an empty directory shows one
-/// empty line, a directory with files lists `subdir/` first, then hidden
-/// names in byte order; the buffer name carries a trailing `/` and the
-/// filetype is `directory`.
+/// `:edit {dir}` stages an empty directory buffer instead of failing with E484
+/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`): the buffer name carries
+/// a trailing `/` and the filetype is `directory`, while the listing itself is
+/// rendered by `runtime/plugin/dir.lua` on `BufEnter` (no Lua host here, so the
+/// buffer stays empty). Oracle (`dir_spec.lua` startup listing).
 #[test]
 fn edit_directory_opens_listing_buffer() {
     let root = std::env::temp_dir().join(format!("oxvim-edit-dir-{}", std::process::id()));
@@ -352,16 +351,16 @@ fn edit_directory_opens_listing_buffer() {
     let editor = TestEditorAccess::new(raw);
     let mut executor = ExExecutor::new();
 
-    executor
-        .execute_line(&editor, &format!("edit {}", empty.display()))
-        .unwrap();
-    {
+    for dir in [&empty, &root] {
+        executor
+            .execute_line(&editor, &format!("edit {}", dir.display()))
+            .unwrap();
         let current = editor.editor().current_buffer().unwrap();
         let guard = editor.editor();
         let state = guard.buffer(current).unwrap();
         assert_eq!(
             state.name().to_string_lossy(),
-            format!("{}/", empty.display())
+            format!("{}/", dir.display())
         );
         let text = state.text().unwrap();
         let lines: Vec<Vec<u8>> = (1..=text.line_count())
@@ -373,46 +372,26 @@ fn edit_directory_opens_listing_buffer() {
             Ok(crate::OptionValue::String(value)) if value == "directory"
         ));
     }
-
-    executor
-        .execute_line(&editor, &format!("edit {}", root.display()))
-        .unwrap();
-    let current = {
-        let current = editor.editor().current_buffer().unwrap();
-        let guard = editor.editor();
-        let state = guard.buffer(current).unwrap();
-        assert_eq!(
-            state.name().to_string_lossy(),
-            format!("{}/", root.display())
-        );
-        let text = state.text().unwrap();
-        let lines: Vec<String> = (1..=text.line_count())
-            .map(|line| String::from_utf8(text.line(line).unwrap()).unwrap())
-            .collect();
-        assert_eq!(lines, vec!["empty/", "subdir/", ".hidden", "alpha.txt"]);
-        assert!(matches!(
-            editor.editor().options().get_buffer(current, "filetype"),
-            Ok(crate::OptionValue::String(value)) if value == "directory"
-        ));
-        current
-    };
-    // A bare `:edit` refreshes a directory buffer in place
-    // (`dir_spec.lua` "reloads directory buffers").
-    std::fs::write(root.join("beta.txt"), "beta").unwrap();
+    // A bare `:edit` on a directory buffer runs the directory lifecycle
+    // (`BufReadPre`, `BufReadCmd`, `BufEnter`) without failing: with no
+    // handlers the buffer keeps its (empty) lines in place.
+    // (`dir_spec.lua` "reloads directory buffers"; the plugin reloads there.)
+    let current = editor.editor().current_buffer().unwrap();
     executor.execute_line(&editor, "edit").unwrap();
     {
         let reloaded = editor.editor().current_buffer().unwrap();
         assert_eq!(reloaded, current);
         let guard = editor.editor();
         let state = guard.buffer(reloaded).unwrap();
-        let text = state.text().unwrap();
-        let lines: Vec<String> = (1..=text.line_count())
-            .map(|line| String::from_utf8(text.line(line).unwrap()).unwrap())
-            .collect();
         assert_eq!(
-            lines,
-            vec!["empty/", "subdir/", ".hidden", "alpha.txt", "beta.txt"]
+            state.name().to_string_lossy(),
+            format!("{}/", root.display())
         );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
     }
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -2850,10 +2829,11 @@ fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
-/// A directory entered through the switch path opens the directory view
+/// A directory entered through the switch path stages an empty directory buffer
 /// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`) instead of failing the
 /// read: the `:buffer` switch succeeds, the buffer keeps the directory name
-/// with a trailing `/`, and its lines list the directory.
+/// with a trailing `/`, and the listing is left to `runtime/plugin/dir.lua`
+/// (no Lua host here, so the lines stay empty).
 #[test]
 fn autocmd_buffer_switch_directory_opens_listing() {
     let dir = std::env::temp_dir().join(format!("oxvim-excmd-unloaded-{}", std::process::id()));

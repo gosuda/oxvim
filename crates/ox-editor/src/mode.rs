@@ -1,7 +1,7 @@
 //! Modal input state machine, shaped like `state.c`'s check/execute loop.
 
 use ox_text::Position;
-use ox_types::{BufHandle, WinHandle};
+use ox_types::{BufHandle, Object, OxStr, WinHandle};
 use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
@@ -796,6 +796,34 @@ impl ModeMachine {
                         let lhs = editor.typeahead().keylen(width).to_vec();
                         self.recordbuff.extend_from_slice(&lhs);
                     }
+                    self.publish_mapping_count(editor);
+                    if self.apply_mapping(editor, action, options, width)? {
+                        return Ok(Step::ProcessEvents);
+                    }
+                    continue;
+                }
+            } else if editor.typeahead().as_bytes().starts_with(b"<Plug>") {
+                // Upstream expands `<Plug>` mappings even through `:noremap`
+                // (`getchar.c` matches a leading `<Plug>` token against the
+                // mapping table regardless of the no-remap marks): a noremap
+                // right-hand side that names a `<Plug>` mapping still reaches
+                // it, which is how `vim.keymap.set` (noremap by default)
+                // drives `runtime/plugin/dir.lua`'s buffer maps.
+                let mode = map_mode(&self.mode);
+                let buffer = editor.current_buffer();
+                let plug = match editor
+                    .mappings()
+                    .lookup_typeahead(editor.typeahead(), mode, buffer)
+                {
+                    Lookup::Exact(mapping, width)
+                        if mapping.lhs.as_bytes().starts_with(b"<Plug>") =>
+                    {
+                        Some((mapping.action.clone(), mapping.options.clone(), width))
+                    }
+                    _ => None,
+                };
+                if let Some((action, options, width)) = plug {
+                    self.publish_mapping_count(editor);
                     if self.apply_mapping(editor, action, options, width)? {
                         return Ok(Step::ProcessEvents);
                     }
@@ -959,6 +987,28 @@ impl ModeMachine {
     ///
     /// Reports whether an action was parked, which is the caller's cue to
     /// leave the input loop so the host can run it.
+    /// Publishes the pending count for a triggered mapping (`v:count` is the
+    /// raw count, `v:count1` defaults it to 1; `getchar.c` sets both while a
+    /// mapping runs). Only normal mode accumulates a count; elsewhere the
+    /// defaults apply.
+    fn publish_mapping_count(&mut self, editor: &mut Editor) {
+        let (count, count1) = match &self.mode {
+            Mode::Normal(state) => {
+                let count = i64::try_from(state.count).unwrap_or(i64::MAX);
+                (count, count.max(1))
+            }
+            _ => (0, 1),
+        };
+        editor
+            .vvars_mut()
+            .insert(OxStr::from("count"), Object::Integer(count));
+        editor.vvars_mut().insert(
+            OxStr::from("count1"),
+            Object::Integer(count1),
+        );
+    }
+
+
     fn apply_mapping(
         &mut self,
         editor: &mut Editor,

@@ -1248,6 +1248,19 @@ pub(crate) fn run_mapping_action<F: FileIO, E: ExEditorAccess>(
     action: MappingAction,
     options: &MappingOptions,
 ) -> Flow {
+    // The mode machine publishes the pending count as `v:count`/`v:count1`
+    // on the editor when the mapping triggers (`getchar.c`); carry those two
+    // keys into the scope before it flushes, or the flush restores the stale
+    // scope map and Lua sees nil.
+    access.with_ex_editor(|editor| {
+        for key in ["count", "count1"] {
+            if let Some(Object::Integer(value)) =
+                editor.vvars().get(&OxStr::from(key)).cloned().as_ref()
+            {
+                scope.replace_pair(ScopeKind::Vim, key, Typval::Number(*value));
+            }
+        }
+    });
     // Same entry discipline as every other user-code boundary (see
     // `run_autocmd_plan`): a mapping right-hand side may reenter through
     // another executor, so scope dirt flushes before it runs.
@@ -9099,29 +9112,28 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E32", "No file name");
     };
-    // A bare `:edit` on a directory buffer refreshes the listing in place
-    // (`dir_spec.lua` "reloads directory buffers"): like the initial open,
-    // no `E484` and no `BufReadPost`, only the new lines and `BufEnter`.
+    // A bare `:edit` on a directory buffer reloads through the listing
+    // (`dir_spec.lua` "reloads directory buffers"): `BufReadPre` runs, then
+    // a `BufReadCmd` handler (the plugin's reload) replaces the read, and
+    // `BufEnter` lets the plugin notice. No `E484`, no `BufReadPost`, and no
+    // native listing: without handlers the buffer keeps its lines.
     if is_directory_path(runtime, path) {
         let flow =
             fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
-        let entries = list_directory_entries(runtime, path);
-        let line_vecs: Vec<Vec<u8>> = entries.iter().map(directory_entry_line).collect();
-        let text = match Buffer::from_lines(&line_vecs, false) {
-            Ok(text) => text,
-            Err(error) => return error_flow(runtime, "E474", error.to_string()),
-        };
-        access.with_ex_editor(|editor| {
-            if let Ok(state) = editor.buffer_mut(buffer) {
-                state.load(text);
-                state.mark_saved();
-                state.flags.set(crate::BufferFlags::NOTEDITED, false);
-            }
-        });
-        set_directory_buffer_options(access, buffer);
+        if !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok()) {
+            return Flow::Normal;
+        }
+        let flow =
+            fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadCmd], buffer);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        if !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok()) {
+            return Flow::Normal;
+        }
         return fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], buffer);
     }
     let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
@@ -9324,6 +9336,11 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
         Ok((handle, origin)) => (handle, origin),
         Err(flow) => return flow,
     };
+    if access.with_ex_editor(|editor| editor.current_buffer()) == Some(handle)
+        && is_directory_path(runtime, &path)
+    {
+        return edit_reload_current(runtime, access, scope, lua, &path);
+    }
     // `findswapname` (memline.c:3480+) runs before the file is read: an
     // existing swapfile fires `SwapExists`, honors `v:swapchoice`, and falls
     // back to the `nvim.swapfile` default. Only a freshly staged buffer can
@@ -9427,6 +9444,13 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             .with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E948", error.to_string());
+    }
+    // A `FileType` handler may have replaced or wiped the target while it
+    // loaded (the `3P dir-browser` case): then the switch stays where the
+    // handler left it, like `set_curbuf` skipping entry for a wiped target
+    // (`buffer.c:1790-1794`).
+    if !access.with_ex_editor(|editor| editor.buffer(handle).is_ok()) {
+        return Flow::Normal;
     }
     // `win_enter` (`window.c:2722`): entering the buffer fires `BufEnter`.
     fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], handle)
@@ -13116,6 +13140,20 @@ fn rename_current_buffer<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     name: OxStr,
 ) -> Flow {
+    // `setfname` (`buffer.c:3624-3660`, `fname_expand`): a name that resolves
+    // to a directory keeps a trailing separator, so a `:file` rename (the
+    // plugin's `render_entries`) leaves directory buffers recognizable to
+    // `filetype.lua`. Non-directories (including `scheme://` listings) pass
+    // through untouched.
+    let name = if !name.as_bytes().is_empty()
+        && !name.to_string_lossy().ends_with('/')
+        && is_directory_path(runtime, &path_from_ox_str(&name))
+    {
+        let slashed = format!("{}/", name.to_string_lossy());
+        OxStr::from(slashed.as_str())
+    } else {
+        name
+    };
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E32", "No file name");
     };
@@ -16258,13 +16296,6 @@ fn announce_buffer_creation<F: FileIO, E: ExEditorAccess>(
     }
 }
 
-/// One rendered directory entry (`runtime/lua/nvim/dir.lua` `nvim.dir.Entry`).
-struct DirectoryEntry {
-    /// File name without any directory prefix.
-    name: String,
-    /// Whether the entry is a directory (rendered with a trailing `/`).
-    dir: bool,
-}
 
 /// Whether `path` names a directory.
 ///
@@ -16283,8 +16314,9 @@ fn is_directory_path<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> bool {
 }
 
 /// Buffer name for a directory: collapsed separators with a single trailing
-/// `/` (`nvim.dir.fs.normalize`, `dir_spec.lua` "normalizes edited directory
-/// names": `.../$HOME///` → `.../$HOME/`).
+/// `/` (`fname_expand`, `buffer.c:3624-3660`; `dir_spec.lua` "normalizes edited
+/// directory names": `.../$HOME///` → `.../$HOME/`). The trailing separator is
+/// what `filetype.lua` matches to report `directory` before the plugin renders.
 fn normalize_dir_buffer_name(path: &Path) -> String {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -16314,177 +16346,30 @@ fn normalize_dir_buffer_name(path: &Path) -> String {
     text
 }
 
-/// Entries for a directory buffer in browser order: directories first, then
-/// byte order, hidden names included, no `../`
-/// (`runtime/lua/nvim/dir/fs.lua` `M.list`, `dir_spec.lua` startup listing).
-fn list_directory_entries<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> Vec<DirectoryEntry> {
-    collect_directory_entries(runtime.scripts.io(), path)
-}
-
-/// Directory entries for a listing, read through one [`FileIO`].
-///
-/// `:edit <dir>` and a startup directory argument both render this, so the two
-/// paths cannot drift: one reads the entries, [`directory_entry_line`] renders
-/// them, and [`directory_buffer_lines`] wraps both for a buffer.
-fn collect_directory_entries(io: &dyn FileIO, path: &Path) -> Vec<DirectoryEntry> {
-    let Ok(read) = io.read_dir(path) else {
-        return Vec::new();
-    };
-    let mut entries: Vec<DirectoryEntry> = Vec::new();
-    for entry in read {
-        let name = entry.name.to_string_lossy().into_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let dir = io
-            .metadata(&entry.path, true)
-            .is_ok_and(|meta| matches!(meta.kind, crate::script::FileKind::Directory));
-        entries.push(DirectoryEntry { name, dir });
-    }
-    entries.sort_by(|left, right| {
-        if left.dir != right.dir {
-            return right.dir.cmp(&left.dir);
-        }
-        left.name.cmp(&right.name)
-    });
-    entries
-}
-
-/// Rendered listing line for one entry (`entry_line` in `nvim/dir.lua`):
-/// embedded newlines become NUL, directories gain a trailing `/`.
-fn directory_entry_line(entry: &DirectoryEntry) -> Vec<u8> {
-    let mut line = entry.name.replace('\n', "\0");
-    if entry.dir {
-        line.push('/');
-    }
-    line.into_bytes()
-}
-
-/// Loads a directory listing into `buffer`, the view `:edit <dir>` shows.
-///
-/// Startup needs this because a directory argument must not be read as a file:
-/// upstream `readfile` answers `NOTDONE` for a directory (`fileio.c:420-424`),
-/// so the buffer keeps the directory name and holds the listing. `-d dir1
+/// Stages a startup directory argument: the buffer keeps the directory name
+/// (full path with trailing separator, `fname_expand`) and stays empty; the
+/// `VimEnter` handler (`runtime/plugin/dir.lua` `handle_startup_dirs`) renders
+/// the listing, like upstream's `NOTDONE` read (`fileio.c:420-424`). `-d dir1
 /// dir2` depends on it, since both arguments are directories.
+///
+/// No options are set here: `buftype`, `filetype`, and the lines all come
+/// from the plugin, so startup and `:edit <dir>` cannot drift.
 ///
 /// # Errors
 ///
-/// Returns [`crate::EditorError::Buffer`] when the listing cannot become text
-/// or the buffer cannot take it.
+/// Returns [`crate::EditorError::Buffer`] when the buffer cannot take the name.
 pub fn load_directory_view(
     editor: &mut Editor,
     buffer: BufHandle,
     path: &Path,
 ) -> Result<(), crate::EditorError> {
     let display = normalize_dir_buffer_name(path);
-    let line_vecs = directory_buffer_lines(&crate::script::RealFileIO, path);
-    let text = Buffer::from_lines(&line_vecs, false)
-        .map_err(|error| crate::EditorError::Buffer(error.into()))?;
     let state = editor.buffer_mut(buffer)?;
     state.set_name(OxStr::from(display.as_str()));
-    state.load(text);
+    state.load(Buffer::new());
     state.mark_saved();
     state.flags.set(crate::BufferFlags::NOTEDITED, false);
-    let _ = editor.options_mut().set_buffer(
-        buffer,
-        "buftype",
-        OptionValue::String("nowrite".to_owned()),
-    );
-    let _ = editor.options_mut().set_buffer(
-        buffer,
-        "filetype",
-        OptionValue::String("directory".to_owned()),
-    );
     Ok(())
-}
-
-/// Listing lines for `path`, the entries `:edit <dir>` shows.
-fn directory_buffer_lines(io: &dyn FileIO, path: &Path) -> Vec<Vec<u8>> {
-    collect_directory_entries(io, path)
-        .iter()
-        .map(directory_entry_line)
-        .collect()
-}
-
-/// Directory-buffer options matching `render_entries` + `fs.init`:
-/// `buftype=nowrite`, `filetype=directory`, read-only and unmodifiable once
-/// the lines land. Failures are ignored: the option may not exist on every
-/// build, and the listing is still correct without it.
-fn set_directory_buffer_options<E: ExEditorAccess>(access: &E, buffer: BufHandle) {
-    let _ = access.with_ex_editor(|editor| {
-        editor.options_mut().set_buffer(
-            buffer,
-            "buftype",
-            OptionValue::String("nowrite".to_owned()),
-        )
-    });
-    let _ = access.with_ex_editor(|editor| {
-        editor.options_mut().set_buffer(
-            buffer,
-            "filetype",
-            OptionValue::String("directory".to_owned()),
-        )
-    });
-    let _ = access.with_ex_editor(|editor| {
-        editor
-            .options_mut()
-            .set_buffer(buffer, "readonly", OptionValue::Boolean(true))
-    });
-    let _ = access.with_ex_editor(|editor| {
-        editor
-            .options_mut()
-            .set_buffer(buffer, "modifiable", OptionValue::Boolean(false))
-    });
-    access.with_ex_editor(|editor| {
-        if let Ok(state) = editor.buffer_mut(buffer) {
-            state.mark_did_filetype();
-        }
-    });
-}
-
-/// Fire `FileType directory` with the filetype as the match pattern
-/// (`do_filetype_autocmd`, `autocmd.c:2595-2613`), so third-party `FileType`
-/// handlers can replace the listing like upstream's `3P dir-browser` case.
-fn fire_directory_filetype<F: FileIO, E: ExEditorAccess>(
-    runtime: &mut ExRuntime<F>,
-    access: &E,
-    scope: &mut Scope,
-    lua: Option<&Rc<dyn LuaExec>>,
-    buffer: BufHandle,
-) -> Result<(), Flow> {
-    if access.with_ex_editor(|editor| editor.autocmds().is_ignored(Event::FileType)) {
-        return Ok(());
-    }
-    let name = access.with_ex_editor(|editor| {
-        editor
-            .buffer(buffer)
-            .ok()
-            .map(|state| state.name().to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let plan = access.with_ex_editor(|editor| {
-        editor.autocmds_mut().plan(
-            Event::FileType,
-            AutocmdContext {
-                buffer: Some(buffer),
-                file_name: Some(name.as_bytes()),
-                match_name: Some(&b"directory"[..]),
-                nested: true,
-                data: None,
-            },
-        )
-    });
-    if plan.ready.is_empty() {
-        return Ok(());
-    }
-    runtime.filetype_autocmd_depth += 1;
-    let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
-    runtime.filetype_autocmd_depth -= 1;
-    if matches!(flow, Flow::Normal) {
-        Ok(())
-    } else {
-        Err(flow)
-    }
 }
 
 /// Loads an unloaded file-backed buffer before a focus switch.
@@ -16570,26 +16455,18 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
 
     // `readfile` returns `NOTDONE` for a directory (`fileio.c:420-424`,
     // `buffer.c:412-415`): no `E484`, no `BufReadPost`; the buffer keeps the
-    // directory name and the browser renders the listing. Match that
-    // observable here so `:edit <dir>` opens a directory view instead of
-    // failing in `readfile` like a missing file would.
+    // directory name (full path with trailing separator, `fname_expand`) and
+    // the browser renders the listing on `BufEnter` (`runtime/plugin/dir.lua`
+    // into `require('nvim.dir')`). Stage an empty buffer here and let the
+    // plugin drive: `BufReadPre` runs, then `setf directory` stands in for
+    // the `filetypedetect` `BufRead` pass (`buffer.c:412-427`) so `FileType`
+    // fires before the caller's `BufEnter`.
     if is_directory_path(runtime, &path) {
         let display = normalize_dir_buffer_name(&path);
-        let entries = list_directory_entries(runtime, &path);
-        let line_vecs: Vec<Vec<u8>> =
-            entries.iter().map(directory_entry_line).collect();
-        let text = match Buffer::from_lines(&line_vecs, false) {
-            Ok(text) => text,
-            Err(error) => {
-                return Err(LoadSwitchError::Editor(crate::EditorError::Buffer(
-                    error.into(),
-                )));
-            }
-        };
         if let Err(error) = access.with_ex_editor(|editor| {
             let state = editor.buffer_mut(buffer)?;
             state.set_name(OxStr::from(display.as_str()));
-            state.load(text);
+            state.load(Buffer::new());
             state.mark_saved();
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
             Ok::<(), crate::EditorError>(())
@@ -16605,10 +16482,44 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
-        set_directory_buffer_options(access, buffer);
-        if let Err(flow) = fire_directory_filetype(runtime, access, scope, lua, buffer) {
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
+        if !matches!(flow, Flow::Normal) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(LoadSwitchError::Flow(flow));
+        }
+        if !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok()) {
+            return Ok(LoadSwitchOutcome::Abandoned);
+        }
+        // A handler may have replaced or wiped the buffer (the `3P
+        // dir-browser` case): then the caller stays where the handler left
+        // it, like `set_curbuf` skipping entry for a wiped target
+        // (`buffer.c:1790-1794`).
+        let filetype_unset = access.with_ex_editor(|editor| {
+            editor.current_buffer() == Some(buffer)
+                && editor.buffer(buffer).is_ok_and(|state| {
+                    !state.did_filetype()
+                        && matches!(
+                            editor.options().get_buffer(buffer, "filetype"),
+                            Ok(OptionValue::String(value)) if value.is_empty()
+                        )
+                })
+        });
+        if filetype_unset {
+            let flow = command_set(
+                runtime,
+                access,
+                scope,
+                lua,
+                "filetype=directory",
+                SetLayer::Local,
+            );
+            if !matches!(flow, Flow::Normal) {
+                rollback_buffer_switch(access, buffer, &mut restore, false);
+                return Err(LoadSwitchError::Flow(flow));
+            }
+        }
+        if !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok()) {
+            return Ok(LoadSwitchOutcome::Abandoned);
         }
         return Ok(entered());
     }
@@ -16944,6 +16855,12 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
             .with_ex_editor(|editor| editor.set_current_buffer(target, BufferRelease::KeepLoaded))
     {
         return error_flow(runtime, "E86", error.to_string());
+    }
+    // `set_curbuf` skips the entry when a handler invalidated the target
+    // (`buffer.c:1790-1794`), so a wiped target leaves the caller where it
+    // is instead of surfacing an error after handlers ran.
+    if !access.with_ex_editor(|editor| editor.buffer(target).is_ok()) {
+        return Flow::Normal;
     }
     fire_buffer_lifecycle(runtime, access, scope, lua, &transition.enters, target)
 }
