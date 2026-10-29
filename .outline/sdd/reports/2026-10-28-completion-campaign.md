@@ -549,3 +549,35 @@ host, which is what upstream does.
 first assertions: `indent_size = 3` leaves `'shiftwidth'` at 8, so
 `runtime/lua/editorconfig.lua` never applies. These specs run under the
 functional harness, not `-u NONE`, so the probe has to go through the harness.
+
+
+### Buffer names: API regression
+
+`buf_set_name_keeps_a_url_out_of_the_working_directory` (`crates/ox-api/src/tests.rs`)
+now pins the boundary the `dir_spec` URI failure crosses: a URL survives
+`nvim_buf_set_name` unchanged, and a relative name still becomes absolute. The
+test fails with the guard removed and passes with it.
+
+### OptionSet: the event is declared but never fired
+
+`dir_spec` "triggers nested autocmds when opening directory buffers" and
+"handles nested autocmds deleting the directory buffer" register
+`autocmd OptionSet buftype` and read `v:option_new`. In this port the event name
+exists (`crates/ox-editor/src/autocmd.rs:146`) but no code path fires it, so
+those tests cannot pass however the listing is implemented.
+
+The contract to port is `apply_optionset_autocmd_now` (`option.c:2099-2134`):
+
+- it fires only when not starting up and not already inside an OptionSet
+  dispatch (`*get_vim_var_str(VV_OPTION_TYPE) != NUL` gates recursion);
+- the pattern is the option's full name;
+- it sets `v:option_new`, `v:option_old`, `v:option_oldlocal`,
+  `v:option_oldglobal`, `v:option_type` (`local` or `global`), and
+  `v:option_command` (`set`, `setlocal`, `setglobal`, or `modeline`), then
+  resets those variables afterwards.
+
+The port has three option setters (`Options::set_global`, `set_buffer`,
+`set_window`, `crates/ox-editor/src/options.rs:333-420`) and no single place that
+knows a change happened, which scope it took, and the old value. Firing needs
+that knowledge, so the hook belongs above the setters, where the editor also
+holds the autocmd executor.
