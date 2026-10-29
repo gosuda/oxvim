@@ -252,7 +252,15 @@ Diagnosis of the remaining difftool failure, measured outside the test harness:
 - `vim.split`, the `Files 'a' and 'b' differ` pattern, `vim.fs.relpath`,
   `vim.fs.abspath` and `setqflist` with `quickfixtextfunc` all answer what the
   plugin expects, and a hand-built list of four entries survives `setqflist`.
-- Hypothesis, not measured: the quickfix list is empty only when the plugin
+- Resolved by `fix(quickfix): jump through a list whose entries are all
+  invalid` (`f0797e8`): the list was never empty. `set_items` held the entries,
+  but the port had no `qf_nonevalid` flag, so `:cfirst` searched for a valid
+  entry, found none (difftool items carry a filename but no line or pattern) and
+  answered `E553`. Upstream marks such a list and then ignores validity. With
+  that flag, `difftool_spec` answers T1, T3, T4 and T6 as passing, and T2, T5,
+  T7 fail on their own causes: split layout, autocmd cleanup, and `vim -d`.
+  Evidence: `.outline/evidence/difftool-nonevalid.log`.
+- Superseded hypothesis, not measured: the quickfix list is empty only when the plugin
   runs from an Ex command. No probe yet records `vim.system` output or the
   quickfix count inside a real Ex host, so executor starvation during
   `:wait()` remains a candidate, in the same class as the `vim.wait`
