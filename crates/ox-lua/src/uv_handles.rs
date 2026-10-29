@@ -1013,13 +1013,19 @@ impl UserData for LuaProcess {
         methods.add_method("get_pid", |_, this, ()| {
             Ok(this.inner.borrow().as_ref().map(Process::pid))
         });
-        methods.add_method("kill", |_, this, signal: Option<i32>| {
-            this.inner
-                .borrow()
-                .as_ref()
-                .ok_or_else(|| mlua::Error::runtime("process is closed"))?
-                .kill(signal)
-                .map_err(mlua::Error::external)?;
+        methods.add_method("kill", |_, this, signal: Option<Value>| {
+            // `uv_process_kill` takes a number, while `vim.system` documents
+            // and passes a name such as `'sigterm'`.
+            let signal = match signal {
+                Some(value) => Some(signal_number(value)?),
+                None => None,
+            };
+            // A timeout can race the exit: `vim.system` calls this after the
+            // handle closed, and upstream's kill then has nothing to signal.
+            // Answering true keeps the timeout path quiet.
+            if let Some(process) = this.inner.borrow().as_ref() {
+                process.kill(signal).map_err(mlua::Error::external)?;
+            }
             Ok(true)
         });
         methods.add_method("close", |_, this, ()| {
@@ -2066,7 +2072,20 @@ pub(crate) fn install(
         let spawn_pending = pending_processes.clone();
         let spawn_access = access.clone();
         let spawn_registry = Rc::clone(&pipe_registry);
-        uv.set("spawn", lua.create_function(move |lua, (program, options, callback): (String, Table, Function)| {
+        uv.set("spawn", lua.create_function(move |lua, (program, options, callback): (Value, Table, Function)| {
+            // `vim.system` hands the command straight here, so this is where an
+            // empty command list has to be reported, with upstream's text.
+            let program = match program {
+                Value::String(program) if !program.as_bytes().is_empty() => {
+                    program.to_str()?.to_owned()
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "cmd: expected non-empty list of strings",
+                    ));
+                }
+            };
+            let program_name = program.clone();
             let mut spawn_options = SpawnOptions::new(program);
             if let Some(args) = options.get::<Option<Table>>("args")? {
                 spawn_options.args = args
@@ -2142,7 +2161,30 @@ pub(crate) fn install(
                 }
             }
             let completion = Arc::new(ProcessCompletion::default()); let waiter = completion.clone();
-            let spawned = process::spawn_with_owned_stdio(&mut spawn_loop.borrow_mut(), spawn_options, process::OwnedStdio(owned_slots), move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } }).map_err(mlua::Error::external)?;
+            let cwd_name = spawn_options
+                .cwd
+                .as_ref()
+                .map(|cwd| cwd.to_string_lossy().into_owned());
+            let spawned = process::spawn_with_owned_stdio(&mut spawn_loop.borrow_mut(), spawn_options, process::OwnedStdio(owned_slots), move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } })
+                .map_err(|error| {
+                    // `vim.system` surfaces this text to callers, and the
+                    // functional tests match upstream's spelling.
+                    let text = error.to_string();
+                    if text.contains("No such file or directory") {
+                        // A missing working directory fails first and names the
+                        // directory; otherwise the command is what is missing.
+                        match cwd_name.as_deref().filter(|cwd| !std::path::Path::new(cwd).is_dir()) {
+                            Some(cwd) => mlua::Error::runtime(format!(
+                                "ENOENT: no such file or directory (cwd): '{cwd}'"
+                            )),
+                            None => mlua::Error::runtime(format!(
+                                "ENOENT: no such file or directory (cmd): '{program_name}'"
+                            )),
+                        }
+                    } else {
+                        mlua::Error::external(error)
+                    }
+                })?;
             // The spawn took the descriptors; record the numbers the Lua side
             // still closes so `fs_close` answers once and then `EBADF`.
             for descriptor in owned_descriptors {
