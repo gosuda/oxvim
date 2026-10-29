@@ -286,7 +286,7 @@ pub(crate) fn install(
     let pump_scheduler = scheduler.clone();
     core.set(
         "loop_poll",
-        lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
+        lua.create_function(move |_, (timeout, fast_only): (i64, bool)| {
             // Serve the `vim.schedule` queue on every wait turn: without
             // this a blocking `vim.wait` never advances the continuations
             // it waits on (upstream `LOOP_PROCESS_EVENTS`, executor.c).
@@ -296,6 +296,16 @@ pub(crate) fn install(
             // `vim.wait(t, cond, 0)` runs without a dummy wake timer
             // (editor.lua:146-148), so blocking first would strand
             // pre-queued work until the timeout fires.
+            //
+            // `fast_only` forbids non-fast events (`vim.wait(..., true)`,
+            // editor.lua:171): the scheduled queue is a non-fast event, so a
+            // fast-only wait must leave it alone and keep `vim.schedule`
+            // callbacks for the main loop. `SystemObj:wait()` relies on this
+            // (api_level → `vim.wait(..., nil, true)`).
+            if fast_only {
+                poll_access.poll(timeout)?;
+                return Ok(());
+            }
             if !pump_scheduler.pump_scheduled() {
                 poll_access.poll(timeout)?;
                 let _ = pump_scheduler.pump_scheduled();
