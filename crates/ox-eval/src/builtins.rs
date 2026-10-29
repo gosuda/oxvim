@@ -13,11 +13,11 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::error::{EvalError, Result};
 use crate::eval::{
-    BufferHost, BuiltinHost, ClosureRegistry, Evaluator, RegexEngine, compare_bytes,
+    BufferHost, BuiltinHost, CallArg, ClosureRegistry, Evaluator, RegexEngine, compare_bytes,
 };
 use crate::parser::Parser;
 use crate::path_builtins;
-use crate::scope::{Scope, ScopeKind, env_os_string};
+use crate::scope::{Scope, ScopeKind, ScopeMap, env_os_string, scope_entry_flags};
 
 const MAX_CONTAINER_DEPTH: usize = 100;
 
@@ -140,6 +140,239 @@ pub fn call_higher_order_builtin<H: BuiltinHost, R: RegexEngine>(
         _ => unreachable!("higher-order builtin predicate and dispatcher disagree"),
     }
 }
+/// Calls a collection builtin with identity-carrying arguments.
+///
+/// `filter()` on a bare scope namespace (`g:`/`b:`/`w:`/`t:`) mutates the
+/// scope map itself and reports per-key scope events; the identity is the
+/// same one the `dictwatcheradd()` registration path records. Every other
+/// collection call runs through [`call_higher_order_builtin`] with plain
+/// values.
+///
+/// # Errors
+///
+/// Returns the builtin's arity, callback, conversion, or collection error.
+pub fn call_higher_order_builtin_with_identities<H: BuiltinHost, R: RegexEngine>(
+    host: &mut H,
+    regex: &R,
+    name: &str,
+    args: Vec<CallArg>,
+    scope: &mut Scope,
+) -> Result<Typval> {
+    let spec = builtin_spec(name)
+        .filter(|_| is_higher_order_builtin(name))
+        .ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
+    check_arity(spec, args.len())?;
+    if name == "filter" {
+        let scoped = args.first().and_then(|first| {
+            scope_kind_for_identity(first.identity, scope)
+                .filter(|_| matches!(first.value, Typval::Dict(_)))
+        });
+        if let Some(kind) = scoped {
+            let mut values = args.into_iter().map(|arg| arg.value);
+            let _container = values.next();
+            let callback = values.next().ok_or_else(|| {
+                EvalError::new("E119", 0, "not enough arguments")
+            })?;
+            return filter_scope(host, regex, scope, kind, callback);
+        }
+    }
+    let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+    call_higher_order_builtin(host, regex, name, values, scope)
+}
+
+/// Resolves a bare scope-namespace argument (`g:`/`b:`/`w:`/`t:`) to its
+/// kind: the evaluator records the live map's identity for exactly these
+/// expressions, so matching it against the same maps in `scope` tells them
+/// apart from a Dict-valued variable like `g:d`, whose identity is its
+/// variable slot's instead. Anything else is not a scope namespace.
+fn scope_kind_for_identity(identity: Option<usize>, scope: &Scope) -> Option<ScopeKind> {
+    let identity = identity?;
+    [
+        (std::ptr::from_ref(&scope.global) as usize, ScopeKind::Global),
+        (std::ptr::from_ref(&scope.buffer) as usize, ScopeKind::Buffer),
+        (std::ptr::from_ref(&scope.window) as usize, ScopeKind::Window),
+        (std::ptr::from_ref(&scope.tab) as usize, ScopeKind::Tab),
+    ]
+    .into_iter()
+    .find(|(pointer, _)| *pointer == identity)
+    .map(|(_, kind)| kind)
+}
+
+/// Reads one scope map by kind. Callers only pass the watcher-namespaced
+/// kinds (`g:`/`b:`/`w:`/`t:`), but the match stays exhaustive.
+fn scope_map(scope: &Scope, kind: ScopeKind) -> &ScopeMap {
+    match kind {
+        ScopeKind::Global => &scope.global,
+        ScopeKind::Buffer => &scope.buffer,
+        ScopeKind::Window => &scope.window,
+        ScopeKind::Tab => &scope.tab,
+        ScopeKind::Script => &scope.script,
+        ScopeKind::Local => &scope.local,
+        ScopeKind::Argument => &scope.argument,
+        ScopeKind::Vim => &scope.vim,
+    }
+}
+
+/// The `g:key` spelling [`Scope::check_value_lock`] expects.
+fn scoped_builtin_name(kind: ScopeKind, key: &[u8]) -> Vec<u8> {
+    let mut written = Vec::with_capacity(kind.as_str().len() + key.len());
+    written.extend_from_slice(kind.as_str().as_bytes());
+    written.extend_from_slice(key);
+    written
+}
+
+/// The read-only/read-only-plus-fixed metadata for one scope variable.
+fn scope_flags(kind: ScopeKind, key: &[u8]) -> DictEntryFlags {
+    scope_entry_flags(kind, key).map_or(DictEntryFlags::NONE, |(flags, _)| flags)
+}
+
+/// `remove()` on a bare scope namespace: removes the scope variable itself
+/// (the snapshot would only drop it from a copy) and reports a scope event
+/// with `old` and no `new`, mirroring the dictionary shape. A missing key
+/// is `E716`, a fixed entry `E795`, a read-only one `E46`.
+fn remove_from_scope<H: BuiltinHost>(
+    host: &mut H,
+    scope: &mut Scope,
+    kind: ScopeKind,
+    args: &[Typval],
+) -> Result<Typval> {
+    let first = number_arg(&args[1])?;
+    let last = args.get(2).map(number_arg).transpose()?;
+    let _ = (first, last);
+    let key =
+        string_arg(&args[1]).map_err(|_| EvalError::new("E731", 0, "Dictionary key must be a String"))?;
+    let key_bytes = key.as_bytes();
+    let flags = scope_flags(kind, key_bytes);
+    if flags.intersects(DictEntryFlags::FIXED) {
+        return Err(EvalError::new(
+            "E795",
+            0,
+            "Cannot delete variable remove() argument",
+        ));
+    }
+    check_writable(flags, "remove() argument")?;
+    let old = scope.get_scoped(kind, key_bytes, 0).ok().cloned();
+    let Some(previous) = old.clone() else {
+        return Err(EvalError::new("E716", 0, "Key not present in Dictionary"));
+    };
+    scope.check_value_lock(&scoped_builtin_name(kind, key_bytes), 0)?;
+    scope.remove_pair(kind, key_bytes);
+    host.record_scope_mutation(kind, key_bytes, Some(previous.clone()), None);
+    Ok(previous)
+}
+
+/// `extend()`/`extendnew()` on a bare scope namespace: merges the right
+/// dictionary's entries into the scope map itself and reports one scope
+/// event per added or replaced key — `old` only when the key existed —
+/// mirroring the dictionary rules (`keep` skips, `error` refuses with
+/// `E737`, `force` checks the value lock, then read-only). `extendnew()`
+/// (`notify` false) still merges, silently.
+fn extend_scope<H: BuiltinHost>(
+    host: &mut H,
+    scope: &mut Scope,
+    kind: ScopeKind,
+    args: Vec<Typval>,
+    notify: bool,
+) -> Result<Typval> {
+    let mode = if args.len() > 2 {
+        Some(string_arg(&args[2])?)
+    } else {
+        None
+    };
+    let right = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    let Typval::Dict(right_ref) = right else {
+        return Err(EvalError::new(
+            "E712",
+            0,
+            "Argument of extend() must be a List or Dictionary",
+        ));
+    };
+    let right = cloned_entries(&right_ref)?;
+    let mode = mode.as_ref().map_or(b"force".as_slice(), OxStr::as_bytes);
+    for entry in right {
+        let key_bytes = entry.key.as_bytes().to_vec();
+        if scope.get_scoped(kind, &key_bytes, 0).is_ok() {
+            match mode {
+                b"keep" => {}
+                b"error" => {
+                    return Err(EvalError::new(
+                        "E737",
+                        0,
+                        format!("Key already exists: {}", entry.key.to_string_lossy()),
+                    ));
+                }
+                b"force" => {
+                    check_writable(scope_flags(kind, &key_bytes), "extend() argument")?;
+                    scope.check_value_lock(&scoped_builtin_name(kind, &key_bytes), 0)?;
+                    let old = scope.get_scoped(kind, &key_bytes, 0).ok().cloned();
+                    let new = Some(entry.value.clone());
+                    scope.set_scoped(kind, &key_bytes, 0, entry.value)?;
+                    if notify {
+                        host.record_scope_mutation(kind, &key_bytes, old, new);
+                    }
+                }
+                _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
+            }
+        } else {
+            let new = Some(entry.value.clone());
+            scope.set_scoped(kind, &key_bytes, 0, entry.value)?;
+            if notify {
+                host.record_scope_mutation(kind, &key_bytes, None, new);
+            }
+        }
+    }
+    Ok(scope.scope_dict(kind))
+}
+
+/// `filter()` on a bare scope namespace: drops each scope variable the
+/// predicate rejects and reports one scope event per removed key with `old`
+/// and no `new`. Kept keys notify nothing. A violated entry aborts with
+/// the same `E46`/`E795` the dictionary path owes.
+fn filter_scope<H: BuiltinHost, R: RegexEngine>(
+    host: &mut H,
+    regex: &R,
+    scope: &mut Scope,
+    kind: ScopeKind,
+    callback: Typval,
+) -> Result<Typval> {
+    let entries: Vec<(OxStr, Typval)> = scope_map(scope, kind)
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    for (key, value) in entries {
+        let mapped = eval_callback_with_host(
+            host,
+            regex,
+            &callback,
+            Typval::String(key.clone()),
+            value,
+            scope,
+        )?;
+        if !mapped.is_truthy() {
+            let key_bytes = key.as_bytes();
+            let old = scope.get_scoped(kind, key_bytes, 0).ok().cloned();
+            let Some(previous) = old.clone() else {
+                return Err(borrow_error());
+            };
+            let flags = scope_flags(kind, key_bytes);
+            if flags.intersects(DictEntryFlags::FIXED) {
+                return Err(EvalError::new(
+                    "E795",
+                    0,
+                    "Cannot delete variable filter() argument",
+                ));
+            }
+            check_writable(flags, "filter() argument")?;
+            scope.check_value_lock(&scoped_builtin_name(kind, key_bytes), 0)?;
+            scope.remove_pair(kind, key_bytes);
+            host.record_scope_mutation(kind, key_bytes, Some(previous), None);
+        }
+    }
+    Ok(scope.scope_dict(kind))
+}
 
 /// Typval-only builtin dispatcher. Regex operations use only the supplied seam.
 pub struct Builtins<'a> {
@@ -147,9 +380,10 @@ pub struct Builtins<'a> {
     closures: ClosureRegistry,
     ambiguous_wide: bool,
     watch_events: Option<Vec<(DictRef, Vec<u8>, Option<Typval>, Option<Typval>)>>,
+    scope_watch_events: Option<Vec<(ScopeKind, Vec<u8>, Option<Typval>, Option<Typval>)>>,
 }
-
 impl<'a> Builtins<'a> {
+
     /// Create a dispatcher with regex-backed builtins enabled through `regex`.
     #[must_use]
     pub fn new(regex: &'a dyn RegexEngine) -> Self {
@@ -158,6 +392,7 @@ impl<'a> Builtins<'a> {
             closures: ClosureRegistry::new(),
             ambiguous_wide: false,
             watch_events: None,
+            scope_watch_events: None,
         }
     }
 
@@ -169,6 +404,7 @@ impl<'a> Builtins<'a> {
             closures: ClosureRegistry::new(),
             ambiguous_wide: false,
             watch_events: None,
+            scope_watch_events: None,
         }
     }
 
@@ -191,14 +427,17 @@ impl<'a> Builtins<'a> {
     pub const fn closure_registry(&self) -> &ClosureRegistry {
         &self.closures
     }
-
     /// Enables the dictionary-mutation sink: subsequent `remove()`,
     /// `extend()`, and `filter()` calls on live dictionaries record
-    /// `(dict, key, old, new)` here. Unset by default, so unit-test
-    /// dispatchers stay inert.
+    /// `(dict, key, old, new)` here, and the same calls on a bare scope
+    /// namespace (`g:`/`b:`/`w:`/`t:`) record `(kind, key, old, new)` in
+    /// the scope sink. Unset by default, so unit-test dispatchers stay inert.
     pub fn set_dict_watch_sink(&mut self) {
         if self.watch_events.is_none() {
             self.watch_events = Some(Vec::new());
+        }
+        if self.scope_watch_events.is_none() {
+            self.scope_watch_events = Some(Vec::new());
         }
     }
 
@@ -207,6 +446,18 @@ impl<'a> Builtins<'a> {
         &mut self,
     ) -> Vec<(DictRef, Vec<u8>, Option<Typval>, Option<Typval>)> {
         self.watch_events
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// Drains the scope-namespace mutation sink enabled by
+    /// [`set_dict_watch_sink`](Self::set_dict_watch_sink).
+    #[must_use]
+    pub fn take_scope_watch_events(
+        &mut self,
+    ) -> Vec<(ScopeKind, Vec<u8>, Option<Typval>, Option<Typval>)> {
+        self.scope_watch_events
             .as_mut()
             .map(std::mem::take)
             .unwrap_or_default()
@@ -375,6 +626,47 @@ impl<'a> Builtins<'a> {
             "xor" => binary_number(&args, |left, right| left ^ right),
             _ => Err(EvalError::not_implemented(OxStr::from(name))),
         }
+    }
+    /// Identity-preserving dispatch for scope-aware builtins: `remove()`,
+    /// `extend()`/`extendnew()`, and the higher-order `filter()` resolve a
+    /// bare scope namespace (`g:`/`b:`/`w:`/`t:`) from the first argument's
+    /// identity — the same identity the evaluator records for the
+    /// `dictwatcheradd()` registration path — and mutate the scope map
+    /// itself instead of a snapshot. Every other builtin runs through
+    /// [`dispatch`](Self::dispatch) with plain values.
+    fn dispatch_with_identities(
+        &mut self,
+        name: &str,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        if matches!(name, "remove" | "extend" | "extendnew") {
+            let spec =
+                builtin_spec(name).ok_or_else(|| EvalError::not_implemented(OxStr::from(name)))?;
+            if !is_builtin_implemented(name) {
+                return Err(EvalError::not_implemented(OxStr::from(name)));
+            }
+            check_arity(spec, args.len())?;
+            let kind = args.first().and_then(|first| {
+                scope_kind_for_identity(first.identity, scope)
+                    .filter(|_| matches!(first.value, Typval::Dict(_)))
+            });
+            let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+            if let Some(kind) = kind {
+                return match name {
+                    "remove" => remove_from_scope(self, scope, kind, &values),
+                    "extend" => extend_scope(self, scope, kind, values, true),
+                    _ => extend_scope(self, scope, kind, values, false),
+                };
+            }
+            return self.dispatch(name, values, scope);
+        }
+        if is_higher_order_builtin(name) {
+            let regex = RegexRef(self.regex);
+            return call_higher_order_builtin_with_identities(self, &regex, name, args, scope);
+        }
+        let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+        self.dispatch(name, values, scope)
     }
 
     fn regex(&self) -> Result<&dyn RegexEngine> {
@@ -1468,6 +1760,45 @@ impl BuiltinHost for Builtins<'_> {
         if let Some(events) = self.watch_events.as_mut() {
             events.push((Rc::clone(dict), key.to_vec(), old, new));
         }
+    }
+    fn record_scope_mutation(
+        &mut self,
+        kind: ScopeKind,
+        key: &[u8],
+        old: Option<Typval>,
+        new: Option<Typval>,
+    ) {
+        if let Some(events) = self.scope_watch_events.as_mut() {
+            events.push((kind, key.to_vec(), old, new));
+        }
+    }
+
+    fn call_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        self.dispatch_with_identities(&name.to_string_lossy(), args, scope)
+    }
+
+    fn call_method_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let name_text = name.to_string_lossy();
+        let spec =
+            builtin_spec(&name_text).ok_or_else(|| EvalError::not_implemented(name.clone()))?;
+        if !spec.method {
+            return Err(EvalError::new(
+                "E276",
+                0,
+                format!("Cannot use function as a method: {name_text}"),
+            ));
+        }
+        self.dispatch_with_identities(&name_text, args, scope)
     }
 
     fn closure_registry(&self) -> Option<ClosureRegistry> {

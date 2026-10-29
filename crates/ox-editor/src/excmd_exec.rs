@@ -4319,6 +4319,22 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
         });
     }
 
+    fn record_scope_mutation(
+        &mut self,
+        kind: ScopeKind,
+        key: &[u8],
+        old: Option<Typval>,
+        new: Option<Typval>,
+    ) {
+        self.runtime.dict_watch_events.push(DictWatchEvent {
+            target: WatchTarget::Scope(kind),
+            dict: None,
+            key: key.to_vec(),
+            old,
+            new,
+        });
+    }
+
     fn set_call_receiver(&mut self, receiver: Option<ox_types::DictRef>) {
         self.call_receiver = receiver;
     }
@@ -4415,12 +4431,23 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 new,
             });
         }
+        for (kind, key, old, new) in self.builtins.take_scope_watch_events() {
+            self.runtime.dict_watch_events.push(DictWatchEvent {
+                target: WatchTarget::Scope(kind),
+                dict: None,
+                key,
+                old,
+                new,
+            });
+        }
         result
     }
 
-    /// Identity-carrying entry point the evaluator uses for every call: only
-    /// the environment family resolves scope-namespace arguments, so it
-    /// forwards there with identities intact. Everything else runs through
+    /// Identity-carrying entry point the evaluator uses for every call: the
+    /// environment family resolves scope-namespace arguments, and
+    /// `remove()`/`extend()`/`extendnew()` plus the higher-order `filter()`
+    /// keep argument identities so a bare `g:`/`b:`/`w:`/`t:` mutates the
+    /// scope map itself instead of a snapshot. Everything else runs through
     /// [`call`](BuiltinHost::call) with plain values — a `g:` snapshot that
     /// merely flows through a value (a List element, a `call()`-builtin list)
     /// is a Dict, not a Scope.
@@ -4433,12 +4460,28 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
         if let Some(family) = Self::environment_route(name) {
             return self.env_call_with_identities(name, family, args, scope);
         }
+        let name_text = name.to_string_lossy();
+        if matches!(name_text.as_ref(), "remove" | "extend" | "extendnew") {
+            self.builtins.set_dict_watch_sink();
+            let result = self
+                .builtins
+                .call_with_identities(name, args, scope);
+            Self::drain_builtins_watch_events(self);
+            return result;
+        }
+        if ox_eval::is_higher_order_builtin(&name_text) {
+            let regex = VimRegex;
+            return ox_eval::call_higher_order_builtin_with_identities(
+                self, &regex, &name_text, args, scope,
+            );
+        }
         let values = args.into_iter().map(|arg| arg.value).collect();
         self.call(name, values, scope)
     }
 
     /// Identity-carrying `receiver->name(...)` entry point: same environment
-    /// interception as [`call_with_identities`](BuiltinHost::call_with_identities).
+    /// and scope-namespace interception as
+    /// [`call_with_identities`](BuiltinHost::call_with_identities).
     fn call_method_with_identities(
         &mut self,
         name: &OxStr,
@@ -4447,6 +4490,21 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
     ) -> ox_eval::Result<Typval> {
         if let Some(family) = Self::environment_route(name) {
             return self.env_call_with_identities(name, family, args, scope);
+        }
+        let name_text = name.to_string_lossy();
+        if matches!(name_text.as_ref(), "remove" | "extend" | "extendnew") {
+            self.builtins.set_dict_watch_sink();
+            let result = self
+                .builtins
+                .call_with_identities(name, args, scope);
+            Self::drain_builtins_watch_events(self);
+            return result;
+        }
+        if ox_eval::is_higher_order_builtin(&name_text) {
+            let regex = VimRegex;
+            return ox_eval::call_higher_order_builtin_with_identities(
+                self, &regex, &name_text, args, scope,
+            );
         }
         let values = args.into_iter().map(|arg| arg.value).collect();
         self.call_method(name, values, scope)
@@ -4482,6 +4540,30 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
     ) -> ox_eval::Result<Typval> {
         let name_text = name.to_string_lossy();
         crate::builtins::call_with_identities(self, family, &name_text, args, scope)
+    }
+    /// Moves the typval dispatcher's recorded mutations into the runtime
+    /// queue: live-`Dict` reports keep their identity, scope-namespace
+    /// reports become [`WatchTarget::Scope`] events the drain builds its
+    /// callback argument for.
+    fn drain_builtins_watch_events(host: &mut EvalHost<'_, F, E>) {
+        for (dict, key, old, new) in host.builtins.take_dict_watch_events() {
+            host.runtime.dict_watch_events.push(DictWatchEvent {
+                target: WatchTarget::Dict(Rc::as_ptr(&dict) as usize),
+                dict: Some(Typval::Dict(Rc::clone(&dict))),
+                key,
+                old,
+                new,
+            });
+        }
+        for (kind, key, old, new) in host.builtins.take_scope_watch_events() {
+            host.runtime.dict_watch_events.push(DictWatchEvent {
+                target: WatchTarget::Scope(kind),
+                dict: None,
+                key,
+                old,
+                new,
+            });
+        }
     }
 
     /// Calls one `nvim_*` API function through the installed Lua host, the

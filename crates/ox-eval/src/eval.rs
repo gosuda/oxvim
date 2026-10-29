@@ -100,6 +100,22 @@ pub trait BuiltinHost {
     ) {
     }
 
+    /// Reports one successful scope-namespace mutation for watcher
+    /// notification: `remove()`/`extend()`/`filter()` on a bare `g:`/`b:`/
+    /// `w:`/`t:` argument mutate the scope map itself (not a snapshot), so
+    /// the event targets [`ScopeKind`] instead of a live `Dict` identity.
+    /// `old` is the previous value (`None` for a newly added key) and `new`
+    /// the new value (`None` for a removal). The default drops the report,
+    /// so hosts without watchers keep working unchanged.
+    fn record_scope_mutation(
+        &mut self,
+        _kind: ScopeKind,
+        _key: &[u8],
+        _old: Option<Typval>,
+        _new: Option<Typval>,
+    ) {
+    }
+
     /// Registry shared with callback-capable builtins, when this host owns one.
     fn closure_registry(&self) -> Option<ClosureRegistry> {
         None

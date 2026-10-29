@@ -12120,6 +12120,100 @@ fn dictwatcher_fires_on_filter_builtin() {
         "unexpected olds: {olds:?}"
     );
 }
+/// `remove()` on a scope namespace notifies the scope watcher with `old`
+/// and no `new`, and drops the variable itself: the snapshot would only
+/// drop it from a copy.
+#[test]
+fn dictwatcher_fires_on_scope_remove_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_remove.vim",
+            "function! WatchScopeRemoveCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:swatched = 1\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:, '*', 'WatchScopeRemoveCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call remove(g:, 'swatched')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("swatched".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+    assert!(
+        executor
+            .evaluate_expression(&editor, "exists('g:swatched')")
+            .is_ok_and(|value| value == ox_types::Typval::Number(0)),
+        "remove(g:, 'swatched') must drop the variable"
+    );
+}
+/// `extend()` on a scope namespace notifies once per added or replaced
+/// key: a replaced key carries both `old` and `new`, a new key `new` only.
+#[test]
+fn dictwatcher_fires_on_scope_extend_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_extend.vim",
+            "function! WatchScopeExtendCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:exk = 1\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:, '*', 'WatchScopeExtendCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call extend(g:, {'exk': 2, 'exn': 3})")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("exk".to_owned(), 1, 1), ("exn".to_owned(), 1, 0)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(2), ox_types::Typval::Number(3)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `filter()` on a scope namespace notifies once per removed key with `old`
+/// and no `new`; kept keys notify nothing.
+#[test]
+fn dictwatcher_fires_on_scope_filter_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_filter.vim",
+            "function! WatchScopeFilterCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:sfa = 1\nlet g:sfb = 2\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:, '*', 'WatchScopeFilterCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call filter(g:, \"v:key != 'sfa'\")")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("sfa".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
 
 /// A watcher callback that writes the same dictionary does not re-enter its
 /// own round: the nested mutation drains while the outer round still holds
