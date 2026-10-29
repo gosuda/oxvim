@@ -647,12 +647,15 @@ editor.
 dispatch added for `OptionSet` is the shape that fits here: a command-level
 hook that reads the record and dispatches with the full context.
 
-**`:checkhealth` providers.** `:checkhealth` already routes to
+**`:checkhealth` providers.** `:checkhealth` routes to
 `require('vim.health')._check` when a Lua host answers
-(`excmd_exec.rs:17071-17076`), and falls back to the native report when the host
-cannot run the module re-entrantly. The functional `health_spec` failures show
-`E5108: Lua callbacks are not installed` from the harness client, so the
-missing piece is the host seam for that call, not the command.
+(`excmd_exec.rs:17071-17076`) and falls back to the native report when the host
+cannot run the module re-entrantly. The functional `health_spec` failures report
+`E5108: Lua callbacks are not installed` at `testnvim.lua:144`, which is a
+client-side call, so the provider call itself is not proven to be the failing
+one. Two mechanisms fit and a measurement separates them: run the same
+`:checkhealth` through the embedded server with only one executor slot occupied,
+and see whether the providers run. Until then the cause stays unconfirmed.
 
 
 ### Full `just oldtest`, measured
@@ -678,7 +681,7 @@ than by file, so one cause carries many files:
 | E117 unknown function | 157 | `s:LoadFTPlugin` from `runtime/ftplugin.vim`, `g:foo#bar.echo` |
 | E488 trailing characters | 114 | command forms that take arguments we reject |
 | E474 invalid argument | 107 | option values |
-| E5108 Lua callback not installed | 99 | harness-side Lua calls |
+| E5108 Lua call failed | 99 | see below; three different causes in one code |
 | E806 variable scope errors | 97 | |
 | E518 unknown option | 95 | options the metadata lacks |
 | E121 undefined variable | 90 | |
@@ -688,6 +691,20 @@ Worst files by failed count: `test_cmdline.vim` (364), `test_winfixbuf.vim`
 `test_normal.vim` (91), `test_options.vim` (63), `test_edit.vim` (59),
 `test_diffmode.vim` (45), `test_search.vim` (52), `test_filetype.vim` (70),
 `test_window_cmd.vim` (49).
+
+E5108 is one code with several causes, so it is not a single cluster. Three
+samples from the same run:
+
+- `luaeval()` calling a nil value (`Test_cmdmod_completion`);
+- `s:LoadFTPlugin` unknown, raised through `runtime/filetype.lua:27`
+  (`Test_compiler_spotbugs_properties`), so this one shares the E117 cause;
+- `test_disable_char_avail` undefined symbol in the binary
+  (`Test_cmdcomplete_info`), which the test harness itself overrides.
+
+The E492 count also over-reports missing built-ins: its sample includes
+user-defined names such as `xxx`, `one`, and `foo2`, which tests register
+themselves and which are expected to fail. Any repair batch has to compare each
+name against the command registry and the reference test first.
 
 A minimal reproduction of one E117 sample (`s:Hello()` called from an `au
 FileType` defined in the same script) answers `yes` on both binaries, so that
