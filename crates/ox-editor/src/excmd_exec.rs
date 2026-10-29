@@ -13717,6 +13717,64 @@ fn directory_entry_line(entry: &DirectoryEntry) -> Vec<u8> {
     line.into_bytes()
 }
 
+/// Loads a directory listing into `buffer`, the view `:edit <dir>` shows.
+///
+/// Startup needs this because a directory argument must not be read as a file:
+/// upstream `readfile` answers `NOTDONE` for a directory (`fileio.c:420-424`),
+/// so the buffer keeps the directory name and holds the listing. `-d dir1
+/// dir2` depends on it, since both arguments are directories.
+///
+/// # Errors
+///
+/// Returns [`crate::EditorError::Buffer`] when the listing cannot become text
+/// or the buffer cannot take it.
+pub fn load_directory_view(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    path: &Path,
+) -> Result<(), crate::EditorError> {
+    let display = normalize_dir_buffer_name(path);
+    let mut entries: Vec<DirectoryEntry> = std::fs::read_dir(path)
+        .map(|read| {
+            read.filter_map(std::result::Result::ok)
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name == "." || name == ".." {
+                        return None;
+                    }
+                    let dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+                    Some(DirectoryEntry { name, dir })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.sort_by(|left, right| {
+        if left.dir != right.dir {
+            return right.dir.cmp(&left.dir);
+        }
+        left.name.cmp(&right.name)
+    });
+    let line_vecs: Vec<Vec<u8>> = entries.iter().map(directory_entry_line).collect();
+    let text = Buffer::from_lines(&line_vecs, false)
+        .map_err(|error| crate::EditorError::Buffer(error.into()))?;
+    let state = editor.buffer_mut(buffer)?;
+    state.set_name(OxStr::from(display.as_str()));
+    state.load(text);
+    state.mark_saved();
+    state.flags.set(crate::BufferFlags::NOTEDITED, false);
+    let _ = editor.options_mut().set_buffer(
+        buffer,
+        "buftype",
+        OptionValue::String("nowrite".to_owned()),
+    );
+    let _ = editor.options_mut().set_buffer(
+        buffer,
+        "filetype",
+        OptionValue::String("directory".to_owned()),
+    );
+    Ok(())
+}
+
 /// Directory-buffer options matching `render_entries` + `fs.init`:
 /// `buftype=nowrite`, `filetype=directory`, read-only and unmodifiable once
 /// the lines land. Failures are ignored: the option may not exist on every

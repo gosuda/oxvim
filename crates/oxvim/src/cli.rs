@@ -124,6 +124,8 @@ pub struct Cli {
     pub no_swap_file: bool,
     /// Edit in binary mode (`-b`).
     pub binary: bool,
+    /// Start in diff mode (`-d`): every startup window shows diffs.
+    pub diff_mode: bool,
     /// Edit standard input as the sole file (`nvim -`).
     pub stdin_file: bool,
     /// Explicit `-o{N}`/`-O{N}`/`-p{N}` count; zero means "one per file".
@@ -166,6 +168,7 @@ impl Default for Cli {
             no_modifiable: false,
             no_swap_file: false,
             binary: false,
+            diff_mode: false,
             stdin_file: false,
             window_count: 0,
             window_layout: WindowLayout::Single,
@@ -379,7 +382,10 @@ impl Cli {
                 Ok(Want::Done)
             }
             'D' => Err(unsupported(argument, "the Ex debugger")),
-            'd' => Err(unsupported(argument, "a diff engine")),
+            'd' => {
+                self.diff_mode = true;
+                Ok(Want::Done)
+            }
             'e' => {
                 self.batch.get_or_insert_with(BatchMode::default);
                 Ok(Want::Done)
@@ -1181,11 +1187,6 @@ mod tests {
                 message: "--embed conflicts with -es/-Es/-l",
                 code: 1,
             },
-            Case {
-                args: &["-d"],
-                message: "Option not supported: \"-d\": requires a diff engine",
-                code: 1,
-            },
         ];
         for case in cases {
             let error = Cli::parse(case.args.iter().copied())
@@ -1227,11 +1228,21 @@ mod tests {
     #[test]
     #[expect(
         clippy::expect_used,
+        reason = "the parse must succeed for a supported option"
+    )]
+    fn diff_mode_option_keeps_file_arguments() {
+        let cli = Cli::parse(["-d", "left", "right"].into_iter()).expect("parse -d");
+        assert!(cli.diff_mode, "-d enables diff mode");
+        assert_eq!(cli.files, ["left", "right"], "both arguments are files");
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
         reason = "unsupported forms must fail in this test"
     )]
     fn unsupported_options_are_rejected_with_their_missing_subsystem() {
         for (args, requirement) in [
-            (vec!["-d"], "a diff engine"),
             (
                 vec!["-A"],
                 "the 'arabic' option side effects and keymap files",

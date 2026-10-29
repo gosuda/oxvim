@@ -771,8 +771,12 @@ impl AppState {
         if self.exiting {
             return Ok(());
         }
-        self.session
-            .with_editor_mut(|editor| open_startup_buffers(editor, cli, None))?;
+        self.session.with_editor_mut(|editor| {
+            // `v:argf` is fixed before any buffer opens, so later `:args`
+            // changes cannot move it (`vvars.txt`, `v:argf`).
+            crate::runtime::seed_argf(editor, &cli.files);
+            open_startup_buffers(editor, cli, None)
+        })?;
         timer.mark("opening buffers");
         for command in &cli.commands {
             self.run_startup_command(command);

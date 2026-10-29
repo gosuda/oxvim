@@ -59,6 +59,28 @@ pub fn seed_argv(editor: &mut Editor) {
         .insert(OxStr::from("argv"), Object::Array(argv));
 }
 
+/// Seeds `v:argf` (`vvars.txt`): the positional file arguments given at
+/// startup, as absolute paths, without option arguments and without the
+/// `:args` list that later commands can change.
+pub fn seed_argf(editor: &mut Editor, files: &[String]) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let args = files
+        .iter()
+        .map(|file| {
+            let path = std::path::Path::new(file);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            Object::String(OxStr::from(absolute.to_string_lossy().as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    editor
+        .vvars_mut()
+        .insert(OxStr::from("argf"), Object::Array(args));
+}
+
 /// Rebuilds the parsed command line for the embedded child process.
 ///
 /// The child is the editor, so every option the scanner parsed has its
@@ -399,6 +421,20 @@ pub fn open_startup_buffers(
     if cli.window_layout != WindowLayout::Single {
         create_startup_windows(editor, cli, &buffers)?;
     }
+    if cli.diff_mode {
+        // `-d` is `diff_mode` in `main.c`: every window that shows a startup
+        // file starts with `'diff'` set, which is what the difftool plugin
+        // checks before opening itself (`plugin/difftool.lua` `start_diff`).
+        let windows = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
+        for window in windows {
+            let _ = editor
+                .options_mut()
+                .set_window(window, "diff", OptionValue::Boolean(true));
+        }
+    }
     Ok(())
 }
 
@@ -469,6 +505,30 @@ fn open_startup_files(
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
+        // A directory argument shows its listing, not an `E484`. Startup
+        // reuses the `:edit <dir>` view so `-d dir1 dir2` can reach VimEnter
+        // with both directories loaded.
+        if std::path::Path::new(file).is_dir() {
+            let buffer = if index == 0 && first_into_current {
+                editor
+                    .current_buffer()
+                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?
+            } else {
+                editor
+                    .create_buffer_with(Buffer::from_bytes(b"").map_err(|error| {
+                        AppError::Editor(error.to_string())
+                    })?, true)
+                    .map_err(|error| AppError::Editor(error.to_string()))?
+            };
+            ox_editor::excmd_exec::load_directory_view(
+                editor,
+                buffer,
+                std::path::Path::new(file),
+            )
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+            handles.push(buffer);
+            continue;
+        }
         let bytes = read_startup_file(file)?;
         // `file_readonly` (fileio.c:462): a file with no write permission
         // bit loads 'readonly'; a file that does not exist yet stays
@@ -701,6 +761,8 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             })?;
         } else {
             session.with_editor_mut(|editor| {
+                // `v:argf` is fixed at startup, before any `:args` change.
+                seed_argf(editor, &cli.files);
                 open_startup_buffers(editor, cli, cli.stdin_file.then_some(input.as_str()))
             })?;
         }
