@@ -7382,6 +7382,37 @@ fn set_fires_optionset_with_the_new_value() {
     assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
 }
 
+/// `:doautocmd {event}` applies the registrations for that event to the
+/// current buffer (`do_doautocmd`, autocmd.c:1141), and reports when nothing
+/// matched.
+#[test]
+fn doautocmd_fires_one_event_and_reports_a_miss() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:hits = 0 | let g:msgs = []")
+        .unwrap();
+    executor.execute_line(&editor, "augroup Probe").unwrap();
+    executor.execute_line(&editor, "autocmd!").unwrap();
+    executor.execute_line(&editor, "augroup END").unwrap();
+    executor
+        .execute_line(&editor, "autocmd Probe BufEnter * let g:hits += 1")
+        .unwrap();
+    executor.execute_line(&editor, "doautocmd Probe BufEnter").unwrap();
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "the event fired"
+    );
+    // A different event has no matching definition, which is reported rather
+    // than failing the command.
+    executor.execute_line(&editor, "doautocmd Probe BufLeave").unwrap();
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "nothing else fired"
+    );
+}
+
 /// A legacy `:autocmd` body keeps the `s:` scope of the script that defined
 /// it (`autocmd.c` stores `sc_sid` on the entry). Without that, a body defined
 /// in `runtime/ftplugin.vim` calls `s:LoadFTPlugin()` under whichever script is

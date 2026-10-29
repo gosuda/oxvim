@@ -4068,6 +4068,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "sign" => access.with_ex_editor(|editor| command_sign(runtime, editor, command)),
         "augroup" => access.with_ex_editor(|editor| command_augroup(runtime, editor, command)),
         "autocmd" => command_autocmd(runtime, access, lua, command),
+        "doautocmd" => command_doautocmd(runtime, access, scope, lua, command),
         "command" => access.with_ex_editor(|editor| command_user_command(runtime, editor, command)),
         "comclear" => {
             runtime.user_commands.borrow_mut().commands.clear();
@@ -19908,6 +19909,101 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
         )
     }) {
         return error_flow(runtime, "E216", error.to_string());
+    }
+    Flow::Normal
+}
+
+/// `:doautocmd [group] {event} [fname]` (`do_doautocmd`, autocmd.c:1141):
+/// apply the definitions for one or more events to the current buffer.
+///
+/// `*` is rejected with E217, an unknown event name fails the command before
+/// anything fires (E216), and a run that matches nothing reports
+/// "No matching autocommands: {arg}". `<nomodeline>` is accepted and dropped;
+/// this port does not run modelines at all, so the trailing step upstream
+/// takes after a successful run has nothing to do.
+fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let args = command.args.trim();
+    let args = args.trim_end_matches("<nomodeline>").trim_end().to_owned();
+    let (first, tail) = args
+        .split_once(char::is_whitespace)
+        .map_or((args.as_str(), ""), |(first, tail)| {
+            (first, tail.trim_start())
+        });
+    let named_group = access.with_ex_editor(|editor| editor.autocmds().group(first));
+    let (group, rest) = named_group.map_or((None, args.as_str()), |group| (Some(group), tail));
+    if rest.starts_with('*') {
+        return error_flow(runtime, "E217", "Can't execute autocommands for ALL events");
+    }
+    let mut words = rest.splitn(2, char::is_whitespace);
+    let Some(event_names) = words.next().filter(|names| !names.is_empty()) else {
+        return Flow::Normal;
+    };
+    let file_name = words.next().map(|name| name.trim_start().to_owned());
+    let mut events = Vec::new();
+    for event_name in event_names.split(',').filter(|name| !name.is_empty()) {
+        match Event::from_name(event_name) {
+            Some(event) => events.push(event),
+            None => {
+                return error_flow(
+                    runtime,
+                    "E216",
+                    format!("No such group or event: {event_name}"),
+                );
+            }
+        }
+    }
+    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+    let file_name = file_name.or_else(|| {
+        access.with_ex_editor(|editor| {
+            buffer
+                .and_then(|buffer| editor.buffer(buffer).ok())
+                .map(|state| state.name().to_string_lossy().into_owned())
+        })
+    });
+    let mut fired = false;
+    for event in events {
+        let plan = access.with_ex_editor(|editor| match group {
+            Some(group) => editor.autocmds_mut().plan_in_group(
+                event,
+                group,
+                AutocmdContext {
+                    buffer,
+                    file_name: file_name.as_deref().map(str::as_bytes),
+                    match_name: None,
+                    nested: true,
+                    data: None,
+                },
+            ),
+            None => editor.autocmds_mut().plan(
+                event,
+                AutocmdContext {
+                    buffer,
+                    file_name: file_name.as_deref().map(str::as_bytes),
+                    match_name: None,
+                    nested: true,
+                    data: None,
+                },
+            ),
+        });
+        if plan.ready.is_empty() {
+            continue;
+        }
+        fired = true;
+        let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+    }
+    if !fired {
+        access.with_ex_editor(|editor| {
+            push_info_text_message(editor, format!("No matching autocommands: {args}"))
+        });
     }
     Flow::Normal
 }
