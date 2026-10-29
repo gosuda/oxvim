@@ -793,3 +793,30 @@ them. That makes the watcher hook the highest-value next change in this group,
 not a small one: a watcher callback dispatches through four live forms
 (`Name`, `Funcref`, `Partial`, and a removed watcher, `userfunc.rs:82-92`), and
 the round must mark, check, and finish around user code that can reenter.
+
+
+### Dict watchers: the design that fits the port
+
+More is known now than when the gap was first recorded:
+
+- `WatchCallback` has no Lua form (`userfunc.rs:82-92`): a name, a `Funcref`, a
+  `Partial`, or `None`. So firing needs no Lua host for the callback itself.
+- The dispatch helpers still take `Option<&Rc<dyn LuaExec>>` as a parameter
+  (`call_user_function_with_self`, `excmd_exec.rs:5054`; the timer path's
+  `EvalHost`, `excmd_exec.rs:1385-1400`), and lvalue has no access to it.
+- `dict_write_key` holds `try_borrow_mut` until it returns
+  (`lvalue.rs:886-908`), and upstream passes the replaced value as `old` while
+  omitting `old` for a newly added key (`tv_dict_watcher_notify`,
+  typval.c:2054).
+
+That fixes the shape: the leaf records `(dict, key, old, new)` into a queue on
+`ExRuntime`, and `ExExecutor` drains it at the end of the command, where
+`self.lua`, `access`, and `scope` all exist. The round then runs
+`dictwatcher_begin` → `is_live` → invoke → `dictwatcher_arguments` →
+`dictwatcher_finish` exactly as `userfunc.rs:475-535` expects, so a callback
+that removes a watcher or mutates the dictionary mid-round stays consistent.
+
+Ordering is per command rather than per mutation. For `:let d.a = 1 | let
+d.b = 2` that is still one fire per write, because the `|` separator runs two
+commands; the divergence appears only if a single command writes one dictionary
+twice, and that case needs a test before this lands.
