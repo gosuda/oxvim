@@ -373,3 +373,23 @@ largest remaining clusters are `lua:` (99), `async` (73), plain `lua` (67),
 `vim.snippet` (28), `luaeval()` (17), `vim.fs` (11), `vim.diagnostic` (11) and
 `vim._watch` (11). Evidence:
 `.outline/evidence/functional-lua-post3.log`.
+
+
+### Control: `vim.system (sync) supports timeout` fails on the reference binary
+
+The one remaining failure in `test/functional/lua/system_spec.lua` is not a
+port regression. Running the same test through the same harness, with
+`NVIM_PRG` pointing at `.references/neovim/build/bin/nvim`:
+
+```
+RUN T1 vim.system (sync) supports timeout  FAIL
+Expected: code = 0
+Actual:   code = 124
+RUN T2 vim.system (async) supports timeout OK
+```
+
+The `-l` probe agrees between the two binaries as well: both answer
+`code = 124, stdout = "late"` for
+`vim.system({'sh','-c','(sleep 0.3; printf late) & exit 0'})` when `wait(100)`
+times out, so the port matches the reference here rather than diverging from
+it. The sync expectation depends on the harness environment, not on the port.
