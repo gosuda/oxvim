@@ -326,3 +326,30 @@ provider/host messages.
 All logs live under `.outline/evidence/` (gitignored): `gates/`, `oldtest-final/`, `functional-*.log`,
 `nextest-final.log`, `final-apidiff.log`. Census and runner tools are in `.outline/evidence/tools/`:
 `gates.sh`, `oldtest-census.sh`, `functional-census.sh`.
+
+
+## Functional lua group re-measure (2026-10-29)
+
+Direct per-group run of `test/functional/lua` (the recipe's `TEST_PARALLEL_GROUP`
+is only read by cmake, not by the justfile guard):
+
+- Result: `Process terminated due to timeout` at T840,
+  `vim.system (sync) handle input`. Partial counts before the stop: 412 FAIL,
+  485 pass. The group has no summary until that test stops hanging.
+  Evidence: `.outline/evidence/functional-lua-post2.log`.
+- Cause, found by probe: `vim.system({'cat'}, { stdin = 'hellocat' })` hung.
+  Three defects: `pipe_pair` created both ends without `O_CLOEXEC`, so the child
+  inherited a writer to its own stdin; a zero-length write never reported
+  completion, so the flush before shutdown stalled; and a pipe shutdown never
+  answered its callback, so the handle that ends the stream never closed.
+  Fixed in `b425af0`, with `pipe_pair_ends_are_close_on_exec` pinning the
+  descriptor flag. `/bin/cat` now exits, and the child's output arrives.
+- `test/functional/lua/system_spec.lua` after the fixes: 13 of 16 pass, and the
+  file runs to completion instead of timing out. `44ba18e` gave `kill` signal
+  names, made a closed process's kill quiet, and matched upstream's
+  `cmd: expected non-empty list of strings` and `ENOENT ... (cmd|cwd)` text.
+  Remaining: `supports timeout` expects `wait(100)` to return the finished
+  result after `is_closing()` turns true, but the port reports `is_closing()`
+  at child exit, before the child's stdout pipe drains, so the short wait kills
+  a process that was still writing. Evidence:
+  `.outline/evidence/system-spec-post5.log`.
