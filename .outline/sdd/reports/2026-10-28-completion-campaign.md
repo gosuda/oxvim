@@ -741,8 +741,16 @@ that now reach a later, unsupported feature instead of failing at the handler.
 `<nomodeline>` without running modelines, and reports
 "No matching autocommands: {arg}" when nothing matched. The regression covers a
 firing event and a miss. Red proof, run in both states: with the dispatch
-replaced by `Flow::Normal`, `doautocmd_fires_one_event_and_reports_a_miss`
-fails; with the command restored it passes.
+replaced by `Flow::Normal`, the regression fails; with the command restored it
+passes.
+
+`45d2c27` corrected three details against the reference after review:
+`<nomodeline>` is a prefix (`autocmd.c:1244`), a run that matches nothing is
+silent because `ex_doautocmd` passes `do_msg = false` (`ex_docmd.c:4527`), and
+E216 names the group only when one was given (`autocmd.c:2467`). The regression
+now covers an explicit file name, a name the pattern rejects, the
+`<nomodeline>` prefix, group restriction, E217, and both E216 texts. Modeline
+execution remains out of scope: this port does not run modelines.
 
 This is the first item from the E492 census. The census itself over-counts
 missing built-ins because it also contains user-defined names such as `xxx`,
