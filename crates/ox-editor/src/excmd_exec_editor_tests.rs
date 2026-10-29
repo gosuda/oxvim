@@ -7391,6 +7391,31 @@ fn set_fires_optionset_with_the_new_value() {
     );
 }
 
+/// `g:['key'] = v` writes the scope dictionary itself (`get_lval` on a bare
+/// scope prefix with subscripts). The reference reports `42` here;
+/// `dict_notifications_spec.lua:38` writes its watchers exactly this way.
+#[test]
+fn a_scope_dict_subscript_assignment_reaches_the_scope() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"probe\"] = 42")
+        .unwrap_or_else(|error| panic!("scope-dict assignment: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "probe"),
+        Some(ox_types::Typval::Number(42))
+    );
+    // The value must also reach the editor's own `g:` map, which is what an
+    // RPC client reads (`nvim_get_var`), not only the executor's scope mirror.
+    assert_eq!(
+        editor
+            .editor()
+            .gvars()
+            .get(&ox_types::OxStr::from("probe"))
+            .cloned(),
+        Some(ox_types::Object::Integer(42))
+    );
+}
+
 /// `:doautocmd` applies one event's registrations to the current buffer
 /// (`do_doautocmd`, autocmd.c:1141). The covered grammar is a named group, a
 /// plain event, an explicit file name, and the two argument errors; a run that

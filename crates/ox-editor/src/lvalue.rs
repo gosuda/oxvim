@@ -228,6 +228,22 @@ pub(crate) fn assign_lvalue<F: FileIO, E: ExEditorAccess>(
             name,
             scope_kind,
             subs,
+        } if name.as_bytes().is_empty()
+            && let Some(kind) = *scope_kind
+            && subs.len() == 1
+            && let BoundSub::Key(key) = &subs[0] =>
+        {
+            // `g:['k'] = v` writes the scope variable itself. `scope_dict`
+            // hands back a per-read snapshot, so assigning into that would
+            // drop the value; the scope setter is the live path.
+            scope
+                .set_scoped(kind, key.as_bytes(), 0, value)
+                .map_err(|error| eval_error(runtime, error))
+        }
+        Lvalue::Variable {
+            name,
+            scope_kind,
+            subs,
         } => {
             let lock_name = scoped_lock_name(*scope_kind, name.as_bytes());
             scope
@@ -528,7 +544,18 @@ fn bind_expression_chain<F: FileIO, E: ExEditorAccess>(
     loop {
         match &current.kind {
             ExprKind::Variable(name) => {
-                let (mut scope_kind, bare) = split_scoped_name(name.as_bytes());
+                let (mut scope_kind, mut bare) = split_scoped_name(name.as_bytes());
+                // `g:['k']` names the scope dictionary itself; only a bare
+                // `g:` with no subscript is E461 (`get_lval`, eval.c).
+                if scope_kind.is_none()
+                    && !subs.is_empty()
+                    && name.as_bytes().len() == 2
+                    && name.as_bytes()[1] == b':'
+                    && let Some(kind) = ScopeKind::from_byte(name.as_bytes()[0])
+                {
+                    scope_kind = Some(kind);
+                    bare = b"";
+                }
                 if bare.contains(&b'#') {
                     scope_kind = Some(ScopeKind::Global);
                 }
