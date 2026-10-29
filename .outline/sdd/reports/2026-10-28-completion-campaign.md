@@ -758,9 +758,12 @@ missing built-ins because it also contains user-defined names such as `xxx`,
 before it is implemented.
 
 
-### `ex_cmds` functional group, measured
+### `ex_cmds` functional group, partial measurement
 
-One run, 1200 seconds, exit 1 (the harness kills the group at its timeout):
+This is a timed-out partial measurement, not a completed group. One run,
+1200 seconds, exit 1: the runner killed the group while `:write appends FIFO
+file` (T435, `write_spec.lua`) was still running, so no group summary exists
+and both counts below are lower bounds.
 
 | Outcome | Count |
 |---|---|
@@ -781,8 +784,8 @@ Worst specs, failures over tests:
 | `ex_cmds/pack_spec.lua` | 15 of 15 |
 | `ex_cmds/cmd_map_spec.lua` | 15 of 15 |
 
-The group ends at `:write appends FIFO file`, which the harness kills on
-timeout, so this is a lower bound on both counts.
+The last test reached is T435 `:write appends FIFO file`; the log has no
+per-group total line because the process died at the timeout.
 
 `dict_notifications_spec` is the largest single cluster here, and it is exactly
 the dict-watcher gap: the registry and its firing round exist, and nothing calls
