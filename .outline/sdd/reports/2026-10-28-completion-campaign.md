@@ -260,6 +260,16 @@ Diagnosis of the remaining difftool failure, measured outside the test harness:
   that flag, `difftool_spec` answers T1, T3, T4 and T6 as passing, and T2, T5,
   T7 fail on their own causes: split layout, autocmd cleanup, and `vim -d`.
   Evidence: `.outline/evidence/difftool-nonevalid.log`.
+
+Update: the whole spec is green. `fix(layout): split the outermost frame for
+botright windows` (`47625dd`) gives `:copen` the `WSP_BOT` split it needs, so
+the list window spans the tabpage width and `getwininfo()` answers the columns
+before the bottom row; T2 passes. `feat(startup): support -d and report
+v:argf` (`3ca8241`) implements `-d`, seeds `v:argf`, and loads a directory
+argument as the listing view `:edit <dir>` shows; T7 passes.
+
+`test/functional/plugin/difftool_spec.lua`: seven of seven pass, in about
+280 ms each. Evidence: `.outline/evidence/difftool-dashd.log`.
 - Superseded hypothesis, not measured: the quickfix list is empty only when the plugin
   runs from an Ex command. No probe yet records `vim.system` output or the
   quickfix count inside a real Ex host, so executor starvation during
