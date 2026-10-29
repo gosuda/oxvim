@@ -653,3 +653,43 @@ hook that reads the record and dispatches with the full context.
 cannot run the module re-entrantly. The functional `health_spec` failures show
 `E5108: Lua callbacks are not installed` from the harness client, so the
 missing piece is the host seam for that call, not the command.
+
+
+### Full `just oldtest`, measured
+
+One run over all 236 files, 340 seconds, exit 1:
+
+| Outcome | Count |
+|---|---|
+| executed | 3764 |
+| failed | 2364 |
+| skipped | 693 |
+| clean files | 11 |
+| blocked | 39 |
+| timeout or crash | 3 |
+
+The gate is measured, not closed. The failures cluster by error code rather
+than by file, so one cause carries many files:
+
+| Error | Count | Sample |
+|---|---|---|
+| E605 (wrapped inner error) | 243 | `Vim(argdelete):E480: No match: x` |
+| E492 not an editor command | 221 | `:syntax`, `:diffsplit`, `:match`, `:recover`, `:compiler`, `:helptags`, `:doautocmd`, `:filter`, `:tabs`, `:saveas`, `:checkpath`, `:breakadd` |
+| E117 unknown function | 157 | `s:LoadFTPlugin` from `runtime/ftplugin.vim`, `g:foo#bar.echo` |
+| E488 trailing characters | 114 | command forms that take arguments we reject |
+| E474 invalid argument | 107 | option values |
+| E5108 Lua callback not installed | 99 | harness-side Lua calls |
+| E806 variable scope errors | 97 | |
+| E518 unknown option | 95 | options the metadata lacks |
+| E121 undefined variable | 90 | |
+
+Worst files by failed count: `test_cmdline.vim` (364), `test_winfixbuf.vim`
+(79), `test_ins_complete.vim` (104 executed, 22 failed of 141),
+`test_normal.vim` (91), `test_options.vim` (63), `test_edit.vim` (59),
+`test_diffmode.vim` (45), `test_search.vim` (52), `test_filetype.vim` (70),
+`test_window_cmd.vim` (49).
+
+A minimal reproduction of one E117 sample (`s:Hello()` called from an `au
+FileType` defined in the same script) answers `yes` on both binaries, so that
+cluster comes from a different script-context path than the simple case and
+needs its own reproducer before any fix.
