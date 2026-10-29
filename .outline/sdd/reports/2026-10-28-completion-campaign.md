@@ -943,3 +943,33 @@ Measured from the captured plugin-group run plus code citations, without edits:
   with both `try_borrow` results; `None` confirms this caller, and only a
   both-borrows-failed result plus the `"no free Ex executor…"` string would
   revive the re-entrancy theory.
+
+
+### Ex command inventory: upstream against the dispatch table
+
+Method: every name in `.references/neovim/src/nvim/ex_cmds.lua` (44-3459) against
+the dispatch in `excmd_exec.rs:3734-4139`, exact-string rows, alias families kept
+separate and multi-name arms expanded.
+
+| Set | Count |
+|---|---|
+| upstream names this port does not dispatch | 201 |
+| names both accept | 363 |
+| names this port accepts that upstream does not list as rows | 7 |
+
+The 7 are `b`, `bprev`, `cprev`, `lcexpr`, `lprev`, `tabc`, `tabn`. They read as
+an artifact of the exact-row method rather than a defect: upstream reaches those
+spellings through prefix matching, not as table rows, so this line is a
+method note, not a finding.
+
+The 201 missing names carry oldtest evidence where the census has it:
+`recover` 8, `diffsplit` 6, `helptags` 6, `match` 5, `checkpath` 4, `tabs` 4,
+`>`, `~`, and `@` 3 each, `tabprevious` 3, then `breakadd`, `earlier`, `goto`,
+`pedit`, `psearch`, `rundo`, `wundo`, `arglocal`, `ascii`, `ball`, `balt`,
+`changes`, `diffpatch`, `folddoopen`, `grep`, `left`, `make`, `packloadall`,
+`pbuffer`, `saveas`, `sargument`, `sball`, `sfind`, `tabmove`, `tags`,
+`undolist`, `=` with 1 or 2 each.
+
+Cheapest five, by behaviour rather than popularity: `pwd`, `list`, `number`,
+`uptime`, `tabs` — each reuses an existing path (`command_cd`, `command_print`,
+`command_version`, the tab iteration) and adds no state.
