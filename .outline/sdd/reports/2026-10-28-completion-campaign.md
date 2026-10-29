@@ -740,7 +740,9 @@ that now reach a later, unsupported feature instead of failing at the handler.
 `*` with E217, fails before firing on an unknown name (E216), accepts
 `<nomodeline>` without running modelines, and reports
 "No matching autocommands: {arg}" when nothing matched. The regression covers a
-firing event and a miss.
+firing event and a miss. Red proof, run in both states: with the dispatch
+replaced by `Flow::Normal`, `doautocmd_fires_one_event_and_reports_a_miss`
+fails; with the command restored it passes.
 
 This is the first item from the E492 census. The census itself over-counts
 missing built-ins because it also contains user-defined names such as `xxx`,
