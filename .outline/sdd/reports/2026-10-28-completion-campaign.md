@@ -893,3 +893,17 @@ So two causes remain, in this order:
 2. The watchers never fire, which is the round described above.
 
 The run is a lower bound for the same timeout reason as the group measurement.
+
+
+### `rpcnotify` to the client channel: the seam it needs
+
+`JobManager::rpc_notify` sends to a job, else to a socket, else errors
+(`job.rs:982-988`); the client channel is neither, so `rpcnotify(1, ...)` from
+Vimscript always reports E475. `ServerHost` is not the answer either: it
+exposes only `start`, `stop`, and `list` (`server.rs:21-41`) and knows nothing
+about transports.
+
+The shape that fits is the one `set_lua_exec` already uses: the manager gains an
+embedder-installed sink, and the server installs it with a handle that writes a
+`[2, event, params]` frame into its `ChannelOutput` (`server.rs:51`). No
+`JobManager` fallback should pretend a transport channel is a job.
