@@ -14142,15 +14142,64 @@ fn command_close_inner<F: FileIO>(
             error_flow(runtime, "E444", "Cannot close last window")
         };
     };
-    if editor.buffer(buffer).is_ok_and(|state| {
-        state.flags.contains(crate::BufferFlags::MODIFIED) && state.attachments == 1
-    }) && !command.bang
+    // `ex_quit` (`ex_docmd.c:4813-4818`): exiting via the last window runs
+    // `check_changed_any` — any modified buffer blocks `:q` without `!`,
+    // even when `'hidden'` is on. A non-exiting `:q`/`:close` only checks
+    // the current buffer via `need_hide` + `buf_hide` below.
+    let exiting =
+        quit && current_tabpage_window_count(editor) <= 1 && editor.tabpages().len() <= 1;
+    if exiting
+        && !command.bang
+        && editor.buffers().into_iter().any(|handle| {
+            editor
+                .buffer(handle)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
     {
         return error_flow(
             runtime,
             "E37",
             "No write since last change (add ! to override)",
         );
+    }
+    // `ex_win_close` (`ex_docmd.c:5204-5217`): `need_hide` is a changed
+    // buffer shown in at most one window; it refuses with E37 only when the
+    // buffer cannot hide (`buf_hide`: `'bufhidden=hide'`, `'hidden'`, or
+    // `:hide`) and the bang is absent. Neovim's default `'hidden'` is on,
+    // so closing a split with a modified buffer hides it instead of failing.
+    let need_hide = editor
+        .buffer(buffer)
+        .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        && editor
+            .windows()
+            .into_iter()
+            .filter(|window| {
+                editor
+                    .window(*window)
+                    .is_ok_and(|state| state.buffer == buffer)
+            })
+            .take(2)
+            .count()
+            <= 1;
+    if need_hide && !command.bang {
+        let hideable = matches!(
+            editor.options().get_global("hidden"),
+            Ok(OptionValue::Boolean(true))
+        ) || command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::Hide)
+            || matches!(
+                editor.options().get_buffer(buffer, "bufhidden"),
+                Ok(OptionValue::String(value)) if value == "hide"
+            );
+        if !hideable {
+            return error_flow(
+                runtime,
+                "E37",
+                "No write since last change (add ! to override)",
+            );
+        }
     }
     let Some(tab) = editor.current_tabpage() else {
         return Flow::Quit(0);

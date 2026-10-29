@@ -1487,12 +1487,14 @@ fn tabpagewinnr_rejects_bad_arity_and_selector() {
 // Citations: ex_docmd.c ex_close (E37, E444), ex_edit (E37)
 // ---------------------------------------------------------------------------
 
-/// `:close` on a modified buffer without `!` raises E37.
-/// Upstream: `ex_docmd.c` `ex_close` — `buf_modified` check before
-/// `win_close`.
+/// `:close` on a modified buffer without `!` raises E37 when the buffer
+/// cannot hide (`'hidden'` off, no `:hide`, `'bufhidden'` not `hide`).
+/// Upstream: `ex_docmd.c` `ex_close` → `ex_win_close` (`need_hide` +
+/// `buf_hide`, `buffer.c:4120`) — `buf_modified` check before `win_close`.
 #[test]
 fn close_modified_buffer_without_bang_raises_e37() {
     let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
     // Need two windows so :close can target one.
     executor.execute_line(&editor, "split").unwrap();
     assert_eq!(editor.editor().windows().len(), 2);
@@ -1513,6 +1515,32 @@ fn close_modified_buffer_without_bang_raises_e37() {
     assert_vim_error(result, "E37");
     // Window count unchanged because close was refused.
     assert_eq!(editor.editor().windows().len(), 2);
+}
+
+/// `:close` on a modified buffer hides it under Neovim's default `'hidden'`.
+/// Upstream: `ex_docmd.c:5204-5217` — `need_hide && !buf_hide(buf)` is false
+/// when `'hidden'` is on, so `win_close` runs instead of raising E37.
+#[test]
+fn close_modified_buffer_with_hidden_on_succeeds() {
+    let (editor, mut executor) = setup();
+    assert!(matches!(
+        editor.editor().options().get_global("hidden"),
+        Ok(crate::OptionValue::Boolean(true))
+    ));
+    executor.execute_line(&editor, "split").unwrap();
+    assert_eq!(editor.editor().windows().len(), 2);
+
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+
+    executor.execute_line(&editor, "close").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+    assert!(editor.editor().buffer(buffer).is_ok());
 }
 
 /// `:close!` on a modified buffer succeeds, discarding the modified check.
