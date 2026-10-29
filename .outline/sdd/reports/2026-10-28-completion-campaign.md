@@ -625,3 +625,31 @@ Two details the implementation had to get right, both found by the tests:
 `buftype` to be written through the option API by `nvim.dir`, and this port
 still renders the listing in Rust, so that write never happens. The listing
 cutover is the change that makes those two tests reachable.
+
+
+### The three open gaps, with the constraint that blocks each
+
+**Terminal output during `vim.wait` when both executors are busy.** The pump
+already drains PTY output and deferred job events from whichever executor slot
+it can borrow (`crates/oxvim/src/server.rs:6318-6360`). When both slots are
+held by the enclosing frames, nothing can be drained, because the bytes live in
+`ExRuntime.jobs` and `flush_pty_output` (`excmd_exec.rs:1733`) needs `&mut
+ExExecutor`. The editor itself is reachable from the session at that point, so
+the blocker is ownership, not access: the PTY output queue has to move out of
+the executors into session-owned state before the pump can serve a fully busy
+editor.
+
+**Dict watchers.** The registry and the firing round are complete
+(`userfunc.rs`), and nothing calls them. The delete path is threaded as
+`&ExRuntime` from `remove_subscript_chain` down to `dict_remove_key`
+(`lvalue.rs:815-850`, `:911`), while firing needs `&mut ExRuntime` plus
+`access`, `scope`, and `lua` (`excmd_exec.rs:5054`). The Ex-side `:set`
+dispatch added for `OptionSet` is the shape that fits here: a command-level
+hook that reads the record and dispatches with the full context.
+
+**`:checkhealth` providers.** `:checkhealth` already routes to
+`require('vim.health')._check` when a Lua host answers
+(`excmd_exec.rs:17071-17076`), and falls back to the native report when the host
+cannot run the module re-entrantly. The functional `health_spec` failures show
+`E5108: Lua callbacks are not installed` from the harness client, so the
+missing piece is the host seam for that call, not the command.
