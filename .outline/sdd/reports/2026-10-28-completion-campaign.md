@@ -843,3 +843,25 @@ remaining candidates are the `:let` target resolution in `command_let`
 (`excmd_exec.rs:5402`) and its `split_assignment` (`excmd_exec.rs:22412`), and
 the E121 text renders the name as `g` rather than `g:`, which points at the
 name-handling step before either.
+
+
+### Scope-dict subscripts: fixed and verified
+
+`g:['k'] = v` and `unlet g:['k']` address the scope dictionary itself
+(`get_lval`), and only a bare prefix is E461. Both failed: the lvalue bound as a
+plain variable called `g:` (E121), and the removal went through the snapshot
+`scope_dict` returns.
+
+| Probe | Before | After | Reference |
+|---|---|---|---|
+| `let g:["probe"] = 42`, then `get(g:, 'probe')` | no value | `42` | `42` |
+| `unlet g:["probe"]`, then `exists("g:probe")` | `1` | `0` | `0` |
+
+| Test | Red proof |
+|---|---|
+| `a_scope_dict_subscript_assignment_reaches_the_scope` | failed with E121 before `f359610` |
+| `a_scope_dict_subscript_unlet_removes_the_variable` | failed with the `remove_pair` arm disabled, passed after restoring it |
+
+Both fixes are single-key forms. A multi-key path such as
+`let g:['a']['b'] = 1` still resolves through the snapshot and is untested;
+`dict_notifications_spec.lua` writes only single keys.
