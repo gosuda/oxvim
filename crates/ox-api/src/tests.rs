@@ -2476,6 +2476,89 @@ fn definition_count(session: &crate::ApiSession, id: i64) -> usize {
 }
 
 #[test]
+/// A committed option write fires `OptionSet` with the option's full name as
+/// the pattern and `v:option_new` set (`apply_optionset_autocmd_now`,
+/// option.c:2099-2134). `nvim.dir` relies on exactly this to notice
+/// `buftype` becoming `nowrite`.
+#[test]
+fn set_option_value_fires_optionset_with_the_new_value() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    // Startup is over: the event does not fire before `v:vim_did_enter` is 1.
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("buftype"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    // The `v:option_*` values are live only while the callback runs: upstream
+    // resets them when the dispatch returns (`reset_v_option_vars`).
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let actions_written = actions.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_new")).cloned(),
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor.vvars().get(&OxStr::from("option_type")).cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        let _ = &actions_written;
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("buftype"),
+        Object::String(OxStr::from("nowrite")),
+        dict(&[("buf", Object::Integer(1))]),
+    )
+    .unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "one snapshot");
+    assert_eq!(
+        seen[0][0],
+        Some(Object::String(OxStr::from("nowrite"))),
+        "v:option_new during the callback"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("setlocal"))),
+        "a buffer-local write reports setlocal"
+    );
+    assert_eq!(
+        seen[0][2],
+        Some(Object::String(OxStr::from("local"))),
+        "and local scope"
+    );
+    // After the dispatch the variables are back to empty, as upstream resets
+    // them.
+    session.with_editor(|editor| {
+        assert_eq!(
+            editor.vvars().get(&OxStr::from("option_new")),
+            Some(&Object::String(OxStr::from("")))
+        );
+    });
+    let _ = id;
+}
+
 /// `nvim_buf_set_name` passes the name through `fname_expand` and then
 /// `vim_FullName`, which leaves a URL alone (`path.c:1780`). A URL that gained
 /// the working directory in front of it would be a different buffer name, and

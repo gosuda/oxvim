@@ -4,7 +4,8 @@ use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
     MOD_MASK_META, MOD_MASK_SHIFT, Message, MessageKind, OptionError, OptionListKind,
-    OptionMetadata, OptionScope, OptionType, OptionValue, TypeaheadFlags, UserCommand,
+    OptionMetadata, OptionScope, OptionSetScope, OptionType, OptionValue, TypeaheadFlags,
+    UserCommand,
     focus_transition,
 };
 use ox_excmd::ExCommand;
@@ -1157,18 +1158,51 @@ pub fn nvim_set_option_value(
         )),
         other => other,
     };
-    let value = crate::option_merge::merge(
-        metadata,
-        &current_option_value(session, name, target)?,
-        value,
-        operation,
-    )?;
+    let previous = current_option_value(session, name, target)?;
+    let previous_object = structured_option_value(metadata, &previous);
+    let value = crate::option_merge::merge(metadata, &previous, value, operation)?;
     if dict_bool(&opts, "dry_run")? == Some(true) {
         validate_option_at(session, name, &value, target)?;
         return Ok(structured_option_value(metadata, &value));
     }
     let assigned = structured_option_value(metadata, &value);
-    set_option_at(session, name, value, target)?;
+    set_option_at(session, name, value.clone(), target)?;
+    // `apply_optionset_autocmd_now` (option.c:2099): a committed change fires
+    // `OptionSet` with the option's full name as the pattern and the six
+    // `v:option_*` values published for the callbacks.
+    let (scope, old_local, old_global) = match target {
+        OptionTarget::Global => (OptionSetScope::Global, None, Some(previous_object.clone())),
+        OptionTarget::Buffer(_) | OptionTarget::Window(_) => (OptionSetScope::Local, None, None),
+        // `:set` reaches both scopes, so the callbacks see each old value
+        // separately (`option.c:2123-2129`).
+        OptionTarget::GlobalAndBuffer(buffer) => {
+            let local = current_option_value(session, name, OptionTarget::Buffer(buffer))?;
+            let global = current_option_value(session, name, OptionTarget::Global)?;
+            (
+                OptionSetScope::Set,
+                Some(structured_option_value(metadata, &local)),
+                Some(structured_option_value(metadata, &global)),
+            )
+        }
+        OptionTarget::GlobalAndWindow(window) => {
+            let local = current_option_value(session, name, OptionTarget::Window(window))?;
+            let global = current_option_value(session, name, OptionTarget::Global)?;
+            (
+                OptionSetScope::Set,
+                Some(structured_option_value(metadata, &local)),
+                Some(structured_option_value(metadata, &global)),
+            )
+        }
+    };
+    crate::autocmd::fire_option_set(
+        session,
+        metadata.name,
+        scope,
+        &previous_object,
+        old_local.as_ref(),
+        old_global.as_ref(),
+        &assigned,
+    )?;
     if metadata.name == "modified"
         && let OptionTarget::Buffer(buffer) | OptionTarget::GlobalAndBuffer(buffer) = target
         && let Object::Boolean(modified) = &assigned

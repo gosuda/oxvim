@@ -702,6 +702,15 @@ impl Editor {
                 // the true value. An absent key made `vim.v.vim_did_enter > 0`
                 // a nil comparison.
                 ("vim_did_enter".into(), Object::Integer(0)),
+                // The six `v:option_*` values an `OptionSet` dispatch
+                // publishes. Upstream always has them defined and empty
+                // between dispatches (`reset_v_option_vars`, eval/vars.c:3382).
+                ("option_new".into(), Object::String(OxStr::from(""))),
+                ("option_old".into(), Object::String(OxStr::from(""))),
+                ("option_oldlocal".into(), Object::String(OxStr::from(""))),
+                ("option_oldglobal".into(), Object::String(OxStr::from(""))),
+                ("option_type".into(), Object::String(OxStr::from(""))),
+                ("option_command".into(), Object::String(OxStr::from(""))),
                 // `v:msgpack_types` (`eval.c` `set_internal_string_var`): the
                 // five marker lists that name the special msgpack maps, so
                 // `msgpackparse()` can build them and `msgpackdump()` can
@@ -2442,6 +2451,71 @@ impl Editor {
     pub fn vvars_mut(&mut self) -> &mut Dict {
         self.vvars_version = self.vvars_version.wrapping_add(1);
         &mut self.vvars
+    }
+
+    /// Publishes the six `v:option_*` values an `OptionSet` dispatch shows,
+    /// and returns what they were so the caller can put them back
+    /// (`apply_optionset_autocmd_now`, option.c:2099-2134, resets them with
+    /// `reset_v_option_vars` afterwards).
+    ///
+    /// The caller owns the restore because it also owns the dispatch: a
+    /// callback may set another option, which publishes its own values and
+    /// restores them on its way out, in either order.
+    pub fn publish_option_set(
+        &mut self,
+        scope: OptionSetScope,
+        old: &Object,
+        old_local: Option<&Object>,
+        old_global: Option<&Object>,
+        new: &Object,
+    ) -> OptionSetVars {
+        let saved = OptionSetVars {
+            saved: OPTION_SET_VARS.map(|key| {
+                self.vvars
+                    .get(&OxStr::from(key))
+                    .cloned()
+                    .unwrap_or_else(|| Object::String(OxStr::from("")))
+            }),
+        };
+        // `option.c:2108-2129`: `oldlocal` and `oldglobal` are written only
+        // by the branch that names them, and stay reset otherwise.
+        let empty = Object::String(OxStr::from(""));
+        let (command, option_type, local_old, global_old) = match scope {
+            OptionSetScope::Set => (
+                "set",
+                "global",
+                old_local.cloned().unwrap_or_else(|| empty.clone()),
+                old_global.cloned().unwrap_or_else(|| empty.clone()),
+            ),
+            OptionSetScope::Local => ("setlocal", "local", old.clone(), empty.clone()),
+            OptionSetScope::Global => ("setglobal", "global", empty.clone(), old.clone()),
+            OptionSetScope::Modeline => ("modeline", "local", old.clone(), empty.clone()),
+        };
+        let values = [
+            new.clone(),
+            old.clone(),
+            local_old,
+            global_old,
+            Object::String(OxStr::from(option_type)),
+            Object::String(OxStr::from(command)),
+        ];
+        {
+            let vars = self.vvars_mut();
+            for (key, value) in OPTION_SET_VARS.into_iter().zip(values) {
+                vars.insert(OxStr::from(key), value);
+            }
+        }
+        saved
+    }
+
+    /// Puts the `v:option_*` values back as [`Self::publish_option_set`] found
+    /// them. The names are always present, empty until a dispatch publishes
+    /// them (`reset_v_option_vars`, `eval/vars.c:3382`).
+    pub fn restore_option_set(&mut self, saved: OptionSetVars) {
+        let vars = self.vvars_mut();
+        for (key, value) in OPTION_SET_VARS.into_iter().zip(saved.saved) {
+            vars.insert(OxStr::from(key), value);
+        }
     }
 
     /// Returns the `v:` variable-map version used by the differential sync.
@@ -5845,3 +5919,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Which option command produced the `OptionSet` dispatch
+/// (`apply_optionset_autocmd_now`, option.c:2099).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionSetScope {
+    /// `:set` and a script assignment that reached both scopes.
+    Set,
+    /// `:setlocal`.
+    Local,
+    /// `:setglobal`.
+    Global,
+    /// `:set` from a modeline.
+    Modeline,
+}
+
+/// The `v:option_*` values that were in force before a dispatch, kept so the
+/// caller can restore them without knowing which of them existed.
+#[derive(Clone, Debug)]
+pub struct OptionSetVars {
+    saved: [Object; 6],
+}
+
+/// The `v:option_*` names in `reset_v_option_vars` order
+/// (`eval/vars.c:3382`).
+const OPTION_SET_VARS: [&str; 6] = [
+    "option_new",
+    "option_old",
+    "option_oldlocal",
+    "option_oldglobal",
+    "option_type",
+    "option_command",
+];

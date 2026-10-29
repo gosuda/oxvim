@@ -61,7 +61,7 @@ pub use decoration::Decorations;
 pub use editor::{
     BufferEditMode, BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError,
     HighlightDefinition, LineReplaceRequest, Message, MessageDestination, MessageKind,
-    MessageRouting, expand_buffer_name,
+    MessageRouting, OptionSetScope, OptionSetVars, expand_buffer_name,
 };
 #[cfg(any(test, feature = "testutils"))]
 pub use excmd_exec::TestEditorAccess;
