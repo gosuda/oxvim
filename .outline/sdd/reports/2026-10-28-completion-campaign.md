@@ -1180,3 +1180,20 @@ The 49-test jump comes from the shared watcher registry and the API scoped
 writes, not from a new command: `dict_notifications_spec` alone accounts for one
 of them, so the rest are group tests whose setup or teardown needed a watcher
 notification to arrive.
+
+
+### `b:changedtick` for insert-mode text
+
+`81e7e73` moved tick recording to command boundaries: per dispatch in
+`run_instructions`, around the typeahead drain in `run_typeahead` (which is what
+`insert('t')` needs), and in `call_builtin`. The old `EvalHost::call` wrapper was
+deleted because it ran inside dispatch and would have double-fired.
+
+| `dict_notifications_spec` | Before | After |
+|---|---|---|
+| OK | 67 | 68 |
+| FAIL | 3 | 2 |
+
+The two remaining failures both fail identically at baseline and are unrelated
+to the tick: `calls watcher deleted in callback` and the `tabpagebuflist()`
+teardown case.
