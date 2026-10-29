@@ -1215,3 +1215,16 @@ The last failure is `tabpagebuflist() with dict watcher during buffer close/wipe
 (grow a watcher during window/tab teardown, `E37` on `close`). It fails the same
 way on the pristine baseline, so it is a separate teardown defect rather than a
 regression from the watcher work.
+
+
+### `dict_notifications_spec`: 70 of 70
+
+`e85d433` fixed the last case: `:close` from a watcher fired during buffer
+teardown refused with E37 because the port ignored 'hidden'. `:close` now
+mirrors `ex_win_close`'s `need_hide` decision, and `:quit` leaving the last
+window keeps `check_changed_any`, so a modified buffer still blocks `:q`.
+
+| `dict_notifications_spec` | Round start | Now |
+|---|---|---|
+| OK | 0 (34 run, killed at 300 s) | 70 |
+| FAIL | 33 | 0 |
