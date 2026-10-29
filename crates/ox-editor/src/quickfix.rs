@@ -2225,6 +2225,64 @@ mod tests {
         assert_eq!(editor.quickfix().current().unwrap().idx(), 1);
     }
 
+    /// `nvim.difftool` builds entries with a filename but no line and no
+    /// pattern, so every entry is invalid. Upstream marks such a list
+    /// `qf_nonevalid` and jumps ignore validity (quickfix.c:2569); without the
+    /// flag `:cfirst` answered `E553` on a populated list.
+    #[test]
+    fn all_invalid_list_jumps_to_its_first_entry() {
+        let (mut editor, _) = setup();
+        let entries: Vec<Typval> = ["A", "M", "D"]
+            .into_iter()
+            .map(|text| {
+                Typval::dict(vec![
+                    pair("filename", Typval::String(OxStr::from("a.txt"))),
+                    pair("text", Typval::String(OxStr::from(text))),
+                ])
+            })
+            .collect();
+        call(&mut editor, "setqflist", &[Typval::list(entries)]).unwrap();
+        let list = editor.quickfix().current().unwrap();
+        assert!(
+            list.items().iter().all(|item| !item.valid),
+            "every entry is invalid without a line or a pattern"
+        );
+
+        jump(&mut editor, QuickfixMove::First, false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 1);
+        jump(&mut editor, QuickfixMove::Next(1), false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 2);
+        jump(&mut editor, QuickfixMove::Last, false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 3);
+    }
+
+    /// A mixed list still skips invalid entries: `qf_nonevalid` only applies
+    /// when no entry is valid at all.
+    #[test]
+    fn mixed_list_still_skips_invalid_entries() {
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        let entries = vec![
+            Typval::dict(vec![
+                pair("filename", Typval::String(OxStr::from("a.txt"))),
+                pair("text", Typval::String(OxStr::from("invalid"))),
+            ]),
+            item(buffer, 2, "valid"),
+        ];
+        call(&mut editor, "setqflist", &[Typval::list(entries)]).unwrap();
+        assert!(
+            !editor.quickfix().current().unwrap().items()[0].valid,
+            "the first entry stays invalid"
+        );
+
+        jump(&mut editor, QuickfixMove::First, false).unwrap();
+        assert_eq!(
+            editor.quickfix().current().unwrap().idx(),
+            2,
+            "the first valid entry wins"
+        );
+    }
+
     #[test]
     fn invalid_action_reports_e927() {
         let (mut editor, _) = setup();
