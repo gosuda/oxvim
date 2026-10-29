@@ -919,3 +919,27 @@ The shape that fits is the one `set_lua_exec` already uses: the manager gains an
 embedder-installed sink, and the server installs it with a handle that writes a
 `[2, event, params]` frame into its `ChannelOutput` (`server.rs:51`). No
 `JobManager` fallback should pretend a transport channel is a job.
+
+
+### `:checkhealth`: cause identified, not a missing host
+
+Measured from the captured plugin-group run plus code citations, without edits:
+
+- The group's first failure is **T76**, an assertion (`:checkhealth detects invalid
+  $VIMRUNTIME`: expected false, actual true), not an error.
+- The first `E5108` is **T82** `:checkhealth vim.g.health`, raised at
+  `testnvim.lua:144` from `Vim(checkhealth)` in `health_spec.lua:82-88`, and it
+  repeats through T97.
+- That string comes only from a `lua: None` path
+  (`excmd_exec.rs:18861-18865`, `run_lua_autocmd_callback`; same shape at
+  `20477-20479`). A busy executor pair prints a different text
+  (`"no free Ex executor for …"`, `server.rs:5189-5192`), so re-entrancy is not
+  this failure. Both executors are configured with hosts
+  (`server.rs:636-637`, `4756-4770`).
+- `require('vim.health')` loads and its table works: T80 passes
+  (`health_spec.lua:68-76`). The gap is callback delivery into `:checkhealth`,
+  not a missing health API.
+- Confirmation step, if wanted: at the `None` branch record `lua.is_some()`
+  with both `try_borrow` results; `None` confirms this caller, and only a
+  both-borrows-failed result plus the `"no free Ex executor…"` string would
+  revive the re-entrancy theory.
