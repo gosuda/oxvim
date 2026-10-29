@@ -7416,6 +7416,23 @@ fn a_scope_dict_subscript_assignment_reaches_the_scope() {
     );
 }
 
+/// `unlet g:['k']` removes the scope variable itself, like the assignment form
+/// writes it. Oracle: after `let g:["probe"] = 42` and
+/// `unlet g:["probe"]`, `exists("g:probe")` is 0.
+#[test]
+fn a_scope_dict_subscript_unlet_removes_the_variable() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"probe\"] = 42")
+        .unwrap();
+    executor.execute_line(&editor, "unlet g:[\"probe\"]").unwrap();
+    assert_eq!(
+        global_value(&executor, "probe"),
+        None,
+        "the variable is gone from the scope"
+    );
+}
+
 /// `:doautocmd` applies one event's registrations to the current buffer
 /// (`do_doautocmd`, autocmd.c:1141). The covered grammar is a named group, a
 /// plain event, an explicit file name, and the two argument errors; a run that

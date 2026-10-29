@@ -282,6 +282,19 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             name,
             scope_kind,
             subs,
+        } if name.as_bytes().is_empty()
+            && let Some(kind) = *scope_kind
+            && subs.len() == 1
+            && let BoundSub::Key(key) = &subs[0] =>
+        {
+            // `unlet g:['k']` removes the scope variable itself; the snapshot
+            // `scope_dict` hands back would remove it from a copy.
+            Ok(scope.remove_pair(kind, key.as_bytes()))
+        }
+        Lvalue::Variable {
+            name,
+            scope_kind,
+            subs,
         } => {
             let root = read_root_variable(runtime, scope, name.as_bytes(), *scope_kind)?;
             let target = rendered_target(*scope_kind, name.as_bytes(), subs);
