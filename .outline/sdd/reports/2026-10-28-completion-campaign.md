@@ -1290,3 +1290,21 @@ The 20 remaining `dir_spec` failures, each with its observed cause:
 | 12 | reload of a removed directory | `ENOENT` message not captured |
 | 15 | coexists with netrw | netrw's autoload hits E488 |
 | 16-20 | `:browse edit/split/vsplit/tabedit/tabnew` | `:browse` is unsupported |
+
+
+### `dir_spec` after the browse and maparg work
+
+| Change | Commit | `dir_spec` |
+|---|---|---|
+| cutover measured | `c9cd14d` | 18 of 38 |
+| `:browse` rewrite plus `.`-component normalization plus `:tabnew` BufEnter | `ee9e5d6` | 23 of 38 |
+| `maparg` callback dict and `buffer` flag | `0a6f41c` | 24 of 38 (the provider-replacement case passes) |
+
+The 14 remaining, grouped by cause:
+
+| Group | Cases |
+|---|---|
+| listing entry activation does not switch the window buffer | navigates entries, displays filenames as text and opens them, encodes special characters, preserves a modified unnamed buffer, preserves the alternate buffer, `<Plug>(nvim-dir-up)` parent navigation |
+| buffer lifecycle | follows global `'hidden'` when abandoned |
+| messages capture | provider errors, reload of a removed directory |
+| missing subsystems | `:syntax` (`reloads directory buffers`), netrw coexistence (`E488` inside netrw's autoload), `vim.fs.mkdir` (`E745`), `[count]-` overshoot |
