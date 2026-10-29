@@ -1021,3 +1021,20 @@ The remaining 44 cluster on mutation routes this round did not cover:
 
 Each is a producer gap in `builtins.rs` (dictionary-builtin mutations), not a
 round defect: the round itself is exercised by the tests that pass.
+
+
+### Builtin producers: measured, and what remains
+
+`36779d3` made `remove()`, `extend()`, and `filter()` notify dictionary watchers.
+
+| Measure | Before | After |
+|---|---|---|
+| `dict_notifications_spec` OK | 26 | 28 |
+| `ex_cmds` group OK (of 405) | 58 | 76 |
+
+The spec moves by only two tests, and the remaining failures still name
+`remove()` and `extend()` on `g:`. That is the diagnosis: the spec mutates the
+scope mapping itself (`remove(g:, 'k')`, `extend(g:, {...})`), not a dictionary
+variable, so the new producers record a `WatchTarget::Dict` event while the
+watcher is registered as `WatchTarget::Scope(Global)`. The builtin routes need
+the same scope-identity mapping that `dictwatcheradd` already uses.
