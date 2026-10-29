@@ -7433,6 +7433,84 @@ fn a_scope_dict_subscript_unlet_removes_the_variable() {
     );
 }
 
+/// A1: `unlet g:['missing']` raises E716 naming the key. The scope-dict form
+/// reaches the same removal as `unlet g:missing`. Oracle:
+/// `E716: Key not present in Dictionary: "nope"`.
+#[test]
+fn a_scope_dict_unlet_of_a_missing_key_raises_e716() {
+    let (editor, mut executor) = setup();
+    let error = executor
+        .execute_line(&editor, "unlet g:[\"nope\"]")
+        .expect_err("a missing key is an error");
+    let text = format!("{error:?}");
+    assert!(text.contains("E716"), "E716 for a missing key: {text}");
+    assert!(text.contains("nope"), "the error names the key: {text}");
+}
+
+/// A1b: a missing key on a plain dictionary subscript quotes the key too.
+/// Oracle: `unlet g:d.nope` answers
+/// `E716: Key not present in Dictionary: "nope"`.
+#[test]
+fn a_dict_subscript_unlet_quotes_the_missing_key() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "let g:d = {}").unwrap();
+    let error = executor
+        .execute_line(&editor, "unlet g:d.nope")
+        .expect_err("a missing key is an error");
+    let text = format!("{error:?}");
+    assert!(text.contains("E716"), "E716 for a missing key: {text}");
+    assert!(
+        text.contains("\\\"nope\\\""),
+        "the key is quoted: {text}"
+    );
+}
+
+/// A2: the bang form is silent. Oracle: `unlet! g:['nope']` reports nothing.
+#[test]
+fn a_scope_dict_unlet_bang_ignores_a_missing_key() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "unlet! g:[\"nope\"]")
+        .unwrap_or_else(|error| panic!("bang form is silent: {error:?}"));
+}
+
+/// A4: a bare `:doautocmd` is a silent no-op, not an error. Oracle: the
+/// command returns without a message or exception.
+#[test]
+fn doautocmd_without_an_event_is_a_silent_noop() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "doautocmd")
+        .unwrap_or_else(|error| panic!("bare doautocmd is silent: {error:?}"));
+}
+
+/// A5: `<nomodeline>` with no event after it is also a silent no-op, because
+/// the stripping happens before the event scan (`check_nomodeline`).
+#[test]
+fn doautocmd_with_only_nomodeline_is_a_silent_noop() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "doautocmd <nomodeline>")
+        .unwrap_or_else(|error| panic!("no event after the tag: {error:?}"));
+}
+
+/// A9: the empty key is a legal dictionary key. `let g:[''] = 1` stores it and
+/// `g:['']` reads it back; a boundary on the key, not on the scope.
+#[test]
+fn a_scope_dict_empty_key_round_trips() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"\"] = 7")
+        .unwrap_or_else(|error| panic!("empty key assignment: {error:?}"));
+    executor
+        .execute_line(&editor, "let g:readback = g:[\"\"]")
+        .unwrap_or_else(|error| panic!("empty key read: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "readback"),
+        Some(ox_types::Typval::Number(7))
+    );
+}
+
 /// `:doautocmd` applies one event's registrations to the current buffer
 /// (`do_doautocmd`, autocmd.c:1141). The covered grammar is a named group, a
 /// plain event, an explicit file name, and the two argument errors; a run that

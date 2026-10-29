@@ -288,8 +288,18 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             && let BoundSub::Key(key) = &subs[0] =>
         {
             // `unlet g:['k']` removes the scope variable itself; the snapshot
-            // `scope_dict` hands back would remove it from a copy.
-            Ok(scope.remove_pair(kind, key.as_bytes()))
+            // `scope_dict` hands back would remove it from a copy. A missing
+            // key is E716 quoting the key, not the E108 a bare name gets
+            // (`ex_unlet`, ex_docmds.c:5544-5560).
+            let removed = scope.remove_pair(kind, key.as_bytes());
+            if removed || bang {
+                return Ok(removed);
+            }
+            Err(lvalue_error(
+                runtime,
+                "E716",
+                format!("Key not present in Dictionary: \"{}\"", key.to_string_lossy()),
+            ))
         }
         Lvalue::Variable {
             name,
@@ -909,7 +919,7 @@ fn dict_read_key<F: FileIO>(
                 runtime,
                 "E716",
                 format!(
-                    "Key not present in Dictionary: {}",
+                    "Key not present in Dictionary: \"{}\"",
                     String::from_utf8_lossy(key)
                 ),
             )
@@ -970,7 +980,10 @@ fn dict_remove_key<F: FileIO>(
         return Err(lvalue_error(
             runtime,
             "E716",
-            format!("Key not present in Dictionary: {}", key.to_string_lossy()),
+            format!(
+                "Key not present in Dictionary: \"{}\"",
+                key.to_string_lossy()
+            ),
         ));
     };
     // Dict-item resolution checks the read-only flag only; the fixed bit is
