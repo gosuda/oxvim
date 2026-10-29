@@ -7303,6 +7303,22 @@ fn a_trailing_cr_survives_into_normal_and_a_mapping_rhs() {
     assert_eq!(global_text(&executor, "qargs").as_deref(), Some("hi\r"));
 }
 
+/// `<q-bang>` is the quoted bang: `"!"` when the command carried one, `""`
+/// otherwise (`uc_check_code` `ct_BANG` with `quote`, `usercmd.c:1563`).
+/// `pack/dist/opt/cfilter/plugin/cfilter.vim:61` builds a `:call` expression
+/// from it, so a literal tag there is E15, not a value.
+#[test]
+fn q_bang_expands_to_the_quoted_bang() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "command! -bang T69Qbang let g:qbang = <q-bang>")
+        .unwrap();
+    executor.execute_line(&editor, "T69Qbang!").unwrap();
+    assert_eq!(global_text(&executor, "qbang").as_deref(), Some("!"));
+    executor.execute_line(&editor, "T69Qbang").unwrap();
+    assert_eq!(global_text(&executor, "qbang").as_deref(), Some(""));
+}
+
 /// The trailing-space half of the same rule. `:map` is `EX_TRLBAR` *with*
 /// `EX_NOTRLCOM`, so `del_trailing_spaces` never reaches it and the spaces stay
 /// in the right-hand side — the rhs below still executes with three spaces

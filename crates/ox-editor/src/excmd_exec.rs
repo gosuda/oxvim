@@ -20284,6 +20284,11 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
         .replace("<f-args>", &split_command_arguments(args))
         .replace("<args>", args)
         .replace("<q-args>", &format!("'{}'", args.replace('\'', "''")))
+        // `<q-bang>` is the quoted form: `"!"` or `""`, never empty
+        // (`uc_check_code`, usercmd.c:1563). It replaces before `<bang>`,
+        // otherwise the plain form would rewrite the middle of the tag.
+        .replace("<q-bang>", if command.bang { "\"!\"" } else { "\"\"" })
+        .replace("<Q-bang>", if command.bang { "\"!\"" } else { "\"\"" })
         .replace("<bang>", if command.bang { "!" } else { "" })
         .replace("<mods>", &render_command_mods(&command.modifiers))
         .replace("<line1>", &line1.to_string())
