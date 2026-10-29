@@ -994,3 +994,30 @@ sink for `rpcnotify`).
 The `ex_cmds` numbers predate the client sink, because the run used the binary
 built before `acbc643`; the `dict_notifications_spec` re-measure with the sink
 is the next gate.
+
+
+### `dict_notifications_spec` after the sink and the watcher round
+
+| Measure | Before round | After |
+|---|---|---|
+| tests run | 34 (killed at 300 s) | 70 (finished, exit 1) |
+| OK | 0 | 26 |
+| FAIL | 33 | 44 |
+
+The spec now runs to completion instead of dying at the harness timeout, and 26
+of its 70 tests pass. Two causes carried the earlier zero: `rpcnotify(1, ...)`
+failed with E475 until the client sink landed (`acbc643`), and no watcher fired
+until `cef2725`/`bb7df47`.
+
+The remaining 44 cluster on mutation routes this round did not cover:
+
+- `remove()` on a dictionary (T2, and the same test through `nvim_*_var` and
+  `vim.g.` in T3 and T4): `ox-eval`'s `remove()` builtin mutates a dictionary
+  outside the lvalue paths the watcher producer watches.
+- `extend()` (T5): same reason, different builtin.
+- key patterns, empty keys, and the change-sequence tests: pattern matching and
+  ordering once the above routes notify.
+- `b:` remove: the scope variant of the first item.
+
+Each is a producer gap in `builtins.rs` (dictionary-builtin mutations), not a
+round defect: the round itself is exercised by the tests that pass.
