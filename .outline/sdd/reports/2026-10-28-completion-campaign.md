@@ -252,12 +252,21 @@ Diagnosis of the remaining difftool failure, measured outside the test harness:
 - `vim.split`, the `Files 'a' and 'b' differ` pattern, `vim.fs.relpath`,
   `vim.fs.abspath` and `setqflist` with `quickfixtextfunc` all answer what the
   plugin expects, and a hand-built list of four entries survives `setqflist`.
-- The quickfix list is empty only when the plugin runs from an Ex command,
-  which points at job progress not being pumped while the Ex executor is busy,
-  the same class as the `vim.wait` terminal-pump gap.
-- `fix(uv): keep pipe descriptor reuse safe` (`e7677d4`) removes a stale-marker
+- Hypothesis, not measured: the quickfix list is empty only when the plugin
+  runs from an Ex command. No probe yet records `vim.system` output or the
+  quickfix count inside a real Ex host, so executor starvation during
+  `:wait()` remains a candidate, in the same class as the `vim.wait`
+  terminal-pump gap, rather than a confirmed cause.
+- `fix(uv): keep pipe descriptor reuse safe` (`f8da21d`) removes a stale-marker
   hazard: registering a pair or taking a half now drops an awaiting-close
-  marker for the same number, and `close` clears both states.
+  marker for the same number, and `close` clears both states. Two tests pin it,
+  `stale_marker_never_reports_a_second_close` and
+  `taking_a_number_clears_its_marker`, and both fail when the previous `close`
+  and `take` bodies are restored, so the tests bite on the defect rather than
+  passing by construction.
+- `fix(uv): mark spawned descriptors only after the spawn starts` (`17a6c24`)
+  keeps a rejected `stdio` table from stranding a marker for a descriptor that
+  was released.
 
 Two defects surfaced while wiring the registry. `pipe:open` adopted the
 descriptor without installing the reactor callback, so reads never reached Lua
