@@ -709,6 +709,17 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             exit_code = code;
             break 'startup;
         }
+        // Startup is over: `v:vim_did_enter` turns 1 and `VimEnter` applies
+        // before the Ex loop reads standard input (main.c:620). Batch mode
+        // never fired either, so every `-S`/`-c` script after startup saw 0.
+        session.with_editor_mut(ox_editor::Editor::set_v_vim_did_enter);
+        let plan = session.with_editor_mut(|editor| {
+            editor
+                .autocmds_mut()
+                .plan(ox_editor::Event::VimEnter, ox_editor::AutocmdContext::default())
+        });
+        ox_api::execute_firing_plan(&session, plan)
+            .map_err(|error| AppError::Api(error.to_string()))?;
         // The Ex-commands read sits at the end of startup (main.c:670-685)
         // and only when stdin is not a tty (main.c:674-676: "nvim -es +cmd"
         // in a tty executes and exits, it doesn't wait for input).

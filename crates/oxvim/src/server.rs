@@ -1055,6 +1055,8 @@ impl AppState {
 
     fn fire_vim_enter(&mut self) -> Result<(), AppError> {
         let plan = self.session.with_editor_mut(|editor| {
+            // `v:vim_did_enter` turns 1 just before `VimEnter` is applied.
+            editor.set_v_vim_did_enter();
             editor
                 .autocmds_mut()
                 .plan(Event::VimEnter, AutocmdContext::default())

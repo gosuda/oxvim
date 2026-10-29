@@ -2459,3 +2459,28 @@ impl Handle for Udp {
         close_id(uv_loop, self.id, Some(callback))
     }
 }
+
+/// Creates an anonymous pipe and answers its raw descriptor numbers.
+///
+/// This is what luv's `uv.pipe(options, stream)` returns when a second
+/// argument is present: a `{ read = fd, write = fd }` pair that the caller
+/// hands to `uv.spawn` as a stdio slot (`runtime/lua/vim/_core/system.lua`
+/// builds its subprocess pipes that way). The descriptors are deliberately
+/// detached from Rust ownership with `into_raw_fd`: the Lua side owns them and
+/// closes them through `uv.new_pipe(...):open(fd)`.
+///
+/// # Errors
+///
+/// Returns [`NetError::Io`] when the system pipe call fails.
+pub fn pipe_pair(nonblock: bool) -> std::io::Result<(i64, i64)> {
+    use std::os::fd::IntoRawFd;
+    let (reader, writer) = rustix::pipe::pipe()?;
+    if nonblock {
+        rustix::io::ioctl_fionbio(&reader, true)?;
+        rustix::io::ioctl_fionbio(&writer, true)?;
+    }
+    Ok((
+        i64::from(reader.into_raw_fd()),
+        i64::from(writer.into_raw_fd()),
+    ))
+}

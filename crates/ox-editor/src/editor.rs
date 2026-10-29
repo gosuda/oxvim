@@ -696,10 +696,12 @@ impl Editor {
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
                 ("register".into(), Object::String(OxStr::from("\""))),
-                // `v:vim_did_enter` is 1 once startup finished (`VimEnter`
-                // fired); runtime plugins branch on it, and an absent value
-                // makes `vim.v.vim_did_enter > 0` a nil comparison.
-                ("vim_did_enter".into(), Object::Integer(1)),
+                // `v:vim_did_enter` is 0 through startup and 1 from the
+                // moment VimEnter is fired (`eval.c` `set_vim_var_nr`, main.c),
+                // so a runtime plugin that branches on it during startup sees
+                // the true value. An absent key made `vim.v.vim_did_enter > 0`
+                // a nil comparison.
+                ("vim_did_enter".into(), Object::Integer(0)),
                 // `v:msgpack_types` (`eval.c` `set_internal_string_var`): the
                 // five marker lists that name the special msgpack maps, so
                 // `msgpackparse()` can build them and `msgpackdump()` can
@@ -2446,6 +2448,14 @@ impl Editor {
     #[must_use]
     pub const fn vvars_version(&self) -> u64 {
         self.vvars_version
+    }
+
+    /// Marks startup finished for `v:vim_did_enter` (`set_vim_var_nr`,
+    /// main.c: just before `VimEnter` is applied).
+    pub fn set_v_vim_did_enter(&mut self) {
+        self.vvars
+            .insert("vim_did_enter".into(), Object::Integer(1));
+        self.vvars_version = self.vvars_version.wrapping_add(1);
     }
 
     /// Sets the read-only `v:register` to `name` and bumps `vvars_version`

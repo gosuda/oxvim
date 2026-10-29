@@ -783,6 +783,29 @@ impl UserData for LuaProcessPipe {
             }));
             Ok(true)
         });
+        // `pipe:open(fd)` adopts a descriptor, which is how
+        // `vim/_core/system.lua` turns a `uv.pipe({}, {})` half into a handle
+        // it can read the child's stdout from.
+        methods.add_method("open", |_, this, fd: i32| {
+            let inner = this.inner.clone();
+            let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+            let failure_slot = Rc::clone(&failure);
+            this.access.apply(Box::new(move |uv_loop| {
+                // SAFETY: the descriptor came from `uv.pipe`, and `open`
+                // hands its ownership to the handle, which closes it.
+                let owned = unsafe {
+                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+                };
+                match ox_uv::process::ProcessPipe::adopt(uv_loop, owned) {
+                    Ok(pipe) => *inner.borrow_mut() = Some(pipe),
+                    Err(error) => *failure_slot.borrow_mut() = Some(error.to_string()),
+                }
+            }));
+            match failure.borrow_mut().take() {
+                Some(message) => Err(mlua::Error::runtime(message)),
+                None => Ok(true),
+            }
+        });
         methods.add_method("read_stop", |_, this, ()| {
             this.callbacks.borrow_mut().read = None;
             let inner = this.inner.clone();
@@ -1915,6 +1938,45 @@ pub(crate) fn install(
                 })
             })?,
         )?;
+
+        // `uv.pipe([options [, stream]])` (`luvref.txt`): with a second
+        // argument it creates an OS pipe pair and answers
+        // `{ read = fd, write = fd }`, which is what
+        // `vim/_core/system.lua` needs to hand stdout/stderr to `uv.spawn`;
+        // without one it is a pipe handle, the same object `new_pipe` builds.
+        {
+            let pair_lua = lua.clone();
+            let pair_access = access.clone();
+            let pair_fast = fast.clone();
+            uv.set(
+                "pipe",
+                lua.create_function(
+                    move |lua, (options, stream): (Option<Table>, Option<Value>)| {
+                        if stream.is_none() {
+                            return Ok(Value::UserData(lua.create_userdata(
+                                LuaProcessPipe {
+                                    inner: Rc::new(RefCell::new(None)),
+                                    callbacks: Rc::new(RefCell::new(StreamCallbacks::default())),
+                                    lua: pair_lua.clone(),
+                                    fast: pair_fast.clone(),
+                                    access: pair_access.clone(),
+                                    closing: Rc::new(Cell::new(false)),
+                                },
+                            )?));
+                        }
+                        let nonblock = options
+                            .as_ref()
+                            .is_some_and(|options| options.get::<Option<bool>>("nonblock").ok().flatten() == Some(true));
+                        let (reader, writer) = ox_uv::net::pipe_pair(nonblock)
+                            .map_err(mlua::Error::external)?;
+                        let pair = lua.create_table()?;
+                        pair.set("read", reader)?;
+                        pair.set("write", writer)?;
+                        Ok(Value::Table(pair))
+                    },
+                )?,
+            )?;
+        }
 
         let spawn_loop = uv_loop.clone();
         let spawn_pending = pending_processes.clone();

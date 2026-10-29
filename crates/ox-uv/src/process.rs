@@ -308,6 +308,27 @@ impl std::fmt::Debug for ProcessPipe {
 
 #[cfg(unix)]
 impl ProcessPipe {
+    /// Adopts an owned descriptor as a pipe endpoint, the way luv's
+    /// `pipe:open(fd)` does. The descriptor's access mode decides the
+    /// direction: a write-only descriptor becomes the child-stdin endpoint,
+    /// anything else is read from. The caller builds the `OwnedFd`, so this
+    /// crate never touches a raw descriptor itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loop-registration or non-blocking-mode failure.
+    pub fn adopt(uv_loop: &mut UvLoop, owned: std::os::fd::OwnedFd) -> NetResult<Self> {
+        let write_only = rustix::fs::fcntl_getfl(&owned)
+            .map(|flags| flags.contains(rustix::fs::OFlags::WRONLY))
+            .unwrap_or(false);
+        let stream = if write_only {
+            ChildStream::In(ChildStdin::from(owned))
+        } else {
+            ChildStream::Out(ChildStdout::from(owned))
+        };
+        Self::attach(uv_loop, stream)
+    }
+
     fn attach(uv_loop: &mut UvLoop, stream: ChildStream) -> NetResult<Self> {
         stream.set_nonblocking().map_err(NetError::Io)?;
         let token = uv_loop.allocate_io_token()?;
