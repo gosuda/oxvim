@@ -353,3 +353,23 @@ is only read by cmake, not by the justfile guard):
   at child exit, before the child's stdout pipe drains, so the short wait kills
   a process that was still writing. Evidence:
   `.outline/evidence/system-spec-post5.log`.
+
+
+### Re-measure after the stdin fix
+
+`TEST_FILE=test/functional/lua timeout 1500 just functional` (the recipe only
+honours the group switch through `TEST_FILE`), run to completion:
+
+| Result | Count |
+|---|---|
+| Tests run | 1460 |
+| PASS | 852 |
+| SKIP | 21 |
+| FAIL | 574 |
+
+Before the fix the same group reported 590 FAIL and 870 pass-or-skip, so
+sixteen tests moved to passing and the run no longer stops at a timeout. The
+largest remaining clusters are `lua:` (99), `async` (73), plain `lua` (67),
+`vim.snippet` (28), `luaeval()` (17), `vim.fs` (11), `vim.diagnostic` (11) and
+`vim._watch` (11). Evidence:
+`.outline/evidence/functional-lua-post3.log`.
