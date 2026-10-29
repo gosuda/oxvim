@@ -43,6 +43,9 @@ pub struct QuickfixItem {
 /// One list in the quickfix history (`qf_list_T`).
 #[derive(Clone, Debug)]
 pub struct QuickfixList {
+    /// No entry in this list is valid, so jumps ignore validity
+    /// (upstream `qfl->qf_nonevalid`, quickfix.c:2569).
+    none_valid: bool,
     items: Vec<QuickfixItem>,
     title: OxStr,
     id: u64,
@@ -59,6 +62,7 @@ impl QuickfixList {
             title,
             id,
             idx: 0,
+            none_valid: false,
             changedtick: 0,
             context: Typval::String(OxStr::from("")),
             quickfixtextfunc: Typval::String(OxStr::from("")),
@@ -94,6 +98,7 @@ impl QuickfixList {
     /// Replaces all entries and resets the cursor to the first valid one.
     pub fn set_items(&mut self, items: Vec<QuickfixItem>) {
         self.items = items;
+        self.refresh_none_valid();
         self.idx = self
             .items
             .iter()
@@ -108,6 +113,7 @@ impl QuickfixList {
     pub fn set_items_update(&mut self, items: Vec<QuickfixItem>) {
         let previous = self.idx;
         self.items = items;
+        self.refresh_none_valid();
         self.idx = if previous != 0 && self.items.get(previous - 1).is_some_and(|item| item.valid) {
             previous
         } else {
@@ -122,6 +128,7 @@ impl QuickfixList {
     pub fn append_items(&mut self, items: Vec<QuickfixItem>) {
         let was_empty = self.items.is_empty();
         self.items.extend(items);
+        self.refresh_none_valid();
         if was_empty {
             self.idx = self
                 .items
@@ -136,6 +143,18 @@ impl QuickfixList {
     /// marks the list changed for title/context edits too).
     pub fn touch(&mut self) {
         self.changedtick = self.changedtick.saturating_add(1);
+    }
+
+    /// Upstream marks a list `qf_nonevalid` when it has no valid entry, and
+    /// every jump then ignores validity instead of failing `E553`
+    /// (`qf_get_nth_valid_entry`, quickfix.c:2569).
+    fn refresh_none_valid(&mut self) {
+        self.none_valid = !self.items.iter().any(|item| item.valid);
+    }
+
+    /// Validity for a jump: an all-invalid list counts every entry as usable.
+    fn jumpable(&self, index: usize) -> bool {
+        self.none_valid || self.items.get(index).is_some_and(|item| item.valid)
     }
 
     fn set_idx(&mut self, idx: i64) {
@@ -365,7 +384,6 @@ impl QuickfixStack {
         // step at most `count` valid entries (upstream `get_nth_valid_entry`,
         // quickfix.c:2600-2631). Only `:cc` addresses a literal index.
         if !matches!(movement, QuickfixMove::Absolute(_)) {
-            let items = &quickfix_list.items;
             let forward = !matches!(movement, QuickfixMove::Previous(_) | QuickfixMove::Last);
             match movement {
                 QuickfixMove::Next(count) | QuickfixMove::Previous(count) => {
@@ -373,9 +391,9 @@ impl QuickfixStack {
                     let mut first_step = true;
                     while remaining > 0 {
                         let found = if forward {
-                            (selected + 1..=last_index).find(|&index| items[index].valid)
+                            (selected + 1..=last_index).find(|&index| quickfix_list.jumpable(index))
                         } else {
-                            (0..selected).rev().find(|&index| items[index].valid)
+                            (0..selected).rev().find(|&index| quickfix_list.jumpable(index))
                         };
                         if let Some(index) = found {
                             selected = index;
@@ -393,7 +411,7 @@ impl QuickfixStack {
                     }
                 }
                 _ => loop {
-                    if items.get(selected).is_some_and(|item| item.valid) {
+                    if quickfix_list.jumpable(selected) {
                         break;
                     }
                     if forward {
@@ -1246,6 +1264,8 @@ fn dict_entries(value: &Typval) -> Result<Option<Vec<DictEntry>>> {
 #[allow(clippy::too_many_lines)] // one entry mapping, upstream-ordered
 fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<QuickfixItem> {
     let mut bufnr = dict_number(entries, "bufnr").unwrap_or(0);
+    let filename_is_empty = dict_string(entries, "filename")
+        .is_none_or(|filename| filename.as_bytes().is_empty());
     if bufnr == 0
         && let Some(filename) = dict_string(entries, "filename")
         && !filename.as_bytes().is_empty()
@@ -1263,7 +1283,11 @@ fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<Quickfi
     }
     let lnum = dict_number(entries, "lnum").unwrap_or(0);
     let pattern = dict_string(entries, "pattern").unwrap_or_else(|| OxStr::from(""));
-    let detected_valid = bufnr != 0 && (lnum != 0 || !pattern.as_bytes().is_empty());
+    // Upstream `dict_to_qf_item`: an entry is invalid when it names neither a
+    // buffer nor a file, or when it has no line and no pattern. A filename is
+    // enough on its own (quickfix.c:6652-6660).
+    let named = bufnr != 0 || !filename_is_empty;
+    let detected_valid = named && (lnum != 0 || !pattern.as_bytes().is_empty());
     Ok(QuickfixItem {
         bufnr,
         module: dict_string(entries, "module").unwrap_or_else(|| OxStr::from("")),
