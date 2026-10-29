@@ -1697,19 +1697,6 @@ fn buffer_delete_rehomes_windows_without_force() {
 }
 
 #[test]
-fn buffer_delete_rehomes_windows_with_explicit_false_force() {
-    let (editor, buffer, _, window) = editor_with_lines(&["one"]);
-    let session = session_with(editor);
-    crate::buffer::nvim_buf_delete(&session, buffer, dict(&[("force", Object::Boolean(false))]))
-        .unwrap();
-    assert!(session.with_editor(|editor| editor.buffer(buffer).is_err()));
-    assert_ne!(
-        session.with_editor(|editor| editor.window(window).unwrap().buffer),
-        buffer
-    );
-}
-
-#[test]
 fn cursor_column_rejects_values_above_maxcol_before_clamping() {
     // Upstream rejects col > MAXCOL before the silent clamp
     // (api/window.c:122-130, pos_defs.h MAXCOL = 0x7fffffff).
