@@ -420,6 +420,14 @@ pub struct BufferState {
     /// buffer with a non-empty value and no reset has run since. `:setf` is a
     /// silent no-op while set; `did_filetype()` reads it.
     did_filetype: bool,
+    /// Buffer-local working directory set by `:bcd` (`b_localdir`); `None`
+    /// means the buffer follows the window/tab/global chain. This port owns
+    /// the field on `BufferState` (upstream keeps it on `buf_T`) so the Ex
+    /// layer can resolve `getcwd(-1, -1, {bufnr})` without a window.
+    pub local_directory: Option<std::path::PathBuf>,
+    /// Previous directory for this buffer's `bcd -` (`b_prevdir`); `None`
+    /// when no `:bcd` has recorded one yet.
+    pub previous_directory: Option<std::path::PathBuf>,
     /// Text generation last consumed by diagnostics.
     pub changedtick_diag: u64,
     /// Text generation last consumed by fold computation.
@@ -482,6 +490,8 @@ impl BufferState {
             forced_modified: false,
             attachments: 0,
             did_filetype: false,
+            local_directory: None,
+            previous_directory: None,
             changedtick_diag: 0,
             changedtick_fold: 0,
         }

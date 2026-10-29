@@ -1069,6 +1069,12 @@ pub struct TabpageState {
     variables_version: u64,
     current: WinHandle,
     previous: Option<WinHandle>,
+    /// Tabpage-local working directory set by `:tcd` (`tp_localdir`); `None`
+    /// means the tabpage follows the global directory.
+    pub local_directory: Option<PathBuf>,
+    /// Previous directory for this tabpage's `tcd -` (`tp_prevdir`); `None`
+    /// when no `:tcd` has recorded one yet.
+    pub previous_directory: Option<PathBuf>,
 }
 
 impl TabpageState {
@@ -1089,6 +1095,8 @@ impl TabpageState {
             variables_version: 1,
             current,
             previous: None,
+            local_directory: None,
+            previous_directory: None,
         }
     }
 

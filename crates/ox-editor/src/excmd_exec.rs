@@ -4253,13 +4253,20 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             }
         }
         "execute" => command_execute(runtime, access, scope, lua, &command.args),
-        "cd" => access.with_ex_editor(|editor| {
-            command_cd(runtime, editor, &command.args, DirectoryScope::Global)
+        "cd" | "chdir" => access.with_ex_editor(|editor| {
+            command_cd(runtime, editor, &command.args, DirectoryScope::Global, command.bang)
         }),
-        // `:tcd`/`:tchdir` is tabpage-scoped upstream; this port models one
-        // local-directory scope (see `getcwd`'s "tabpage" mapping).
-        "lcd" | "bcd" | "tcd" | "tchdir" => access.with_ex_editor(|editor| {
-            command_cd(runtime, editor, &command.args, DirectoryScope::Window)
+        // `:lcd`/`:lchdir` is window-scoped, `:tcd`/`:tchdir` tabpage-scoped,
+        // and `:bcd`/`:bchdir` buffer-scoped upstream (`ex_cd`,
+        // `ex_docmd.c:6413-6457`).
+        "lcd" | "lchdir" => access.with_ex_editor(|editor| {
+            command_cd(runtime, editor, &command.args, DirectoryScope::Window, command.bang)
+        }),
+        "tcd" | "tchdir" => access.with_ex_editor(|editor| {
+            command_cd(runtime, editor, &command.args, DirectoryScope::Tabpage, command.bang)
+        }),
+        "bcd" | "bchdir" => access.with_ex_editor(|editor| {
+            command_cd(runtime, editor, &command.args, DirectoryScope::Buffer, command.bang)
         }),
         // `:pwd` (`ex_pwd`, `ex_docmd.c:6460-6484`): print the effective
         // working directory. A bang never reaches this arm: the `pwd` spec
@@ -4367,6 +4374,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "vsplit" | "vnew" => command_split(runtime, access, scope, lua, command, true),
         "tabnew" | "tabedit" => command_tabnew(runtime, access, scope, lua, command),
         "tabnext" | "tabn" => command_tabnext(runtime, access, scope, lua, command),
+        "tabprevious" | "tabprev" | "tabp" | "tabNext" => {
+            command_tabprevious(runtime, access, scope, lua, command)
+        }
         "tabonly" => access.with_ex_editor(|editor| command_tabonly(runtime, editor, command)),
         "tabclose" | "tabc" => {
             access.with_ex_editor(|editor| command_tabclose(runtime, editor, command))
@@ -8011,9 +8021,18 @@ fn command_cd<F: FileIO>(
     editor: &mut Editor,
     args: &str,
     scope: DirectoryScope,
+    bang: bool,
 ) -> Flow {
     let path = args.trim();
+    // `:lcd!`, `:tcd!`, `:bcd!` with no path clear only their own scope's
+    // directory (`chdir_clear`, `ex_docmd.c:6396-6411`); a bang with a path
+    // is just a set, and `:cd!` never unsets. An empty path otherwise needs
+    // an argument (`E471`).
     if path.is_empty() {
+        if bang && scope != DirectoryScope::Global {
+            editor.clear_local_directory(scope);
+            return Flow::Normal;
+        }
         return error_flow(runtime, "E471", "Argument required");
     }
     match change_directory(editor, path, scope) {
@@ -8023,17 +8042,13 @@ fn command_cd<F: FileIO>(
 }
 
 /// `:pwd` (`ex_pwd`, `ex_docmd.c:6460-6484`): print the effective working
-/// directory — the window-local directory, else the global one, else the
-/// process directory. `change_directory` records `std::env::current_dir()`
-/// after the chdir, so like upstream's `os_dirname` (`uv_cwd`) this is the
-/// resolved physical path; `E187: Unknown` when it cannot be read.
+/// directory — buffer-local, else window-local, else tabpage-local, else the
+/// saved global fallback, else the process directory. `change_directory`
+/// records `std::env::current_dir()` after the chdir, so like upstream's
+/// `os_dirname` (`uv_cwd`) this is the resolved physical path; `E187: Unknown`
+/// when it cannot be read.
 fn command_pwd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    let tracked = editor
-        .current_window()
-        .and_then(|window| editor.window_local_directory(window).ok().flatten())
-        .or_else(|| editor.global_directory().map(Path::to_path_buf))
-        .or_else(|| std::env::current_dir().ok());
-    let Some(directory) = tracked else {
+    let Some(directory) = editor.effective_directory() else {
         return error_flow(runtime, "E187", "Unknown");
     };
     push_text_message(editor, directory.display().to_string(), false, false);
@@ -13591,6 +13606,18 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             .modifiers
             .iter()
             .any(|modifier| modifier.kind == ModifierKind::Vertical);
+    // `:belowright`/`:botright` (`WSP_BELOW`/`WSP_BOT`, `do_window`,
+    // `window.c`) place the new window below/right of the target; without a
+    // placement modifier a horizontal split goes above and a vertical split
+    // goes left, matching the unset `'splitbelow'`/`'splitright'` defaults.
+    // Upstream also honors the options for bare `:split`, but this port only
+    // applies explicit modifiers so existing bare-split layouts do not move.
+    let below_right = command.modifiers.iter().any(|modifier| {
+        matches!(
+            modifier.kind,
+            ModifierKind::BelowRight | ModifierKind::BotRight | ModifierKind::RightBelow
+        )
+    });
     let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
         return error_flow(runtime, "E749", "Empty buffer");
     };
@@ -13631,8 +13658,13 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             origin,
             LoadSwitchFocus::Revalidate,
             |_runtime| {
-                let created = if vertical {
+                let created = if vertical && !below_right {
                     access.with_ex_editor(|editor| editor.split_left(tab, window, new_buffer, true))
+                } else if vertical {
+                    access.with_ex_editor(|editor| editor.split_vertical(tab, window, new_buffer, true))
+                } else if below_right {
+                    access
+                        .with_ex_editor(|editor| editor.split_horizontal(tab, window, new_buffer, true))
                 } else {
                     access
                         .with_ex_editor(|editor| editor.split_above(tab, window, new_buffer, true))
@@ -13707,8 +13739,12 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     // position before the layout change and restore it in the new window.
     let origin_cursor =
         access.with_ex_editor(|editor| editor.window(window).ok().map(|state| state.cursor));
-    let created = if vertical {
+    let created = if vertical && !below_right {
         access.with_ex_editor(|editor| editor.split_left(tab, window, new_buffer, true))
+    } else if vertical {
+        access.with_ex_editor(|editor| editor.split_vertical(tab, window, new_buffer, true))
+    } else if below_right {
+        access.with_ex_editor(|editor| editor.split_horizontal(tab, window, new_buffer, true))
     } else {
         access.with_ex_editor(|editor| editor.split_above(tab, window, new_buffer, true))
     };
@@ -13887,6 +13923,40 @@ fn command_tabnext<F: FileIO, E: ExEditorAccess>(
                 current + 1
             };
             tabs.get(next - 1).copied()
+        } else {
+            tabpage_arg(editor, command).ok()
+        }
+    });
+    let Some(target) = target else {
+        return error_flow(runtime, "E475", format!("Invalid argument: {argument}"));
+    };
+    switch_current_tabpage(runtime, access, scope, lua, target)
+}
+
+/// `:tabprevious` (`ex_tabnext`, `ex_docmd.c`): go to the previous tabpage,
+/// wrapping to the last one. An explicit argument or range addresses an
+/// absolute tabpage through the same `tabpage_arg` the next-tab path uses.
+fn command_tabprevious<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let argument = command.args.trim();
+    let target = access.with_ex_editor(|editor| {
+        if argument.is_empty() && command.range.is_none() {
+            let tabs = editor.tabpages();
+            let current = editor
+                .current_tabpage()
+                .and_then(|tab| editor.tabpage_index(tab))
+                .unwrap_or(1);
+            let previous = if current <= 1 {
+                tabs.len()
+            } else {
+                current - 1
+            };
+            tabs.get(previous.wrapping_sub(1)).copied()
         } else {
             tabpage_arg(editor, command).ok()
         }
@@ -16767,6 +16837,17 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
     let handle = access.with_ex_editor(|editor| {
         if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
             Ok(handle)
+        } else if arg == "#"
+            && let Some(alternate) = editor
+                .current_window()
+                .and_then(|window| editor.window(window).ok())
+                .and_then(|window| window.alternate_buffer)
+                .filter(|buffer| editor.buffer(*buffer).is_ok())
+        {
+            // `:b#` edits the alternate buffer (`do_buffer`'s `#`
+            // expansion, `buffer.c`): without a live alternate the name
+            // match below reports `E94`, as before.
+            Ok(alternate)
         } else {
             let matches: Vec<BufHandle> = editor
                 .buffers()

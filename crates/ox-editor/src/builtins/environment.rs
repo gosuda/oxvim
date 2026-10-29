@@ -27,6 +27,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     match name {
+        "getcwd" => host
+            .access
+            .with_ex_editor(|editor| call_getcwd_builtin(editor, args)),
         "chdir" => host
             .access
             .with_ex_editor(|editor| call_chdir_builtin(editor, args)),
@@ -317,6 +320,11 @@ fn non_zero_arg(value: &Typval) -> bool {
     }
 }
 
+/// `f_chdir` (`eval/fs.c:400-435`): change the directory of `{scope}`, or of
+/// the narrowest scope holding a local directory when `{scope}` is absent:
+/// buffer-local, else window-local, else tabpage-local, else global.
+/// Returns the previous directory, empty when the change failed or the old
+/// directory could not be read.
 fn call_chdir_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     if args.is_empty() || args.len() > 2 {
         return Err(EvalError::new(
@@ -328,16 +336,34 @@ fn call_chdir_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<T
     let Typval::String(path) = &args[0] else {
         return Ok(Typval::String(OxStr::from("")));
     };
-    let local_active = editor
-        .current_window()
-        .and_then(|window| editor.window_local_directory(window).ok().flatten())
-        .is_some();
     let scope = match args.get(1) {
         None => {
-            if local_active {
-                DirectoryScope::Window
+            // Narrowest scope currently holding a local directory, else
+            // global (`f_chdir`'s `curbuf`/`curwin`/`curtab` chain).
+            let buffer_local = editor
+                .current_buffer()
+                .and_then(|buffer| editor.buffer_local_directory(buffer).ok().flatten())
+                .is_some();
+            if buffer_local {
+                DirectoryScope::Buffer
             } else {
-                DirectoryScope::Global
+                let window_local = editor
+                    .current_window()
+                    .and_then(|window| editor.window_local_directory(window).ok().flatten())
+                    .is_some();
+                if window_local {
+                    DirectoryScope::Window
+                } else {
+                    let tab_local = editor
+                        .current_tabpage()
+                        .and_then(|tab| editor.tab_local_directory(tab).ok().flatten())
+                        .is_some();
+                    if tab_local {
+                        DirectoryScope::Tabpage
+                    } else {
+                        DirectoryScope::Global
+                    }
+                }
             }
         }
         Some(value) => {
@@ -351,7 +377,9 @@ fn call_chdir_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<T
             };
             match scope.as_bytes() {
                 b"global" => DirectoryScope::Global,
-                b"window" | b"tabpage" | b"buffer" => DirectoryScope::Window,
+                b"window" => DirectoryScope::Window,
+                b"tabpage" => DirectoryScope::Tabpage,
+                b"buffer" => DirectoryScope::Buffer,
                 _ => {
                     return Err(EvalError::new(
                         "E475",
@@ -601,13 +629,55 @@ fn call_shiftwidth_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<
     Ok(Typval::Number(buffer_number_option(editor, "tabstop", 8)))
 }
 
-/// `f_haslocaldir` (`eval/fs.c:1041`): whether the addressed scope object
-/// has a local working directory. Only window-local directories exist in
-/// this port (`:lcd`/`:tcd` both land on `DirectoryScope::Window`), so the
-/// tab, buffer, and global scopes answer 0; argument validation mirrors
-/// `getcwd_scope_args` exactly.
-fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
-    check_arity("haslocaldir", args.len())?;
+/// Scope addressed by `getcwd()`/`haslocaldir()` arguments
+/// (`getcwd_scope_args`, `eval/fs.c:657-760`). In an argument `0` means the
+/// current object and `-1` skips the scope, requesting the next broader one;
+/// the argument order (window, tab, buffer) differs from the `CdScope` order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CwdAddress {
+    /// No arguments to `getcwd()`: the effective working directory.
+    Effective,
+    /// A window in a tabpage: the window's local directory, else the
+    /// tabpage's. The tab is the addressed tabpage (or the current one when
+    /// no `{tabnr}` was given), which the window lookup runs in.
+    Window {
+        /// Addressed window.
+        window: ox_types::WinHandle,
+        /// Addressed tabpage, if one is live.
+        tab: Option<ox_types::TabHandle>,
+    },
+    /// A tabpage: its local directory.
+    Tabpage {
+        /// Addressed tabpage, if one is live.
+        tab: Option<ox_types::TabHandle>,
+    },
+    /// A buffer: its local directory, skipping window and tab scopes. A
+    /// buffer belongs to no particular window/tabpage, so this falls back
+    /// to the global directory.
+    Buffer {
+        /// Addressed buffer.
+        buffer: ox_types::BufHandle,
+    },
+    /// The session-global directory.
+    Global,
+}
+
+/// Resolves `[{winnr}[, {tabnr}[, {bufnr}]]]` to the requested scope
+/// (`getcwd_scope_args`, `eval/fs.c:657-760`). `unspecified` is the scope
+/// with no arguments: [`CwdAddress::Effective`] for `getcwd()`,
+/// the current window for `haslocaldir()`.
+///
+/// # Errors
+///
+/// Returns `E474` for non-number arguments or numbers below `-1`, `E5001`
+/// for `-1` after an explicit scope, `E5006` for a buffer scope with a
+/// window/tab argument, `E5007` for a missing buffer, `E5000` for a missing
+/// tabpage, and `E5002` for a missing window.
+fn resolve_cwd_address(
+    editor: &Editor,
+    args: &[Typval],
+    unspecified: CwdAddress,
+) -> ox_eval::Result<CwdAddress> {
     let mut selected = [0i64; 3];
     for (index, argument) in args.iter().enumerate() {
         // Upstream rejects anything but `VAR_NUMBER` with `E474`.
@@ -633,8 +703,11 @@ fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result
     }
     let argc = args.len();
     let (window_number, tab_number, buffer_number) = (selected[0], selected[1], selected[2]);
-    // Buffer scope requires the window and tab slots to be skipped; only a
-    // buffer target reaches the buffer branch.
+    if argc == 0 {
+        return Ok(unspecified);
+    }
+    // A buffer target skips the window and tab scopes entirely; only
+    // `-1, -1, {bufnr}` reaches it.
     if argc == 3 && buffer_number >= 0 {
         if window_number >= 0 || tab_number >= 0 {
             return Err(EvalError::new(
@@ -650,18 +723,13 @@ fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result
                 .ok()
                 .filter(|buffer| editor.buffer(*buffer).is_ok())
         };
-        if buffer.is_none() {
+        let Some(buffer) = buffer else {
             return Err(EvalError::new("E5007", 0, "Cannot find buffer number."));
-        }
-        // This port stores no buffer-local directories.
-        return Ok(Typval::Number(0));
+        };
+        return Ok(CwdAddress::Buffer { buffer });
     }
-    // Without arguments the window scope is implied; `-1` skips one scope
-    // outward, exactly like `getcwd_scope_args`: no window argument (or a
-    // non-negative one) stays at the window, `-1` with no (or a
-    // non-negative) tab argument selects the tab, and `-1, -1` selects the
-    // global scope.
-    let window_scope = argc == 0 || window_number >= 0;
+    // Narrowest requested scope. Missing `{tabnr}` implies the current
+    // tabpage, exactly like the zero-initialized `argv` upstream.
     let tab = if argc >= 2 && tab_number > 0 {
         let tabs = editor.tabpages();
         let Some(tab) = usize::try_from(tab_number)
@@ -675,23 +743,24 @@ fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result
     } else {
         editor.current_tabpage()
     };
-    if !window_scope {
-        // Tab scope (`haslocaldir(-1[, ...])`) or global scope
-        // (`haslocaldir(-1, -1[, ...])`): neither stores a directory here,
-        // but an explicit bad tab number above still reports `E5000`.
-        return Ok(Typval::Number(0));
+    if argc == 1 && window_number < 0 {
+        return Ok(CwdAddress::Tabpage { tab });
     }
+    if argc >= 2 && window_number < 0 {
+        if tab_number >= 0 {
+            return Ok(CwdAddress::Tabpage { tab });
+        }
+        return Ok(CwdAddress::Global);
+    }
+    // A window target: `0` answers the current window (even when a `{tabnr}`
+    // was given, like `find_win_by_nr`); otherwise a live handle wins over
+    // the 1-based position in the addressed tabpage.
     let window = if window_number == 0 {
-        // `find_win_by_nr` answers `curwin`, which always exists upstream;
-        // without one there is no window-local directory to report.
-        let Some(window) = editor.current_window() else {
-            return Ok(Typval::Number(0));
-        };
-        Some(window)
+        editor.current_window()
     } else {
-        let windows = tab.and_then(|tab| editor.tabpage_windows(tab).ok()).unwrap_or_default();
-        // A live handle wins over the ordinal, mirroring `find_win_by_nr`'s
-        // window-ID branch; otherwise the 1-based position in the tab.
+        let windows = tab
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
         ox_types::WinHandle::try_from(window_number)
             .ok()
             .filter(|handle| windows.contains(handle))
@@ -705,13 +774,85 @@ fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result
     let Some(window) = window else {
         return Err(EvalError::new("E5002", 0, "Cannot find window number."));
     };
-    Ok(Typval::Number(i64::from(
+    Ok(CwdAddress::Window { window, tab })
+}
+
+/// `f_getcwd` (`eval/fs.c:771-832`): the working directory of the addressed
+/// scope. A window address falls back to its tabpage, then the global
+/// directory; tabpage and buffer addresses fall back to the global directory
+/// (a buffer belongs to no particular window/tabpage); the global address
+/// reads the saved fallback, else the live process directory. Whatever falls
+/// through to the process directory answers `""` when it cannot be read.
+fn call_getcwd_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("getcwd", args.len())?;
+    let address = resolve_cwd_address(editor, args, CwdAddress::Effective)?;
+    let global_or_os = || {
         editor
+            .global_directory()
+            .map(std::path::Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok())
+    };
+    let directory = match address {
+        CwdAddress::Effective => std::env::current_dir().ok(),
+        CwdAddress::Window { window, tab } => editor
+            .window_local_directory(window)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                tab.and_then(|tab| editor.tab_local_directory(tab).ok().flatten())
+            })
+            .or_else(global_or_os),
+        CwdAddress::Tabpage { tab } => tab
+            .and_then(|tab| editor.tab_local_directory(tab).ok().flatten())
+            .or_else(global_or_os),
+        CwdAddress::Buffer { buffer } => editor
+            .buffer_local_directory(buffer)
+            .ok()
+            .flatten()
+            .or_else(global_or_os),
+        CwdAddress::Global => global_or_os(),
+    };
+    Ok(Typval::String(OxStr::from(
+        directory
+            .map(|directory| directory.to_string_lossy().into_owned())
+            .unwrap_or_default()
+            .as_str(),
+    )))
+}
+
+/// `f_haslocaldir` (`eval/fs.c:1041`): whether the addressed scope object
+/// has a local working directory. The global scope never has one; argument
+/// validation mirrors `getcwd_scope_args` exactly.
+fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("haslocaldir", args.len())?;
+    // Without arguments the window scope is implied, like
+    // `getcwd_scope_args` with a window default. A missing current window
+    // has no window-local directory to report.
+    let Some(current) = editor.current_window() else {
+        return Ok(Typval::Number(0));
+    };
+    let unspecified = CwdAddress::Window {
+        window: current,
+        tab: editor.current_tabpage(),
+    };
+    let address = resolve_cwd_address(editor, args, unspecified)?;
+    let present = match address {
+        CwdAddress::Window { window, .. } => editor
             .window_local_directory(window)
             .ok()
             .flatten()
             .is_some(),
-    )))
+        CwdAddress::Tabpage { tab } => tab
+            .and_then(|tab| editor.tab_local_directory(tab).ok().flatten())
+            .is_some(),
+        CwdAddress::Buffer { buffer } => editor
+            .buffer_local_directory(buffer)
+            .ok()
+            .flatten()
+            .is_some(),
+        CwdAddress::Global | CwdAddress::Effective => false,
+    };
+    Ok(Typval::Number(i64::from(present)))
 }
 
 /// `f_bufloaded` (`eval/buffer.c:498`): whether `find_buffer()` resolves the

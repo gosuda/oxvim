@@ -89,7 +89,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "changenr" | "deletebufline" | "did_filetype" | "getbufinfo" | "getbufline"
         | "getbufvar" | "getchangelist" | "last_buffer_nr" | "prompt_getprompt"
         | "prompt_setprompt" | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
-        "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
+        "api_info" | "chdir" | "defer" | "eventhandler" | "getcwd" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
         | "state" | "swapname" | "shiftwidth" | "haslocaldir" | "bufloaded" | "dictwatcheradd"
         | "dictwatcherdel" => Family::Environment,

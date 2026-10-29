@@ -346,16 +346,31 @@ pub enum BufferEditMode {
     Insert,
 }
 
-/// Scope of a directory change: session-global (`:cd`) or window-local
-/// (`:lcd`), matching upstream `changedir_func`'s `local` flag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Scope of a directory change: session-global (`:cd`), tabpage-local
+/// (`:tcd`), window-local (`:lcd`), or buffer-local (`:bcd`), matching
+/// upstream `CdScope` (`vim_defs.h:33-39`). The declaration order matters:
+/// `post_chdir` (`ex_docmd.c:6262-6322`) clears the window-local directory
+/// for every scope at or above [`DirectoryScope::Window`] and the
+/// tabpage-local directory for every scope at or above
+/// [`DirectoryScope::Tabpage`], so the variants are ordered
+/// buffer < window < tabpage < global exactly like upstream's
+/// `kCdScopeBuffer < kCdScopeWindow < kCdScopeTabpage < kCdScopeGlobal`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum DirectoryScope {
-    /// `:cd` — changes the process cwd and clears the current window's local
-    /// directory so every window without its own `:lcd` follows it.
-    Global,
-    /// `:lcd` — changes the process cwd and records it on the current window
-    /// only; other windows are unaffected.
+    /// `:bcd` — records the process cwd on the current buffer only; every
+    /// other scope keeps its directory and the buffer-local one stays in
+    /// effect over later `:lcd`/`:tcd`/`:cd` moves.
+    Buffer,
+    /// `:lcd` — records the process cwd on the current window only; other
+    /// windows are unaffected.
     Window,
+    /// `:tcd` — records the process cwd on the current tabpage (clearing
+    /// the current window's local directory); other tabpages are unaffected.
+    Tabpage,
+    /// `:cd` — records the process cwd as the session fallback, clearing
+    /// the current window's and the current tabpage's local directories so
+    /// every scope without its own `:lcd`/`:tcd` follows it.
+    Global,
 }
 
 /// Failures from [`Editor::change_directory`]. The Ex layer maps these to
@@ -1170,10 +1185,14 @@ impl Editor {
         Ok(alternate)
     }
 
-    /// `do_autochdir` (buffer.c:1890): when 'autochdir' is set and the current
-    /// buffer has a file name, change the window-local directory to the
-    /// buffer's parent directory.  Matches upstream `vim_chdirfile` which
-    /// strips the tail from `b_ffname` and `os_chdir`s to the result.
+    /// `do_autochdir` (`buffer.c:1897`): when 'autochdir' is set and the
+    /// current buffer has a file name, change to the buffer's parent
+    /// directory. This is a bare process move (`vim_chdirfile`,
+    /// `file_search.c:1900-1928`, reports `kCdScopeWindow` to the autocmd
+    /// only): unlike `:lcd` it records no scope-local directory, so the
+    /// window/tab/global scopes keep theirs and `getcwd({winnr})` still
+    /// answers the scope chain while the effective directory follows the
+    /// file.
     pub fn do_autochdir(&mut self) {
         let autochdir = self
             .options
@@ -1198,15 +1217,15 @@ impl Editor {
         let Some(parent) = path.parent() else {
             return;
         };
-        // Nothing to do if already there.
+        // Nothing to do if already there (`path_equal` early return).
         if let Ok(cwd) = std::env::current_dir()
             && parent == cwd
         {
             return;
         }
-        // Change to the buffer's directory (window-local scope, matching
-        // upstream `kCdScopeWindow`).
-        let _ = self.change_directory(parent, DirectoryScope::Window);
+        // WHY: `vim_chdirfile` ignores the `os_chdir` failure — the buffer
+        // switch that triggered it has already committed.
+        std::mem::drop(std::env::set_current_dir(parent));
     }
 
     /// Returns an immutable live tabpage state.
@@ -1319,12 +1338,13 @@ impl Editor {
         self.previous_window = window;
     }
 
-    /// Returns the previous directory for `cd -` / `lcd -` resolution.
+    /// Returns the previous directory for `cd -` / `lcd -` / `tcd -` /
+    /// `bcd -` resolution (`get_prevdir`, `ex_docmd.c:6247-6260`).
     ///
-    /// [`DirectoryScope::Global`] reads the session-global previous directory;
-    /// [`DirectoryScope::Window`] reads the current window's previous
-    /// directory, or `None` when the current window has none or no current
-    /// window exists.
+    /// Each scope owns its slot: [`DirectoryScope::Global`] reads the
+    /// session-global slot, the rest read the current window's, tabpage's,
+    /// or buffer's slot, or `None` when that scope recorded nothing (or no
+    /// current object exists).
     #[must_use]
     pub fn previous_directory(&self, scope: DirectoryScope) -> Option<PathBuf> {
         match scope {
@@ -1332,6 +1352,14 @@ impl Editor {
             DirectoryScope::Window => self
                 .current_window()
                 .and_then(|window| self.window(window).ok())
+                .and_then(|state| state.previous_directory.clone()),
+            DirectoryScope::Tabpage => self
+                .current_tab
+                .and_then(|tab| self.tabpages.get(&tab))
+                .and_then(|state| state.previous_directory.clone()),
+            DirectoryScope::Buffer => self
+                .current_buffer()
+                .and_then(|buffer| self.buffers.get(&buffer))
                 .and_then(|state| state.previous_directory.clone()),
         }
     }
@@ -1344,8 +1372,8 @@ impl Editor {
     /// Returns [`EditorError::NoCurrentTabpage`] when a current-window request
     /// has no live tabpage, [`EditorError::UnknownWindow`] when the window is
     /// not live, [`EditorError::UnknownTabpage`] when its owning tabpage is
-    /// missing, or [`EditorError::Layout`] when the tabpage does not contain
-    /// the window.
+    /// missing, or [`EditorError::Layout`] when the tabpage layout rejects the
+    /// window.
     pub fn window_local_directory(
         &self,
         window: WinHandle,
@@ -1353,79 +1381,216 @@ impl Editor {
         Ok(self.window(window)?.local_directory.clone())
     }
 
-    /// Returns the session-global fallback directory, or `None` before the
-    /// first tabpage is created.
+    /// Returns the tabpage-local directory set by `:tcd`, or `None` when the
+    /// tabpage has none (`tp_localdir`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::NoCurrentTabpage`] when a current-tabpage
+    /// request has no live tabpage, or [`EditorError::UnknownTabpage`] when
+    /// the tabpage is not live.
+    pub fn tab_local_directory(
+        &self,
+        tab: TabHandle,
+    ) -> Result<Option<PathBuf>, EditorError> {
+        Ok(self.tabpage(tab)?.local_directory.clone())
+    }
+
+    /// Returns the buffer-local directory set by `:bcd`, or `None` when the
+    /// buffer has none (`b_localdir`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::UnknownBuffer`] when the buffer is not live.
+    pub fn buffer_local_directory(
+        &self,
+        buffer: BufHandle,
+    ) -> Result<Option<PathBuf>, EditorError> {
+        Ok(self.buffer(buffer)?.local_directory.clone())
+    }
+
+    /// Returns the session-global fallback directory (`globaldir`), or `None`
+    /// when the process is parked in a scope-local directory and the global
+    /// one was consumed by a scope switch, or before the first tabpage is
+    /// created.
     #[must_use]
     pub fn global_directory(&self) -> Option<&Path> {
         self.global_directory.as_deref()
+    }
+
+    /// Returns the process directory the current context effectively runs
+    /// tabpage-local one, else the saved session-global fallback, else the
+    /// live process directory. Mirrors the `update_cwd` precedence
+    /// (`window.c:5367-5383`) without consuming the saved fallback.
+    #[must_use]
+    pub fn effective_directory(&self) -> Option<PathBuf> {
+        self.current_buffer()
+            .and_then(|buffer| self.buffers.get(&buffer))
+            .and_then(|state| state.local_directory.clone())
+            .or_else(|| {
+                self.current_window()
+                    .and_then(|window| self.window(window).ok())
+                    .and_then(|state| state.local_directory.clone())
+            })
+            .or_else(|| {
+                self.current_tab
+                    .and_then(|tab| self.tabpages.get(&tab))
+                    .and_then(|state| state.local_directory.clone())
+            })
+            .or_else(|| self.global_directory.clone())
+            .or_else(|| std::env::current_dir().ok())
     }
 
     /// Changes the process working directory and records the directory left
     /// behind as the previous directory for the given scope.
     ///
     /// `target` is an already-resolved path (the Ex layer handles `-` and
-    /// `cdpath`). The window is resolved *before* the OS mutation so a failure
-    /// leaves no model state changed. On success the old `current_dir()` is
-    /// stored as the previous directory and the new `current_dir()` (read back
-    /// as an absolute path) is stored as the local or global directory.
+    /// `cdpath`). The scope object is resolved *before* the OS mutation so a
+    /// failure leaves no model state changed. On success the old
+    /// `current_dir()` is stored as the scope's previous directory and the
+    /// new `current_dir()` (read back as an absolute path) is stored on the
+    /// scope, following upstream `do_chdir` + `post_chdir`
+    /// (`ex_docmd.c:6262-6394`):
     ///
-    /// A [`DirectoryScope::Global`] change clears the current window's
-    /// `local_directory` so every window without its own `:lcd` follows the
-    /// global directory, matching upstream `:cd`.
+    /// - [`DirectoryScope::Buffer`] overwrites only the buffer-local
+    ///   directory; the window/tab scopes keep theirs.
+    /// - [`DirectoryScope::Window`] overwrites only the window-local
+    ///   directory.
+    /// - [`DirectoryScope::Tabpage`] overwrites the tabpage-local directory
+    ///   and clears the current window's local directory.
+    /// - [`DirectoryScope::Global`] clears the current window's and the
+    ///   current tabpage's local directories and resets the session-global
+    ///   fallback, so every scope without its own directory follows it.
+    ///
+    /// A buffer-local directory is never cleared by another scope's move and
+    /// stays in effect: the new directory is still entered (so the scope
+    /// slot records its resolved name) and the process is then parked back
+    /// in the buffer-local directory, exactly like upstream's `bcd_active`
+    /// path.
     ///
     /// # Errors
     ///
-    /// Returns [`DirectoryError::NoCurrentWindow`] when a window-scoped change
-    /// has no current window, or [`DirectoryError::ChangeFailed`] when the OS
-    /// refuses the transition.
+    /// Returns [`DirectoryError::NoCurrentWindow`] when a scoped change has
+    /// no current window/tabpage/buffer, or [`DirectoryError::ChangeFailed`]
+    /// when the OS refuses the transition.
     pub fn change_directory(
         &mut self,
         target: &Path,
         scope: DirectoryScope,
     ) -> Result<PathBuf, DirectoryError> {
-        let window = match scope {
-            DirectoryScope::Window => Some(
-                self.current_window()
-                    .ok_or(DirectoryError::NoCurrentWindow)?,
-            ),
-            DirectoryScope::Global => self.current_window(),
-        };
-        // Unreadable outgoing cwd records no previous path (empty PathBuf),
-        // matching upstream `post_chdir` which leaves `prevdir` unset when
-        // `os_dirname` fails.
-        let mut previous: Option<PathBuf> = None;
-        if let Ok(path) = std::env::current_dir() {
-            previous = Some(path);
+        // Resolve the scope object before touching the OS so a missing
+        // current window/tabpage/buffer refuses the move with no state
+        // changed, like upstream's NULL `curwin`/`curtab`/`curbuf` guard in
+        // `do_chdir`.
+        let window = self.current_window();
+        let tab = self.current_tab;
+        let buffer = self.current_buffer();
+        match scope {
+            DirectoryScope::Window => {
+                window.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Tabpage => {
+                tab.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Buffer => {
+                buffer.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Global => {}
         }
+        // Unreadable outgoing cwd records no previous path, matching upstream
+        // `do_chdir` which leaves `prevdir` NULL when `os_dirname` fails.
+        let previous: Option<PathBuf> = std::env::current_dir().ok();
+        // Whether a buffer-local directory is in effect for a non-buffer
+        // move (`bcd_active`, `ex_docmd.c:6364`): the move still enters the
+        // new directory, then parks back in the buffer-local one.
+        let buffer_local_active = scope != DirectoryScope::Buffer
+            && buffer
+                .and_then(|buffer| self.buffers.get(&buffer))
+                .and_then(|state| state.local_directory.clone())
+                .is_some();
         std::env::set_current_dir(target).map_err(|error| DirectoryError::ChangeFailed {
             target: target.to_path_buf(),
             error,
         })?;
         // Unreadable readback leaves the effective path unrecorded (None):
-        // neither the local nor global state is set, and later reapplies
-        // fall back to global_directory.
-        let mut new_directory: Option<PathBuf> = None;
-        if let Ok(path) = std::env::current_dir() {
-            new_directory = Some(path);
+        // neither the local nor global state is set.
+        let new_directory: Option<PathBuf> = std::env::current_dir().ok();
+        // `post_chdir` (`ex_docmd.c:6262-6322`): only `:bcd` overwrites the
+        // buffer-local directory; `:cd`/`:tcd`/`:lcd` overwrite the
+        // window-local one; `:cd`/`:tcd` overwrite the tabpage-local one.
+        if scope == DirectoryScope::Buffer
+            && let Some(buffer) = buffer
+            && let Some(state) = self.buffers.get_mut(&buffer)
+        {
+            state.local_directory.clone_from(&new_directory);
         }
+        if scope >= DirectoryScope::Window
+            && let Some(window) = window
+            && let Ok(state) = self.window_mut(window)
+        {
+            state.local_directory = None;
+        }
+        if scope >= DirectoryScope::Tabpage
+            && let Some(tab) = tab
+            && let Some(state) = self.tabpages.get_mut(&tab)
+        {
+            state.local_directory = None;
+        }
+        // The first scope-local move out of the global directory remembers
+        // it, so a later scope switch can return to it: `post_chdir` copies
+        // the just-left directory into `globaldir` when it is NULL
+        // (`ex_docmd.c:6282-6288`). The scope's own previous-directory slot
+        // records the same directory (`do_chdir`'s `*pp = pdir`).
+        if scope < DirectoryScope::Global && let Some(previous) = previous.clone() {
+            if self.global_directory.is_none() {
+                self.global_directory = Some(previous.clone());
+            }
+            if let Some(slot) = self.previous_directory_slot(scope, window, tab, buffer) {
+                *slot = Some(previous);
+            }
+        }
+        // A global move records only the session-global previous directory
+        // here; `post_chdir` resets the fallback below.
+        if scope == DirectoryScope::Global {
+            self.previous_directory.clone_from(&previous);
+        }
+        // Record the entered directory on the scope. A global move forgets
+        // the saved fallback first — unless a buffer-local directory is in
+        // effect, in which case the entered directory becomes the remembered
+        // global one (`post_chdir`'s `kCdScopeGlobal` arm).
         match scope {
+            DirectoryScope::Global => {
+                self.global_directory = None;
+                if buffer_local_active {
+                    self.global_directory = new_directory;
+                }
+            }
+            DirectoryScope::Tabpage => {
+                if let Some(tab) = tab
+                    && let Some(state) = self.tabpages.get_mut(&tab)
+                {
+                    state.local_directory = new_directory;
+                }
+            }
+            DirectoryScope::Buffer => {}
             DirectoryScope::Window => {
                 if let Some(window) = window
                     && let Ok(state) = self.window_mut(window)
                 {
-                    state.previous_directory.clone_from(&previous);
                     state.local_directory = new_directory;
                 }
             }
-            DirectoryScope::Global => {
-                self.previous_directory.clone_from(&previous);
-                self.global_directory = new_directory;
-                if let Some(window) = window
-                    && let Ok(state) = self.window_mut(window)
-                {
-                    state.local_directory = None;
-                }
-            }
+        }
+        // A buffer-local directory stays in effect over other scopes' moves:
+        // park back in it after recording the move above.
+        if buffer_local_active
+            && let Some(buffer) = buffer
+            && let Some(local) = self
+                .buffers
+                .get(&buffer)
+                .and_then(|state| state.local_directory.clone())
+        {
+            std::mem::drop(std::env::set_current_dir(local));
         }
         Ok(match previous {
             Some(path) => path,
@@ -1433,48 +1598,139 @@ impl Editor {
         })
     }
 
-    /// Reapplies the effective working directory for the current window.
+    /// Returns the previous-directory slot for `scope`, or `None` when the
+    fn previous_directory_slot(
+        &mut self,
+        scope: DirectoryScope,
+        window: Option<WinHandle>,
+        tab: Option<TabHandle>,
+        buffer: Option<BufHandle>,
+    ) -> Option<&mut Option<PathBuf>> {
+        match scope {
+            DirectoryScope::Global => Some(&mut self.previous_directory),
+            DirectoryScope::Window => {
+                let window = window?;
+                // `window_mut` resolves through the owning tabpage, the same
+                // lookup `previous_directory` uses for the read path.
+                self.window_mut(window)
+                    .ok()
+                    .map(|state| &mut state.previous_directory)
+            }
+            DirectoryScope::Tabpage => {
+                let tab = tab?;
+                self.tabpages
+                    .get_mut(&tab)
+                    .map(|state| &mut state.previous_directory)
+            }
+            DirectoryScope::Buffer => {
+                let buffer = buffer?;
+                self.buffers
+                    .get_mut(&buffer)
+                    .map(|state| &mut state.previous_directory)
+            }
+        }
+    }
+
+    /// Clears the scope-local directory (`chdir_clear`, `ex_docmd.c:6396-6411`).
     ///
-    /// If the current window has a `local_directory`, the process cwd is set
-    /// to it; otherwise, if a `global_directory` is recorded, the process cwd
-    /// is set to that. When neither is available the process cwd is left
-    /// unchanged. This is called after buffer replacement, window switches,
-    /// tab switches, and window closes to maintain the best-effort
-    /// invariant that the process cwd reflects the current window's effective directory.
+    /// Only the scope's own directory is cleared: `:lcd!` never touches the
+    /// tabpage or buffer slots and `:cd!` never unsets anything. A no-op when
+    /// the scope has no local directory. On a real clear the effective
+    /// directory is reapplied, matching upstream's `update_cwd` call.
+    pub fn clear_local_directory(&mut self, scope: DirectoryScope) {
+        let cleared = match scope {
+            DirectoryScope::Global => false,
+            DirectoryScope::Window => self
+                .current_window()
+                .and_then(|window| self.window_mut(window).ok())
+                .is_some_and(|state| state.local_directory.take().is_some()),
+            DirectoryScope::Tabpage => self
+                .current_tab
+                .and_then(|tab| self.tabpages.get_mut(&tab))
+                .is_some_and(|state| state.local_directory.take().is_some()),
+            DirectoryScope::Buffer => self
+                .current_buffer()
+                .and_then(|buffer| self.buffers.get_mut(&buffer))
+                .is_some_and(|state| state.local_directory.take().is_some()),
+        };
+        if cleared {
+            self.apply_effective_directory();
+        }
+    }
+
+    /// Reapplies the effective working directory for the current context.
     ///
-    /// Matches upstream `update_cwd` (`window.c:5365`): the window/tab/buffer
-    /// transition has already committed, so a failure to `os_chdir` does not
-    /// undo the transition. The state change remains valid and the process
-    /// simply stays at its prior cwd — no error is queued or surfaced.
-    fn apply_effective_directory(&self) {
-        let target = self
+    /// Precedence is buffer-local, then window-local, then tabpage-local,
+    /// then the saved session-global fallback (`update_cwd`,
+    /// `window.c:5365-5425`). A scope-local directory also remembers the
+    /// directory left behind as the session-global fallback when none is
+    /// saved, so a later scope switch can return to it. When no local
+    /// directory applies but a global one was saved while entering a scope,
+    /// the process returns to it and the saved value is consumed. When
+    /// nothing applies the process cwd is left unchanged.
+    ///
+    /// Matches upstream `update_cwd`: the window/tab/buffer transition has
+    /// already committed, so a failure to `os_chdir` does not undo the
+    /// transition. The state change remains valid and the process simply
+    /// stays at its prior cwd — no error is queued or surfaced.
+    fn apply_effective_directory(&mut self) {
+        // Buffer-local wins: the buffer belongs to no particular
+        // window/tabpage, so it is consulted first regardless of context.
+        let buffer_local = self
+            .current_buffer()
+            .and_then(|buffer| self.buffers.get(&buffer))
+            .and_then(|state| state.local_directory.clone());
+        let window_local = self
             .current_window()
             .and_then(|window| self.window(window).ok())
-            .and_then(|state| state.local_directory.as_ref())
-            .or(self.global_directory.as_ref());
-        if let Some(target) = target {
-            // WHY: upstream `update_cwd` ignores `os_chdir` failure — the
-            // transition is already committed and the old process cwd stays
-            // in effect. No E344 is queued or surfaced.
-            //
-            // WHY(process-state guard): the process cwd is shared by every
-            // test in this binary; a window/tab/buffer switch in an unrelated
-            // editor must not overwrite the directory a cwd-sensitive test
-            // just `lcd`'d into. While a sibling test holds the guard this
-            // restore is skipped — the write is advisory (`update_cwd`
-            // ignores its own failure anyway) and the holder owns the cwd
-            // for its duration. The holding thread itself, and any thread
-            // while the guard is free, still applies it normally.
-            #[cfg(test)]
+            .and_then(|state| state.local_directory.clone());
+        let tab_local = self
+            .current_tab
+            .and_then(|tab| self.tabpages.get(&tab))
+            .and_then(|state| state.local_directory.clone());
+        if let Some(target) = buffer_local.or(window_local).or(tab_local) {
+            // A scope-local directory applies: remember the directory left
+            // behind as the session-global fallback when none is saved
+            // (`update_cwd`'s `globaldir == NULL` arm, `window.c:5391-5397`).
+            if self.global_directory.is_none()
+                && let Ok(cwd) = std::env::current_dir()
             {
-                let free = crate::PROCESS_STATE_GUARD.try_lock().ok();
-                if crate::holds_process_state_guard() || free.is_some() {
-                    std::mem::drop(std::env::set_current_dir(target));
-                }
+                self.global_directory = Some(cwd);
             }
-            #[cfg(not(test))]
-            std::mem::drop(std::env::set_current_dir(target));
+            Self::apply_current_dir(&target);
+            return;
         }
+        // No local directory applies and the process is parked elsewhere:
+        // return to the saved global directory and consume it, matching
+        // upstream's `globaldir` clear on the way back.
+        if let Some(target) = self.global_directory.take() {
+            Self::apply_current_dir(&target);
+        }
+    }
+
+    /// Best-effort `os_chdir` for [`Self::apply_effective_directory`].
+    ///
+    /// WHY: upstream `update_cwd` ignores `os_chdir` failure — the transition
+    /// is already committed and the old process cwd stays in effect. No E344
+    /// is queued or surfaced.
+    ///
+    /// WHY(process-state guard): the process cwd is shared by every test in
+    /// this binary; a window/tab/buffer switch in an unrelated editor must
+    /// not overwrite the directory a cwd-sensitive test just `lcd`'d into.
+    /// While a sibling test holds the guard this restore is skipped — the
+    /// write is advisory (`update_cwd` ignores its own failure anyway) and
+    /// the holder owns the cwd for its duration. The holding thread itself,
+    /// and any thread while the guard is free, still applies it normally.
+    fn apply_current_dir(target: &Path) {
+        #[cfg(test)]
+        {
+            let free = crate::PROCESS_STATE_GUARD.try_lock().ok();
+            if crate::holds_process_state_guard() || free.is_some() {
+                std::mem::drop(std::env::set_current_dir(target));
+            }
+        }
+        #[cfg(not(test))]
+        std::mem::drop(std::env::set_current_dir(target));
     }
 
     /// Displays a live buffer in the current window.
@@ -3485,8 +3741,17 @@ impl Editor {
         if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
             buffer_state.attach()?;
         }
+        // A new tabpage inherits the previous current tabpage's tab-local
+        // directory (`win_new_tabpage`, `window.c:4509-4510`); its own
+        // previous-directory slot starts empty, like the zeroed `tabpage_T`.
+        let inherited_tab_directory = self
+            .current_tab
+            .and_then(|tab| self.tabpages.get(&tab))
+            .and_then(|state| state.local_directory.clone());
+        let mut tabpage = TabpageState::new(layout);
+        tabpage.local_directory = inherited_tab_directory;
         self.windows.insert(window, tab);
-        self.tabpages.insert(tab, TabpageState::new(layout));
+        self.tabpages.insert(tab, tabpage);
         self.tab_order.insert(index.min(self.tab_order.len()), tab);
         self.current_tab = Some(tab);
         self.apply_effective_directory();
