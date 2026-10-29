@@ -243,6 +243,22 @@ later:
 
 Evidence: `.outline/evidence/difftool-after-pipes.log`.
 
+Diagnosis of the remaining difftool failure, measured outside the test harness:
+
+- `vim.system({ 'diff', '-qrN', left, right }, { text = true, env = { LC_ALL = 'C' } }):wait()`
+  answers the right code and stdout, both with absolute and with relative
+  directory arguments, from a `-l` script.
+- `vim.fn.executable('diff')` answers 1, so the plugin takes the `diffr` path.
+- `vim.split`, the `Files 'a' and 'b' differ` pattern, `vim.fs.relpath`,
+  `vim.fs.abspath` and `setqflist` with `quickfixtextfunc` all answer what the
+  plugin expects, and a hand-built list of four entries survives `setqflist`.
+- The quickfix list is empty only when the plugin runs from an Ex command,
+  which points at job progress not being pumped while the Ex executor is busy,
+  the same class as the `vim.wait` terminal-pump gap.
+- `fix(uv): keep pipe descriptor reuse safe` (`e7677d4`) removes a stale-marker
+  hazard: registering a pair or taking a half now drops an awaiting-close
+  marker for the same number, and `close` clears both states.
+
 Two defects surfaced while wiring the registry. `pipe:open` adopted the
 descriptor without installing the reactor callback, so reads never reached Lua
 and the child's output vanished. The readiness path then held the callback
