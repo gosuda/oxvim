@@ -7455,11 +7455,14 @@ fn command_runtime<F: FileIO, E: ExEditorAccess>(
             }
         }
         for file in matches {
-            match source_path(runtime, access, scope, lua, &file, true) {
-                Ok(Flow::Finish) => return Flow::Normal,
-                Ok(flow) if !matches!(flow, Flow::Normal) => return flow,
-                Ok(_) => {}
-                Err(error) => return exec_error_flow(runtime, error),
+            // `:runtime` sources through the same extension split as
+            // `plugin/**`: a `.lua` file runs as Lua (`source_callback`,
+            // runtime.c:975-990), never as Vimscript.
+            let flow = source_runtime_file(runtime, access, scope, lua, &file, true);
+            match flow {
+                Flow::Normal => {}
+                Flow::Finish => return Flow::Normal,
+                other => return other,
             }
         }
     }
@@ -7573,11 +7576,12 @@ fn command_packadd<F: FileIO, E: ExEditorAccess>(
         }
         plugin_files.sort();
         for file in plugin_files {
-            match source_path(runtime, access, scope, lua, &file, true) {
-                Ok(Flow::Finish) => return Flow::Normal,
-                Ok(flow) if !matches!(flow, Flow::Normal) => return flow,
-                Ok(_) => {}
-                Err(error) => return exec_error_flow(runtime, error),
+            let flow = source_runtime_file(runtime, access, scope, lua, &file, true);
+            if !matches!(flow, Flow::Normal) {
+                return match flow {
+                    Flow::Finish => Flow::Normal,
+                    other => other,
+                };
             }
         }
         let ftdetect = directory.join("ftdetect");
@@ -7587,11 +7591,12 @@ fn command_packadd<F: FileIO, E: ExEditorAccess>(
                 .unwrap_or_default();
             files.sort();
             for file in files {
-                match source_path(runtime, access, scope, lua, &file, true) {
-                    Ok(Flow::Finish) => return Flow::Normal,
-                    Ok(flow) if !matches!(flow, Flow::Normal) => return flow,
-                    Ok(_) => {}
-                    Err(error) => return exec_error_flow(runtime, error),
+                let flow = source_runtime_file(runtime, access, scope, lua, &file, true);
+                if !matches!(flow, Flow::Normal) {
+                    return match flow {
+                        Flow::Finish => Flow::Normal,
+                        other => other,
+                    };
                 }
             }
         }
@@ -18274,6 +18279,7 @@ fn source_runtime_file<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
     path: &Path,
+    load_once: bool,
 ) -> Flow {
     if path.extension().is_some_and(|extension| extension == "lua") {
         let Some(host) = lua else {
@@ -18290,7 +18296,7 @@ fn source_runtime_file<F: FileIO, E: ExEditorAccess>(
             (Ok(()), Ok(())) => Flow::Normal,
         };
     }
-    match source_path(runtime, access, scope, lua, path, false) {
+    match source_path(runtime, access, scope, lua, path, load_once) {
         Ok(Flow::Finish) => Flow::Normal,
         Ok(flow) => flow,
         Err(error) => exec_error_flow(runtime, error),
@@ -18320,7 +18326,7 @@ fn source_runtime_all<F: FileIO, E: ExEditorAccess>(
             if !runtime.scripts.io().exists(&path) {
                 continue;
             }
-            let flow = source_runtime_file(runtime, access, scope, lua, &path);
+            let flow = source_runtime_file(runtime, access, scope, lua, &path, false);
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
@@ -18586,7 +18592,7 @@ fn command_colorscheme<F: FileIO, E: ExEditorAccess>(
             format!("Cannot find color scheme '{name}'"),
         );
     };
-    let flow = source_runtime_file(runtime, access, scope, lua, &path);
+    let flow = source_runtime_file(runtime, access, scope, lua, &path, false);
     if !matches!(flow, Flow::Normal) {
         return flow;
     }

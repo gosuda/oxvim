@@ -8974,6 +8974,75 @@ impl crate::LuaExec for CallbackRecorder {
         Ok(Object::Nil)
     }
 }
+/// `:runtime` sources a `.lua` file through the Lua host and a `.vim` file
+/// through the Vimscript sourcer (`source_callback`, runtime.c:975-990).
+/// Sourcing a Lua plugin as Vimscript parses its first statement as an Ex
+/// command, which is how `plugin/difftool.lua` produced
+/// `E488: Trailing characters: ~= nil then`.
+#[test]
+fn runtime_sources_a_lua_file_through_the_lua_host() {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    struct RecordingLua(Rc<RefCell<Vec<PathBuf>>>);
+    impl crate::LuaExec for RecordingLua {
+        fn execute_chunk(
+            &self,
+            _code: &str,
+            _args: Vec<Object>,
+        ) -> Result<Object, crate::LuaExecError> {
+            Ok(Object::Nil)
+        }
+        fn execute_file(&self, path: &Path) -> Result<(), crate::LuaExecError> {
+            self.0.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+        fn invoke_callback(&self, _: usize, _: Vec<Object>) -> Result<Object, crate::LuaExecError> {
+            Ok(Object::Nil)
+        }
+    }
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let io = MemoryFileIO::new();
+    io.insert("/rt/plugin/probe.lua", "if vim.g.x ~= nil then return end\n");
+    io.insert("/rt/plugin/probe.vim", "let g:vim_plugin = 'ran'\n");
+    let mut executor = ExExecutor::with_io(io);
+    executor.set_lua_exec(Rc::new(RecordingLua(Rc::clone(&seen))));
+    let (editor, _) = {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (TestEditorAccess::new(editor), ())
+    };
+    executor
+        .execute_line(&editor, "set runtimepath=/rt")
+        .expect("runtimepath");
+    executor
+        .execute_line(&editor, "runtime plugin/probe.lua")
+        .expect("a Lua plugin must source through the Lua host");
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [PathBuf::from("/rt/plugin/probe.lua")],
+        "the .lua file goes through the Lua host"
+    );
+    executor
+        .execute_line(&editor, "runtime plugin/probe.vim")
+        .expect("a Vimscript plugin still sources");
+    assert_eq!(
+        global_text(&executor, "vim_plugin").as_deref(),
+        Some("ran"),
+        "the .vim file still runs as Vimscript"
+    );
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "the Vimscript file must not reach the Lua host"
+    );
+}
+
 /// Re-enters an Ex executor while a Lua callback is active. The host itself
 /// is an owned `Rc`, so callback dispatch does not borrow a runtime cell across
 /// the user-code call.

@@ -696,6 +696,10 @@ impl Editor {
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
                 ("register".into(), Object::String(OxStr::from("\""))),
+                // `v:vim_did_enter` is 1 once startup finished (`VimEnter`
+                // fired); runtime plugins branch on it, and an absent value
+                // makes `vim.v.vim_did_enter > 0` a nil comparison.
+                ("vim_did_enter".into(), Object::Integer(1)),
                 // `v:msgpack_types` (`eval.c` `set_internal_string_var`): the
                 // five marker lists that name the special msgpack maps, so
                 // `msgpackparse()` can build them and `msgpackdump()` can
