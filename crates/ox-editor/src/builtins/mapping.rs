@@ -20,11 +20,6 @@
 //!
 //! Named gaps, each one a thing that would have to exist first:
 //!
-//!  * **`callback`** needs a Funcref. [`MappingAction::Callback`] is a `u64`
-//!    host-callback identity, not a callable value, and upstream's key holds
-//!    the `LuaRef` itself (`mapping.c:2111-2112`). Nothing script-reachable
-//!    creates one — `:map` cannot — so a mapping with a callback answers the
-//!    empty dictionary rather than an invented Funcref.
 //!  * **`lhsrawalt`** needs key simplification. Upstream emits it only when
 //!    `replace_termcodes` reported `did_simplify` (`mapping.c:2124-2127`), that
 //!    is when the written left-hand side has a second, simplified byte form
@@ -42,7 +37,7 @@
 use ox_eval::EvalError;
 use ox_eval::Scope;
 use ox_excmd::ExCommand;
-use ox_types::{BufHandle, OxStr, Typval};
+use ox_types::{BufHandle, Funcref, OxStr, Typval};
 
 use crate::excmd_exec::{
     EvalHost, ExEditorAccess, ExRuntime, Flow, map_leader, push_info_text_message, typval_number,
@@ -78,13 +73,11 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 /// the dict's right-hand side, flags, description, and script context are
 /// stored, so a saved mapping round-trips. `{mode}` selects the mode set;
 /// the dict's own `mode` entry is not used. Errors mirror upstream: `E460`
-/// for a missing `mode`/`abbr`/`lhs`/`lhsraw`/`rhs` entry and `E1276` for an
-/// illegal mode string.
+/// for a missing `mode`/`abbr`/`lhs`/`lhsraw` entry (or missing both `rhs`
+/// and `callback`) and `E1276` for an illegal mode string.
 ///
-/// Named gaps: a `callback` Funcref cannot name a host callback identity
-/// (`MappingAction::Callback` is a `u64` no script value can construct), so
-/// a dict with a callback and no `rhs` answers `E460` instead of inventing
-/// one; `lhsrawalt` restores a second entry for the alternate form rather
+/// A `callback` Funcref preserves its host-callback identity;
+/// `lhsrawalt` restores a second entry for the alternate form rather
 /// than the linked `m_alt` pair upstream keeps (this port has no key
 /// simplification, so both forms answer lookups either way); and
 /// `replace_keycodes` is accepted but stored nowhere, matching the report
@@ -135,10 +128,28 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
     let lhs = dict_string(&borrowed, "lhs").ok_or_else(mapset_entries_error)?;
     let lhsraw = dict_string(&borrowed, "lhsraw").ok_or_else(mapset_entries_error)?;
     let lhsrawalt = dict_string(&borrowed, "lhsrawalt");
-    // `orig_rhs` is NULL without an `rhs` entry unless a Lua callback
-    // resolved (`mapping.c:2357-2373`); no script value can name this port's
-    // host callback identity, so a missing `rhs` is always `E460` here.
-    let rhs = dict_string(&borrowed, "rhs").ok_or_else(mapset_entries_error)?;
+    let leader = map_leader(scope, "mapleader");
+    let local_leader = map_leader(scope, "maplocalleader");
+    let callback_ref = borrowed.get(b"callback").and_then(|cb| match cb {
+        Typval::Funcref(funcref) => {
+            let name = funcref.name.to_string_lossy();
+            name.strip_prefix(crate::excmd_exec::LUA_REF_FUNCTION_PREFIX)
+                .and_then(|rest| rest.parse::<u64>().ok())
+        }
+        _ => None,
+    });
+    let (action, rhs) = if let Some(reference) = callback_ref {
+        (MappingAction::Callback(reference), String::new())
+    } else {
+        let rhs = dict_string(&borrowed, "rhs").ok_or_else(mapset_entries_error)?;
+        let action = if borrowed.get(b"expr").and_then(typval_number).unwrap_or(0) != 0 {
+            MappingAction::Expr(rhs.clone())
+        } else {
+            MappingAction::parse_rhs(&rhs, &leader, &local_leader)
+                .map_err(|error| EvalError::new("E474", 0, error.to_string()))?
+        };
+        (action, rhs)
+    };
     let scope_value = if borrowed.get(b"buffer").and_then(typval_number).unwrap_or(0) != 0 {
         let buffer = host
             .access
@@ -149,14 +160,6 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
         }
     } else {
         MapScope::Global
-    };
-    let leader = map_leader(scope, "mapleader");
-    let local_leader = map_leader(scope, "maplocalleader");
-    let action = if borrowed.get(b"expr").and_then(typval_number).unwrap_or(0) != 0 {
-        MappingAction::Expr(rhs.clone())
-    } else {
-        MappingAction::parse_rhs(&rhs, &leader, &local_leader)
-            .map_err(|error| EvalError::new("E474", 0, error.to_string()))?
     };
     let mut flags = MapFlags::REMAP;
     flags.set(
@@ -388,18 +391,24 @@ fn maparg<F: FileIO, E: ExEditorAccess>(
         let Some((entry, local)) = found else {
             return Ok(empty());
         };
-        // A callback abbreviation has no key string, like a callback mapping.
-        let Some(replaced) = entry.action.replaced_keys() else {
-            return Ok(empty());
-        };
         if want_dict {
             return Ok(abbrev_fill_dict(&entry, local));
         }
-        return Ok(Typval::String(if replaced.is_empty() {
-            OxStr::from("<Nop>")
-        } else {
-            OxStr::from(special_notation(replaced, false, false).as_str())
-        }));
+        return match &entry.action {
+            MappingAction::Callback(reference) => {
+                Ok(Typval::String(OxStr::from(format!("<Lua {reference}>").as_str())))
+            }
+            _ => {
+                let Some(replaced) = entry.action.replaced_keys() else {
+                    return Ok(empty());
+                };
+                Ok(Typval::String(if replaced.is_empty() {
+                    OxStr::from("<Nop>")
+                } else {
+                    OxStr::from(special_notation(replaced, false, false).as_str())
+                }))
+            }
+        };
     }
     // `replace_termcodes` on the queried keys, the same translation `:map`
     // applied when the mapping was stored, so `maparg('<Esc>x')` finds what
@@ -418,21 +427,27 @@ fn maparg<F: FileIO, E: ExEditorAccess>(
     let Some((mapping, local)) = found else {
         return Ok(empty());
     };
-    // A callback mapping has no key string, and this port cannot hand back the
-    let Some(replaced) = mapping.action.replaced_keys() else {
-        return Ok(empty());
-    };
     if want_dict {
         return Ok(fill_dict(&mapping, local));
     }
-    // `get_maparg`'s string form (`mapping.c:2200-2210`): an empty right-hand
-    // side prints as the literal `<Nop>`, everything else through
-    // `str2special` with neither spaces nor `<` replaced.
-    Ok(Typval::String(if replaced.is_empty() {
-        OxStr::from("<Nop>")
-    } else {
-        OxStr::from(special_notation(replaced, false, false).as_str())
-    }))
+    match &mapping.action {
+        MappingAction::Callback(reference) => {
+            Ok(Typval::String(OxStr::from(format!("<Lua {reference}>").as_str())))
+        }
+        _ => {
+            let Some(replaced) = mapping.action.replaced_keys() else {
+                return Ok(empty());
+            };
+            // `get_maparg`'s string form (`mapping.c:2200-2210`): an empty right-hand
+            // side prints as the literal `<Nop>`, everything else through
+            // `str2special` with neither spaces nor `<` replaced.
+            Ok(Typval::String(if replaced.is_empty() {
+                OxStr::from("<Nop>")
+            } else {
+                OxStr::from(special_notation(replaced, false, false).as_str())
+            }))
+        }
+    }
 }
 
 /// `f_mapcheck` — `get_maparg` with `exact = 0` (`mapping.c:2148-2227`):
@@ -572,12 +587,6 @@ fn fill_dict(mapping: &Mapping, local: bool) -> Typval {
     let options = &mapping.options;
     let context = options.script_context;
     let mut entries = vec![
-        // `compatible` reports `m_orig_str`, the right-hand side as written,
-        // rather than `str2special` of the replaced form.
-        (
-            OxStr::from("rhs"),
-            Typval::String(OxStr::from(options.orig_rhs.as_str())),
-        ),
         (
             OxStr::from("lhs"),
             Typval::String(OxStr::from(
@@ -641,6 +650,25 @@ fn fill_dict(mapping: &Mapping, local: bool) -> Typval {
             Typval::String(OxStr::from(description.as_str())),
         ));
     }
+    match &mapping.action {
+        MappingAction::Callback(reference) => {
+            entries.push((
+                OxStr::from("callback"),
+                Typval::Funcref(Funcref {
+                    name: crate::excmd_exec::lua_ref_function_name(*reference),
+                    args: Vec::new(),
+                    dict: None,
+                    registry: None,
+                }),
+            ));
+        }
+        _ => {
+            entries.push((
+                OxStr::from("rhs"),
+                Typval::String(OxStr::from(options.orig_rhs.as_str())),
+            ));
+        }
+    }
     Typval::dict(entries)
 }
 
@@ -672,11 +700,7 @@ fn check_arity(name: &str, count: usize) -> ox_eval::Result<()> {
 /// `abbr` is 1.
 fn abbrev_fill_dict(entry: &Abbreviation, local: bool) -> Typval {
     let context = entry.script_context;
-    let entries = vec![
-        (
-            OxStr::from("rhs"),
-            Typval::String(OxStr::from(entry.orig_rhs.as_str())),
-        ),
+    let mut entries = vec![
         (
             OxStr::from("lhs"),
             Typval::String(OxStr::from(
@@ -734,6 +758,25 @@ fn abbrev_fill_dict(entry: &Abbreviation, local: bool) -> Typval {
             Typval::Number(i64::from(entry.modes.bits())),
         ),
     ];
+    match &entry.action {
+        MappingAction::Callback(reference) => {
+            entries.push((
+                OxStr::from("callback"),
+                Typval::Funcref(Funcref {
+                    name: crate::excmd_exec::lua_ref_function_name(*reference),
+                    args: Vec::new(),
+                    dict: None,
+                    registry: None,
+                }),
+            ));
+        }
+        _ => {
+            entries.push((
+                OxStr::from("rhs"),
+                Typval::String(OxStr::from(entry.orig_rhs.as_str())),
+            ));
+        }
+    }
     Typval::dict(entries)
 }
 
@@ -1157,5 +1200,284 @@ let g:arhs = maparg('foo', 'i', 1, 1).rhs
             global_string(&exec, "still").as_deref(),
             Some(":echo \"x\"<CR>")
         );
+    }
+
+    fn dict_number(dict: &ox_types::DictData, key: &str) -> Option<i64> {
+        dict.get(key.as_bytes()).and_then(typval_number)
+    }
+
+    /// Shape and field values of `maparg(..., true)` for a global mapping
+    /// and a `<buffer>`-local mapping.
+    #[test]
+    fn maparg_dict_shape_global_and_buffer_mapping() {
+        let mut ed = Editor::new();
+        let _buf1 = ed.create_buffer(true).unwrap();
+        let buf2 = ed.create_buffer(true).unwrap();
+        ed.create_tabpage(buf2, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(ed);
+        let mut exec = ExExecutor::new();
+
+        exec.execute_script(
+            &editor,
+            "test_maparg_shape.vim",
+            r#"
+nnoremap <silent> <Plug>(global) foo
+nnoremap <buffer> <nowait> <Plug>(local) bar
+let g:global_dict = maparg('<Plug>(global)', 'n', 0, 1)
+let g:local_dict = maparg('<Plug>(local)', 'n', 0, 1)
+"#,
+        )
+        .unwrap();
+
+        let global_val = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"global_dict", 0)
+            .unwrap();
+        let Typval::Dict(global_dict) = global_val else {
+            panic!("expected dict, got {global_val:?}");
+        };
+        let g_borrowed = global_dict.borrow();
+        assert_eq!(
+            dict_string_for_test(&g_borrowed, "lhs").as_deref(),
+            Some("<Plug>(global)")
+        );
+        assert_eq!(
+            dict_string_for_test(&g_borrowed, "rhs").as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            dict_string_for_test(&g_borrowed, "lhsraw").as_deref(),
+            Some("<Plug>(global)")
+        );
+        assert_eq!(dict_number(&g_borrowed, "buffer"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "noremap"), Some(1));
+        assert_eq!(dict_number(&g_borrowed, "script"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "expr"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "silent"), Some(1));
+        assert_eq!(dict_number(&g_borrowed, "nowait"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "scriptversion"), Some(1));
+        assert_eq!(dict_number(&g_borrowed, "replace_keycodes"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "abbr"), Some(0));
+        assert_eq!(
+            dict_string_for_test(&g_borrowed, "mode").as_deref(),
+            Some("n")
+        );
+        assert_eq!(dict_number(&g_borrowed, "mode_bits"), Some(1));
+        assert!(dict_number(&g_borrowed, "sid").is_some());
+        assert!(dict_number(&g_borrowed, "lnum").is_some());
+        assert_eq!(g_borrowed.entries.len(), 16, "global mapping dict has exactly 16 keys");
+
+        let local_val = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"local_dict", 0)
+            .unwrap();
+        let Typval::Dict(local_dict) = local_val else {
+            panic!("expected dict, got {local_val:?}");
+        };
+        let l_borrowed = local_dict.borrow();
+        assert_eq!(
+            dict_string_for_test(&l_borrowed, "lhs").as_deref(),
+            Some("<Plug>(local)")
+        );
+        assert_eq!(
+            dict_string_for_test(&l_borrowed, "rhs").as_deref(),
+            Some("bar")
+        );
+        assert_eq!(
+            dict_number(&l_borrowed, "buffer"),
+            Some(1),
+            "local mapping reports 1 for buffer flag"
+        );
+        assert_eq!(dict_number(&l_borrowed, "nowait"), Some(1));
+        assert_eq!(dict_number(&l_borrowed, "silent"), Some(0));
+        assert_eq!(
+            dict_string_for_test(&l_borrowed, "lhsraw").as_deref(),
+            Some("<Plug>(local)")
+        );
+        assert!(dict_number(&l_borrowed, "sid").is_some());
+        assert!(dict_number(&l_borrowed, "lnum").is_some());
+        assert_eq!(l_borrowed.entries.len(), 16, "local mapping dict has exactly 16 keys");
+    }
+
+    /// Shape and field values of `maparg(..., true)` for a global abbreviation
+    /// and a `<buffer>`-local abbreviation.
+    #[test]
+    fn maparg_dict_shape_global_and_buffer_abbrev() {
+        let mut ed = Editor::new();
+        let _buf1 = ed.create_buffer(true).unwrap();
+        let buf2 = ed.create_buffer(true).unwrap();
+        ed.create_tabpage(buf2, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let editor = TestEditorAccess::new(ed);
+        let mut exec = ExExecutor::new();
+
+        exec.execute_script(
+            &editor,
+            "test_maparg_abbrev_shape.vim",
+            r#"
+iabbrev <silent> <Plug>(global_abbr) foo
+iabbrev <buffer> <nowait> <Plug>(local_abbr) bar
+let g:global_dict = maparg('<Plug>(global_abbr)', 'i', 1, 1)
+let g:local_dict = maparg('<Plug>(local_abbr)', 'i', 1, 1)
+"#,
+        )
+        .unwrap();
+
+        let global_val = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"global_dict", 0)
+            .unwrap();
+        let Typval::Dict(global_dict) = global_val else {
+            panic!("expected dict, got {global_val:?}");
+        };
+        let g_borrowed = global_dict.borrow();
+        assert_eq!(dict_number(&g_borrowed, "buffer"), Some(0));
+        assert_eq!(dict_number(&g_borrowed, "abbr"), Some(1));
+
+        let local_val = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"local_dict", 0)
+            .unwrap();
+        let Typval::Dict(local_dict) = local_val else {
+            panic!("expected dict, got {local_val:?}");
+        };
+        let l_borrowed = local_dict.borrow();
+        assert_eq!(
+            dict_number(&l_borrowed, "buffer"),
+            Some(1),
+            "local abbreviation reports 1 for buffer flag"
+        );
+        assert_eq!(dict_number(&l_borrowed, "abbr"), Some(1));
+    }
+
+    /// Shape and field values of `maparg(..., true)` for a callback mapping.
+    #[test]
+    fn maparg_dict_shape_callback_mapping() {
+        let ed = editor();
+        let editor = TestEditorAccess::new(ed);
+        let mut exec = ExExecutor::new();
+
+        editor.with_ex_editor(|ed| {
+            let lhs = Keys::parse_notation("<Plug>(x)", "", "");
+            ed.mappings_mut()
+                .map(
+                    lhs,
+                    MappingAction::Callback(999),
+                    MappingOptions {
+                        modes: MapMode::Normal.into(),
+                        description: Some("test callback".to_owned()),
+                        ..MappingOptions::default()
+                    },
+                )
+                .unwrap();
+        });
+
+        exec.execute_script(
+            &editor,
+            "test_cb.vim",
+            r#"
+let g:cb_dict = maparg('<Plug>(x)', 'n', 0, 1)
+let g:cb_str = maparg('<Plug>(x)', 'n', 0, 0)
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            global_string(&exec, "cb_str").as_deref(),
+            Some("<Lua 999>")
+        );
+
+        let cb_val = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"cb_dict", 0)
+            .unwrap();
+        let Typval::Dict(cb_dict) = cb_val else {
+            panic!("expected dict, got {cb_val:?}");
+        };
+        let borrowed = cb_dict.borrow();
+        assert_eq!(
+            dict_string_for_test(&borrowed, "lhs").as_deref(),
+            Some("<Plug>(x)")
+        );
+        assert_eq!(borrowed.entries.len(), 17, "callback mapping has 15 standard keys + callback + desc");
+        assert_eq!(
+            dict_string_for_test(&borrowed, "rhs"),
+            None,
+            "callback mappings omit rhs"
+        );
+        assert_eq!(dict_number(&borrowed, "buffer"), Some(0));
+        assert_eq!(
+            dict_string_for_test(&borrowed, "desc").as_deref(),
+            Some("test callback")
+        );
+        let cb_item = borrowed
+            .get(b"callback")
+            .expect("callback field must be present");
+        let Typval::Funcref(funcref) = cb_item else {
+            panic!("callback must be a Funcref, got {cb_item:?}");
+        };
+        assert_eq!(
+            funcref.name.to_string_lossy(),
+            format!("{}\u{1}oxvim_luaref:999", "")
+        );
+    }
+
+    /// `mapset({dict})` restores a saved callback mapping from `maparg()`.
+    #[test]
+    fn mapset_restores_callback_mapping() {
+        let ed = editor();
+        let editor = TestEditorAccess::new(ed);
+        let mut exec = ExExecutor::new();
+
+        editor.with_ex_editor(|ed| {
+            let lhs = Keys::parse_notation("K", "", "");
+            ed.mappings_mut()
+                .map(
+                    lhs,
+                    MappingAction::Callback(42),
+                    MappingOptions {
+                        modes: MapMode::Normal.into(),
+                        ..MappingOptions::default()
+                    },
+                )
+                .unwrap();
+        });
+
+        exec.execute_script(
+            &editor,
+            "mapset_cb.vim",
+            r#"
+let g:save = maparg('K', 'n', 0, 1)
+nnoremap K :echo "changed"<CR>
+let g:changed = maparg('K', 'n', 0, 0)
+call mapset(g:save)
+let g:restored = maparg('K', 'n', 0, 1)
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            global_string(&exec, "changed").as_deref(),
+            Some(":echo \"changed\"<CR>")
+        );
+        let value = exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"restored", 0)
+            .unwrap();
+        let Typval::Dict(dict) = value else {
+            panic!("expected dict, got {value:?}");
+        };
+        let borrowed = dict.borrow();
+        assert!(borrowed.get(b"callback").is_some());
+        assert_eq!(dict_string_for_test(&borrowed, "rhs"), None);
+        editor.with_ex_editor(|ed| {
+            let lhs = Keys::parse_notation("K", "", "");
+            let (mapping, _) = ed
+                .mappings()
+                .find_exact(lhs.as_bytes(), MapMode::Normal.into(), None)
+                .unwrap();
+            assert_eq!(mapping.action, MappingAction::Callback(42));
+        });
     }
 }
