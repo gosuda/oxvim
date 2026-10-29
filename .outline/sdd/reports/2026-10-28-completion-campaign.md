@@ -1054,3 +1054,27 @@ The remaining failures are assertions about behaviour the port has not matched,
 starting with T1 `:checkhealth detects invalid $VIMRUNTIME` (expected false,
 actual true) and T2 for `'runtimepath'`, then `getcompletion()` and cmdline
 completion. Those are separate defects from the callback path.
+
+
+### Why the remaining 42 stay red: the dict argument's identity
+
+The spec's callback refuses to notify unless the dictionary it receives is the
+scope mapping itself:
+
+```vim
+function! g:Changed(dict, key, value)
+  if a:dict isnot g: | throw 'invalid dict' | endif
+  call rpcnotify(g:channel, 'values', a:key, a:value)
+endfunction
+```
+
+Probe on the real binary: a watcher on `g:` with a Vimscript callback that only
+appends to a list fires correctly for `let g:['watched'] = 'test'` on both
+oxvim and the reference, so the producer works. What fails is the identity: the
+drain builds the dict argument with `scope.scope_dict(kind)`, which is a fresh
+per-read snapshot, so `a:dict isnot g:` is true inside the callback and it
+throws before notifying.
+
+The fix is structural: a scope namespace needs one stable dictionary identity
+per session (upstream's `vimvardict`), with `set_scoped` keeping it current,
+instead of a snapshot rebuilt on every evaluation.
