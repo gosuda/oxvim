@@ -2476,6 +2476,68 @@ fn definition_count(session: &crate::ApiSession, id: i64) -> usize {
 }
 
 #[test]
+/// The deprecated `nvim_set_option` reaches the same `set_option_value` path
+/// upstream, so it publishes `OptionSet` too, with the global scope
+/// (`option.c:4373`).
+#[test]
+fn legacy_set_option_fires_optionset_with_global_scope() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("scrolloff"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_new")).cloned(),
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor.vvars().get(&OxStr::from("option_oldglobal")).cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option(&session, OxStr::from("scrolloff"), Object::Integer(9)).unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "one snapshot");
+    assert_eq!(
+        seen[0][0],
+        Some(Object::Integer(9)),
+        "v:option_new during the callback"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("setglobal"))),
+        "the legacy call writes the global scope"
+    );
+    assert!(
+        matches!(seen[0][2], Some(Object::Integer(_))),
+        "v:option_oldglobal carries the previous value"
+    );
+    let _ = id;
+}
+
 /// A committed option write fires `OptionSet` with the option's full name as
 /// the pattern and `v:option_new` set (`apply_optionset_autocmd_now`,
 /// option.c:2099-2134). `nvim.dir` relies on exactly this to notice
