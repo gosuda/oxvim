@@ -951,6 +951,10 @@ pub struct ScriptCtx<F: FileIO = RealFileIO> {
     next_seq: u64,
     scripts: BTreeMap<Sid, ScriptInfo>,
     source_stack: Vec<SourceFrame>,
+    /// Script ids forced by a frame that runs code defined in another script,
+    /// such as a legacy `:autocmd` body (`autocmd.c` stores `sc_sid` on the
+    /// entry and sets `current_sctx` while the body runs).
+    forced_sids: Vec<Sid>,
     sourced_once: BTreeSet<PathBuf>,
     runtime_roots: Vec<RuntimeRoot>,
 }
@@ -965,6 +969,7 @@ impl<F: FileIO> ScriptCtx<F> {
             next_seq: 0,
             scripts: BTreeMap::new(),
             source_stack: Vec::new(),
+            forced_sids: Vec::new(),
             sourced_once: BTreeSet::new(),
             runtime_roots: Vec::new(),
         }
@@ -1090,7 +1095,20 @@ impl<F: FileIO> ScriptCtx<F> {
     /// The SID whose `s:` scope is currently visible.
     #[must_use]
     pub fn current_sid(&self) -> Option<Sid> {
-        self.source_stack.last().map(|frame| frame.sid)
+        self.forced_sids
+            .last()
+            .copied()
+            .or_else(|| self.source_stack.last().map(|frame| frame.sid))
+    }
+
+    /// Makes `sid` the visible `s:` script until [`Self::pop_forced_sid`].
+    pub fn push_forced_sid(&mut self, sid: Sid) {
+        self.forced_sids.push(sid);
+    }
+
+    /// Undoes the last [`Self::push_forced_sid`].
+    pub fn pop_forced_sid(&mut self) {
+        self.forced_sids.pop();
     }
 
     /// The sequence number of the sourcing event currently running, or `0`

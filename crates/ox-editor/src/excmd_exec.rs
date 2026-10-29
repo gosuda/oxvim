@@ -1933,7 +1933,19 @@ impl<F: FileIO> ExExecutor<F> {
         action: &crate::AutocmdAction,
         source: &str,
     ) -> Result<ExecOutcome, ExecError> {
-        self.with_autocmd_context(action, |executor| executor.execute_line(access, source))
+        let script = match &action.kind {
+            AutocmdKind::ExString { script, .. } => *script,
+            AutocmdKind::VimscriptFunction(_) | AutocmdKind::LuaCallback(_) => None,
+        };
+        if let Some(script) = script {
+            self.runtime.scripts.push_forced_sid(script);
+        }
+        let result =
+            self.with_autocmd_context(action, |executor| executor.execute_line(access, source));
+        if script.is_some() {
+            self.runtime.scripts.pop_forced_sid();
+        }
+        result
     }
 
     /// Invokes one API-planned named Vimscript autocmd callback with no arguments.
@@ -18950,14 +18962,22 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
             },
         );
         let (action_flow, delete) = match &action.kind {
-            AutocmdKind::ExString(source) => {
+            AutocmdKind::ExString { source, script } => {
                 let program = parse_cmdline_program(
                     &runtime.user_commands,
                     access.with_ex_editor(|editor| editor.current_buffer()),
                     source,
                     runtime.scripts.current_line(),
                 );
+                // The body keeps the `s:` scope of the script that defined it
+                // (`autocmd.c` `sc_sid`), not the one running when it fires.
+                if let Some(script) = *script {
+                    runtime.scripts.push_forced_sid(script);
+                }
                 let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
+                if script.is_some() {
+                    runtime.scripts.pop_forced_sid();
+                }
                 (flow, false)
             }
             AutocmdKind::VimscriptFunction(name) => {
@@ -19874,7 +19894,10 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
         editor.autocmds_mut().register_legacy(
             &events,
             pattern_text.unwrap_or("*"),
-            &AutocmdKind::ExString(body.to_owned()),
+            &AutocmdKind::ExString {
+                source: body.to_owned(),
+                script: runtime.scripts.current_sid(),
+            },
             &AutocmdOptions {
                 group,
                 buffer: legacy_buffer_pattern(&patterns, current_buffer),

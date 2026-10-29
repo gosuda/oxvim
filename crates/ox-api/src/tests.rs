@@ -2960,7 +2960,7 @@ fn nonmatching_filetype_write_does_not_consume_once() {
         .register_legacy(
             &[Event::FileType],
             "<abuf>",
-            &AutocmdKind::ExString("echo fired".to_owned()),
+            &AutocmdKind::ExString { source: "echo fired".to_owned(), script: None },
             &AutocmdOptions {
                 buffer: Some(current),
                 once: true,
@@ -3088,7 +3088,7 @@ fn get_autocmds_serializes_optional_fields_only_when_present() {
         .register_legacy(
             &[Event::BufEnter],
             "*",
-            &AutocmdKind::ExString("legacy".to_owned()),
+            &AutocmdKind::ExString { source: "legacy".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3326,7 +3326,7 @@ fn query_event_type_errors_match_upstream_text() {
             .register_legacy(
                 &[Event::BufEnter],
                 "*",
-                &AutocmdKind::ExString("legacy".to_owned()),
+                &AutocmdKind::ExString { source: "legacy".to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -9034,7 +9034,7 @@ fn open_tabpage_fires_creation_events_in_new_tab_context() {
             .register_legacy(
                 &[event],
                 "*",
-                &AutocmdKind::ExString("echo fired".to_owned()),
+                &AutocmdKind::ExString { source: "echo fired".to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();

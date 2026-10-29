@@ -5009,7 +5009,7 @@ impl AutocmdExecutor for ServerAutocmdHost {
     ) -> Result<AutocmdExecution, String> {
         let pair = self.action_pair()?;
         match &action.kind {
-            AutocmdKind::ExString(source) => self.execute_vimscript(action, &pair, |executor| {
+            AutocmdKind::ExString { source, .. } => self.execute_vimscript(action, &pair, |executor| {
                 executor.execute_autocmd_command(session, action, source)
             }),
             AutocmdKind::VimscriptFunction(name) => {

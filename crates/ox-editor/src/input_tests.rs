@@ -23,7 +23,7 @@ fn buffer(value: i64) -> BufHandle {
 }
 
 fn ex(value: &str) -> AutocmdKind {
-    AutocmdKind::ExString(value.to_owned())
+    AutocmdKind::ExString { source: value.to_owned(), script: None }
 }
 
 fn context(buffer: Option<BufHandle>, file_name: Option<&str>) -> AutocmdContext<'_> {
@@ -433,7 +433,7 @@ fn definitions_fire_in_registration_order_regardless_of_group() {
         .ready
         .iter()
         .map(|action| match &action.kind {
-            AutocmdKind::ExString(value) => value.as_str(),
+            AutocmdKind::ExString { source: value, .. } => value.as_str(),
             AutocmdKind::VimscriptFunction(_) => "vimscript",
             AutocmdKind::LuaCallback(_) => "lua",
         })
@@ -645,7 +645,7 @@ fn nested_outer_plans_all_matching_inner_actions() {
         .ready
         .iter()
         .map(|action| match &action.kind {
-            AutocmdKind::ExString(value) => value.as_str(),
+            AutocmdKind::ExString { source: value, .. } => value.as_str(),
             AutocmdKind::VimscriptFunction(_) => "vimscript",
             AutocmdKind::LuaCallback(_) => "lua",
         })

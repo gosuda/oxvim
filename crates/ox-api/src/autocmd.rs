@@ -580,7 +580,7 @@ fn autocmd_kind(opts: &Dict) -> Result<AutocmdKind, ApiError> {
     let callback = opts.get(&OxStr::from("callback"));
     match (command, callback) {
         (Some(Object::String(command)), None) => {
-            Ok(AutocmdKind::ExString(text(command, "command")?))
+            Ok(AutocmdKind::ExString { source: text(command, "command")?, script: None })
         }
         (None, Some(Object::LuaRef(callback))) => Ok(AutocmdKind::LuaCallback(
             u64::try_from(*callback).map_err(|_| ApiError::validation("Invalid 'callback'"))?,
@@ -881,7 +881,7 @@ fn autocmd_definition(item: &AutocmdDefinition) -> Dict {
     entries.push((
         OxStr::from("command"),
         match &item.kind {
-            AutocmdKind::ExString(command) => Object::String(OxStr::from(command.as_str())),
+            AutocmdKind::ExString { source: command, .. } => Object::String(OxStr::from(command.as_str())),
             AutocmdKind::VimscriptFunction(_) | AutocmdKind::LuaCallback(_) => {
                 Object::String(OxStr::from(""))
             }
@@ -900,7 +900,7 @@ fn autocmd_definition(item: &AutocmdDefinition) -> Dict {
                 Object::LuaRef(i32::try_from(*callback).unwrap_or(i32::MAX)),
             ));
         }
-        AutocmdKind::ExString(_) => {}
+        AutocmdKind::ExString { .. } => {}
     }
     entries.push((
         OxStr::from("pattern"),

@@ -1954,7 +1954,7 @@ fn autocmd_bang_clears_builtin_popupmenu_group() {
         .register_legacy(
             &[Event::BufEnter],
             "*",
-            &AutocmdKind::ExString("echo stale".to_owned()),
+            &AutocmdKind::ExString { source: "echo stale".to_owned(), script: None },
             &AutocmdOptions {
                 group,
                 ..AutocmdOptions::default()
@@ -2071,7 +2071,7 @@ fn autocmd_bang_with_body_replaces_the_definitions() {
     assert_eq!(definitions.len(), 1, "bang must replace, not only delete");
     assert_eq!(
         definitions[0].kind,
-        AutocmdKind::ExString("let g:new = 1".to_owned())
+        AutocmdKind::ExString { source: "let g:new = 1".to_owned(), script: None }
     );
 
     executor.scripts().io().insert("replaced.py", "x");
@@ -7338,7 +7338,7 @@ fn an_api_optionset_command_reads_the_published_values() {
     );
     assert_eq!(plan.ready.len(), 1, "one handler");
     for action in &plan.ready {
-        let crate::AutocmdKind::ExString(source) = &action.kind else {
+        let crate::AutocmdKind::ExString { source: source, script: None } = &action.kind else {
             panic!("a `:autocmd ... call` handler is Ex source");
         };
         executor
@@ -7380,6 +7380,31 @@ fn set_fires_optionset_with_the_new_value() {
     // A different option never matches the pattern.
     executor.execute_line(&editor, "set tabstop=3").unwrap();
     assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
+}
+
+/// A legacy `:autocmd` body keeps the `s:` scope of the script that defined
+/// it (`autocmd.c` stores `sc_sid` on the entry). Without that, a body defined
+/// in `runtime/ftplugin.vim` calls `s:LoadFTPlugin()` under whichever script is
+/// running when the event fires and raises E117.
+#[test]
+fn an_autocmd_body_keeps_its_defining_script_scope() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert(
+        "sid-def.vim",
+        "let g:hits = 0\nfunc! s:Bump()\n  let g:hits += 1\nendfunc\nau FileType * call s:Bump()\n",
+    );
+    executor.scripts().io().insert("sid-fire.vim", "set filetype=x\n");
+    executor
+        .execute_line(&editor, "source sid-def.vim")
+        .unwrap_or_else(|error| panic!("source the definition: {error:?}"));
+    executor
+        .execute_line(&editor, "source sid-fire.vim")
+        .unwrap_or_else(|error| panic!("source the trigger: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "the body ran under its defining script"
+    );
 }
 
 /// `<q-bang>` is the quoted bang: `"!"` when the command carried one, `""`
@@ -11474,7 +11499,7 @@ fn autocmd_once_flag_fires_once_and_stores_clean_pattern() {
     assert!(!definitions[0].nested);
     assert_eq!(
         definitions[0].kind,
-        AutocmdKind::ExString("let g:hit = 1".to_owned())
+        AutocmdKind::ExString { source: "let g:hit = 1".to_owned(), script: None }
     );
 
     executor.scripts().io().insert("once.py", "x");
@@ -11530,6 +11555,9 @@ fn autocmd_nested_flag_parses_and_duplicates_are_e983() {
     assert!(!trailing.nested);
     assert_eq!(
         trailing.kind,
-        AutocmdKind::ExString("nested_call()".to_owned())
+        AutocmdKind::ExString {
+            source: "nested_call()".to_owned(),
+            script: None,
+        }
     );
 }

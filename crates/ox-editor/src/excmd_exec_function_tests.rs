@@ -2359,7 +2359,7 @@ fn expand_builtin_resolves_autocmd_special_tokens_during_event() {
             .register_legacy(
                 &[Event::FileReadPre],
                 pattern,
-                &AutocmdKind::ExString(body.to_owned()),
+                &AutocmdKind::ExString { source: body.to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -2409,7 +2409,7 @@ fn expand_builtin_restores_autocmd_context_after_nested_event() {
             .register_legacy(
                 &[Event::FileReadPre],
                 pattern,
-                &AutocmdKind::ExString(body.to_owned()),
+                &AutocmdKind::ExString { source: body.to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();

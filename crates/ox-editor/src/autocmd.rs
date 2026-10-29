@@ -225,8 +225,15 @@ pub struct AutocmdEntryId(pub u64);
 /// Host-owned action referenced by an autocommand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutocmdKind {
-    /// Ex source to execute later.
-    ExString(String),
+    /// Ex source to execute later, with the script that defined it so an `s:`
+    /// reference in the body keeps that script's scope. `None` means the
+    /// definition had no script context.
+    ExString {
+        /// The Ex source registered for this entry.
+        source: String,
+        /// The `s:` script that defined the body (`autocmd.c` `sc_sid`).
+        script: Option<crate::script::Sid>,
+    },
     /// Named zero-argument Vimscript function to invoke later.
     VimscriptFunction(String),
     /// Lua registry callback identity to invoke later.

@@ -3374,7 +3374,7 @@ fn top_level_same_value_writes_fire_twice_and_once_consumes_one() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3384,7 +3384,7 @@ fn top_level_same_value_writes_fire_twice_and_once_consumes_one() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:onces = exists('g:onces') ? g:onces + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:onces = exists('g:onces') ? g:onces + 1 : 1".to_owned(), script: None },
             &AutocmdOptions {
                 once: true,
                 ..AutocmdOptions::default()
@@ -3411,7 +3411,7 @@ fn same_value_filetype_inside_a_nested_handler_does_not_recurse() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3421,7 +3421,7 @@ fn same_value_filetype_inside_a_nested_handler_does_not_recurse() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("set filetype=python".to_owned()),
+            &AutocmdKind::ExString { source: "set filetype=python".to_owned(), script: None },
             &AutocmdOptions {
                 nested: true,
                 ..AutocmdOptions::default()
@@ -3447,7 +3447,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("set filetype=lua".to_owned()),
+            &AutocmdKind::ExString { source: "set filetype=lua".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3457,7 +3457,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("let g:outer_match = expand('<amatch>')".to_owned()),
+            &AutocmdKind::ExString { source: "let g:outer_match = expand('<amatch>')".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3467,7 +3467,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "lua",
-            &AutocmdKind::ExString("let g:inner_match = expand('<amatch>')".to_owned()),
+            &AutocmdKind::ExString { source: "let g:inner_match = expand('<amatch>')".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3496,7 +3496,7 @@ fn query_display_and_failed_writes_never_fire_filetype() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
