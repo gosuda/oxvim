@@ -12292,6 +12292,26 @@ fn dictwatcher_fires_on_scope_variable_set() {
     );
 }
 
+/// A scope-namespace watcher receives the same `g:` object the read path
+/// hands out: `a:dict isnot g:` inside the callback is false, because one
+/// stable dict mirrors the scope map for the session.
+#[test]
+fn dictwatcher_scope_callback_dict_is_the_scope_dict() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_identity.vim",
+            "function! Changed(d, k, c)\n  call add(g:log, a:d isnot g: ? 'identity-mismatch' : 'identity-ok')\nendfunction\nlet g:log = []\ncall dictwatcheradd(g:, 'watched', 'Changed')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:[\"watched\"] = \"test\"").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "log"),
+        vec!["identity-ok".to_owned()]
+    );
+}
+
 /// The `g:['k']` subscript spelling writes the scope variable itself (not a
 /// snapshot), so its watcher round matches the plain spelling: an add
 /// carries `new` only and the removal carries `old` only.
