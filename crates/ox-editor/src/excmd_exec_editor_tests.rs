@@ -11926,6 +11926,93 @@ fn dictwatcher_fires_on_unlet_with_old_only() {
         "unexpected olds: {olds:?}"
     );
 }
+/// `remove()` on a watched dictionary notifies with `old` and no `new`,
+/// the same change shape as `unlet` (`tv_dict_watcher_notify`).
+#[test]
+fn dictwatcher_fires_on_remove_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_remove.vim",
+            "function! WatchRemoveCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'k': 1}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:d, '*', 'WatchRemoveCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call remove(g:d, 'k')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("k".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `extend()` notifies once per added or replaced key: a replaced key
+/// carries both `old` and `new`, a new key carries `new` only.
+#[test]
+fn dictwatcher_fires_on_extend_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_extend.vim",
+            "function! WatchExtendCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'k': 1}\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:d, '*', 'WatchExtendCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call extend(g:d, {'k': 2, 'n': 3})")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 1), ("n".to_owned(), 1, 0)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(2), ox_types::Typval::Number(3)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `filter()` notifies once per removed key with `old` and no `new`;
+/// kept keys notify nothing.
+#[test]
+fn dictwatcher_fires_on_filter_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_filter.vim",
+            "function! WatchFilterCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'a': 1, 'b': 2}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:d, '*', 'WatchFilterCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call filter(g:d, 'v:val > 1')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("a".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
 
 /// A watcher callback that writes the same dictionary does not re-enter its
 /// own round: the nested mutation drains while the outer round still holds

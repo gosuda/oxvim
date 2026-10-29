@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
-use ox_types::{DictEntry, DictEntryFlags, EntryValueLock, Funcref, OxStr, Special, Typval};
+use ox_types::{DictEntry, DictEntryFlags, DictRef, EntryValueLock, Funcref, OxStr, Special, Typval};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use unicode_segmentation::UnicodeSegmentation;
@@ -146,6 +146,7 @@ pub struct Builtins<'a> {
     regex: Option<&'a dyn RegexEngine>,
     closures: ClosureRegistry,
     ambiguous_wide: bool,
+    watch_events: Option<Vec<(DictRef, Vec<u8>, Option<Typval>, Option<Typval>)>>,
 }
 
 impl<'a> Builtins<'a> {
@@ -156,6 +157,7 @@ impl<'a> Builtins<'a> {
             regex: Some(regex),
             closures: ClosureRegistry::new(),
             ambiguous_wide: false,
+            watch_events: None,
         }
     }
 
@@ -166,6 +168,7 @@ impl<'a> Builtins<'a> {
             regex: None,
             closures: ClosureRegistry::new(),
             ambiguous_wide: false,
+            watch_events: None,
         }
     }
 
@@ -187,6 +190,26 @@ impl<'a> Builtins<'a> {
     #[must_use]
     pub const fn closure_registry(&self) -> &ClosureRegistry {
         &self.closures
+    }
+
+    /// Enables the dictionary-mutation sink: subsequent `remove()`,
+    /// `extend()`, and `filter()` calls on live dictionaries record
+    /// `(dict, key, old, new)` here. Unset by default, so unit-test
+    /// dispatchers stay inert.
+    pub fn set_dict_watch_sink(&mut self) {
+        if self.watch_events.is_none() {
+            self.watch_events = Some(Vec::new());
+        }
+    }
+
+    #[must_use]
+    pub fn take_dict_watch_events(
+        &mut self,
+    ) -> Vec<(DictRef, Vec<u8>, Option<Typval>, Option<Typval>)> {
+        self.watch_events
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
     // Upstream's builtin dispatch is one giant if/else chain; this match mirrors it.
     #[allow(clippy::too_many_lines)]
@@ -238,7 +261,8 @@ impl<'a> Builtins<'a> {
             "executable" => path_builtins::executable(&args[0]),
             "exepath" => path_builtins::exepath(&args[0]),
             "exists" => exists(&args[0], scope),
-            "extend" | "extendnew" => extend(args),
+            "extend" => extend(self, args),
+            "extendnew" => extendnew(self, args),
             "flatten" => flatten(&args, true),
             "flattennew" => flatten(&args, false),
             "findfile" => path_builtins::findfilendir(
@@ -294,7 +318,7 @@ impl<'a> Builtins<'a> {
             "pow" => float_binary(&args, f64::powf),
             "printf" => printf_builtin(&args),
             "range" => range(&args),
-            "remove" => remove(&args),
+            "remove" => remove(self, &args),
             "repeat" => repeat(&args),
             "resolve" => path_builtins::resolve(&args[0]),
             "pathshorten" => pathshorten(&args),
@@ -863,17 +887,23 @@ impl<'a> Builtins<'a> {
                             }
                             CollectionOp::Filter => {
                                 if !mapped.is_truthy() {
-                                    let mut data =
-                                        reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                    let Some(index) = data
-                                        .entries
-                                        .iter()
-                                        .position(|candidate| candidate.key == entry.key)
-                                    else {
-                                        return Err(borrow_error());
+                                    let removed = {
+                                        let mut data = reference
+                                            .try_borrow_mut()
+                                            .map_err(|_| borrow_error())?;
+                                        let Some(index) = data
+                                            .entries
+                                            .iter()
+                                            .position(|candidate| candidate.key == entry.key)
+                                        else {
+                                            return Err(borrow_error());
+                                        };
+                                        check_deletable(&data.entries[index], "filter() argument")?;
+                                        data.entries.remove(index)
                                     };
-                                    check_deletable(&data.entries[index], "filter() argument")?;
-                                    data.entries.remove(index);
+                                    let key = removed.key.as_bytes().to_vec();
+                                    let old = Some(removed.value);
+                                    host.record_dict_mutation(reference, &key, old, None);
                                 }
                             }
                             CollectionOp::MapNew => output.push((entry.key, mapped)),
@@ -1426,6 +1456,18 @@ impl BuiltinHost for Builtins<'_> {
             ));
         }
         self.dispatch(&name_text, args, scope)
+    }
+
+    fn record_dict_mutation(
+        &mut self,
+        dict: &DictRef,
+        key: &[u8],
+        old: Option<Typval>,
+        new: Option<Typval>,
+    ) {
+        if let Some(events) = self.watch_events.as_mut() {
+            events.push((Rc::clone(dict), key.to_vec(), old, new));
+        }
     }
 
     fn closure_registry(&self) -> Option<ClosureRegistry> {
@@ -3969,7 +4011,19 @@ fn count(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::Number(saturating_i64(total)))
 }
 
-fn extend(mut args: Vec<Typval>) -> Result<Typval> {
+fn extend<H: BuiltinHost>(host: &mut H, args: Vec<Typval>) -> Result<Typval> {
+    extend_common(host, args, true)
+}
+
+fn extendnew<H: BuiltinHost>(host: &mut H, args: Vec<Typval>) -> Result<Typval> {
+    extend_common(host, args, false)
+}
+
+fn extend_common<H: BuiltinHost>(
+    host: &mut H,
+    mut args: Vec<Typval>,
+    notify: bool,
+) -> Result<Typval> {
     let mode = if args.len() > 2 {
         Some(string_arg(&args[2])?)
     } else {
@@ -4018,12 +4072,23 @@ fn extend(mut args: Vec<Typval>) -> Result<Typval> {
                         b"force" => {
                             check_value_lock(existing.value_lock, "extend() argument")?;
                             check_writable(existing.flags, "extend() argument")?;
+                            let old = Some(existing.value.clone());
+                            let new = Some(entry.value.clone());
+                            let key = existing.key.as_bytes().to_vec();
                             existing.value = entry.value;
+                            if notify {
+                                host.record_dict_mutation(left_ref, &key, old, new);
+                            }
                         }
                         _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
                     }
                 } else {
+                    let key = entry.key.as_bytes().to_vec();
+                    let new = Some(entry.value.clone());
                     left.entries.push(DictEntry::new(entry.key, entry.value));
+                    if notify {
+                        host.record_dict_mutation(left_ref, &key, None, new);
+                    }
                 }
             }
             drop(left);
@@ -4392,7 +4457,7 @@ fn range(args: &[Typval]) -> Result<Typval> {
     Ok(Typval::list(values))
 }
 
-fn remove(args: &[Typval]) -> Result<Typval> {
+fn remove<H: BuiltinHost>(host: &mut H, args: &[Typval]) -> Result<Typval> {
     let first = number_arg(&args[1])?;
     let last = args.get(2).map(number_arg).transpose()?;
     let dict_key = string_arg(&args[1]).ok();
@@ -4437,7 +4502,12 @@ fn remove(args: &[Typval]) -> Result<Typval> {
                 .ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
             // `tv_dict_remove` (`typval.c:3439`): fixed, then read-only.
             check_deletable(&data.entries[index], "remove() argument")?;
-            Ok(data.entries.remove(index).value)
+            let removed = data.entries.remove(index);
+            let key_bytes = removed.key.as_bytes().to_vec();
+            let old = Some(removed.value.clone());
+            let value = removed.value;
+            host.record_dict_mutation(reference, &key_bytes, old, None);
+            Ok(value)
         }
         _ => Err(EvalError::new(
             "E896",

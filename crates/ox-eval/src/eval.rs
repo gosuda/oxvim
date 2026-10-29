@@ -85,6 +85,21 @@ pub trait BuiltinHost {
     /// user-function frames can bind it as `self` for the next call.
     fn set_call_receiver(&mut self, _receiver: Option<ox_types::DictRef>) {}
 
+    /// Reports one successful dictionary mutation for watcher notification.
+    ///
+    /// `dict` is the live mutated dictionary, `key` its byte key, `old` the
+    /// previous value (`None` for a newly added key) and `new` the new value
+    /// (`None` for a removal). The default drops the report, so hosts without
+    /// watchers (including unit-test dispatchers) keep working unchanged.
+    fn record_dict_mutation(
+        &mut self,
+        _dict: &ox_types::DictRef,
+        _key: &[u8],
+        _old: Option<Typval>,
+        _new: Option<Typval>,
+    ) {
+    }
+
     /// Registry shared with callback-capable builtins, when this host owns one.
     fn closure_registry(&self) -> Option<ClosureRegistry> {
         None

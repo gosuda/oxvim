@@ -4220,10 +4220,16 @@ pub(crate) fn eval_text<F: FileIO, E: ExEditorAccess>(
         call_receiver: None,
     };
     let result = Evaluator::new(&mut host, &regex).eval(&expression, scope);
-    if let Some(exception) = host.escaped_exception {
+    let EvalHost {
+        runtime,
+        escaped_exception,
+        ..
+    } = host;
+    drain_dict_watchers(runtime, access, scope, lua);
+    if let Some(exception) = escaped_exception {
         return Err(Flow::Exception(exception));
     }
-    result.map_err(|error| eval_error_flow(host.runtime, error))
+    result.map_err(|error| eval_error_flow(runtime, error))
 }
 
 /// Serve one builtin call through the same [`EvalHost`] a Vimscript
@@ -4255,7 +4261,13 @@ fn call_builtin_dispatch<F: FileIO, E: ExEditorAccess>(
     } else {
         BuiltinHost::call(&mut host, name, args.to_vec(), scope)
     };
-    if let Some(exception) = host.escaped_exception {
+    let EvalHost {
+        runtime,
+        escaped_exception,
+        ..
+    } = host;
+    drain_dict_watchers(runtime, access, scope, lua);
+    if let Some(exception) = escaped_exception {
         return Err(ExecError::Vim(exception));
     }
     result.map_err(ExecError::Eval)
@@ -4291,6 +4303,22 @@ pub(crate) struct EvalHost<'a, F: FileIO, E: ExEditorAccess> {
 }
 
 impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
+    fn record_dict_mutation(
+        &mut self,
+        dict: &ox_types::DictRef,
+        key: &[u8],
+        old: Option<Typval>,
+        new: Option<Typval>,
+    ) {
+        self.runtime.dict_watch_events.push(DictWatchEvent {
+            target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
+            dict: Some(Typval::Dict(Rc::clone(dict))),
+            key: key.to_vec(),
+            old,
+            new,
+        });
+    }
+
     fn set_call_receiver(&mut self, receiver: Option<ox_types::DictRef>) {
         self.call_receiver = receiver;
     }
@@ -4376,7 +4404,18 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
             let regex = VimRegex;
             return ox_eval::call_higher_order_builtin(self, &regex, &name_text, args, scope);
         }
-        self.builtins.call(name, args, scope)
+        self.builtins.set_dict_watch_sink();
+        let result = self.builtins.call(name, args, scope);
+        for (dict, key, old, new) in self.builtins.take_dict_watch_events() {
+            self.runtime.dict_watch_events.push(DictWatchEvent {
+                target: WatchTarget::Dict(Rc::as_ptr(&dict) as usize),
+                dict: Some(Typval::Dict(Rc::clone(&dict))),
+                key,
+                old,
+                new,
+            });
+        }
+        result
     }
 
     /// Identity-carrying entry point the evaluator uses for every call: only
