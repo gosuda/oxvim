@@ -710,3 +710,24 @@ A minimal reproduction of one E117 sample (`s:Hello()` called from an `au
 FileType` defined in the same script) answers `yes` on both binaries, so that
 cluster comes from a different script-context path than the simple case and
 needs its own reproducer before any fix.
+
+
+### `s:` in autocmd bodies: measured effect
+
+`a20c5e0` makes an autocmd body run under the script that defined it. The
+`runtime/ftplugin.vim` failure (`au FileType * call s:LoadFTPlugin()`) no longer
+appears in the oldtest messages at all, and one file moved a long way.
+
+| Measure | Before | After |
+|---|---|---|
+| executed | 3764 | 3285 |
+| failed | 2364 | 2055 |
+| skipped | 693 | 571 |
+| blocked | 39 | 45 |
+| clean files | 11 | 11 |
+| `test_cmdline.vim` failed | 364 | 121 |
+
+Both runs are full `just oldtest` passes over the same 236 files. The failure
+count drops by 309; the block count rises by 6, so part of the change is tests
+that now reach a later, unsupported feature instead of failing at the handler.
+`test_cmdline.vim` accounts for 243 of the drop.
