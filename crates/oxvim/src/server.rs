@@ -525,8 +525,10 @@ pub(crate) fn build_embedded_core(
         .map_err(|error| AppError::Lua(error.to_string()))?;
     bind_variables(
         lua.lua(),
-        Rc::new(EditorVariables {
+        Rc::new(ServerVariables {
             session: session.clone(),
+            ex: ex.clone(),
+            nested_ex: nested_ex.clone(),
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -4437,6 +4439,74 @@ impl VariableHost for EditorVariables {
     }
 }
 
+/// Lua variable access for the embedded server: every scope but `g:` reads
+/// and writes the editor's canonical API dictionaries, while `g:` runs on
+/// the live executor pair (via [`write_global_var`]) so a scope watcher
+/// registered on `g:` fires the way `:let`/`unlet` fire it, with no editor
+/// borrow held while the round runs. `b:`/`w:`/`t:` keep the silent map
+/// write. [`EditorVariables`] keeps the same silent write for hostless
+/// contexts (the script runner installs no command host, so there is no
+/// hook to route through); the embedded server always binds this host.
+struct ServerVariables {
+    session: Rc<ApiSession>,
+    ex: Rc<RefCell<ExExecutor>>,
+    nested_ex: Rc<RefCell<ExExecutor>>,
+}
+
+impl VariableHost for ServerVariables {
+    fn get_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: &OxStr,
+    ) -> Result<Option<Object>, String> {
+        self.session.with_editor(|editor| {
+            let variables = variables(editor, scope, handle)?;
+            Ok(variables.get(name).cloned())
+        })
+    }
+
+    fn set_var(
+        &self,
+        scope: VariableScope,
+        handle: i64,
+        name: OxStr,
+        value: Option<Object>,
+    ) -> Result<(), String> {
+        if scope == VariableScope::Vim && !vim_variable_is_writable(name.as_bytes()) {
+            return Err(format!(
+                "E46: Cannot change read-only variable \"{}\"",
+                name.to_string_lossy()
+            ));
+        }
+        if scope == VariableScope::Global {
+            // Deleting a missing key is a silent no-op, matching `vim.g`
+            // (unlike `nvim_del_var`'s "Key not found").
+            if value.is_none()
+                && !self
+                    .session
+                    .with_editor(|editor| editor.gvars().get(&name).is_some())
+            {
+                return Ok(());
+            }
+            return write_global_var(&self.session, &self.ex, &self.nested_ex, &name, value)
+                .map_err(|error| error.to_string());
+        }
+        self.session.with_editor_mut(|editor| {
+            let variables = variables_mut(editor, scope, handle)?;
+            if let Some(value) = value {
+                variables.insert(name, value);
+            } else {
+                let index = variables.iter().position(|(key, _)| key == &name);
+                if let Some(index) = index {
+                    variables.0.remove(index);
+                }
+            }
+            Ok(())
+        })
+    }
+}
+
 fn variables(editor: &Editor, scope: VariableScope, handle: i64) -> Result<&Dict, String> {
     match scope {
         VariableScope::Global => Ok(editor.gvars()),
@@ -5165,6 +5235,61 @@ fn map_parse_error(error: ExecError) -> ApiError {
     }
 }
 
+/// Writes or deletes one `g:` variable through the live executor pair, so a
+/// scope watcher registered on `g:` fires the way `:let`/`unlet` fire it.
+///
+/// The primary executor runs the write when it is free, otherwise the nested
+/// one -- the same tiering [`ServerCommandHost`] uses for reentrant commands.
+/// `None` deletes; a missing key there is the caller's silent no-op or error
+/// to report. The write drains its watcher round with no editor borrow held
+/// (inside [`ExExecutor::set_global_var`]/[`ExExecutor::remove_global_var`]),
+/// exactly like the `:let` path, so no `deliver_pending_lua_flush` follows.
+fn write_global_var(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    name: &OxStr,
+    value: Option<Object>,
+) -> Result<(), ApiError> {
+    if let Ok(mut guard) = ex.try_borrow_mut() {
+        return match value {
+            Some(value) => guard
+                .set_global_var(session, name, value)
+                .map_err(map_api_exec_error),
+            None => guard
+                .remove_global_var(session, name)
+                .map_err(map_api_exec_error),
+        };
+    }
+    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
+        return Err(ApiError::exception(
+            "no free Ex executor for a nested command",
+        ));
+    };
+    match value {
+        Some(value) => nested
+            .set_global_var(session, name, value)
+            .map_err(map_api_exec_error),
+        None => nested
+            .remove_global_var(session, name)
+            .map_err(map_api_exec_error),
+    }
+}
+
+/// Restores `nvim_del_var`'s validation error for a missing key. The
+/// executor reports it as an [`ExecError::Editor`] failure, which
+/// [`map_api_exec_error`] turns into an exception; the legacy silent path
+/// (and upstream) reports `Validation` ("Key not found"), so remap that one
+/// message and leave every other executor error untouched.
+fn map_del_global_var_error(error: ApiError) -> ApiError {
+    match error {
+        ApiError::Exception(message) if message.starts_with("Key not found") => {
+            ApiError::validation(message)
+        }
+        other => other,
+    }
+}
+
 #[derive(Clone)]
 struct ServerCommandHost {
     session: Rc<ApiSession>,
@@ -5428,6 +5553,20 @@ impl CommandExecutor for ServerCommandHost {
             .map_err(|error| map_api_exec_error(error))
     }
 
+    fn set_global_var(
+        &mut self,
+        session: &ApiSession,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        write_global_var(session, &self.ex, &self.nested_ex, &name, Some(value))
+    }
+
+    fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+        write_global_var(session, &self.ex, &self.nested_ex, &name, None)
+            .map_err(map_del_global_var_error)
+    }
+
     fn fork(&self) -> Option<Box<dyn CommandExecutor>> {
         let (ex, nested_ex) = fresh_executors(
             &self.lua,
@@ -5521,6 +5660,24 @@ impl CommandExecutor for ExApiExecutor<'_> {
         self.executor
             .evaluate_expression(session, expression)
             .map_err(|error| map_api_exec_error(error))
+    }
+
+    fn set_global_var(
+        &mut self,
+        session: &ApiSession,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .set_global_var(session, &name, value)
+            .map_err(map_api_exec_error)
+    }
+
+    fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+        self.executor
+            .remove_global_var(session, &name)
+            .map_err(map_api_exec_error)
+            .map_err(map_del_global_var_error)
     }
 
     fn call_builtin(
@@ -5929,6 +6086,8 @@ fn with_scoped_editor_api<T>(
                 },
             )?)?,
         )?;
+        let setvar_ex = ex.clone();
+        let setvar_nested = nested_ex.clone();
         let setvar_ctx = context.clone();
         vim.set(
             "_setvar",
@@ -5961,6 +6120,25 @@ fn with_scoped_editor_api<T>(
                             Err(error) => return scoped_failure(lua, error),
                         }
                     };
+                    if scope == VariableScope::Global {
+                        // `g:` writes run on the live executor pair so a scope
+                        // watcher fires the way `:let` fires it, with no editor
+                        // borrow held while the round runs. Deleting a missing
+                        // key is a silent no-op, matching `vim.g` today
+                        // (unlike `nvim_del_var`'s "Key not found").
+                        let session = setvar_ctx.session();
+                        if value.is_none()
+                            && !session.with_editor(|editor| editor.gvars().get(&name).is_some())
+                        {
+                            return Ok((true, Value::Nil));
+                        }
+                        if let Err(error) =
+                            write_global_var(session, &setvar_ex, &setvar_nested, &name, value)
+                        {
+                            return scoped_failure(lua, error);
+                        }
+                        return Ok((true, Value::Nil));
+                    }
                     setvar_ctx.session().with_editor_mut(|editor| {
                         let variables = match variables_mut(editor, scope, handle) {
                             Ok(variables) => variables,

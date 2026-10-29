@@ -135,6 +135,55 @@ pub trait CommandExecutor {
         args: Vec<Typval>,
     ) -> Result<Typval, ApiError>;
 
+    /// Writes one `g:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `g:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Global)` event and drain it after the editor
+    /// borrow is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_global_var(
+        &mut self,
+        session: &ApiSession,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor.gvars_mut().insert(name, value);
+        });
+        Ok(())
+    }
+
+    /// Deletes one `g:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `g:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Global)` event and drain it after the editor
+    /// borrow is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor.gvars_mut();
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
     /// Changes the process working directory globally.
     ///
     /// `path` is valid UTF-8. The host retains the previous directory for
@@ -1036,6 +1085,15 @@ pub fn nvim_set_vvar(session: &ApiSession, name: OxStr, value: Object) -> Result
     Ok(())
 }
 
+/// Whether an Ex-command host is installed (or forkable from the prototype),
+/// so `g:` writes go through the evaluator and notify scope watchers instead
+/// of mutating the editor map silently.
+fn host_present(session: &ApiSession) -> bool {
+    session.with_state(|state| {
+        state.command_depth < state.command_pool.len() || state.command_prototype.is_some()
+    })
+}
+
 #[api(since = 1)]
 #[expect(
     clippy::needless_pass_by_value,
@@ -1049,10 +1107,15 @@ pub fn nvim_get_var(session: &ApiSession, name: OxStr) -> Result<Object, ApiErro
 
 #[api(since = 1)]
 #[expect(
-    clippy::unnecessary_wraps,
-    reason = "`#[api]` handlers must return `Result` for the generated dispatcher"
+    clippy::needless_pass_by_value,
+    reason = "the generated dispatcher binds and moves owned RPC arguments"
 )]
 pub fn nvim_set_var(session: &ApiSession, name: OxStr, value: Object) -> Result<(), ApiError> {
+    if host_present(session) {
+        return with_command_executor(session, |session, executor| {
+            executor.set_global_var(session, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         editor.gvars_mut().insert(name, value);
     });
@@ -1065,6 +1128,11 @@ pub fn nvim_set_var(session: &ApiSession, name: OxStr, value: Object) -> Result<
     reason = "the generated dispatcher binds and moves owned RPC arguments"
 )]
 pub fn nvim_del_var(session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+    if host_present(session) {
+        return with_command_executor(session, |session, executor| {
+            executor.del_global_var(session, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         let variables = editor.gvars_mut();
         let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
@@ -4106,4 +4174,231 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     )?;
     registry.register(nvim_input_mouse__API_META(), nvim_input_mouse__API_DISPATCH)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test scaffolding unwraps proven setup values"
+)]
+mod api_scope_watch_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Test host delegating every exercised entry point to the live
+    /// [`ox_editor::ExExecutor`], the same owner the production hosts wrap.
+    /// Only the `g:` write pair matters here; unrelated trait methods report
+    /// themselves as unimplemented.
+    struct LiveHost {
+        executor: Rc<RefCell<ox_editor::ExExecutor>>,
+    }
+
+    impl LiveHost {
+        fn api_error(error: ox_editor::ExecError) -> ApiError {
+            ApiError::exception(error.to_string())
+        }
+    }
+
+    impl CommandExecutor for LiveHost {
+        fn execute(
+            &mut self,
+            session: &ApiSession,
+            commands: &[ExCommand],
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .execute_commands(session, commands)
+                .map(|_| ())
+                .map_err(Self::api_error)
+        }
+
+        fn define_user_command(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+            _command: UserCommand,
+            _force: bool,
+        ) -> Result<(), ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn delete_user_command(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+            _name: &str,
+        ) -> Result<(), ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn list_user_commands(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+        ) -> Result<Vec<UserCommand>, ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn parse_cmdline(
+            &mut self,
+            session: &ApiSession,
+            line: &str,
+        ) -> Result<Vec<ExCommand>, ApiError> {
+            let executor = self.executor.borrow();
+            session
+                .with_editor(|editor| executor.parse_commands(editor, line))
+                .map_err(Self::api_error)
+        }
+
+        fn remove_buffer(&mut self, buffer: BufHandle) -> Result<(), ApiError> {
+            self.executor.borrow_mut().remove_buffer(buffer);
+            Ok(())
+        }
+
+        fn evaluate(&mut self, session: &ApiSession, expression: &str) -> Result<Typval, ApiError> {
+            self.executor
+                .borrow_mut()
+                .evaluate_expression(session, expression)
+                .map_err(Self::api_error)
+        }
+
+        fn call_builtin(
+            &mut self,
+            session: &ApiSession,
+            name: &OxStr,
+            args: Vec<Typval>,
+        ) -> Result<Typval, ApiError> {
+            self.executor
+                .borrow_mut()
+                .call_builtin(session, name, args)
+                .map_err(Self::api_error)
+        }
+
+        fn change_directory(&mut self, session: &ApiSession, path: &str) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .change_directory(session, path)
+                .map_err(Self::api_error)
+        }
+
+        fn set_global_var(
+            &mut self,
+            session: &ApiSession,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_global_var(session, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_global_var(session, &name)
+                .map_err(Self::api_error)
+        }
+    }
+
+    fn session_with_live_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>) {
+        let mut editor = Editor::new();
+        editor.create_buffer(true).unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        let executor = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        crate::set_command_executor(
+            &session,
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+        );
+        (session, executor)
+    }
+
+    fn install_scope_watcher(session: &ApiSession, executor: &RefCell<ox_editor::ExExecutor>) {
+        // The callback records `[key, has_new, has_old]` per notification, the
+        // same shape the scope-`remove()` tests assert on the Ex side.
+        executor
+            .borrow_mut()
+            .execute_script(
+                session,
+                "watch_setup.vim",
+                "function! Changed(d, k, c)\n  call add(g:seen, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:seen = []\ncall dictwatcheradd(g:, 'watched', 'Changed')",
+            )
+            .unwrap();
+    }
+
+    fn seen(session: &ApiSession) -> Object {
+        nvim_get_var(session, OxStr::from("seen")).unwrap()
+    }
+
+    fn row(key: &str, has_new: i64, has_old: i64) -> Object {
+        Object::Array(vec![
+            Object::String(OxStr::from(key)),
+            Object::Integer(has_new),
+            Object::Integer(has_old),
+        ])
+    }
+
+    #[test]
+    fn nvim_set_var_fires_scope_watcher_with_new() {
+        let (session, executor) = session_with_live_host();
+        install_scope_watcher(&session, &executor);
+        nvim_set_var(
+            &session,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        // The write itself lands where `nvim_get_var` reads it.
+        assert_eq!(
+            nvim_get_var(&session, OxStr::from("watched")).unwrap(),
+            Object::String(OxStr::from("test"))
+        );
+        // The API write notifies with `new` and no `old`, exactly like the
+        // `:let` write the reference reports.
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 1, 0)]));
+        // A later `remove()` on the same key then reports the API-written
+        // value as `old`: this is the `remove() when updated with
+        // nvim_*_var` reference sequence.
+        executor
+            .borrow_mut()
+            .execute_line(&session, "call remove(g:, 'watched')")
+            .unwrap();
+        assert_eq!(
+            seen(&session),
+            Object::Array(vec![row("watched", 1, 0), row("watched", 0, 1)])
+        );
+    }
+
+    #[test]
+    fn nvim_del_var_fires_scope_watcher_with_old() {
+        let (session, executor) = session_with_live_host();
+        install_scope_watcher(&session, &executor);
+        nvim_set_var(
+            &session,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        executor
+            .borrow_mut()
+            .execute_line(&session, "let g:seen = []")
+            .unwrap();
+        nvim_del_var(&session, OxStr::from("watched")).unwrap();
+        // The API removal drops the variable and notifies with `old` and no
+        // `new`, the same change shape as `unlet`.
+        assert!(nvim_get_var(&session, OxStr::from("watched")).is_err());
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 0, 1)]));
+        // Deleting a missing key keeps the `Key not found` error.
+        let error = nvim_del_var(&session, OxStr::from("watched")).unwrap_err();
+        assert!(
+            error.to_string().contains("Key not found"),
+            "missing key keeps its error: {error:?}"
+        );
+    }
 }

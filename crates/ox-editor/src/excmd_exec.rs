@@ -1855,6 +1855,93 @@ impl<F: FileIO> ExExecutor<F> {
         result
     }
 
+    /// Writes one `g:` variable on behalf of the API surface (`nvim_set_var`),
+    /// recording a scope-namespace watch event the way `:let` does.
+    ///
+    /// The previous value is read before the write and carried as `old`
+    /// (`None` for a new key). The value converts with the same
+    /// [`object_to_typval`] the scope read-sync uses, so the API write lands
+    /// exactly where `nvim_get_var` reads it. The scope syncs back into the
+    /// editor before the round fires, so callbacks re-entering through the
+    /// API observe the write; a second sync after the drain keeps callback
+    /// mutations, the same single-post-sync discipline [`Self::call_builtin`]
+    /// uses. No callback runs under an editor borrow.
+    ///
+    /// # Errors
+    ///
+    /// Returns the scope sync failure or the scoped-write failure.
+    pub fn set_global_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        name: &OxStr,
+        value: Object,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let value = object_to_typval(&value);
+        let old = self
+            .scope
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .ok()
+            .cloned();
+        self.scope
+            .set_scoped(ScopeKind::Global, name.as_bytes(), 0, value.clone())
+            .map_err(ExecError::Eval)?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Global,
+            name.as_bytes(),
+            old,
+            Some(value),
+        );
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Deletes one `g:` variable on behalf of the API surface (`nvim_del_var`),
+    /// recording a scope-namespace watch event carrying `old` and no `new`,
+    /// the same change shape as `remove()` on a scope namespace.
+    ///
+    /// Firing follows [`Self::set_global_var`]: sync into the editor, drain
+    /// with no editor borrow held, then sync again for callback mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] naming the missing key, or the scope
+    /// sync failure.
+    pub fn remove_global_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        name: &OxStr,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let old = self
+            .scope
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .ok()
+            .cloned();
+        if !self.scope.remove_pair(ScopeKind::Global, name.as_bytes()) {
+            return Err(ExecError::Editor(format!(
+                "Key not found: {}",
+                name.to_string_lossy()
+            )));
+        }
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Global,
+            name.as_bytes(),
+            old,
+            None,
+        );
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
     /// Evaluates one Vimscript expression in this executor's persistent scope.
     ///
     /// # Errors
