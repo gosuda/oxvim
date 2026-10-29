@@ -492,11 +492,12 @@ impl UserFunctions {
     /// Begins a notification round for one key change
     /// (`tv_dict_watcher_notify` in `eval/typval.c`): snapshots every
     /// watcher on `target` whose pattern matches `key` and marks them busy.
-    /// The caller invokes each pending callback with
+    /// The caller invokes every pending callback with
     /// [`Self::dictwatcher_arguments`] (holding no registry borrow while
-    /// user code runs), skipping watchers that
-    /// [`Self::dictwatcher_is_live`] no longer reports, then closes the
-    /// round with [`Self::dictwatcher_finish`]. Errors from one watcher do
+    /// user code runs), then closes the round with
+    /// [`Self::dictwatcher_finish`]. A watcher deleted mid-round stays in
+    /// the snapshot and still fires; the finish sweep frees it. Per-watcher
+    /// outcomes (continue vs. propagate) are decided by the drain loop.
     pub fn dictwatcher_begin(
         &mut self,
         target: &WatchTarget,
@@ -506,12 +507,13 @@ impl UserFunctions {
         let watchers = registry.watchers.get_mut(target)?;
         let mut pending = Vec::new();
         for watcher in watchers.iter_mut() {
-            // Upstream's notify loop fires only `!watcher->busy`
-            // (`eval/typval.c:2090`): a callback that writes the same
-            // dictionary re-enters through a nested round while the outer
-            // round still holds `busy`, and must not fire again there.
-            if watcher.needs_free
-                || watcher.busy
+            // Upstream's notify loop fires every matcher that is not busy
+            // (`eval/typval.c:2090`): a watcher marked `needs_free` by a
+            // callback deletion still fires when its turn comes in the same
+            // round; the finish sweep frees it. A callback that writes the
+            // same dictionary re-enters through a nested round while the
+            // outer round still holds `busy`, and must not fire again there.
+            if watcher.busy
                 || !watcher.matches(key)
                 || matches!(watcher.callback, WatchCallback::None)
             {
@@ -532,16 +534,17 @@ impl UserFunctions {
         })
     }
 
-    /// Whether the round watcher `id` still wants its call: false once a
-    /// `dictwatcherdel()` (or a nested round's sweep) removed it. Duplicate
-    /// `(pattern, callback)` registrations carry distinct ids, so removing
-    /// one twin leaves the other live.
+    /// Whether the registry still holds the round watcher `id`: false only
+    /// once the entry itself is gone (removed outright, or swept by
+    /// [`Self::dictwatcher_finish`]). A `dictwatcherdel()` during the round
+    /// only marks `needs_free`, so the watcher stays live and still fires
+    /// for the rest of that round. Duplicate `(pattern, callback)`
+    /// registrations carry distinct ids, so removing one twin leaves the
+    /// other live.
     #[must_use]
     pub fn dictwatcher_is_live(&self, target: &WatchTarget, id: u64) -> bool {
         self.watchers.borrow().watchers.get(target).is_some_and(|watchers| {
-            watchers
-                .iter()
-                .any(|watcher| watcher.id == id && !watcher.needs_free)
+            watchers.iter().any(|watcher| watcher.id == id)
         })
     }
 
@@ -1096,8 +1099,9 @@ mod shared_watcher_registry_tests {
         primary.dictwatcher_finish(&target);
     }
 
-    /// A watcher deleted mid-round through one registry is dead on both:
-    /// not live for the rest of the round and swept before the next one.
+    /// A watcher deleted mid-round through one registry stays live for the
+    /// rest of the round on both (its pending entry still fires), and is
+    /// swept before the next round (`eval/typval.c:2090` skips only `busy`).
     #[test]
     fn watcher_deleted_mid_round_is_dead_on_both_registries() {
         let mut primary = UserFunctions::new();
@@ -1124,8 +1128,9 @@ mod shared_watcher_registry_tests {
             b"*",
             &WatchCallback::Name(OxStr::from("Second")),
         ));
-        assert!(!primary.dictwatcher_is_live(&target, second));
-        assert!(!nested.dictwatcher_is_live(&target, second));
+        // Still live: the pending entry fires later in this same round.
+        assert!(primary.dictwatcher_is_live(&target, second));
+        assert!(nested.dictwatcher_is_live(&target, second));
         primary.dictwatcher_finish(&target);
         let round = nested
             .dictwatcher_begin(&target, b"key")

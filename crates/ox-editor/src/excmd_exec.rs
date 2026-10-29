@@ -6096,7 +6096,7 @@ fn list_scoped_variables(editor: &mut Editor, scope: &Scope, args: &str) -> bool
 /// (only present values get an entry) and skips no watcher but a busy one.
 /// Here the mutation leaves cannot run callbacks under their borrow, so this
 /// runs after it is released: for each recorded event it opens a round with
-/// [`UserFunctions::dictwatcher_begin`], dispatches each still-live watcher by
+/// [`UserFunctions::dictwatcher_begin`], dispatches each pending watcher by
 /// callback form — names through [`call_user_function_with_self`],
 /// `Funcref`/`Partial` through the evaluator path the timer delivery uses —
 /// and closes with [`UserFunctions::dictwatcher_finish`]. A scope-namespace
@@ -6177,6 +6177,10 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
             continue;
         };
         for (id, _pattern, callback) in &round.pending {
+            // A pending entry still fires after a mid-round deletion marks it
+            // `needs_free` (`eval/typval.c:2090` skips only `busy` watchers).
+            // Skip only entries a nested round's sweep already freed, so we
+            // never invoke a watcher the registry no longer holds.
             if !runtime.functions.dictwatcher_is_live(&event.target, *id) {
                 continue;
             }
@@ -27599,10 +27603,11 @@ mod shared_watcher_pair_tests {
         nested.runtime.functions.dictwatcher_finish(&target);
     }
 
-    /// A watcher deleted mid-round through one executor is dead on both:
-    /// skipped for the rest of the round and swept before the next one.
-    /// Call frames stay per-executor: sharing registrations must not share
-    /// the active call stack.
+    /// A watcher deleted mid-round through one executor stays live for the
+    /// rest of the round on both (its pending entry still fires), and is
+    /// swept before the next one. Call frames stay per-executor: sharing
+    /// registrations must not share the active call stack.
+    /// (`eval/typval.c:2090` skips only `busy` watchers.)
     #[test]
     fn watcher_deleted_mid_round_is_dead_on_both_executors() {
         let mut primary = ExExecutor::new();
@@ -27631,8 +27636,9 @@ mod shared_watcher_pair_tests {
             b"*",
             &WatchCallback::Name(OxStr::from("Second")),
         ));
-        assert!(!primary.runtime.functions.dictwatcher_is_live(&target, second));
-        assert!(!nested.runtime.functions.dictwatcher_is_live(&target, second));
+        // Still live: the pending entry fires later in this same round.
+        assert!(primary.runtime.functions.dictwatcher_is_live(&target, second));
+        assert!(nested.runtime.functions.dictwatcher_is_live(&target, second));
         primary.runtime.functions.dictwatcher_finish(&target);
         let round = nested
             .runtime
@@ -27739,10 +27745,10 @@ mod shared_watcher_pair_tests {
         assert_eq!(recorded(&nested, "log"), vec!["watched".to_owned()]);
     }
 
-    /// A real `dictwatcherdel()` inside a callback removes the watcher from
-    /// the shared table: a pending watcher later in the same round is
-    /// skipped (`dictwatcher_is_live` fails it) and the round-end sweep
-    /// frees it, so the next round on either executor fires only survivors.
+    /// A real `dictwatcherdel()` inside a callback only marks the shared
+    /// entry: a pending watcher later in the same round still fires
+    /// (`eval/typval.c:2090` skips only `busy` watchers), and the round-end
+    /// sweep frees it, so the next round on either executor fires nothing.
     #[test]
     fn cross_executor_callback_deletion_skips_pending_and_sweeps() {
         let (editor, mut primary) = pair_setup();
@@ -27762,9 +27768,15 @@ mod shared_watcher_pair_tests {
             )
             .unwrap();
         nested.execute_line(&editor, "let g:key = 1").unwrap();
-        assert_eq!(recorded(&nested, "fires"), vec!["first:key".to_owned()]);
+        assert_eq!(
+            recorded(&nested, "fires"),
+            vec!["first:key".to_owned(), "second:key".to_owned()]
+        );
         nested.execute_line(&editor, "let g:key = 2").unwrap();
-        assert_eq!(recorded(&nested, "fires"), vec!["first:key".to_owned()]);
+        assert_eq!(
+            recorded(&nested, "fires"),
+            vec!["first:key".to_owned(), "second:key".to_owned()]
+        );
         assert!(!nested.runtime.functions.has_dictwatchers());
     }
 }

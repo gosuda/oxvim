@@ -12366,32 +12366,34 @@ fn global_number(executor: &ExExecutor<MemoryFileIO>, name: &str) -> i64 {
     }
 }
 
-/// Assumption 1: a watcher callback that removes its own watcher mid-round.
-/// The round must not call a removed watcher afterwards, and the registry
-/// must not keep it alive (`dictwatcher_finish` sweeps `needs_free`).
-/// `WatchFirst` deletes both `WatchSecond` and itself, then fires; only its
-/// own record may appear, and a later mutation must fire nothing at all.
-#[test]
-fn dictwatcher_self_removal_skips_pending_and_frees_registry() {
-    let (editor, mut executor) = setup();
-    executor
-        .execute_script(
-            &editor,
-            "watch_selfdel.vim",
-            "function! WatchFirst(d, k, c)\n  call dictwatcherdel(g:d, '*', 'WatchSecond')\n  call dictwatcherdel(g:d, '*', 'WatchFirst')\n  call add(g:fires, 'first:' . a:k)\nendfunction\nfunction! WatchSecond(d, k, c)\n  call add(g:fires, 'second:' . a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchFirst')\ncall dictwatcheradd(g:d, '*', 'WatchSecond')\n",
-        )
-        .unwrap();
-    executor.execute_line(&editor, "let g:d.a = 1").unwrap();
-    assert_eq!(
-        recorded_strings(&executor, "fires"),
-        vec!["first:a".to_owned()]
-    );
+    /// Assumption 1: a watcher callback that removes its own watcher mid-round.
+    /// The deleted watcher still fires later in the same round
+    /// (`tv_dict_watcher_notify` skips only `busy` watchers), and the
+    /// registry must not keep it alive afterwards (`dictwatcher_finish`
+    /// sweeps `needs_free`). `WatchFirst` deletes both `WatchSecond` and
+    /// itself, then fires; both records appear, and a later mutation must
+    /// fire nothing at all.
+    #[test]
+    fn dictwatcher_self_removal_skips_pending_and_frees_registry() {
+        let (editor, mut executor) = setup();
+        executor
+            .execute_script(
+                &editor,
+                "watch_selfdel.vim",
+                "function! WatchFirst(d, k, c)\n  call dictwatcherdel(g:d, '*', 'WatchSecond')\n  call dictwatcherdel(g:d, '*', 'WatchFirst')\n  call add(g:fires, 'first:' . a:k)\nendfunction\nfunction! WatchSecond(d, k, c)\n  call add(g:fires, 'second:' . a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchFirst')\ncall dictwatcheradd(g:d, '*', 'WatchSecond')\n",
+            )
+            .unwrap();
+        executor.execute_line(&editor, "let g:d.a = 1").unwrap();
+        assert_eq!(
+            recorded_strings(&executor, "fires"),
+            vec!["first:a".to_owned(), "second:a".to_owned()]
+        );
     // Both registrations were swept at round end: a second mutation fires
     // nothing, and deleting again reports no match.
     executor.execute_line(&editor, "let g:d.b = 2").unwrap();
     assert_eq!(
         recorded_strings(&executor, "fires"),
-        vec!["first:a".to_owned()]
+        vec!["first:a".to_owned(), "second:a".to_owned()]
     );
     assert!(
         executor
