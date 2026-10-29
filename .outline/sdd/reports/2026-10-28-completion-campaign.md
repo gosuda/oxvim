@@ -756,3 +756,37 @@ This is the first item from the E492 census. The census itself over-counts
 missing built-ins because it also contains user-defined names such as `xxx`,
 `one`, and `foo2`, so each remaining candidate still needs a registry check
 before it is implemented.
+
+
+### `ex_cmds` functional group, measured
+
+One run, 1200 seconds, exit 1 (the harness kills the group at its timeout):
+
+| Outcome | Count |
+|---|---|
+| run | 405 |
+| OK | 54 |
+| FAIL | 343 |
+
+Worst specs, failures over tests:
+
+| Spec | Failing |
+|---|---|
+| `ex_cmds/dict_notifications_spec.lua` | 64 of 70 |
+| `ex_cmds/echo_spec.lua` | 39 of 41 |
+| `ex_cmds/cd_spec.lua` | 32 of 36 |
+| `ex_cmds/mksession_spec.lua` | 18 of 18 |
+| `ex_cmds/swapfile_preserve_recover_spec.lua` | 17 of 17 |
+| `ex_cmds/help_spec.lua` | 15 of 16 |
+| `ex_cmds/pack_spec.lua` | 15 of 15 |
+| `ex_cmds/cmd_map_spec.lua` | 15 of 15 |
+
+The group ends at `:write appends FIFO file`, which the harness kills on
+timeout, so this is a lower bound on both counts.
+
+`dict_notifications_spec` is the largest single cluster here, and it is exactly
+the dict-watcher gap: the registry and its firing round exist, and nothing calls
+them. That makes the watcher hook the highest-value next change in this group,
+not a small one: a watcher callback dispatches through four live forms
+(`Name`, `Funcref`, `Partial`, and a removed watcher, `userfunc.rs:82-92`), and
+the round must mark, check, and finish around user code that can reenter.
