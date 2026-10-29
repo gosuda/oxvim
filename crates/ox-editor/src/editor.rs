@@ -5433,8 +5433,13 @@ pub fn expand_buffer_name(name: &OxStr) -> OxStr {
     if bytes.is_empty() {
         return name.clone();
     }
-    // Already absolute — use as-is.
+    // Already absolute — use as-is. A URL counts as absolute
+    // (`vim_isAbsName`, path.c:1750), so `example:///x` keeps its spelling
+    // instead of gaining the working directory in front of it.
     let path_str = std::str::from_utf8(bytes).unwrap_or("");
+    if ox_types::path_with_url(path_str) {
+        return name.clone();
+    }
     let path = std::path::Path::new(path_str);
     if path.is_absolute() {
         return name.clone();

@@ -599,6 +599,12 @@ fn number_arg(value: &Typval) -> Result<i64> {
 
 fn absolute_name(name: &str) -> String {
     let expanded = expand_home(name);
+    // `vim_isAbsName` (path.c:1750) counts a URL as absolute, so `:p` leaves
+    // it alone. Prefixing the cwd instead turns `example:///x` into
+    // `/cwd/example:/x`, which is not the name the caller passed in.
+    if ox_types::path_with_url(&expanded) {
+        return expanded;
+    }
     let path = Path::new(&expanded);
     // Upstream `fullpath_save`/`os_get_fullpath`: join under the cwd and
     // simplify — no canonicalization, and the name's own separators are

@@ -2945,6 +2945,19 @@ fn typval_dispatcher_leaves_buffer_builtins_unimplemented() {
 }
 
 #[test]
+/// `:p` leaves a URL alone: `vim_isAbsName` counts a URL as absolute
+/// (path.c:1750), so `fullpath` is never applied to it. Oracle:
+/// `fnamemodify('example:///x/y', ':p')` answers `example:///x/y`, and
+/// `nvim.dir` names its buffer with exactly such a URI.
+#[test]
+fn fnamemodify_keeps_urls_absolute() {
+    assert_eq!(
+        call("fnamemodify", vec![text("example:///x/y"), text(":p")]).unwrap(),
+        text("example:///x/y")
+    );
+}
+
+#[test]
 fn fnamemodify_obeys_filename_modifier_order() {
     // cmdline.txt `filename-modifiers`: :h/:t and repeated :r/:e.
     assert_eq!(
