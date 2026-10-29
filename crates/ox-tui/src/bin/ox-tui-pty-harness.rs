@@ -64,6 +64,10 @@ fn server(script: &str) -> ExitCode {
     let mut input = io::stdin();
     let mut buffer = [0_u8; 8192];
     let mut played = false;
+    // When the test asks for it, append the text of every input request
+    // to this log: what the client forwarded is the observable half of
+    // the input path.
+    let input_log = env::var("OX_TUI_PTY_INPUT_LOG").ok();
     loop {
         let read = match input.read(&mut buffer) {
             Ok(0) | Err(_) => return ExitCode::SUCCESS,
@@ -73,9 +77,17 @@ fn server(script: &str) -> ExitCode {
             return ExitCode::FAILURE;
         };
         for message in messages {
-            let Message::Request { msgid, method, .. } = message else {
+            let Message::Request {
+                msgid,
+                method,
+                params,
+            } = message
+            else {
                 continue;
             };
+            if let Some(path) = input_log.as_ref() {
+                log_input(path, method.as_bytes(), &params);
+            }
             if !respond(msgid) {
                 return ExitCode::FAILURE;
             }
@@ -91,6 +103,44 @@ fn server(script: &str) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
         }
+    }
+}
+
+/// Append the payload bytes of an editor-bound input request to `path`.
+/// `nvim_input` carries the encoded key stream, `nvim_paste` the pasted
+/// text, and `nvim_input_mouse` the `(button, action, modifier, grid,
+/// row, col)` tuple — logging the first string argument of each gives a
+/// byte-faithful record of what the terminal decoded.
+fn log_input(path: &str, method: &[u8], params: &[Object]) {
+    let payload = match method {
+        b"nvim_input" | b"nvim_paste" => params.first().and_then(string_of),
+        b"nvim_input_mouse" => Some(
+            params
+                .iter()
+                .take(3)
+                .map(|argument| string_of(argument).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("/"),
+        ),
+        _ => return,
+    };
+    if let Some(payload) = payload {
+        let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let _ = log.write_all(payload.as_bytes());
+        let _ = log.write_all(b"\n");
+    }
+}
+
+fn string_of(object: &Object) -> Option<String> {
+    match object {
+        Object::String(text) => Some(text.to_string_lossy().into_owned()),
+        _ => None,
     }
 }
 
@@ -312,6 +362,15 @@ fn batches(script: &str) -> Vec<Vec<Object>> {
             narrow(),
             vec![
                 popupmenu_show(&[["alphabetagamma", "", "", "documentation body"]], 0, 3, 0),
+                flush(),
+            ],
+        ],
+        // A painted sentinel for input tests: the client stays attached
+        // (the `-hold` suffix) so the test can drive its input stream.
+        "input" => vec![
+            wide(),
+            vec![
+                msg_show("echo", "READY", false, false, Object::Nil),
                 flush(),
             ],
         ],

@@ -8,7 +8,7 @@
 #![cfg(unix)]
 #![allow(missing_docs, clippy::expect_used, clippy::panic)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -255,11 +255,16 @@ struct Session {
     pid: Option<u32>,
     columns: usize,
     rows: usize,
+    writer: Box<dyn Write + Send>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
 impl Session {
     fn start(script: &str, columns: u16, rows: u16) -> Self {
+        Self::start_with_env(script, columns, rows, &[])
+    }
+
+    fn start_with_env(script: &str, columns: u16, rows: u16, env: &[(&str, &str)]) -> Self {
         let pty = native_pty_system();
         let pair = pty
             .openpty(PtySize {
@@ -278,12 +283,16 @@ impl Session {
         // The variant is chosen from $COLORFGBG before any highlight arrives,
         // so the dark palette under test is selected explicitly.
         command.env("COLORFGBG", "15;0");
+        for (name, value) in env {
+            command.env(name, value);
+        }
         let child = pair
             .slave
             .spawn_command(command)
             .expect("spawn harness client");
         drop(pair.slave);
         let pid = child.process_id();
+        let writer = pair.master.take_writer().expect("PTY writer");
 
         let (sender, receiver) = mpsc::channel();
         let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");
@@ -304,8 +313,16 @@ impl Session {
             pid,
             columns: usize::from(columns),
             rows: usize::from(rows),
+            writer,
             _master: pair.master,
         }
+    }
+
+    /// Write bytes into the client's terminal: how a real terminal's input
+    /// reaches it — keys, replies, and probe responses alike.
+    fn send(&mut self, bytes: &[u8]) {
+        self.writer.write_all(bytes).expect("write to PTY");
+        self.writer.flush().expect("flush PTY");
     }
 
     fn drain(&mut self) {
@@ -394,6 +411,65 @@ fn render(bytes: &[u8], columns: usize, rows: usize) -> Terminal {
     let mut terminal = Terminal::new(columns, rows);
     terminal.feed(bytes);
     terminal
+}
+
+/// Terminal reply bytes the client did not ask for must not reach the
+/// editor: crossterm's parser cannot frame `?`-led sequences whose final
+/// byte is not `u`/`c` (it parks on them, swallowing all later input),
+/// and it drops the introducer of sequences with undispatched lead
+/// bytes (`>`, `=`, a `0x9b` C1 CSI, or a `0x90`/`0x9d`/`0x9f` C1
+/// string) so their tails arrive as typed text. Upstream consumes every
+/// complete sequence to its final byte and emits nothing for an unknown
+/// command, so the input pre-filter does the same.
+#[test]
+fn terminal_replies_do_not_leak_or_wedge_input() {
+    let dir = std::env::temp_dir().join(format!("ox-tui-input-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create input log dir");
+    let log = dir.join("input.log");
+    let mut session = Session::start_with_env(
+        "input-hold",
+        80,
+        24,
+        &[("OX_TUI_PTY_INPUT_LOG", log.to_str().expect("log path"))],
+    );
+    session.wait_for_screen("READY");
+    session.send(b"\x1b[?2026;2$y"); // DECRPM: parks crossterm's parser
+    session.send(b"\x1b[>0;136;0c"); // secondary DA: leaks "0;136;0c"
+    session.send(b"\x1b[=1;2c"); // tertiary DA: leaks "1;2c"
+    session.send(b"\x9b61;1R"); // C1 CSI: leaks "61;1R"
+    session.send(b"\x90Payload\x9c"); // C1 DCS: leaks "Payload"
+    session.send(b"Q");
+
+    // Exactly the sentinel may reach the editor: any leaked reply byte adds
+    // an input line, and a wedged parser never delivers the sentinel.
+    let deadline = Instant::now() + TIMEOUT;
+    let mut contents = String::new();
+    while Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(&log) {
+            contents = text;
+            if !contents.is_empty() {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Any straggler lines a leak would write after the sentinel.
+    thread::sleep(Duration::from_millis(300));
+    if let Ok(text) = std::fs::read_to_string(&log) {
+        contents = text;
+    }
+    session.signal("TERM");
+    let (_, success) = session.finish();
+    assert!(
+        !success,
+        "the client restores and dies from the signal, not cleanly"
+    );
+    assert_eq!(
+        contents.lines().collect::<Vec<_>>(),
+        vec!["Q"],
+        "unexpected editor input; full log:\n{contents}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

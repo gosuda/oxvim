@@ -13,6 +13,8 @@ crossterm = { workspace = true, features = ["use-dev-tty"] }
 thiserror.workspace = true
 mio.workspace = true
 signal-hook.workspace = true
+# Safe descriptor plumbing for the input pre-filter's pty and termios.
+rustix.workspace = true
 
 [dev-dependencies]
 portable-pty = "0.9.0"

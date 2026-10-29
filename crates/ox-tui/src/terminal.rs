@@ -1248,6 +1248,8 @@ impl<W: Write> TerminalSession<W> {
                 Err(_) => {}
             }
         }
+        #[cfg(unix)]
+        crate::input::restore_terminal_mode();
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),

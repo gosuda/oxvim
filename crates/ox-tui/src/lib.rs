@@ -6,6 +6,8 @@
 
 pub mod chrome;
 pub mod client;
+#[cfg(unix)]
+mod input;
 pub mod screen;
 pub mod terminal;
 pub mod theme;
@@ -468,6 +470,12 @@ pub fn run(mut client: Client) -> Result<(), TuiError> {
         &environment,
         ProbePolicy::default(),
     )?;
+    // The probe must read the real stdin first: after this point the
+    // filter's pump owns the terminal stream, and its pty slave becomes
+    // the descriptor crossterm reads. A failed install leaves the input
+    // path exactly as it was, so continue unfiltered.
+    #[cfg(unix)]
+    let _ = input::install();
     let mut shared = SharedWriter::stdout();
     let mut session = TerminalSession::start(shared.clone(), capabilities)?;
     // Register resize delivery before the first visible frame. A resize during
