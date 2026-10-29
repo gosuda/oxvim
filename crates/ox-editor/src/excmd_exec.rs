@@ -3860,7 +3860,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
                 && matches!(name, "wq" | "xit")
                 && !runtime.write_silent_fail
             {
-                access.with_ex_editor(|editor| command_close(runtime, editor, command, true))
+                command_close(runtime, access, scope, lua, command, true)
             } else {
                 flow
             }
@@ -3899,10 +3899,10 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "wincmd" => access.with_ex_editor(|editor| command_wincmd(runtime, editor, command)),
         "echohl" => access.with_ex_editor(|editor| command_echohl(runtime, editor, command)),
         "redraw" | "redrawstatus" | "redrawtabline" => command_redraw(runtime, access, scope, lua),
-        "close" => access.with_ex_editor(|editor| command_close(runtime, editor, command, false)),
+        "close" => command_close(runtime, access, scope, lua, command, false),
         "pclose" => access.with_ex_editor(|editor| command_pclose(runtime, editor)),
         "only" => access.with_ex_editor(|editor| command_only(runtime, editor)),
-        "quit" => access.with_ex_editor(|editor| command_close(runtime, editor, command, true)),
+        "quit" => command_close(runtime, access, scope, lua, command, true),
         "qall" | "quitall" => {
             access.with_ex_editor(|editor| command_qall(runtime, editor, command))
         }
@@ -12022,11 +12022,52 @@ fn command_pclose<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) ->
     }
 }
 
-fn command_close<F: FileIO>(
+fn command_close<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+    quit: bool,
+) -> Flow {
+    // `WinClosed` fires after the window is gone, with the closed window's id
+    // as the pattern and its buffer as `<abuf>` (`win_close`, window.c:2847;
+    // autocmd.c `apply_autocmds` for `EVENT_WINCLOSED`). Record what closed so
+    // the event carries the right match.
+    let mut closed: Option<(BufHandle, WinHandle)> = None;
+    let flow = access.with_ex_editor(|editor| {
+        command_close_inner(runtime, editor, command, quit, &mut closed)
+    });
+    if let Some((buffer, window)) = closed
+        && matches!(flow, Flow::Normal)
+    {
+        let id = i64::from(window).to_string();
+        let plan = access.with_ex_editor(|editor| {
+            editor.autocmds_mut().plan(
+                Event::WinClosed,
+                AutocmdContext {
+                    buffer: Some(buffer),
+                    file_name: None,
+                    match_name: Some(id.as_bytes()),
+                    nested: true,
+                    data: None,
+                },
+            )
+        });
+        let plan_flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+        if !matches!(plan_flow, Flow::Normal) {
+            return plan_flow;
+        }
+    }
+    flow
+}
+
+fn command_close_inner<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     command: &ExCommand,
     quit: bool,
+    closed: &mut Option<(BufHandle, WinHandle)>,
 ) -> Flow {
     let Some(buffer) = editor.current_buffer() else {
         return if quit {
@@ -12077,7 +12118,10 @@ fn command_close<F: FileIO>(
         return Flow::Normal;
     }
     match editor.close_window(tab, window, true) {
-        Ok(_) => Flow::Normal,
+        Ok(_) => {
+            *closed = Some((buffer, window));
+            Flow::Normal
+        }
         Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
     }
 }

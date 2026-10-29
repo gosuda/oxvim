@@ -1283,9 +1283,10 @@ fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<Quickfi
     }
     let lnum = dict_number(entries, "lnum").unwrap_or(0);
     let pattern = dict_string(entries, "pattern").unwrap_or_else(|| OxStr::from(""));
-    // Upstream `dict_to_qf_item`: an entry is invalid when it names neither a
-    // buffer nor a file, or when it has no line and no pattern. A filename is
-    // enough on its own (quickfix.c:6652-6660).
+    // Upstream `dict_to_qf_item` (quickfix.c:6652-6660): an entry is invalid
+    // when it names neither a buffer nor a file, or when it has neither a line
+    // nor a pattern. Both conditions have to hold for an entry to be valid, so
+    // a filename alone is not enough.
     let named = bufnr != 0 || !filename_is_empty;
     let detected_valid = named && (lnum != 0 || !pattern.as_bytes().is_empty());
     Ok(QuickfixItem {
