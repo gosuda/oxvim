@@ -242,6 +242,9 @@ pub(crate) fn install(
 
     let uv_loop = Rc::new(RefCell::new(UvLoop::new().map_err(mlua::Error::external)?));
     let loop_access = LoopAccess::new(uv_loop.clone());
+    // One descriptor registry per Lua host, shared by `uv.pipe`, `pipe:open`,
+    // `uv.spawn` and `uv.fs_close`.
+    let pipe_registry = crate::pipe_fds::Registry::new();
     let state = Rc::new(CoreState::new());
     let vim: Table = lua.globals().get("vim")?;
     let core: Table = vim.get("_core")?;
@@ -354,8 +357,8 @@ pub(crate) fn install(
     )?;
 
     install_misc(lua, &uv)?;
-    install_fs(lua, &uv, &state, &scheduler, &fast)?;
-    crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast)?;
+    install_fs(lua, &uv, &state, &scheduler, &fast, &pipe_registry)?;
+    crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast, pipe_registry.clone())?;
     vim.set("uv", uv.clone())?;
     vim.set("loop", uv)?;
     Ok(EventLoopPump { uv_loop })
@@ -541,8 +544,9 @@ fn install_fs(
     state: &Rc<CoreState>,
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
+    pipe_registry: &crate::pipe_fds::PipeRegistry,
 ) -> mlua::Result<()> {
-    install_fs_file_ops(lua, uv, state, scheduler, fast)?;
+    install_fs_file_ops(lua, uv, state, scheduler, fast, pipe_registry)?;
     install_fs_attribute_ops(lua, uv, state, scheduler, fast)?;
     install_fs_path_ops(lua, uv, state, scheduler, fast)?;
     install_fs_stat_ops(lua, uv, state, scheduler, fast)?;
@@ -617,7 +621,9 @@ fn install_fs_file_ops(
     state: &Rc<CoreState>,
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
+    pipe_registry: &crate::pipe_fds::PipeRegistry,
 ) -> mlua::Result<()> {
+    let pipe_registry = std::rc::Rc::clone(pipe_registry);
     register_fs_op(
         lua,
         uv,
@@ -642,11 +648,21 @@ fn install_fs_file_ops(
         state,
         scheduler,
         fast,
-        |lua, state, args| {
+        move |lua, state, args| {
             let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            // A real file handle wins: a number can be reused for `fs_open`
+            // while a stale pipe marker still names it.
             let result = match state.files.borrow_mut().remove(&descriptor) {
                 Some(handle) => uvfs::close(&handle).map(|()| true),
-                None => Err(bad_file_descriptor()),
+                None => {
+                    let descriptor = i32::try_from(descriptor)
+                        .map_err(mlua::Error::external)?;
+                    if pipe_registry.borrow_mut().close(descriptor) {
+                        Ok(true)
+                    } else {
+                        Err(bad_file_descriptor())
+                    }
+                }
             };
             Ok((result, callback))
         },

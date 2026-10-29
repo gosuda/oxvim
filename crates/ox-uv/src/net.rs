@@ -2472,16 +2472,17 @@ impl Handle for Udp {
 /// # Errors
 ///
 /// Returns [`NetError::Io`] when the system pipe call fails.
+/// Creates a blocking or non-blocking pipe pair.
+///
+/// The descriptors come back owned, so the caller decides where ownership
+/// goes: the Lua host records them in its pipe registry and answers bare
+/// numbers to Lua, as luv does.
 #[cfg(unix)]
-pub fn pipe_pair(nonblock: bool) -> std::io::Result<(i64, i64)> {
-    use std::os::fd::IntoRawFd;
+pub fn pipe_pair(nonblock: bool) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     let (reader, writer) = rustix::pipe::pipe()?;
     if nonblock {
         rustix::io::ioctl_fionbio(&reader, true)?;
         rustix::io::ioctl_fionbio(&writer, true)?;
     }
-    Ok((
-        i64::from(reader.into_raw_fd()),
-        i64::from(writer.into_raw_fd()),
-    ))
+    Ok((reader, writer))
 }

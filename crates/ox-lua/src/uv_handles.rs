@@ -690,6 +690,9 @@ struct LuaProcessPipe {
     fast: FastCallbackState,
     access: LoopAccess,
     closing: Rc<Cell<bool>>,
+    /// Descriptors this host created; `open` takes one, so a bare number is
+    /// only adopted when the host actually owns it.
+    pipe_registry: crate::pipe_fds::PipeRegistry,
 }
 
 #[cfg(unix)]
@@ -702,7 +705,11 @@ impl LuaProcessPipe {
         pipe.set_callback(move |uv_loop, _, event| {
             access.callback(uv_loop, || match event {
                 NetEvent::Read(bytes) => {
-                    if let Some(callback) = callbacks.borrow().read.clone()
+                    // Clone the callback and drop the borrow before invoking:
+                    // the Lua callback may call `read_stop` on this same
+                    // handle, which mutates `callbacks`.
+                    let callback = callbacks.borrow().read.clone();
+                    if let Some(callback) = callback
                         && let Ok(string) = lua.create_string(bytes)
                     {
                         let mut args = MultiValue::new();
@@ -712,7 +719,8 @@ impl LuaProcessPipe {
                     }
                 }
                 NetEvent::Eof => {
-                    if let Some(callback) = callbacks.borrow().read.clone() {
+                    let callback = callbacks.borrow().read.clone();
+                    if let Some(callback) = callback {
                         let mut args = MultiValue::new();
                         args.push_back(Value::Nil);
                         args.push_back(Value::Nil);
@@ -777,8 +785,16 @@ impl UserData for LuaProcessPipe {
             this.callbacks.borrow_mut().read = Some(callback);
             let inner = this.inner.clone();
             this.access.apply(Box::new(move |uv_loop| {
-                if let Some(pipe) = inner.borrow_mut().as_mut() {
+                // Take the pipe out for the reactor call: readiness can be
+                // delivered inside it, and the Lua callback may call back into
+                // this handle (`read_stop`), so no borrow may be held.
+                let taken = inner.borrow_mut().take();
+                if let Some(mut pipe) = taken {
                     let _ = pipe.read_start_current(uv_loop);
+                    let mut slot = inner.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(pipe);
+                    }
                 }
             }));
             Ok(true)
@@ -787,17 +803,31 @@ impl UserData for LuaProcessPipe {
         // `vim/_core/system.lua` turns a `uv.pipe({}, {})` half into a handle
         // it can read the child's stdout from.
         methods.add_method("open", |_, this, fd: i32| {
-            let inner = this.inner.clone();
             let failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
             let failure_slot = Rc::clone(&failure);
+            // A bare number is only adoptable when this host created it:
+            // taking it out of the registry keeps exactly one owner and
+            // rejects a forged descriptor with `EBADF`, as luv does.
+            let owned = this.pipe_registry.borrow_mut().take(fd);
+            let Some(owned) = owned else {
+                return Err(mlua::Error::runtime("EBADF: bad file descriptor"));
+            };
+            // `install_endpoint` registers the reactor callback and stores the
+            // pipe in `inner`; handing it a copy of this handle's shared fields
+            // installs into the same `inner`, which is what makes reads reach
+            // the Lua callback.
+            let endpoint = LuaProcessPipe {
+                inner: this.inner.clone(),
+                callbacks: this.callbacks.clone(),
+                lua: this.lua.clone(),
+                fast: this.fast.clone(),
+                access: this.access.clone(),
+                closing: this.closing.clone(),
+                pipe_registry: this.pipe_registry.clone(),
+            };
             this.access.apply(Box::new(move |uv_loop| {
-                // SAFETY: the descriptor came from `uv.pipe`, and `open`
-                // hands its ownership to the handle, which closes it.
-                let owned = unsafe {
-                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
-                };
                 match ox_uv::process::ProcessPipe::adopt(uv_loop, owned) {
-                    Ok(pipe) => *inner.borrow_mut() = Some(pipe),
+                    Ok(pipe) => endpoint.install_endpoint(pipe),
                     Err(error) => *failure_slot.borrow_mut() = Some(error.to_string()),
                 }
             }));
@@ -810,8 +840,13 @@ impl UserData for LuaProcessPipe {
             this.callbacks.borrow_mut().read = None;
             let inner = this.inner.clone();
             this.access.apply(Box::new(move |uv_loop| {
-                if let Some(pipe) = inner.borrow_mut().as_mut() {
+                let taken = inner.borrow_mut().take();
+                if let Some(mut pipe) = taken {
                     let _ = pipe.read_stop(uv_loop);
+                    let mut slot = inner.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(pipe);
+                    }
                 }
             }));
             Ok(true)
@@ -835,12 +870,19 @@ impl UserData for LuaProcessPipe {
                     // them all; keep Lua out until the pipe borrow is released.
                     let queued = {
                         callbacks.borrow_mut().write_in_flight = true;
-                        let queued = {
-                            let mut inner = inner.borrow_mut();
-                            match inner.as_mut() {
-                                Some(pipe) => pipe.write(uv_loop, data),
-                                None => Err(ox_uv::net::NetError::Closed),
+                        // Flushing can deliver read and write events; keep the
+                        // pipe out of the cell so Lua can reenter this handle.
+                        let taken = inner.borrow_mut().take();
+                        let queued = match taken {
+                            Some(mut pipe) => {
+                                let result = pipe.write(uv_loop, data);
+                                let mut slot = inner.borrow_mut();
+                                if slot.is_none() {
+                                    *slot = Some(pipe);
+                                }
+                                result
                             }
+                            None => Err(ox_uv::net::NetError::Closed),
                         };
                         callbacks.borrow_mut().write_in_flight = false;
                         queued
@@ -1740,6 +1782,7 @@ pub(crate) fn install(
     access: LoopAccess,
     scheduler: Rc<dyn Scheduler>,
     fast: FastCallbackState,
+    pipe_registry: crate::pipe_fds::PipeRegistry,
 ) -> mlua::Result<()> {
     let uv_loop = access.uv_loop.clone();
     let pending_works: Rc<RefCell<Vec<std::rc::Weak<PendingWork>>>> =
@@ -1925,6 +1968,7 @@ pub(crate) fn install(
         let pipe_access = access.clone();
         let pipe_fast = fast.clone();
         let pipe_lua = lua.clone();
+        let new_pipe_registry = Rc::clone(&pipe_registry);
         uv.set(
             "new_pipe",
             lua.create_function(move |lua, _ipc: Option<bool>| {
@@ -1935,6 +1979,7 @@ pub(crate) fn install(
                     fast: pipe_fast.clone(),
                     access: pipe_access.clone(),
                     closing: Rc::new(Cell::new(false)),
+                    pipe_registry: Rc::clone(&new_pipe_registry),
                 })
             })?,
         )?;
@@ -1948,6 +1993,7 @@ pub(crate) fn install(
             let pair_lua = lua.clone();
             let pair_access = access.clone();
             let pair_fast = fast.clone();
+            let pair_registry = Rc::clone(&pipe_registry);
             uv.set(
                 "pipe",
                 lua.create_function(
@@ -1961,6 +2007,7 @@ pub(crate) fn install(
                                     fast: pair_fast.clone(),
                                     access: pair_access.clone(),
                                     closing: Rc::new(Cell::new(false)),
+                                    pipe_registry: Rc::clone(&pair_registry),
                                 },
                             )?));
                         }
@@ -1969,9 +2016,14 @@ pub(crate) fn install(
                             .is_some_and(|options| options.get::<Option<bool>>("nonblock").ok().flatten() == Some(true));
                         let (reader, writer) = ox_uv::net::pipe_pair(nonblock)
                             .map_err(mlua::Error::external)?;
+                        // The host owns both halves until Lua spends them:
+                        // `pipe:open` takes one, `uv.spawn` takes the other.
+                        let (read, write) = pair_registry
+                            .borrow_mut()
+                            .register_pair(reader, writer);
                         let pair = lua.create_table()?;
-                        pair.set("read", reader)?;
-                        pair.set("write", writer)?;
+                        pair.set("read", read)?;
+                        pair.set("write", write)?;
                         Ok(Value::Table(pair))
                     },
                 )?,
@@ -1981,6 +2033,7 @@ pub(crate) fn install(
         let spawn_loop = uv_loop.clone();
         let spawn_pending = pending_processes.clone();
         let spawn_access = access.clone();
+        let spawn_registry = Rc::clone(&pipe_registry);
         uv.set("spawn", lua.create_function(move |lua, (program, options, callback): (String, Table, Function)| {
             let mut spawn_options = SpawnOptions::new(program);
             if let Some(args) = options.get::<Option<Table>>("args")? {
@@ -2009,6 +2062,9 @@ pub(crate) fn install(
             spawn_options.gid = options.get::<Option<u32>>("gid")?;
             let stdio = options.get::<Option<Table>>("stdio")?;
             let mut pipe_targets: [Option<LuaProcessPipe>; 3] = [None, None, None];
+            // Descriptors that came out of the registry and move into a child
+            // slot here; `None` leaves the slot's `StdioConfig` in charge.
+            let mut owned_slots: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
             if let Some(stdio) = stdio {
                 for (index, target) in pipe_targets.iter_mut().enumerate() {
                     match stdio.raw_get::<Value>(index + 1)? {
@@ -2025,6 +2081,23 @@ pub(crate) fn install(
                                 u8::try_from(fd).map_err(mlua::Error::external)?,
                             );
                         }
+                        // A number this host created is a real descriptor
+                        // slot: take it, and the spawn owns it from here.
+                        Value::Integer(fd) => {
+                            let descriptor = i32::try_from(fd)
+                                .map_err(mlua::Error::external)?;
+                            let owned = spawn_registry
+                                .borrow_mut()
+                                .take(descriptor);
+                            let Some(owned) = owned else {
+                                return Err(mlua::Error::runtime(
+                                    "stdio entries must be pipe handles, false, nil, or descriptors 0, 1, or 2",
+                                ));
+                            };
+                            spawn_registry.borrow_mut().mark_spawned(descriptor);
+                            spawn_options.stdio[index] = StdioConfig::Ignore;
+                            owned_slots[index] = Some(owned);
+                        }
                         _ => {
                             return Err(mlua::Error::runtime(
                                 "stdio entries must be pipe handles, false, nil, or descriptors 0, 1, or 2",
@@ -2034,7 +2107,7 @@ pub(crate) fn install(
                 }
             }
             let completion = Arc::new(ProcessCompletion::default()); let waiter = completion.clone();
-            let spawned = process::spawn(&mut spawn_loop.borrow_mut(), spawn_options, move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } }).map_err(mlua::Error::external)?;
+            let spawned = process::spawn_with_owned_stdio(&mut spawn_loop.borrow_mut(), spawn_options, process::OwnedStdio(owned_slots), move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } }).map_err(mlua::Error::external)?;
             let mut pipes = spawned.pipes;
             if let (Some(target), Some(pipe)) = (&pipe_targets[0], pipes.stdin.take()) { target.install_endpoint(pipe); }
             if let (Some(target), Some(pipe)) = (&pipe_targets[1], pipes.stdout.take()) { target.install_endpoint(pipe); }

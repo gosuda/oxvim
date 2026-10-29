@@ -151,6 +151,43 @@ fn immediate_timer_callback_can_close_its_handle() {
         .unwrap();
 }
 
+/// A read callback may stop reading on the same pipe. The callback used to run
+/// with the pipe's callback state still borrowed, so `read_stop` panicked and
+/// `difftool` lost its output.
+#[cfg(unix)]
+#[test]
+fn pipe_read_callback_can_stop_its_own_pipe() {
+    let (host, _scheduler) = host();
+    host.lua()
+        .load(
+            r"
+            local pair = assert(vim.uv.pipe({ nonblock = true }, {}))
+            local reader = assert(vim.uv.new_pipe(false))
+            local writer = assert(vim.uv.new_pipe(false))
+            reader:open(pair.read)
+            writer:open(pair.write)
+
+            seen = ''
+            stopped = false
+            reader:read_start(function(err, data)
+              assert(err == nil)
+              if not data then return end
+              seen = seen .. data
+              stopped = reader:read_stop()
+              reader:close()
+              writer:close()
+              vim.uv.stop()
+            end)
+            writer:write('chunk\n')
+            vim.uv.run('default')
+            assert(stopped, 'read_stop answered from the callback')
+            assert(seen == 'chunk\n', 'read delivered ' .. vim.inspect(seen))
+            ",
+        )
+        .exec()
+        .expect("read_stop from the read callback");
+}
+
 #[cfg(unix)]
 #[test]
 fn immediate_pipe_callback_can_close_process_handles() {
