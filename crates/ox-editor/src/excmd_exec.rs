@@ -1342,6 +1342,18 @@ impl<F: FileIO> ExExecutor<F> {
         self.lua = Some(lua);
     }
 
+    /// Installs the session's client-channel sink on this executor's job
+    /// manager, creating the manager when none exists. Per instance: the
+    /// sink lives on this executor's manager only.
+    pub fn set_client_notifier(&mut self, sink: Box<dyn Fn(&str, &[Object]) -> bool>) {
+        if self.runtime.jobs.is_none() {
+            self.runtime.jobs = JobManager::new().ok();
+        }
+        if let Some(manager) = self.runtime.jobs.as_mut() {
+            manager.set_client_notifier(Rc::from(sink));
+        }
+    }
+
     /// Returns a clone of the Lua callback host, if one is installed.
     #[must_use]
     pub fn lua_host(&self) -> Option<Rc<dyn LuaExec>> {

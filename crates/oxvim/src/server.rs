@@ -635,6 +635,31 @@ pub(crate) fn build_embedded_core(
     };
     ex.borrow_mut().set_lua_exec(callback_host());
     nested_ex.borrow_mut().set_lua_exec(callback_host());
+    // `rpcnotify(1, ...)` from Vimscript delivers a `Message::Notification`
+    // frame to the connected client through the existing channel output,
+    // never a second stdout path. Per executor: each manager owns its sink.
+    for executor in [&ex, &nested_ex] {
+        let output = channel_output.clone();
+        executor.borrow_mut().set_client_notifier(Box::new(
+            move |event: &str, params: &[Object]| {
+                let frame = match (Message::Notification {
+                    method: OxStr::from(event),
+                    params: params.to_vec(),
+                })
+                .encode_bytes()
+                {
+                    Ok(frame) => frame,
+                    Err(_) => return false,
+                };
+                output
+                    .borrow_mut()
+                    .entry(CHAN_STDIO.get())
+                    .or_default()
+                    .extend_from_slice(&frame);
+                true
+            },
+        ));
+    }
     Ok(EmbeddedCore {
         session,
         lua,

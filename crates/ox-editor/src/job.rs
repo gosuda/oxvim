@@ -358,8 +358,10 @@ pub struct JobManager {
     /// into [`JobEvent`]s once the borrow is free (the same defer-to-a-
     /// borrow-free-boundary shape the channel callbacks use).
     timer_fired: Arc<Mutex<Vec<u64>>>,
+    /// Sink for the session's client channel (`CHAN_STDIO = 1`): per
+    /// session, never global, so two executors in one process stay isolated.
+    client_notifier: Option<Rc<dyn Fn(&str, &[Object]) -> bool>>,
 }
-
 impl JobManager {
     /// Create an isolated reactor-backed job table.
     ///
@@ -378,6 +380,7 @@ impl JobManager {
             timers: HashMap::new(),
             next_timer_id: 1,
             timer_fired: Arc::new(Mutex::new(Vec::new())),
+            client_notifier: None,
         })
     }
 
@@ -385,11 +388,27 @@ impl JobManager {
     pub(crate) fn set_lua_flush_pending(&mut self) {
         self.lua_flush_pending = true;
     }
-
     /// Takes the `jobwait` Lua-flush marker; the caller that delivers the
     /// flushed callbacks consumes it.
     pub(crate) fn take_lua_flush_pending(&mut self) -> bool {
         std::mem::take(&mut self.lua_flush_pending)
+    }
+
+    /// Installs the session's client-channel sink (`CHAN_STDIO = 1`).
+    /// Per instance: installing on one manager never affects another.
+    pub fn set_client_notifier(&mut self, sink: Rc<dyn Fn(&str, &[Object]) -> bool>) {
+        self.client_notifier = Some(sink);
+    }
+
+    /// Delivers an `rpcnotify` event to the session's client channel.
+    /// Consults only this manager's own sink; no fallback of any kind.
+    /// Returns `false` when no sink is installed or the sink declines.
+    #[must_use]
+    pub fn notify_client(&self, event: &str, params: &[Object]) -> bool {
+        match &self.client_notifier {
+            Some(sink) => sink(event, params),
+            None => false,
+        }
     }
 
     /// Spawn a process and register it under the already-allocated channel id.

@@ -913,7 +913,18 @@ fn call_rpc_notify<F: FileIO>(
         for id in manager.rpc_channel_ids() {
             let _ignored = manager.rpc_notify(id, &event, params.clone());
         }
+        let _ignored = manager.notify_client(&event.to_string_lossy(), &params);
         return Ok(Typval::Number(1));
+    }
+    if channel == 1 {
+        if manager.notify_client(&event.to_string_lossy(), &params) {
+            return Ok(Typval::Number(1));
+        }
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: Channel doesn't exist",
+        ));
     }
     let id = u64::try_from(channel).unwrap_or(u64::MAX);
     match manager.rpc_notify(id, &event, params) {
@@ -1899,6 +1910,112 @@ mod tests {
                 |event| matches!(&event.callback, Typval::Funcref(funcref) if funcref.registry == Some(7))
             ),
             "the offending Lua-registered event itself must be requeued"
+        );
+    }
+
+    #[test]
+    fn sink_receives_client_channel_notification() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        exec.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = exec
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect("rpcnotify(1, ...) with a sink must succeed");
+        assert_eq!(result, Typval::Number(1));
+        let received = received.borrow();
+        assert_eq!(received.len(), 1, "the sink must see exactly one event");
+        assert_eq!(received[0].0, "ev");
+        assert_eq!(received[0].1, vec![Object::Integer(1)]);
+    }
+
+    #[test]
+    fn sink_receives_broadcast_notification() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        exec.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = exec
+            .evaluate_expression(&editor, "rpcnotify(0, 'ev', 1)")
+            .expect("broadcast with a sink must succeed");
+        assert_eq!(result, Typval::Number(1));
+        let received = received.borrow();
+        assert_eq!(received.len(), 1, "the broadcast must also reach the sink");
+        assert_eq!(received[0].0, "ev");
+        assert_eq!(received[0].1, vec![Object::Integer(1)]);
+    }
+
+    #[test]
+    fn isolation() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut first = ExExecutor::new();
+        let mut second = ExExecutor::new();
+        // Arm a sinkless manager on the sibling so its E475 comes from
+        // `notify_client` finding no sink, not from a missing manager.
+        second.defer_job_events(Vec::new());
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        first.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = first
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect("notify through the sink owner must succeed");
+        assert_eq!(result, Typval::Number(1));
+        assert_eq!(received.borrow().len(), 1);
+        // The sibling executor owns a different manager with no sink: the
+        // same call must report E475 and never reach the first sink.
+        let error = second
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect_err("notify without a sink must fail");
+        assert!(
+            error.to_string().contains("E475"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            received.borrow().len(),
+            1,
+            "the sibling must not reach the first executor's sink"
+        );
+    }
+
+    #[test]
+    fn unknown_channel_still_reports_e475() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.set_client_notifier(Box::new(|_, _| true));
+        let error = exec
+            .evaluate_expression(&editor, "rpcnotify(999998, 'ev')")
+            .expect_err("an id that is neither job, socket, nor 1 must fail");
+        assert!(
+            error.to_string().contains("E475"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("Channel doesn't exist"),
+            "the E475 text must stay intact, got {error}"
         );
     }
 }
