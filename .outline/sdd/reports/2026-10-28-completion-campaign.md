@@ -1102,3 +1102,24 @@ The six remaining failures, each its own cause:
 | `for b:changedtick` | `b:changedtick` as a synthetic scope key that notifies |
 | `calls watcher deleted in callback` | a watcher removed by an earlier callback in the same round must not run |
 | `tabpagebuflist() with dict watcher during buffer close/wipe` | watcher firing during window/tab teardown without a live executor |
+
+
+### API variable writes now notify
+
+`99b92a0` routes `nvim_set_var`, `nvim_del_var`, `vim.g.x = ...`, and
+`vim.g.x = nil` through `ExExecutor::set_global_var`/`del_global_var`, which
+record a scope event and drain after the editor borrow is released.
+
+| `dict_notifications_spec` | Before | After |
+|---|---|---|
+| OK | 64 | 66 |
+| FAIL | 6 | 4 |
+
+The four remaining failures: `v:_null_dict` write guard, `b:changedtick`,
+a watcher deleted inside an earlier callback, and the `tabpagebuflist()`
+teardown case.
+
+Recorded gap from the same work: watcher registrations are per executor, and a
+`g:` write that lands on the nested executor drains against an empty watcher
+map, so it notifies nobody where upstream notifies. One shared registry across
+the pair is the fix, and it is a design change rather than a patch.
