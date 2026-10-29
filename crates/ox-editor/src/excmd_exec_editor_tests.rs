@@ -7303,6 +7303,85 @@ fn a_trailing_cr_survives_into_normal_and_a_mapping_rhs() {
     assert_eq!(global_text(&executor, "qargs").as_deref(), Some("hi\r"));
 }
 
+/// The API fires `OptionSet` by publishing `v:option_*` and handing each
+/// planned command to `execute_autocmd_command`. That path must see the
+/// published values, not the previous ones: `nvim.dir` records
+/// `call add(g:events, v:option_new)` exactly this way.
+#[test]
+fn an_api_optionset_command_reads_the_published_values() {
+    let (editor, mut executor) = setup();
+    editor.editor_mut().set_v_vim_did_enter();
+    executor.execute_line(&editor, "let g:events = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd OptionSet buftype call add(g:events, v:option_new)",
+        )
+        .unwrap();
+    let plan = editor
+        .editor_mut()
+        .autocmds_mut()
+        .plan(
+            crate::Event::OptionSet,
+            crate::AutocmdContext {
+                match_name: Some(b"buftype"),
+                nested: true,
+                ..crate::AutocmdContext::default()
+            },
+        );
+    let saved = editor.editor_mut().publish_option_set(
+        crate::OptionSetScope::Local,
+        &crate::option_value_object(&crate::OptionValue::String("nowrite".to_owned())),
+        None,
+        None,
+        &crate::option_value_object(&crate::OptionValue::String("nowrite".to_owned())),
+    );
+    assert_eq!(plan.ready.len(), 1, "one handler");
+    for action in &plan.ready {
+        let crate::AutocmdKind::ExString(source) = &action.kind else {
+            panic!("a `:autocmd ... call` handler is Ex source");
+        };
+        executor
+            .execute_autocmd_command(&editor, action, source)
+            .unwrap();
+    }
+    editor.editor_mut().restore_option_set(saved);
+    let events = global_value(&executor, "events");
+    let Some(ox_types::Typval::List(events)) = events else {
+        panic!("g:events is a list");
+    };
+    let items: Vec<String> = events
+        .borrow()
+        .items
+        .iter()
+        .map(|item| match item {
+            ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(items, vec!["nowrite".to_owned()]);
+}
+
+/// `:set` fires `OptionSet` after the write, with `v:option_new` published for
+/// the handler (`apply_optionset_autocmd`, option.c:2154). The event waits for
+/// startup in upstream, so the fixture marks startup finished.
+#[test]
+fn set_fires_optionset_with_the_new_value() {
+    let (editor, mut executor) = setup();
+    editor.editor_mut().set_v_vim_did_enter();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd OptionSet buftype let g:seen = v:option_new .. '|' .. v:option_command",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "set buftype=nowrite").unwrap();
+    assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
+    // A different option never matches the pattern.
+    executor.execute_line(&editor, "set tabstop=3").unwrap();
+    assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
+}
+
 /// `<q-bang>` is the quoted bang: `"!"` when the command carried one, `""`
 /// otherwise (`uc_check_code` `ct_BANG` with `quote`, `usercmd.c:1563`).
 /// `pack/dist/opt/cfilter/plugin/cfilter.vim:61` builds a `:call` expression

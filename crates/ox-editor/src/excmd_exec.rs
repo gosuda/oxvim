@@ -5709,6 +5709,14 @@ struct OptionAssignment {
     /// The effective value before the write differed from `value`
     /// (upstream `os_value_changed`).
     changed: bool,
+    /// The layer the write landed on, which decides what `v:option_command`
+    /// and `v:option_type` report (`option.c:2115-2129`).
+    layer: SetLayer,
+    /// The effective value before the write (`v:option_old`).
+    old: Option<OptionValue>,
+    /// The global value before a `:set` that reached both scopes
+    /// (`v:option_oldglobal`).
+    old_global: Option<OptionValue>,
 }
 
 fn command_set<F: FileIO, E: ExEditorAccess>(
@@ -5744,10 +5752,18 @@ fn command_set<F: FileIO, E: ExEditorAccess>(
         // (`option.c:4150-4156`), before the next argument is processed.
         // The assignment stays committed when a handler fails, and later
         // arguments of this `:set` are abandoned with its flow.
-        if let Some(assignment) = assignment
-            && assignment.name == "filetype"
-        {
-            let flow = fire_filetype_autocmd(runtime, access, scope, lua, &assignment);
+        if let Some(assignment) = &assignment {
+            let flow = if assignment.name == "filetype" {
+                fire_filetype_autocmd(runtime, access, scope, lua, assignment)
+            } else {
+                Flow::Normal
+            };
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+            // `apply_optionset_autocmd` runs after every committed write
+            // (`option.c:2154`), before the next argument of this `:set`.
+            let flow = fire_optionset_autocmd(runtime, access, scope, lua, assignment);
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
@@ -10431,6 +10447,86 @@ fn fire_filetype_autocmd<F: FileIO, E: ExEditorAccess>(
     runtime.filetype_autocmd_depth += 1;
     let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
     runtime.filetype_autocmd_depth -= 1;
+    flow
+}
+
+/// Fires `OptionSet` for one committed `:set` write
+/// (`apply_optionset_autocmd_now`, option.c:2099-2134).
+///
+/// The option's full name is the match text, the six `v:option_*` values are
+/// published for the handlers and put back afterwards, and the event never
+/// nests into itself: the published `v:option_type` is the guard upstream
+/// uses, so no extra state is needed.
+fn fire_optionset_autocmd<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    assignment: &OptionAssignment,
+) -> Flow {
+    if access.with_ex_editor(|editor| {
+        editor.vvars().get(&OxStr::from("vim_did_enter")) != Some(&Object::Integer(1))
+    }) {
+        return Flow::Normal;
+    }
+    let in_flight = access.with_ex_editor(|editor| {
+        !matches!(
+            editor.vvars().get(&OxStr::from("option_type")),
+            Some(Object::String(value)) if value.as_bytes().is_empty()
+        )
+    });
+    if in_flight {
+        return Flow::Normal;
+    }
+    let option_scope = match assignment.layer {
+        SetLayer::Global => crate::editor::OptionSetScope::Global,
+        SetLayer::Local => crate::editor::OptionSetScope::Local,
+        SetLayer::Effective => crate::editor::OptionSetScope::Set,
+    };
+    let empty = OptionValue::String(String::new());
+    let old = assignment.old.as_ref().unwrap_or(&empty);
+    let old_object = crate::option_value_object(old);
+    let old_global_object = assignment
+        .old_global
+        .as_ref()
+        .map(crate::option_value_object);
+    let new_object = crate::option_value_object(&assignment.value);
+    let saved = access.with_ex_editor(|editor| {
+        editor.publish_option_set(
+            option_scope,
+            &old_object,
+            Some(&old_object),
+            old_global_object.as_ref(),
+            &new_object,
+        )
+    });
+    // The handlers read `v:` through the scope mirror, so the published
+    // values have to reach it before the plan runs. The version stamp makes
+    // this a rebuild of `v:` only.
+    if let Err(error) = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope)) {
+        access.with_ex_editor(|editor| editor.restore_option_set(saved));
+        return exec_error_flow(runtime, error);
+    }
+    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+    let name = OxStr::from(assignment.name);
+    let plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::OptionSet,
+            AutocmdContext {
+                buffer,
+                file_name: None,
+                match_name: Some(name.as_bytes()),
+                nested: true,
+                data: None,
+            },
+        )
+    });
+    let flow = if plan.ready.is_empty() {
+        Flow::Normal
+    } else {
+        run_autocmd_plan(runtime, access, scope, lua, plan)
+    };
+    access.with_ex_editor(|editor| editor.restore_option_set(saved));
     flow
 }
 
@@ -23388,6 +23484,11 @@ fn set_option_value(
     let metadata =
         crate::option_metadata(name).ok_or_else(|| ("E355", format!("Unknown option: {name}")))?;
     let old = option_value(editor, metadata.name, layer).cloned();
+    // A plain `:set` reports both scopes' old values, so the global one is
+    // read before the write even though only the effective value is compared.
+    let old_global = matches!(layer, SetLayer::Effective)
+        .then(|| option_value(editor, metadata.name, SetLayer::Global).cloned())
+        .flatten();
     let result = match layer {
         SetLayer::Global => {
             if metadata.scopes.contains(&OptionScope::Global) {
@@ -23490,6 +23591,9 @@ fn set_option_value(
         buffer,
         changed: old.as_ref() != Some(&value),
         value,
+        layer,
+        old,
+        old_global,
     })
 }
 
