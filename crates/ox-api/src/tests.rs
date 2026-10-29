@@ -2476,6 +2476,30 @@ fn definition_count(session: &crate::ApiSession, id: i64) -> usize {
 }
 
 #[test]
+/// `nvim_buf_set_name` passes the name through `fname_expand` and then
+/// `vim_FullName`, which leaves a URL alone (`path.c:1780`). A URL that gained
+/// the working directory in front of it would be a different buffer name, and
+/// `nvim.dir` names its listing buffers with exactly such a URI.
+#[test]
+fn buf_set_name_keeps_a_url_out_of_the_working_directory() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let target = editor
+        .create_buffer_with(Buffer::from_lines(&[b"x".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    crate::buffer::nvim_buf_set_name(&session, target, OxStr::from("example:///z/w")).unwrap();
+    let name = crate::buffer::nvim_buf_get_name(&session, target).unwrap();
+    assert_eq!(name.as_bytes(), b"example:///z/w");
+
+    // A plain relative name still becomes absolute.
+    crate::buffer::nvim_buf_set_name(&session, target, OxStr::from("src/lib.rs")).unwrap();
+    let name = crate::buffer::nvim_buf_get_name(&session, target).unwrap();
+    assert_eq!(
+        name.as_bytes(),
+        ox_editor::expand_buffer_name(&OxStr::from("src/lib.rs")).as_bytes()
+    );
+}
+
 fn set_option_value_fires_one_populated_filetype_after_commit() {
     let (mut editor, current, _, window) = editor_with_lines(&["one"]);
     let target = editor
