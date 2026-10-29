@@ -951,10 +951,6 @@ pub struct ScriptCtx<F: FileIO = RealFileIO> {
     next_seq: u64,
     scripts: BTreeMap<Sid, ScriptInfo>,
     source_stack: Vec<SourceFrame>,
-    /// Script ids forced by a frame that runs code defined in another script,
-    /// such as a legacy `:autocmd` body (`autocmd.c` stores `sc_sid` on the
-    /// entry and sets `current_sctx` while the body runs).
-    forced_sids: Vec<Sid>,
     sourced_once: BTreeSet<PathBuf>,
     runtime_roots: Vec<RuntimeRoot>,
 }
@@ -969,7 +965,6 @@ impl<F: FileIO> ScriptCtx<F> {
             next_seq: 0,
             scripts: BTreeMap::new(),
             source_stack: Vec::new(),
-            forced_sids: Vec::new(),
             sourced_once: BTreeSet::new(),
             runtime_roots: Vec::new(),
         }
@@ -1095,20 +1090,32 @@ impl<F: FileIO> ScriptCtx<F> {
     /// The SID whose `s:` scope is currently visible.
     #[must_use]
     pub fn current_sid(&self) -> Option<Sid> {
-        self.forced_sids
-            .last()
-            .copied()
-            .or_else(|| self.source_stack.last().map(|frame| frame.sid))
+        self.source_stack.last().map(|frame| frame.sid)
     }
 
-    /// Makes `sid` the visible `s:` script until [`Self::pop_forced_sid`].
-    pub fn push_forced_sid(&mut self, sid: Sid) {
-        self.forced_sids.push(sid);
+    /// Runs the next body under script `sid` without a real `:source`
+    /// (`current_sctx = autocmd->sc_sctx`, `autocmd.c`). An alias frame
+    /// observes the defining script's `s:` and `<SNR>`, does not appear in
+    /// `v:throwpoint`, and lets a `:source` inside the body stack its own
+    /// frame on top, so the sourced script wins for the duration of the
+    /// source.
+    ///
+    /// Returns whether the frame was pushed; an unknown `sid` has no scope to
+    /// restore and reports false.
+    pub fn push_autocmd_script(&mut self, sid: Sid) -> bool {
+        if self.current_sid() == Some(sid) {
+            return false;
+        }
+        let Some(name) = self.script_name(sid).map(str::to_owned) else {
+            return false;
+        };
+        self.push_alias_source(sid, 0, 0, name, 0);
+        true
     }
 
-    /// Undoes the last [`Self::push_forced_sid`].
-    pub fn pop_forced_sid(&mut self) {
-        self.forced_sids.pop();
+    /// Undoes [`Self::push_autocmd_script`].
+    pub fn pop_autocmd_script(&mut self) {
+        self.source_stack.pop();
     }
 
     /// The sequence number of the sourcing event currently running, or `0`

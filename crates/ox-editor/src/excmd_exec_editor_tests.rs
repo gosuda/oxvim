@@ -7318,17 +7318,14 @@ fn an_api_optionset_command_reads_the_published_values() {
             "autocmd OptionSet buftype call add(g:events, v:option_new)",
         )
         .unwrap();
-    let plan = editor
-        .editor_mut()
-        .autocmds_mut()
-        .plan(
-            crate::Event::OptionSet,
-            crate::AutocmdContext {
-                match_name: Some(b"buftype"),
-                nested: true,
-                ..crate::AutocmdContext::default()
-            },
-        );
+    let plan = editor.editor_mut().autocmds_mut().plan(
+        crate::Event::OptionSet,
+        crate::AutocmdContext {
+            match_name: Some(b"buftype"),
+            nested: true,
+            ..crate::AutocmdContext::default()
+        },
+    );
     let saved = editor.editor_mut().publish_option_set(
         crate::OptionSetScope::Local,
         &crate::option_value_object(&crate::OptionValue::String("nowrite".to_owned())),
@@ -7338,7 +7335,11 @@ fn an_api_optionset_command_reads_the_published_values() {
     );
     assert_eq!(plan.ready.len(), 1, "one handler");
     for action in &plan.ready {
-        let crate::AutocmdKind::ExString { source: source, script: None } = &action.kind else {
+        let crate::AutocmdKind::ExString {
+            source: source,
+            script: None,
+        } = &action.kind
+        else {
             panic!("a `:autocmd ... call` handler is Ex source");
         };
         executor
@@ -7375,41 +7376,109 @@ fn set_fires_optionset_with_the_new_value() {
             "autocmd OptionSet buftype let g:seen = v:option_new .. '|' .. v:option_command",
         )
         .unwrap();
-    executor.execute_line(&editor, "set buftype=nowrite").unwrap();
-    assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
+    executor
+        .execute_line(&editor, "set buftype=nowrite")
+        .unwrap();
+    assert_eq!(
+        global_text(&executor, "seen").as_deref(),
+        Some("nowrite|set")
+    );
     // A different option never matches the pattern.
     executor.execute_line(&editor, "set tabstop=3").unwrap();
-    assert_eq!(global_text(&executor, "seen").as_deref(), Some("nowrite|set"));
+    assert_eq!(
+        global_text(&executor, "seen").as_deref(),
+        Some("nowrite|set")
+    );
 }
 
-/// `:doautocmd {event}` applies the registrations for that event to the
-/// current buffer (`do_doautocmd`, autocmd.c:1141), and reports when nothing
-/// matched.
+/// `:doautocmd` applies one event's registrations to the current buffer
+/// (`do_doautocmd`, autocmd.c:1141). The covered grammar is a named group, a
+/// plain event, an explicit file name, and the two argument errors; a run that
+/// matches nothing is silent, because `ex_doautocmd` passes `do_msg = false`
+/// (`ex_docmd.c:4527`). Modeline execution is out of scope: this port does not
+/// run modelines at all, so `<nomodeline>` is only accepted and dropped.
 #[test]
-fn doautocmd_fires_one_event_and_reports_a_miss() {
+fn doautocmd_applies_one_event_and_rejects_bad_arguments() {
     let (editor, mut executor) = setup();
     executor
-        .execute_line(&editor, "let g:hits = 0 | let g:msgs = []")
+        .execute_line(&editor, "let g:hits = 0 | let g:named = 0")
         .unwrap();
     executor.execute_line(&editor, "augroup Probe").unwrap();
     executor.execute_line(&editor, "autocmd!").unwrap();
     executor.execute_line(&editor, "augroup END").unwrap();
     executor
-        .execute_line(&editor, "autocmd Probe BufEnter * let g:hits += 1")
+        .execute_line(&editor, "autocmd Probe BufEnter *.txt let g:hits += 1")
         .unwrap();
-    executor.execute_line(&editor, "doautocmd Probe BufEnter").unwrap();
+    executor
+        .execute_line(&editor, "autocmd Probe User Hit let g:named += 1")
+        .unwrap();
+
+    // An explicit file name decides whether the pattern matches.
+    executor
+        .execute_line(&editor, "doautocmd Probe BufEnter notes.txt")
+        .unwrap();
     assert_eq!(
         global_value(&executor, "hits"),
         Some(ox_types::Typval::Number(1)),
-        "the event fired"
+        "the explicit name matched the pattern"
     );
-    // A different event has no matching definition, which is reported rather
-    // than failing the command.
-    executor.execute_line(&editor, "doautocmd Probe BufLeave").unwrap();
+    executor
+        .execute_line(&editor, "doautocmd Probe BufEnter other.md")
+        .unwrap();
     assert_eq!(
         global_value(&executor, "hits"),
         Some(ox_types::Typval::Number(1)),
-        "nothing else fired"
+        "a name the pattern rejects fires nothing"
+    );
+
+    // `<nomodeline>` is stripped only at the start of the whole argument
+    // (`check_nomodeline`, autocmd.c:1244), so it cannot follow a group name.
+    executor
+        .execute_line(&editor, "doautocmd <nomodeline> User Hit")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "named"),
+        Some(ox_types::Typval::Number(1)),
+        "a prefixed <nomodeline> still fires the event"
+    );
+
+    // A named group restricts the match: the same event fires nothing in an
+    // empty group, silently.
+    executor.execute_line(&editor, "augroup Other").unwrap();
+    executor.execute_line(&editor, "autocmd!").unwrap();
+    executor.execute_line(&editor, "augroup END").unwrap();
+    executor
+        .execute_line(&editor, "doautocmd Other User Hit")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "named"),
+        Some(ox_types::Typval::Number(1)),
+        "another group has no definition for the event"
+    );
+
+    // `*` is E217.
+    let error = executor
+        .execute_line(&editor, "doautocmd *")
+        .expect_err("`*` is rejected");
+    assert!(
+        format!("{error:?}").contains("E217"),
+        "E217 for the wildcard: {error:?}"
+    );
+    // An unknown event name names the group only when one was given
+    // (`arg_event_skip`, autocmd.c:2467).
+    let error = executor
+        .execute_line(&editor, "doautocmd BadEvent")
+        .expect_err("an unknown name fails before firing");
+    assert!(
+        format!("{error:?}").contains("No such group or event"),
+        "combined form without a group: {error:?}"
+    );
+    let error = executor
+        .execute_line(&editor, "doautocmd Probe BadEvent")
+        .expect_err("an unknown name after a group fails too");
+    assert!(
+        format!("{error:?}").contains("No such event"),
+        "group form names only the event: {error:?}"
     );
 }
 
@@ -7424,7 +7493,10 @@ fn an_autocmd_body_keeps_its_defining_script_scope() {
         "sid-def.vim",
         "let g:hits = 0\nfunc! s:Bump()\n  let g:hits += 1\nendfunc\nau FileType * call s:Bump()\n",
     );
-    executor.scripts().io().insert("sid-fire.vim", "set filetype=x\n");
+    executor
+        .scripts()
+        .io()
+        .insert("sid-fire.vim", "set filetype=x\n");
     executor
         .execute_line(&editor, "source sid-def.vim")
         .unwrap_or_else(|error| panic!("source the definition: {error:?}"));

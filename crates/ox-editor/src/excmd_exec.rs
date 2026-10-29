@@ -1937,13 +1937,11 @@ impl<F: FileIO> ExExecutor<F> {
             AutocmdKind::ExString { script, .. } => *script,
             AutocmdKind::VimscriptFunction(_) | AutocmdKind::LuaCallback(_) => None,
         };
-        if let Some(script) = script {
-            self.runtime.scripts.push_forced_sid(script);
-        }
+        let pushed = script.is_some_and(|script| self.runtime.scripts.push_autocmd_script(script));
         let result =
             self.with_autocmd_context(action, |executor| executor.execute_line(access, source));
-        if script.is_some() {
-            self.runtime.scripts.pop_forced_sid();
+        if pushed {
+            self.runtime.scripts.pop_autocmd_script();
         }
         result
     }
@@ -18972,12 +18970,10 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
                 );
                 // The body keeps the `s:` scope of the script that defined it
                 // (`autocmd.c` `sc_sid`), not the one running when it fires.
-                if let Some(script) = *script {
-                    runtime.scripts.push_forced_sid(script);
-                }
+                let pushed = script.is_some_and(|script| runtime.scripts.push_autocmd_script(script));
                 let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
-                if script.is_some() {
-                    runtime.scripts.pop_forced_sid();
+                if pushed {
+                    runtime.scripts.pop_autocmd_script();
                 }
                 (flow, false)
             }
@@ -19916,11 +19912,12 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
 /// `:doautocmd [group] {event} [fname]` (`do_doautocmd`, autocmd.c:1141):
 /// apply the definitions for one or more events to the current buffer.
 ///
-/// `*` is rejected with E217, an unknown event name fails the command before
-/// anything fires (E216), and a run that matches nothing reports
-/// "No matching autocommands: {arg}". `<nomodeline>` is accepted and dropped;
-/// this port does not run modelines at all, so the trailing step upstream
-/// takes after a successful run has nothing to do.
+/// `*` is rejected with E217 and an unknown event name fails the command
+/// before anything fires (E216, whose text names a group only when one was
+/// given). A run that matches nothing is silent: `ex_doautocmd` passes
+/// `do_msg = false` (`ex_docmd.c:4527`), so the "No matching autocommands"
+/// message belongs to the `do_msg` callers alone. `<nomodeline>` is accepted
+/// and dropped; this port does not run modelines at all.
 fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -19929,7 +19926,11 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
 ) -> Flow {
     let args = command.args.trim();
-    let args = args.trim_end_matches("<nomodeline>").trim_end().to_owned();
+    // `check_nomodeline` (autocmd.c:1244) tests the *start* of the argument.
+    let args = args
+        .strip_prefix("<nomodeline>")
+        .map_or(args, |rest| rest.trim_start())
+        .to_owned();
     let (first, tail) = args
         .split_once(char::is_whitespace)
         .map_or((args.as_str(), ""), |(first, tail)| {
@@ -19949,6 +19950,11 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
     for event_name in event_names.split(',').filter(|name| !name.is_empty()) {
         match Event::from_name(event_name) {
             Some(event) => events.push(event),
+            // `arg_event_skip` (autocmd.c:2467) names the group only when one
+            // was given, so `:doautocmd BadEvent` reports the combined form.
+            None if group.is_some() => {
+                return error_flow(runtime, "E216", format!("No such event: {event_name}"));
+            }
             None => {
                 return error_flow(
                     runtime,
@@ -19966,7 +19972,6 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
                 .map(|state| state.name().to_string_lossy().into_owned())
         })
     });
-    let mut fired = false;
     for event in events {
         let plan = access.with_ex_editor(|editor| match group {
             Some(group) => editor.autocmds_mut().plan_in_group(
@@ -19994,16 +19999,10 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
         if plan.ready.is_empty() {
             continue;
         }
-        fired = true;
         let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
         if !matches!(flow, Flow::Normal) {
             return flow;
         }
-    }
-    if !fired {
-        access.with_ex_editor(|editor| {
-            push_info_text_message(editor, format!("No matching autocommands: {args}"))
-        });
     }
     Flow::Normal
 }
