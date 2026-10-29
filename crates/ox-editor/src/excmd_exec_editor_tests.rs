@@ -32,7 +32,7 @@ use ox_text::Buffer;
 use crate::excmd_exec::{
     LuaExec, run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor,
 };
-use crate::script::{FileIO, FileKind, FileMetadata};
+use crate::script::{FileEntry, FileIO, FileKind, FileMetadata};
 use crate::{
     AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess,
@@ -49,6 +49,8 @@ use crate::{
 struct MemoryFileIO {
     files: Rc<RefCell<HashMap<PathBuf, String>>>,
     directories: Rc<RefCell<HashSet<PathBuf>>>,
+    /// Raw byte content (swapfiles) that is not valid UTF-8 text.
+    blobs: Rc<RefCell<HashMap<PathBuf, Vec<u8>>>>,
 }
 
 impl MemoryFileIO {
@@ -71,6 +73,11 @@ impl MemoryFileIO {
 
     fn insert_directory(&self, path: &str) {
         self.directories.borrow_mut().insert(PathBuf::from(path));
+    }
+    fn insert_blob(&self, path: &str, data: Vec<u8>) {
+        self.blobs
+            .borrow_mut()
+            .insert(PathBuf::from(path), data);
     }
 
     fn content(&self, path: &str) -> Option<String> {
@@ -102,6 +109,48 @@ impl FileIO for MemoryFileIO {
 
     fn exists(&self, path: &Path) -> bool {
         self.files.borrow().contains_key(path)
+            || self.blobs.borrow().contains_key(path)
+            || self.directories.borrow().contains(path)
+    }
+    fn read_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        if let Some(blob) = self.blobs.borrow().get(path) {
+            return Ok(blob.clone());
+        }
+        self.read_to_string(path).map(String::into_bytes)
+    }
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<FileEntry>> {
+        use std::collections::BTreeMap;
+
+        let mut children: BTreeMap<std::ffi::OsString, PathBuf> = BTreeMap::new();
+        let all = self
+            .files
+            .borrow()
+            .keys()
+            .cloned()
+            .chain(self.directories.borrow().iter().cloned())
+            .chain(self.blobs.borrow().keys().cloned())
+            .collect::<Vec<_>>();
+        for candidate in &all {
+            if let Ok(rest) = candidate.strip_prefix(path) {
+                let mut components = rest.components();
+                if let Some(first) = components.next() {
+                    children
+                        .entry(first.as_os_str().to_owned())
+                        .or_insert_with(|| path.join(first));
+                }
+            }
+        }
+        if children.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "directory not found",
+            ));
+        }
+        Ok(children
+            .into_iter()
+            .map(|(name, full)| FileEntry { path: full, name })
+            .collect())
     }
 
     fn metadata(&self, path: &Path, _follow_links: bool) -> std::io::Result<FileMetadata> {
@@ -12483,4 +12532,243 @@ fn tabs_lists_each_tabpage_marking_the_active_window() {
     executor.execute_line(&editor, "tabs").unwrap();
     let messages = echo_messages(&editor);
     assert_eq!(&messages[messages.len() - 2..], &["Tab page 3", ">   [No Name]"]);
+}
+
+/// `:recover` reloads the current buffer from its swapfile: `:preserve`d
+/// content wins over later edits, a missing swapfile fails `E305`, and a
+/// modified buffer without a bang fails `E37`.
+/// Upstream: `ex_docmd.c` `ex_recover` → `ml_recover` (`memline.c:771+`);
+/// oldtest `test_recover.vim` (`E305` with no swapfile).
+#[test]
+fn recover_restores_swapfile_content() {
+    let io = MemoryFileIO::new();
+    io.insert("orig.txt", "original\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io.clone());
+    executor.execute_line(&editor, "edit orig.txt").unwrap();
+    executor.execute_line(&editor, "set directory=.").unwrap();
+    // The swapfile snapshot (`:preserve` output shape): port-written bytes
+    // stored through the seam at the `makeswapname` candidate.
+    let snapshot = Buffer::from_lines(&[b"recovered".to_vec()], true).unwrap();
+    let mut swap = Vec::new();
+    ox_text::SwapFile::new("orig.txt", snapshot)
+        .write(&mut swap)
+        .unwrap();
+    io.insert_blob(".orig.txt.swp", swap);
+    // A modified buffer without a bang refuses first (`E37`).
+    executor
+        .execute_line(&editor, "call setline(1, 'edited')")
+        .unwrap();
+    assert_vim_error(executor.execute_line(&editor, "recover"), "E37");
+    executor.execute_line(&editor, "recover!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["recovered"]);
+    assert!(
+        editor
+            .editor()
+            .current_buffer()
+            .is_some_and(|buffer| editor
+                .editor()
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED)))
+    );
+    assert!(
+        echo_messages(&editor)
+            .iter()
+            .any(|message| message.contains("Using swap file")),
+        "expected a swap-file notice, got {:?}",
+        echo_messages(&editor)
+    );
+    // No swapfile for an unnamed, unmodified buffer: `E305`.
+    let (clean, mut clean_executor) = setup();
+    assert_vim_error(clean_executor.execute_line(&clean, "recover"), "E305");
+}
+
+/// `:diffsplit {file}` splits like `:split` and enables diff mode in both
+/// windows; a bare `:diffsplit` re-shows the current buffer in diff mode.
+/// Upstream: `ex_diffsplit` (`diff.c:1510-1558`); oldtest
+/// `test_diffmode.vim` (`vert diffsplit Xfile2`, bare `diffsplit`).
+#[test]
+fn diffsplit_opens_file_with_diff_on_both_windows() {
+    fn window_diff(editor: &TestEditorAccess, window: ox_types::WinHandle) -> bool {
+        matches!(
+            editor.editor().options().get_window(window, "diff"),
+            Ok(crate::options::OptionValue::Boolean(true))
+        )
+    }
+    let io = MemoryFileIO::new();
+    io.insert("one.txt", "aaa\n");
+    io.insert("two.txt", "bbb\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit one.txt").unwrap();
+    executor.execute_line(&editor, "diffsplit two.txt").unwrap();
+    let tab = editor.editor().current_tabpage().unwrap();
+    let windows = editor.editor().tabpage_windows(tab).unwrap();
+    assert_eq!(windows.len(), 2);
+    assert!(windows.iter().all(|window| window_diff(&editor, *window)));
+    // The new window is current and shows the requested file.
+    let current = editor.editor().current_window().unwrap();
+    let shown = editor.editor().window(current).unwrap().buffer;
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(shown)
+            .unwrap()
+            .name()
+            .to_string_lossy()
+            .into_owned(),
+        "two.txt"
+    );
+    // A bare `:diffsplit` splits the current buffer with diff on everywhere.
+    executor.execute_line(&editor, "diffsplit").unwrap();
+    let windows = editor.editor().tabpage_windows(tab).unwrap();
+    assert_eq!(windows.len(), 3);
+    assert!(windows.iter().all(|window| window_diff(&editor, *window)));
+}
+
+/// `:helptags` builds a sorted `tags` file from `*tag*` markers, skipping
+/// markers inside `>...` example regions; `++t` writes only the index
+/// entry, and missing help files or a non-directory fail `E151`/`E150` while
+/// duplicate tags fail `E154`.
+/// Upstream: `vim._core.help.gen_tags`
+/// (`runtime/lua/vim/_core/help.lua:537-600`); oldtest
+/// `test_help.vim:Test_helptag_cmd`.
+#[test]
+fn helptags_builds_tags_from_help_markers() {
+    let io = MemoryFileIO::new();
+    for dir in ["Xtagdir", "Xtagdir/a", "Xtagdir/a/doc"] {
+        io.insert_directory(dir);
+    }
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io.clone());
+    // No help file to process in the directory.
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir"),
+        "E151",
+    );
+    io.insert(
+        "Xtagdir/a/doc/sample.txt",
+        "*tag1*\nExample: >\n  *notag1*\nExample end: *tag2*\n>\n  *notag2*\n<\n*tag3*\nCode: >vim\n  *notag3*\nCode end: *tag4*\n>i3config\n  *notag4*\n<\n",
+    );
+    executor.execute_line(&editor, "helptags Xtagdir").unwrap();
+    assert_eq!(
+        io.content("Xtagdir/tags").unwrap(),
+        "tag1\ta/doc/sample.txt\t/*tag1*\ntag2\ta/doc/sample.txt\t/*tag2*\ntag3\ta/doc/sample.txt\t/*tag3*\ntag4\ta/doc/sample.txt\t/*tag4*\n"
+    );
+    // Duplicate tags in the help file.
+    io.insert("Xtagdir/a/doc/sample.txt", "*tag1*\n*tag1*\n*tag2*\n");
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir"),
+        "E154",
+    );
+    // `++t` writes only the index entry for an empty help file.
+    io.insert("Xtagdir/a/doc/sample.txt", "");
+    executor.execute_line(&editor, "helptags ++t Xtagdir").unwrap();
+    assert_eq!(io.content("Xtagdir/tags").unwrap(), "help-tags\ttags\t1\n");
+    // Not a directory.
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir/a/doc/sample.txt"),
+        "E150",
+    );
+}
+
+/// `:[range]match` arms, clears, and redefines the window-local `:match`
+/// highlights (IDs 1-3, default 1); out-of-range IDs fail `E476`, a group
+/// without a pattern fails `E475`, and trailing text fails `E488`.
+/// Upstream: `ex_match` (`match.c:1154-1216`); oldtest
+/// `test_match.vim:14-27,154-157`.
+#[test]
+fn match_manages_window_highlights() {
+    let (editor, mut executor) = setup_with_content(&[b"TODO: fix".to_vec()]);
+    executor.execute_line(&editor, "match MyGroup1 /TODO/").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, 1);
+    assert_eq!(items[0].priority, 10);
+    assert_eq!(items[0].group, "MyGroup1");
+    assert_eq!(items[0].pattern.as_deref(), Some("TODO"));
+    executor.execute_line(&editor, "2match Other /fix/").unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 2);
+    // A bare `:match` clears ID 1 only.
+    executor.execute_line(&editor, "match").unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, 2);
+    // `:match none` (and an explicit ID) clears.
+    executor.execute_line(&editor, "match none").unwrap();
+    assert_eq!(editor.editor().get_matches(window).len(), 1);
+    executor.execute_line(&editor, "2match none").unwrap();
+    assert!(editor.editor().get_matches(window).is_empty());
+    assert_vim_error(
+        executor.execute_line(&editor, "4match Error /x/"),
+        "E476",
+    );
+    assert_vim_error(executor.execute_line(&editor, "match Error"), "E475");
+    assert_vim_error(
+        executor.execute_line(&editor, "match Error /x/ y"),
+        "E488",
+    );
+}
+
+/// `:checkpath` lists only includes missing from `'path'`; `:checkpath!`
+/// prints the whole nested tree with ` -->` arrows, `NOT FOUND`, and
+/// `(Already listed)` markers.
+/// Upstream: `ex_checkpath` → `find_pattern_in_path` with `CHECK_PATH`
+/// (`search.c:2974+`); oldtest `test_checkpath.vim:Test_checkpath1`.
+#[test]
+fn checkpath_lists_includes_missing_from_path() {
+    let io = MemoryFileIO::new();
+    io.insert("Xbase.a", "#include    \"foo.a\"\n#include    \"gone.a\"\n");
+    io.insert("Xdir1/dir2/foo.a", "#include    \"bar.a\"\n");
+    io.insert("Xdir1/dir2/bar.a", "#include    \"baz.a\"\n");
+    io.insert("Xdir1/dir2/baz.a", "#include    \"foo.a\"\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit Xbase.a").unwrap();
+    executor
+        .execute_line(&editor, "set path=Xdir1/dir2")
+        .unwrap();
+    executor.execute_line(&editor, "checkpath").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["--- Included files not found in path ---", "\"gone.a\""]
+    );
+    executor.execute_line(&editor, "checkpath!").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(
+        &messages[messages.len() - 9..],
+        &[
+            "--- Included files in path ---",
+            "Xdir1/dir2/foo.a",
+            "Xdir1/dir2/foo.a -->",
+            "  Xdir1/dir2/bar.a",
+            "  Xdir1/dir2/bar.a -->",
+            "    Xdir1/dir2/baz.a",
+            "    Xdir1/dir2/baz.a -->",
+            "      \"foo.a\"  (Already listed)",
+            "\"gone.a\"  NOT FOUND",
+        ]
+    );
 }

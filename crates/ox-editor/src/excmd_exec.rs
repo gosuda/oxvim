@@ -3861,6 +3861,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "packadd" => command_packadd(runtime, access, scope, lua, command),
         "runtime" => command_runtime(runtime, access, scope, lua, command),
         "preserve" => command_preserve(runtime, access),
+        "recover" => command_recover(runtime, access, command),
         "wshada" | "wviminfo" => command_wshada(runtime, access, command),
         "rshada" | "rviminfo" => command_rshada(runtime, access, command),
         "iabbrev" | "abclear" => {
@@ -3962,6 +3963,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "diffupdate" => access.with_ex_editor(|editor| command_diffupdate(runtime, editor)),
         "diffget" => command_diffgetput(runtime, access, command, false),
         "diffput" => command_diffgetput(runtime, access, command, true),
+        "diffsplit" => command_diffsplit(runtime, access, scope, lua, command),
         "resize" => access.with_ex_editor(|editor| command_resize(runtime, editor, command)),
         "wincmd" => access.with_ex_editor(|editor| command_wincmd(runtime, editor, command)),
         "echohl" => access.with_ex_editor(|editor| command_echohl(runtime, editor, command)),
@@ -4061,15 +4063,18 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "badd" => access.with_ex_editor(|editor| command_badd(runtime, editor, command)),
         "checkhealth" => command_checkhealth(runtime, access, scope, lua, command),
         "checktime" => command_checktime(runtime, access, scope, lua, command),
+        "checkpath" => command_checkpath(runtime, access, command),
         "tabfirst" | "tabrewind" => {
             command_tabfirst(runtime, access, scope, lua, command)
         }
         "tablast" => command_tablast(runtime, access, scope, lua, command),
         "helpclose" => access.with_ex_editor(|editor| command_helpclose(runtime, editor, command)),
+        "helptags" => command_helptags(runtime, access, command),
         "mark" | "k" => access.with_ex_editor(|editor| command_mark(runtime, editor, command)),
         "marks" => access.with_ex_editor(|editor| command_marks(runtime, editor)),
         "jumps" => access.with_ex_editor(command_jumps),
         "delmarks" => access.with_ex_editor(|editor| command_delmarks(runtime, editor, command)),
+        "match" => access.with_ex_editor(|editor| command_match(runtime, editor, command)),
         "cc" | "ll" => {
             access.with_ex_editor(|editor| command_quickfix_jump(runtime, editor, command))
         }
@@ -6452,6 +6457,315 @@ fn command_help<F: FileIO, E: ExEditorAccess>(
     }
     error_flow(runtime, "E149", format!("Sorry, no help for {topic}"))
 }
+
+/// `:helptags [++t] {dir}` / `:helptags [++t] ALL` (`ex_helptags`,
+/// ex_docmd.c → `vim._core.help.gen_tags`,
+/// `runtime/lua/vim/_core/help.lua:537-600`): build a `tags` file from the
+/// `*tag*` markers in every help file under `{dir}`.
+///
+/// Help files are `*.txt` (language `en`) and `*.??x` translations
+/// (`helpfile_lang`, help.lua:413); each language gets its own tags file
+/// (`tags` for English, `tags-{lang}` otherwise). `++t` appends the
+/// `help-tags` index entry; `ALL` processes every `doc` directory on
+/// `'runtimepath'` and ignores unwritable outputs (`ignore_writeerr`).
+/// Errors mirror upstream: `E150` for a non-directory, `E151` when no help
+/// file matches, `E152` when the tags file cannot be written, `E153` when a
+/// help file cannot be read, and `E154` for a duplicate tag (the file is
+/// still written, like upstream's `report_duplicates`-then-write order).
+///
+/// Reachable subset: tag scanning approximates the `helptags_pattern` lpeg
+/// grammar (help.lua:457-480) line by line — a `*tag*` marker must start
+/// the line or follow a blank, hold no blanks or `|`, and end the line or
+/// precede a blank; `>...` example regions (through indented or blank
+/// continuation lines) contribute no tags. Symlinked help trees are not
+/// followed, and the `$VIMRUNTIME/doc` implied index entry has no
+/// `$VIMRUNTIME` to compare against in this port, so only an explicit
+/// `++t` adds `help-tags`.
+fn command_helptags<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    let mut args = command.args.trim();
+    let mut index_tag = false;
+    if args.len() > 3 && args.as_bytes()[..3].eq_ignore_ascii_case(b"++t") {
+        if let Some(rest) = args.get(3..)
+            && rest.starts_with([' ', '\t'])
+        {
+            index_tag = true;
+            args = rest.trim_start_matches([' ', '\t']);
+        }
+    }
+    if args.is_empty() {
+        return error_flow(runtime, "E471", "Argument required");
+    }
+    let all = args == "ALL";
+    let dirs: Vec<String> = if all {
+        helptags_runtime_doc_dirs(runtime, access)
+    } else {
+        vec![args.to_owned()]
+    };
+    let mut failure: Option<HelptagsError> = None;
+    for dir in &dirs {
+        if let Err(error) = helptags_one_dir(runtime.scripts.io(), dir, index_tag, all)
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+    }
+    match failure {
+        Some(error) => error_flow(runtime, error.code, error.message),
+        None => Flow::Normal,
+    }
+}
+
+/// One `:helptags` failure, converted to a `Flow` by the caller.
+struct HelptagsError {
+    /// Stable upstream `E` code (`E150`-`E154`).
+    code: &'static str,
+    /// Message text without the `E123: ` prefix.
+    message: String,
+}
+
+/// Every `doc` directory on `'runtimepath'` (`nvim_get_runtime_file('doc',
+/// true)` in `gen_tags`), falling back to the script runtime roots like the
+/// native health listing does.
+fn helptags_runtime_doc_dirs<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+) -> Vec<String> {
+    let rtp = access.with_ex_editor(|editor| match editor.options().get_global("runtimepath") {
+        Ok(OptionValue::String(text)) => text.clone(),
+        _ => String::new(),
+    });
+    let mut roots: Vec<PathBuf> = rtp
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    if roots.is_empty() {
+        roots.extend(
+            runtime
+                .scripts
+                .runtime_roots()
+                .iter()
+                .map(|root| root.path().to_path_buf()),
+        );
+    }
+    roots
+        .iter()
+        .map(|root| root.join("doc").to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Generate the tags file(s) for one help directory. Returns the first
+/// failure, mirroring `echo_err` without aborting the `ALL` walk.
+fn helptags_one_dir<F: FileIO>(
+    io: &F,
+    dir: &str,
+    index_tag: bool,
+    ignore_write_err: bool,
+) -> Result<(), HelptagsError> {
+    let failed = |code: &'static str, message: String| HelptagsError { code, message };
+    let normalized = dir.trim_end_matches('/');
+    let normalized = if normalized.is_empty() { "/" } else { normalized };
+    let is_dir = io
+        .metadata(Path::new(normalized), true)
+        .map(|meta| meta.kind == crate::script::FileKind::Directory)
+        .unwrap_or(false);
+    if !is_dir {
+        return Err(failed("E150", format!("Not a directory: {dir}")));
+    }
+    let mut help_files = helptags_help_files(io, Path::new(normalized));
+    if help_files.is_empty() {
+        return Err(failed("E151", format!("No match: {normalized}/**/*.txt")));
+    }
+    help_files.sort();
+    // Categorize per language (`help-translated`, help.lua:562-581).
+    let mut per_lang: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for file in &help_files {
+        if let Some(lang) = helptags_lang(file) {
+            per_lang.entry(lang).or_default().push(file.clone());
+        }
+    }
+    for (lang, files) in &per_lang {
+        let tags_name = if lang == "en" {
+            "tags".to_owned()
+        } else {
+            format!("tags-{lang}")
+        };
+        let out_path = Path::new(normalized).join(&tags_name);
+        let mut tags: Vec<String> = Vec::new();
+        for file in files {
+            let bytes = match io.read_bytes(Path::new(file)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Err(failed("E153", format!("Unable to open {file} for reading")));
+                }
+            };
+            let rel = file
+                .strip_prefix(normalized)
+                .unwrap_or(file.as_str())
+                .trim_start_matches('/')
+                .replace('\\', "/");
+            helptags_extract(&mut tags, &bytes, &rel);
+        }
+        if index_tag {
+            tags.push(format!("help-tags\t{tags_name}\t1"));
+        }
+        tags.sort();
+        let mut duplicate: Option<HelptagsError> = None;
+        let mut previous = "";
+        for (index, line) in tags.iter().enumerate() {
+            let tag = line.split('\t').next().unwrap_or("");
+            if tag == previous {
+                let current_file = line.split('\t').nth(1).unwrap_or("");
+                let previous_file = tags[index - 1].split('\t').nth(1).unwrap_or("");
+                let files = if current_file == previous_file {
+                    current_file.to_owned()
+                } else {
+                    format!("{current_file} and {previous_file}")
+                };
+                duplicate = Some(failed("E154", format!("Duplicate tag \"{tag}\" in {files}")));
+            }
+            previous = tag;
+        }
+        let mut contents = String::new();
+        for tag in &tags {
+            contents.push_str(tag);
+            contents.push('\n');
+        }
+        if io.write_string(&out_path, &contents).is_err() {
+            if !ignore_write_err {
+                return Err(failed(
+                    "E152",
+                    format!("Cannot open {} for writing", out_path.display()),
+                ));
+            }
+            continue;
+        }
+        if let Some(error) = duplicate {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect help files under `dir` (`vim.fs.find` with
+/// `helpfile_lang` in `gen_tags`, help.lua:555-561). Results are full paths
+/// as strings; the caller sorts them.
+fn helptags_help_files<F: FileIO>(io: &F, dir: &Path) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.clone()) {
+            continue;
+        }
+        let mut entries = io.read_dir(&current).unwrap_or_default();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        for entry in entries {
+            let is_dir = io
+                .metadata(&entry.path, true)
+                .map(|meta| meta.kind == crate::script::FileKind::Directory)
+                .unwrap_or(false);
+            if is_dir {
+                stack.push(entry.path);
+            } else if helptags_lang(&entry.name.to_string_lossy()).is_some() {
+                files.push(entry.path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    files
+}
+
+/// Language code of a help file name (`helpfile_lang`, help.lua:413-421):
+/// `"en"` for `*.txt`, the two letters of `*.??x` otherwise.
+fn helptags_lang(file_name: &str) -> Option<String> {
+    if file_name.len() < 4 {
+        return None;
+    }
+    let suffix = file_name[file_name.len() - 4..].to_ascii_lowercase();
+    let bytes = suffix.as_bytes();
+    if bytes == b".txt" {
+        return Some("en".to_owned());
+    }
+    if bytes[0] == b'.' && bytes[1].is_ascii_alphabetic() && bytes[2].is_ascii_alphabetic() && bytes[3] == b'x' {
+        return Some(suffix[1..3].to_owned());
+    }
+    None
+}
+
+/// Extract `*tag*` markers from one help file into `tags`
+/// (`extract_tags`, help.lua:467-486), line by line. A marker opens with
+/// `*` at the line start or after a blank, holds no `*`, blank, or `|`,
+/// and closes with `*` at the line end or before a blank. Lines inside a
+/// `>...` example region — opened by `>` at the line start or after a
+/// blank with only lowercase alphanumerics before the line end, continuing
+/// through indented or blank lines — contribute no tags. Each entry renders
+/// as `tag<TAB>file<TAB>/*tag*` with `/` and `\` backslash-escaped.
+fn helptags_extract(tags: &mut Vec<String>, source: &[u8], name: &str) {
+    let mut in_example = false;
+    for raw in source.split(|byte| *byte == b'\n') {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if in_example {
+            if line.is_empty() || line[0] == b' ' || line[0] == b'\t' {
+                continue;
+            }
+            in_example = false;
+        }
+        let mut index = 0;
+        while index < line.len() {
+            if line[index] != b'*'
+                || (index != 0 && line[index - 1] != b' ' && line[index - 1] != b'\t')
+            {
+                index += 1;
+                continue;
+            }
+            let mut close = index + 1;
+            while close < line.len() && !matches!(line[close], b'*' | b' ' | b'\t' | b'|') {
+                close += 1;
+            }
+            if close < line.len()
+                && line[close] == b'*'
+                && close > index + 1
+                && (close + 1 == line.len() || line[close + 1] == b' ' || line[close + 1] == b'\t')
+            {
+                let tag = String::from_utf8_lossy(&line[index + 1..close]);
+                let escaped = tag.replace('\\', "\\\\").replace('/', "\\/");
+                tags.push(format!("{escaped}\t{name}\t/*{escaped}*"));
+                index = close + 1;
+            } else {
+                index += 1;
+            }
+        }
+        if helptags_example_opens(line) {
+            in_example = true;
+        }
+    }
+}
+
+/// Whether `line` opens a `>...` example region: a `>` at the line start or
+/// after a blank, followed only by lowercase alphanumerics to the line end
+/// (`example` in `helptags_pattern`, help.lua:464-473).
+fn helptags_example_opens(line: &[u8]) -> bool {
+    let mut index = 0;
+    while index < line.len() {
+        if line[index] == b'>'
+            && (index == 0 || line[index - 1] == b' ' || line[index - 1] == b'\t')
+            && line[index + 1..]
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 
 fn command_function_list<F: FileIO>(
     runtime: &mut ExRuntime<F>,
@@ -9499,6 +9813,228 @@ fn command_preserve<F: FileIO, E: ExEditorAccess>(runtime: &mut ExRuntime<F>, ac
     });
     Flow::Normal
 }
+/// `:recover [!] [file]` (`ex_recover`, ex_docmd.c:5508-5521 → `ml_recover`,
+/// memline.c:771+): discard the current buffer text and reload it from the
+/// swapfile written by an earlier (crashed) session.
+///
+/// Behaviour mirrors upstream in order: the modified-buffer gate first
+/// (`check_changed` with `CCGD_EXCMD` → `E37` without the bang), then an
+/// explicit file argument renames the buffer (`setfname`, ex_docmd.c:5518),
+/// then the swapfile search runs (`recover_names`, memline.c:1313+). The
+/// search covers this port's `makeswapname` layouts across every
+/// `'directory'` entry plus the `modname(fname, ".swp")` fallback
+/// (memline.c:1397-1408), skipping nothing: this port keeps no open memfile
+/// whose name upstream's `skip_curbuf` would exclude.
+///
+/// Reachable subset: `SwapFile::read` parses the snapshots this port writes
+/// (`ox-text/swapfile.rs`), so recovery from a port-written swapfile is
+/// complete. The interactive multi-swapfile picker (`vim._core.swapfile
+/// select`, memline.c:806-813) has no UI in this port, so several
+/// candidates recover the first in sorted order after naming it. `E308`
+/// (original file newer than the swapfile) is reported from seam metadata
+/// and recovery continues; block-zero identity fields are not parsed back
+/// by `SwapFile::read`, so that half of the `E308` condition is not
+/// evaluated.
+fn command_recover<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    let modified = access.with_ex_editor(|editor| {
+        editor.current_buffer().is_some_and(|buffer| {
+            editor
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
+        })
+    });
+    if modified && !command.bang {
+        return error_flow(
+            runtime,
+            "E37",
+            "No write since last change (add ! to override)",
+        );
+    }
+    let arg = command.args.trim();
+    // A swapfile name given directly opens that file and renames the buffer
+    // to the recorded original (`directly`, memline.c:784-790).
+    if looks_like_swap_name(arg) {
+        return recover_from_swap_file(runtime, access, Path::new(arg), None);
+    }
+    if !arg.is_empty() {
+        let name = OxStr::from(arg);
+        access.with_ex_editor(|editor| {
+            if let Some(buffer) = editor.current_buffer()
+                && let Ok(state) = editor.buffer_mut(buffer)
+            {
+                state.set_name(name.clone());
+            }
+        });
+    }
+    let fname = access.with_ex_editor(|editor| {
+        editor
+            .current_buffer()
+            .and_then(|buffer| editor.buffer(buffer).ok())
+            .map(|state| state.name().to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    if fname.is_empty() {
+        return error_flow(runtime, "E305", "No swap file found for ");
+    }
+    let dirs = access.with_ex_editor(|editor| swap_directories(editor));
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for dir in &dirs {
+        let Some(base) = makeswapname(&fname, dir) else {
+            continue;
+        };
+        // The `.swp` → `.swo` → … → `.saa` permutation chain
+        // (`permute_swap_name`, memline.c:3487-3499) collects what upstream's
+        // `recov_file_names` wildcard expansion would list.
+        let mut current = Some(base);
+        while let Some(path) = current {
+            if runtime.scripts.io().exists(&path) && !candidates.contains(&path) {
+                candidates.push(path.clone());
+            }
+            current = permute_swap_name(&path);
+        }
+    }
+    if candidates.is_empty()
+        && let Some(path) = modname(&fname, ".swp", true)
+        && runtime.scripts.io().exists(&path)
+    {
+        candidates.push(path);
+    }
+    if candidates.is_empty() {
+        return error_flow(runtime, "E305", format!("No swap file found for {fname}"));
+    }
+    candidates.sort();
+    if candidates.len() > 1 {
+        let list = candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        access.with_ex_editor(|editor| {
+            push_text_message(
+                editor,
+                format!("Using first of several swap files: {list}"),
+                false,
+                true,
+            );
+        });
+    }
+    let chosen = candidates[0].clone();
+    recover_from_swap_file(runtime, access, &chosen, Some(fname.as_str()))
+}
+
+/// Whether `name` has a swapfile tail (`checkext`, memline.c:782-790):
+/// `.s[a-w][a-z]`, case-insensitive on the leading `.s`.
+fn looks_like_swap_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.len() < 4 {
+        return false;
+    }
+    let tail = &bytes[bytes.len() - 4..];
+    (tail[0] == b'.')
+        && (tail[1] == b's' || tail[1] == b'S')
+        && matches!(tail[2].to_ascii_lowercase(), b'a'..=b'w')
+        && tail[3].is_ascii_alphabetic()
+}
+
+/// Load `swap_path` over the current buffer (`ml_recover`, memline.c:838+).
+/// `recorded_for` is the buffer file the search ran for; `None` is the
+/// direct-swapfile call, which renames the buffer to the recorded name
+/// (`setfname(b0_fname)`, memline.c:941-945).
+fn recover_from_swap_file<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    swap_path: &Path,
+    recorded_for: Option<&str>,
+) -> Flow {
+    let bytes = match runtime.scripts.io().read_bytes(swap_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return error_flow(
+                runtime,
+                "E306",
+                format!("Cannot open {}", swap_path.display()),
+            );
+        }
+    };
+    // A truncated or foreign file fails here; upstream distinguishes the
+    // mid-file read error (`E295`, memfile.c:548) from the block-zero
+    // identity check (`E307`), but this port reads the whole file at once,
+    // so every structural failure reports `E307`.
+    let snapshot = match SwapFile::read(&bytes[..]) {
+        Ok(snapshot) => snapshot,
+        Err(_) => {
+            return error_flow(
+                runtime,
+                "E307",
+                format!("{} does not look like a Nvim swap file", swap_path.display()),
+            );
+        }
+    };
+    let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    if recorded_for.is_none() {
+        let name = OxStr::from(snapshot.file_name.as_str());
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.set_name(name.clone());
+            }
+        });
+    }
+    // `E308` (memline.c:953-960): the original file on disk is newer than
+    // the swapfile, so recovered text may predate it. A warning only —
+    // recovery continues like upstream.
+    let original = recorded_for.unwrap_or(snapshot.file_name.as_str());
+    let newer_original = match (
+        runtime.scripts.io().metadata(Path::new(original), true),
+        runtime.scripts.io().metadata(swap_path, true),
+    ) {
+        (Ok(original_meta), Ok(swap_meta)) => match (original_meta.modified, swap_meta.modified) {
+            (Some(before), Some(after)) => before > after,
+            _ => false,
+        },
+        _ => false,
+    };
+    if newer_original {
+        access.with_ex_editor(|editor| {
+            push_text_message(
+                editor,
+                "E308: Warning: Original file may have been changed".to_owned(),
+                true,
+                true,
+            );
+        });
+    }
+    access.with_ex_editor(|editor| {
+        push_text_message(
+            editor,
+            format!("Using swap file \"{}\"", swap_path.display()),
+            false,
+            true,
+        );
+    });
+    let recovered = snapshot.buffer.to_bytes();
+    let differs = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .and_then(|state| state.text().ok())
+            .is_none_or(|text| text.to_bytes() != recovered)
+    });
+    access.with_ex_editor(|editor| {
+        if let Ok(state) = editor.buffer_mut(buffer) {
+            state.load(snapshot.buffer);
+            state
+                .flags
+                .set(crate::BufferFlags::MODIFIED, differs);
+        }
+    });
+    Flow::Normal
+}
 
 /// `preserve_exit`'s buffer pass (main.c:917-929): unmodified buffers lose
 /// their swapfiles (`ml_close_notmod` -> `ml_close(buf, true)` ->
@@ -10073,6 +10609,330 @@ fn wincmd_range_count(command: &ExCommand) -> Option<usize> {
         AddressBase::Line(value) if address.offsets.is_empty() => usize::try_from(value).ok(),
         _ => None,
     }
+}
+/// `:checkpath[!]` (`ex_checkpath`, ex_docmd.c:7334-7340 → `find_pattern_in_path`
+/// with `CHECK_PATH`, search.c:2974+): walk the current buffer's `#include`
+/// lines through `'path'` and list what the entries cannot resolve.
+///
+/// Without the bang (`ACTION_SHOW`) only missing files print under the
+/// `--- Included files not found in path ---` header, and a fully resolved
+/// tree reports `All included files were found`. With the bang
+/// (`ACTION_SHOW_ALL`) the whole tree prints under `--- Included files in
+/// path ---`, found files bare, missing files with a `NOT FOUND` suffix,
+/// repeats with `(Already listed)`, and each descended file prefixed by a
+/// `name -->` arrow line (search.c:3074-3145); no includes at all report
+/// `No included files`.
+///
+/// Reachable subset: includes match the effective `'include'` pattern (or
+/// the C-family `^\s*#\s*include` default the filetype plugins assume when
+/// it is empty) via the port regex engine; names resolve against the
+/// including file's directory, then each `'path'` entry as given, then each
+/// entry under the process directory. `'includeexpr'` transformations
+/// (`\zs` isolation, `DotsToFlashes`-style rewrites in
+/// `test_checkpath.vim:Test_checkpath2`) are not evaluated: names come
+/// straight from the line after the match, with surrounding `""`/`<>`
+/// restored like `file_name_in_line` (search.c:3100-3135).
+fn command_checkpath<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    command: &ExCommand,
+) -> Flow {
+    let show_all = command.bang;
+    let Some(buffer) = access.with_ex_editor(|editor| editor.current_buffer()) else {
+        return error_flow(runtime, "E749", "Empty buffer");
+    };
+    let lines = match access.with_ex_editor(|editor| buffer_lines(editor, buffer)) {
+        Ok(lines) => lines,
+        Err(message) => return error_flow(runtime, "E16", message),
+    };
+    let include = access.with_ex_editor(|editor| {
+        match option_value(editor, "include", SetLayer::Effective) {
+            Some(OptionValue::String(text)) if !text.is_empty() => text.clone(),
+            _ => r"^\s*#\s*include".to_owned(),
+        }
+    });
+    let program = match compile_regex(&include, Magic::Magic) {
+        Ok(program) => program,
+        Err(_) => return error_flow(runtime, "E475", format!("Invalid argument: {include}")),
+    };
+    let entries = access.with_ex_editor(|editor| {
+        match option_value(editor, "path", SetLayer::Effective) {
+            Some(OptionValue::String(text)) => split_path_list(text),
+            _ => Vec::new(),
+        }
+    });
+    let base_dir = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .and_then(|state| {
+                let name = state.name().to_string_lossy();
+                let path = Path::new(name.as_ref());
+                path.parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .map(Path::to_path_buf)
+            })
+            .unwrap_or_default()
+    });
+    let mut state = CheckpathState {
+        show_all,
+        visited: Vec::new(),
+        arrows: Vec::new(),
+        printed_arrows: 0,
+        did_show: false,
+        lines: Vec::new(),
+    };
+    let context = CheckpathContext {
+        io: runtime.scripts.io(),
+        program: &program,
+        entries: &entries,
+    };
+    // Depth is the include indent level: the current buffer's own includes
+    // print unindented (upstream depth `-1`, search.c:3023-3035).
+    checkpath_lines(&context, &base_dir, &lines, 0, &mut state);
+    if !state.did_show {
+        state.lines.push(if show_all {
+            "No included files".to_owned()
+        } else {
+            "All included files were found".to_owned()
+        });
+    }
+    let header = if show_all {
+        "--- Included files in path ---"
+    } else {
+        "--- Included files not found in path ---"
+    };
+    access.with_ex_editor(|editor| {
+        push_text_message(editor, header.to_owned(), false, false);
+        for line in &state.lines {
+            push_text_message(editor, line.clone(), false, false);
+        }
+    });
+    Flow::Normal
+}
+
+/// Shared read-only inputs for one `:checkpath` run.
+struct CheckpathContext<'a, F: FileIO> {
+    /// Filesystem seam for existence checks and included-file reads.
+    io: &'a F,
+    /// Compiled `'include'` pattern.
+    program: &'a ox_regex::Prog,
+    /// Split `'path'` option entries.
+    entries: &'a [String],
+}
+
+/// Mutable traversal state for one `:checkpath` run.
+struct CheckpathState {
+    /// Bang given: print the whole tree instead of only missing files.
+    show_all: bool,
+    /// Resolved paths already descended into (upstream's `files[]` names).
+    visited: Vec<String>,
+    /// Ancestor files with not-yet-printed ` -->` arrow lines, indexed by
+    /// include level.
+    arrows: Vec<String>,
+    /// Arrow lines already printed.
+    printed_arrows: usize,
+    /// Whether any display line has been emitted.
+    did_show: bool,
+    /// Output lines after the header.
+    lines: Vec<String>,
+}
+
+/// Scan `lines` (a buffer or an included file whose own includes print at
+/// indent `depth`) for `'include'` matches and record the display lines
+/// (search.c:3035-3145).
+fn checkpath_lines<F: FileIO>(
+    context: &CheckpathContext<'_, F>,
+    base_dir: &Path,
+    lines: &[Vec<u8>],
+    depth: usize,
+    state: &mut CheckpathState,
+) {
+    if depth > 64 {
+        return;
+    }
+    for line in lines {
+        let text = String::from_utf8_lossy(line);
+        let Some(end) = checkpath_match_end(context.program, &text) else {
+            continue;
+        };
+        let Some((resolved, isolated)) = checkpath_resolve(context, &text, end, base_dir) else {
+            continue;
+        };
+        let known = resolved
+            .as_ref()
+            .is_some_and(|path| state.visited.contains(path));
+        if known {
+            // Upstream frees the repeat's resolved name and re-prints the
+            // isolated line text with an `(Already listed)` note under
+            // `ACTION_SHOW_ALL` only (search.c:3082-3090,3122-3124).
+            if state.show_all {
+                while state.printed_arrows < depth {
+                    let name = state.arrows[state.printed_arrows].clone();
+                    state
+                        .lines
+                        .push(format!("{}{} -->", "  ".repeat(state.printed_arrows), name));
+                    state.printed_arrows += 1;
+                }
+                state.did_show = true;
+                state.lines.push(format!(
+                    "{}{isolated}  (Already listed)",
+                    "  ".repeat(depth)
+                ));
+            }
+            continue;
+        }
+        if state.show_all || resolved.is_none() {
+            // Flush pending `parent -->` arrow lines for newly descended
+            // ancestors (search.c:3093-3102), then the file itself.
+            while state.printed_arrows < depth {
+                let name = state.arrows[state.printed_arrows].clone();
+                state
+                    .lines
+                    .push(format!("{}{} -->", "  ".repeat(state.printed_arrows), name));
+                state.printed_arrows += 1;
+            }
+            state.did_show = true;
+            let indent = "  ".repeat(depth);
+            match &resolved {
+                Some(path) => state.lines.push(format!("{indent}{path}")),
+                None => {
+                    let mut row = format!("{indent}{isolated}");
+                    if state.show_all {
+                        row.push_str("  NOT FOUND");
+                    }
+                    state.lines.push(row);
+                }
+            }
+        }
+        let Some(path) = resolved else {
+            continue;
+        };
+        let bytes = match context.io.read_bytes(Path::new(&path)) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        state.visited.push(path.clone());
+        state.arrows.push(path.clone());
+        let nested: Vec<Vec<u8>> = bytes.split(|byte| *byte == b'\n').map(<[u8]>::to_vec).collect();
+        let base_dir = checkpath_base_dir(&path);
+        checkpath_lines(context, &base_dir, &nested, depth + 1, state);
+        state.arrows.pop();
+    }
+}
+
+
+/// Parent directory of one included file for resolving its own includes.
+fn checkpath_base_dir(path: &str) -> PathBuf {
+    Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(PathBuf::new, Path::to_path_buf)
+}
+
+/// Leftmost `'include'` match end byte in `line`, or `None`.
+fn checkpath_match_end(program: &ox_regex::Prog, line: &str) -> Option<usize> {
+    let text = RegexText::new(line.to_owned());
+    let mut cursor = 0;
+    while cursor <= line.len() {
+        let Some(position) = text.position(cursor) else {
+            break;
+        };
+        if let Some(matched) = regex_exec_at(program, &text, position) {
+            return Some(matched.end.byte);
+        }
+        cursor += 1;
+    }
+    None
+}
+
+/// Resolve the file named after an `'include'` match: the display path when
+/// found on disk, plus the isolated line text used for missing entries.
+/// Returns `None` when the line names nothing.
+fn checkpath_resolve<F: FileIO>(
+    context: &CheckpathContext<'_, F>,
+    line: &str,
+    end: usize,
+    base_dir: &Path,
+) -> Option<(Option<String>, String)> {
+    let isolated = checkpath_isolated_name(line, end)?;
+    // The `""`/`<>`-stripped name for path lookup.
+    let bare = isolated
+        .trim_matches(|char| char == '"' || char == '<' || char == '>')
+        .to_owned();
+    if bare.is_empty() {
+        return None;
+    }
+    let bare_path = Path::new(&bare);
+    if bare_path.is_absolute() {
+        return Some((
+            context
+                .io
+                .exists(bare_path)
+                .then(|| bare_path.to_string_lossy().into_owned()),
+            isolated,
+        ));
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut candidates = vec![base_dir.join(bare_path)];
+    for entry in context.entries {
+        if entry.is_empty() {
+            continue;
+        }
+        let entry_path = Path::new(entry);
+        candidates.push(entry_path.join(bare_path));
+        if entry_path.is_relative() {
+            candidates.push(cwd.join(entry_path).join(bare_path));
+        }
+    }
+    let found = candidates
+        .iter()
+        .find(|path| context.io.exists(path))
+        .map(|path| path.to_string_lossy().into_owned());
+    Some((found, isolated))
+}
+
+/// The file name after an `'include'` match (`file_name_in_line`,
+/// search.c:3105-3135 without the `\zs` branch): skip non-filename bytes,
+/// take filename bytes, then restore surrounding `""` or `<>`.
+fn checkpath_isolated_name(line: &str, end: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut start = end;
+    while start < bytes.len() && !is_checkpath_file_char(bytes[start]) {
+        start += 1;
+    }
+    let mut len = 0;
+    while start + len < bytes.len() && is_checkpath_file_char(bytes[start + len]) {
+        len += 1;
+    }
+    let (mut left, mut right) = (start, start + len);
+    if len == 0 {
+        // Nothing found: use the rest of the line (search.c:3126-3129).
+        if start >= bytes.len() {
+            return None;
+        }
+        right = bytes.len();
+    } else {
+        if left > 0 && (bytes[left - 1] == b'"' || bytes[left - 1] == b'<') {
+            left -= 1;
+        }
+        if right < bytes.len() && (bytes[right] == b'"' || bytes[right] == b'>') {
+            right += 1;
+        }
+    }
+    let name = line[left..right].trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+/// `vim_isfilec` approximation for the default `'isfname'`
+/// (`@,48-57,/,.,-,_,+,,,#,$,%,~,=`) minus the characters this port never
+/// produces in include names.
+fn is_checkpath_file_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'.' | b'/' | b'-' | b'_' | b'+' | b',' | b'#' | b'$' | b'%' | b'~' | b'='
+        )
 }
 
 fn command_stopinsert<F: FileIO, E: ExEditorAccess>(
@@ -13415,6 +14275,186 @@ fn command_diffgetput<F: FileIO, E: ExEditorAccess>(
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
+}
+/// `:diffsplit [file]` (`ex_diffsplit`, diff.c:1510-1558): split the window
+/// and show `{file}` in the new window with diff mode on in both windows.
+///
+/// The split reuses `:split`'s machinery (`do_exedit`, diff.c:1532-1535), so
+/// an empty argument keeps the current buffer and a failed file read aborts
+/// before any diff option changes, exactly like upstream's early return when
+/// the split does not happen. Orientation follows `'diffopt'`'s `vertical`
+/// flag (`win_split(0, WSP_VERT)`, diff.c:1527); an explicit `:vertical`
+/// modifier is additionally honored through the shared split path. Both
+/// windows then enter diff mode (`diff_win_options`, diff.c:1539-1543).
+/// Cursor synchronization to the corresponding diff line
+/// (`diff_get_corresponding_line` + `scroll_to_fraction`, diff.c:1545-1557)
+/// is not implemented: the cursor stays where the split left it and the
+/// shared diff blocks are recomputed by `diffupdate`.
+fn command_diffsplit<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let vertical = access.with_ex_editor(|editor| {
+        matches!(
+            option_value(editor, "diffopt", SetLayer::Effective),
+            Some(OptionValue::String(flags))
+                if flags.split(',').any(|flag| flag.trim() == "vertical")
+        )
+    });
+    let old_window = access.with_ex_editor(|editor| editor.current_window());
+    let flow = command_split(runtime, access, scope, lua, command, vertical);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+    if let Err(message) = access.with_ex_editor(|editor| crate::diffmode::diffthis(editor)) {
+        return error_flow(runtime, "E444", message);
+    }
+    let new_window = access.with_ex_editor(|editor| editor.current_window());
+    if old_window != new_window
+        && let Some(old) = old_window
+    {
+        let applied = access.with_ex_editor(|editor| {
+            if editor.window(old).is_err() {
+                return false;
+            }
+            if editor.set_current_window(old).is_err() {
+                return false;
+            }
+            let outcome = crate::diffmode::diffthis(editor).is_ok();
+            if let Some(new) = new_window {
+                let _ = editor.set_current_window(new);
+            }
+            outcome
+        });
+        if !applied {
+            return error_flow(runtime, "E444", "Cannot set diff mode");
+        }
+    }
+    access.with_ex_editor(|editor| crate::diffmode::diffupdate(editor));
+    Flow::Normal
+}
+
+/// `:[range]match {group} {pattern}` (`ex_match`, match.c:1154-1216): arm,
+/// clear, or redefine one of the three window-local `:match` highlights.
+///
+/// The range is the match ID with upstream's `ADDR_OTHER` default of 1 when
+/// no address is given (ex_docmd.c:2231-2234); it is read raw, without line
+/// domain bounds, since `invalid_range` skips `ADDR_OTHER`
+/// (ex_docmd.c:3752+) and only `> 3` reports `E476` (`e_invcmd`,
+/// match.c:1164-1168). A bare `:match` or `:match none` deletes the ID's
+/// highlight (`match_delete(curwin, id, false)`, match.c:1169-1177). A group
+/// without a pattern is `E475` (`e_invarg2`), an unterminated pattern is
+/// `E475`, and trailing text after the closing delimiter is `E488`, all
+/// matching `test_match.vim:154-157`. The highlight group needs no
+/// validation: upstream's `syn_check_group` creates unknown groups
+/// (highlight_group.c:2067-2078). The pattern compiles with magic like
+/// `match_add`'s `vim_regcomp(pat, RE_MAGIC)`; failure is `E475`.
+fn command_match<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    command: &ExCommand,
+) -> Flow {
+    let id: i64 = match &command.range {
+        None => 1,
+        Some(range) if matches!(range.kind, RangeKind::WholeBuffer) => {
+            i64::try_from(buffer_last_line(editor)).unwrap_or(i64::MAX)
+        }
+        Some(range) => {
+            let address = range.end.as_ref().or(range.start.as_ref());
+            match address {
+                Some(Address {
+                    base: AddressBase::Line(line),
+                    offsets,
+                }) if offsets.is_empty() => i64::try_from(*line).unwrap_or(i64::MAX),
+                _ => match resolve_range_raw(editor, command) {
+                    Ok((_, end)) => i64::try_from(end).unwrap_or(i64::MAX),
+                    Err(message) => return error_flow(runtime, "E16", message),
+                },
+            }
+        }
+    };
+    if id > 3 {
+        return error_flow(runtime, "E476", "Invalid command");
+    }
+    let Some(window) = editor.current_window() else {
+        return error_flow(runtime, "E749", "No current window");
+    };
+    editor.delete_match(window, id);
+    let args = command.args.trim();
+    if args.is_empty() || args.eq_ignore_ascii_case("none") {
+        return Flow::Normal;
+    }
+    let bytes = args.as_bytes();
+    let group_end = bytes
+        .iter()
+        .position(|byte| *byte == b' ' || *byte == b'\t')
+        .unwrap_or(bytes.len());
+    let rest = args[group_end..].trim_start_matches([' ', '\t']);
+    if rest.is_empty() {
+        return error_flow(runtime, "E475", format!("Invalid argument: {args}"));
+    }
+    // `skip_regexp(p + 1, *p, true)` (match.c:1189): the byte after the
+    // group word delimits the pattern; backslash escapes skip the next byte.
+    let delimiter = rest.as_bytes()[0];
+    let mut close = None;
+    let mut index = 1;
+    while index < rest.len() {
+        if rest.as_bytes()[index] == b'\\' {
+            index += 2;
+            continue;
+        }
+        if rest.as_bytes()[index] == delimiter {
+            close = Some(index);
+            break;
+        }
+        index += 1;
+    }
+    let Some(close) = close else {
+        return error_flow(runtime, "E475", format!("Invalid argument: {rest}"));
+    };
+    if !rest[close + 1..].bytes().all(|byte| byte == b' ' || byte == b'\t') {
+        return error_flow(
+            runtime,
+            "E488",
+            format!(
+                "Trailing characters: {}",
+                rest[close + 1..].trim_start_matches([' ', '\t'])
+            ),
+        );
+    }
+    let group = &args[..group_end];
+    let pattern = &rest[1..close];
+    if pattern.is_empty() {
+        // `match_add` rejects an empty pattern without an error
+        // (match.c:62-64); the old highlight is already deleted above.
+        return Flow::Normal;
+    }
+    if id < 1 {
+        // `match_add` with an ID below 1 (`E799`, match.c:65-70).
+        return error_flow(
+            runtime,
+            "E799",
+            format!("Invalid ID: {id} (must be greater than or equal to 1)"),
+        );
+    }
+    if compile_regex(pattern, Magic::Magic).is_err() {
+        return error_flow(runtime, "E475", format!("Invalid argument: {pattern}"));
+    }
+    editor.add_match(
+        window,
+        crate::builtins::matches::MatchItem {
+            id,
+            priority: 10,
+            group: group.to_owned(),
+            pattern: Some(pattern.to_owned()),
+            positions: Vec::new(),
+            conceal_char: None,
+        },
+    );
+    Flow::Normal
 }
 
 /// `:hide` (`ex_docmd.c` `ex_hide`:5369): close a window without freeing its
