@@ -973,3 +973,24 @@ The 201 missing names carry oldtest evidence where the census has it:
 Cheapest five, by behaviour rather than popularity: `pwd`, `list`, `number`,
 `uptime`, `tabs` — each reuses an existing path (`command_cd`, `command_print`,
 `command_version`, the tab iteration) and adds no state.
+
+
+### Round summary after the watcher, command, and sink work
+
+Landed commits in this round: `cef2725` (dict watchers, dict targets),
+`bb7df47` (scope targets + registration through the evaluator identity),
+`127e70a` and `d898b6b` (two mutation-proved test deletions), `72425a2`
+(`:pwd`, `:list`, `:number`, `:uptime`, `:tabs`), `acbc643` (client channel
+sink for `rpcnotify`).
+
+| Measure | Before round | After |
+|---|---|---|
+| workspace suite | 3793 | 3811 |
+| `plugin/cfilter_spec` | 18 of 18 | 18 of 18 |
+| `plugin/dir_spec` | 7 of 38 | 8 of 38 |
+| `ex_cmds` group (partial, 1200 s timeout) | 54 OK / 343 FAIL of 405 | 58 OK / 339 FAIL of 405 |
+| `dict_notifications_spec` (partial) | 0 OK / 33 FAIL of 34 | not yet re-measured with the sink built in |
+
+The `ex_cmds` numbers predate the client sink, because the run used the binary
+built before `acbc643`; the `dict_notifications_spec` re-measure with the sink
+is the next gate.
