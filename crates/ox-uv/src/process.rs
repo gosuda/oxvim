@@ -80,6 +80,27 @@ pub struct ExtraStdio {
     pub config: StdioConfig,
 }
 
+/// Descriptors the caller owns and hands to a child's standard slots.
+///
+/// luv's `uv.spawn` accepts an arbitrary descriptor number as a `stdio` entry
+/// and takes ownership of it (`luvref.txt`, `uv.spawn-options.stdio`). The
+/// copyable [`StdioConfig`] cannot carry an `OwnedFd`, so owned descriptors
+/// travel in this separate, deliberately non-`Clone` value through
+/// [`spawn_with_owned_stdio`]. A `Some` slot wins over the matching
+/// [`StdioConfig`] entry.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct OwnedStdio(pub [Option<std::os::fd::OwnedFd>; 3]);
+
+#[cfg(unix)]
+impl OwnedStdio {
+    /// No owned descriptors: every slot keeps its [`StdioConfig`].
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self([None, None, None])
+    }
+}
+
 /// Options accepted by [`spawn`].
 ///
 /// `environment: None` inherits the parent environment. `Some(entries)`
@@ -1012,6 +1033,71 @@ pub fn spawn<F>(
 where
     F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
 {
+    #[cfg(unix)]
+    {
+        spawn_with_stdio(uv_loop, options, OwnedStdio::empty(), on_exit)
+    }
+    #[cfg(not(unix))]
+    {
+        spawn_with_slots(uv_loop, options, |config, _slot| map_stdio(config), on_exit)
+    }
+}
+
+/// Spawns with caller-owned descriptors wired over the standard slots.
+///
+/// This is the entry point luv's numeric `stdio` entries need: the caller
+/// keeps ownership until here, and `Stdio::from(OwnedFd)` transfers it to the
+/// child's slot, closing the parent copy as the child starts.
+///
+/// # Errors
+///
+/// Same failures as [`spawn`].
+#[cfg(unix)]
+pub fn spawn_with_owned_stdio<F>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    owned: OwnedStdio,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+{
+    spawn_with_stdio(uv_loop, options, owned, on_exit)
+}
+
+#[cfg(unix)]
+fn spawn_with_stdio<F>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    owned: OwnedStdio,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+{
+    let OwnedStdio([stdin_owned, stdout_owned, stderr_owned]) = owned;
+    let mut slots = [stdin_owned, stdout_owned, stderr_owned];
+    spawn_with_slots(
+        uv_loop,
+        options,
+        |config, slot| stdio_for(config, slots[slot].take()),
+        on_exit,
+    )
+}
+
+/// Shared spawn body: `slot` maps one standard slot's config (and its index)
+/// to the `Stdio` the child receives, so the owned-descriptor form and the
+/// plain form differ only in that mapper.
+fn spawn_with_slots<F, M>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    mut slot: M,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+    M: FnMut(StdioConfig, usize) -> Result<Stdio, ProcessError>,
+{
     let SpawnOptions {
         program,
         args,
@@ -1036,9 +1122,9 @@ where
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.stdin(map_stdio(stdio[0])?);
-    command.stdout(map_stdio(stdio[1])?);
-    command.stderr(map_stdio(stdio[2])?);
+    command.stdin(slot(stdio[0], 0)?);
+    command.stdout(slot(stdio[1], 1)?);
+    command.stderr(slot(stdio[2], 2)?);
     configure_platform_command(&mut command, uid, gid, detached, hide);
 
     let prepared = prepare_extra_stdio(&extra_stdio)?;
@@ -1896,6 +1982,18 @@ where
         master,
         pty_slave,
     })
+}
+
+/// `Stdio` for one slot: an owned descriptor wins over the copyable config.
+#[cfg(unix)]
+fn stdio_for(
+    config: StdioConfig,
+    owned: Option<std::os::fd::OwnedFd>,
+) -> Result<Stdio, ProcessError> {
+    match owned {
+        Some(owned) => Ok(Stdio::from(owned)),
+        None => map_stdio(config),
+    }
 }
 
 fn map_stdio(config: StdioConfig) -> Result<Stdio, ProcessError> {

@@ -2472,6 +2472,7 @@ impl Handle for Udp {
 /// # Errors
 ///
 /// Returns [`NetError::Io`] when the system pipe call fails.
+#[cfg(unix)]
 pub fn pipe_pair(nonblock: bool) -> std::io::Result<(i64, i64)> {
     use std::os::fd::IntoRawFd;
     let (reader, writer) = rustix::pipe::pipe()?;
