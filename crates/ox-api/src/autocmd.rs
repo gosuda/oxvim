@@ -289,8 +289,9 @@ pub(crate) fn fire_option_set(
     if !started || firing {
         return Ok(());
     }
-    let saved = session
-        .with_editor_mut(|editor| editor.publish_option_set(scope, old, old_local, old_global, new));
+    let saved = session.with_editor_mut(|editor| {
+        editor.publish_option_set(scope, old, old_local, old_global, new)
+    });
     session.with_state_mut(|state| state.option_set_in_flight = true);
     let match_name = OxStr::from(name);
     let buffer = session.with_editor(|editor| editor.current_buffer());

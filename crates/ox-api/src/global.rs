@@ -5,8 +5,7 @@ use ox_editor::{
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
     MOD_MASK_META, MOD_MASK_SHIFT, Message, MessageKind, OptionError, OptionListKind,
     OptionMetadata, OptionScope, OptionSetScope, OptionType, OptionValue, TypeaheadFlags,
-    UserCommand,
-    focus_transition,
+    UserCommand, focus_transition,
 };
 use ox_excmd::ExCommand;
 use ox_types::{Special, Typval};
@@ -1184,33 +1183,39 @@ pub fn nvim_set_option_value(
     }
     let assigned = structured_option_value(metadata, &value);
     set_option_at(session, name, value.clone(), target)?;
-    // `apply_optionset_autocmd_now` (option.c:2099): a committed change fires
-    // `OptionSet` with the option's full name as the pattern and the six
-    // `v:option_*` values published for the callbacks.
-    let (scope, old_local, old_global) = match target {
-        OptionTarget::Global => (OptionSetScope::Global, None, Some(previous_object.clone())),
-        OptionTarget::Buffer(_) | OptionTarget::Window(_) => (OptionSetScope::Local, None, None),
-        // `:set` reaches both scopes, so the callbacks see each old value
-        // separately (`option.c:2123-2129`).
-        OptionTarget::GlobalAndBuffer(buffer) => {
-            let local = current_option_value(session, name, OptionTarget::Buffer(buffer))?;
-            let global = current_option_value(session, name, OptionTarget::Global)?;
-            (
-                OptionSetScope::Set,
-                Some(structured_option_value(metadata, &local)),
-                Some(structured_option_value(metadata, &global)),
-            )
-        }
-        OptionTarget::GlobalAndWindow(window) => {
-            let local = current_option_value(session, name, OptionTarget::Window(window))?;
-            let global = current_option_value(session, name, OptionTarget::Global)?;
-            (
-                OptionSetScope::Set,
-                Some(structured_option_value(metadata, &local)),
-                Some(structured_option_value(metadata, &global)),
-            )
+    // `apply_optionset_autocmd_now` (option.c:2099) reports the flags the
+    // *request* carried, not the value target: `opt_flags` starts at zero and
+    // only a `scope` key, a `buf`, or a `win` sets it (`api/options.c:62-95`).
+    // Zero flags is upstream's plain `set`, which publishes both old values.
+    let requested = match dict_string(&opts, "scope")? {
+        Some(text) if text.as_bytes() == b"global" => OptionSetScope::Global,
+        Some(_) => OptionSetScope::Local,
+        None => {
+            if opts.get(&OxStr::from("buf")).is_some() || opts.get(&OxStr::from("win")).is_some() {
+                OptionSetScope::Local
+            } else {
+                OptionSetScope::Set
+            }
         }
     };
+    let (old_local, old_global) = match requested {
+        OptionSetScope::Set => {
+            // A buffer-only option has no global value to read; upstream's
+            // `oldval_g` is then the value the write replaced.
+            let global = if metadata.scopes.contains(&OptionScope::Global) {
+                structured_option_value(
+                    metadata,
+                    &current_option_value(session, name, OptionTarget::Global)?,
+                )
+            } else {
+                previous_object.clone()
+            };
+            (Some(previous_object.clone()), Some(global))
+        }
+        OptionSetScope::Global => (None, Some(previous_object.clone())),
+        OptionSetScope::Local | OptionSetScope::Modeline => (None, None),
+    };
+    let scope = requested;
     crate::autocmd::fire_option_set(
         session,
         metadata.name,

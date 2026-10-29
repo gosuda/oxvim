@@ -2476,6 +2476,84 @@ fn definition_count(session: &crate::ApiSession, id: i64) -> usize {
 }
 
 #[test]
+/// A `nvim_set_option_value` call with no `scope`, `buf`, or `win` key leaves
+/// upstream's `opt_flags` at zero (`api/options.c:427`), which is the plain
+/// `set` branch: `v:option_command` is `set`, `v:option_type` is `global`, and
+/// both old values are published (`option.c:2125-2129`).
+#[test]
+fn api_option_write_without_a_scope_reports_plain_set() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("scrolloff"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor.vvars().get(&OxStr::from("option_type")).cloned(),
+                editor.vvars().get(&OxStr::from("option_oldlocal")).cloned(),
+                editor
+                    .vvars()
+                    .get(&OxStr::from("option_oldglobal"))
+                    .cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("scrolloff"),
+        Object::Integer(9),
+        dict(&[]),
+    )
+    .unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(
+        seen[0][0],
+        Some(Object::String(OxStr::from("set"))),
+        "no scope key means the plain set branch"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("global"))),
+        "and the global type"
+    );
+    assert!(
+        matches!(seen[0][2], Some(Object::Integer(_))),
+        "v:option_oldlocal is published for a plain set: {:?}",
+        seen[0][2]
+    );
+    assert!(
+        matches!(seen[0][3], Some(Object::Integer(_))),
+        "and so is v:option_oldglobal: {:?}",
+        seen[0][3]
+    );
+    let _ = id;
+}
+
 /// The deprecated `nvim_set_option` reaches the same `set_option_value` path
 /// upstream, so it publishes `OptionSet` too, with the global scope
 /// (`option.c:4373`).
@@ -2501,7 +2579,10 @@ fn legacy_set_option_fires_optionset_with_global_scope() {
             [
                 editor.vvars().get(&OxStr::from("option_new")).cloned(),
                 editor.vvars().get(&OxStr::from("option_command")).cloned(),
-                editor.vvars().get(&OxStr::from("option_oldglobal")).cloned(),
+                editor
+                    .vvars()
+                    .get(&OxStr::from("option_oldglobal"))
+                    .cloned(),
             ]
         });
         recorded.borrow_mut().push(snapshot);
