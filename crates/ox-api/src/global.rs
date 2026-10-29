@@ -1105,9 +1105,26 @@ pub fn nvim_set_option(session: &ApiSession, name: OxStr, value: Object) -> Resu
     let name = option_name(&name)?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
     let value = object_to_legacy_option_value(metadata, name, value)?;
+    // Upstream's `nvim_set_option` reaches the same `set_option_value` path as
+    // the modern setter, so it publishes `OptionSet` too (option.c:4373).
+    let previous = session
+        .with_editor(|editor| editor.options().get_global(name).cloned())
+        .map_err(exception)?;
+    let previous_object = structured_option_value(metadata, &previous);
     session
-        .with_editor_mut(|editor| editor.options_mut().set_global(name, value))
-        .map_err(exception)
+        .with_editor_mut(|editor| editor.options_mut().set_global(name, value.clone()))
+        .map_err(exception)?;
+    let assigned = structured_option_value(metadata, &value);
+    crate::autocmd::fire_option_set(
+        session,
+        metadata.name,
+        OptionSetScope::Global,
+        &previous_object,
+        None,
+        Some(&previous_object),
+        &assigned,
+    )?;
+    Ok(())
 }
 
 #[api(since = 9)]
