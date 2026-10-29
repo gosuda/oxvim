@@ -18530,7 +18530,7 @@ fn command_checkhealth<F: FileIO, E: ExEditorAccess>(
                 // `'runtimepath'` that is a host limitation, not a broken
                 // runtime, so report natively instead of crying `E5009`.
                 if health_framework_available(runtime, access) {
-                    return command_checkhealth_native(runtime, access, scope, &args);
+                    return command_checkhealth_native(runtime, access, scope, Some(lua), &args);
                 }
             }
         }
@@ -18551,10 +18551,10 @@ fn command_checkhealth<F: FileIO, E: ExEditorAccess>(
         }
         return error_flow(runtime, "E5009", "Invalid 'runtimepath'");
     }
-    command_checkhealth_native(runtime, access, scope, &args)
+    command_checkhealth_native(runtime, access, scope, lua, &args)
 }
-
-/// Native `health://` report without a Lua host (unit-test seam).
+/// Native `health://` report, carrying the executor's Lua host when one
+/// exists so `FileType`/`BufEnter` Lua callbacks can run (unit-test seam).
 ///
 /// The shape mirrors `runtime/lua/vim/health.lua`: a `78`-wide `=` rule, a
 /// `name: <summary>` header, a blank line, the reporter lines, and a trailing
@@ -18566,6 +18566,7 @@ fn command_checkhealth_native<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &str,
 ) -> Flow {
     let names: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
@@ -18622,7 +18623,7 @@ fn command_checkhealth_native<F: FileIO, E: ExEditorAccess>(
         }
         out
     };
-    open_health_buffer(runtime, access, scope, &lines)
+    open_health_buffer(runtime, access, scope, lua, &lines)
 }
 
 /// Reporter item rendered into a native health block.
@@ -18827,6 +18828,7 @@ fn open_health_buffer<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     lines: &[Vec<u8>],
 ) -> Flow {
     let existing = access.with_ex_editor(|editor| {
@@ -18872,14 +18874,14 @@ fn open_health_buffer<F: FileIO, E: ExEditorAccess>(
         runtime,
         access,
         scope,
-        None,
+        lua,
         "filetype=checkhealth",
         SetLayer::Local,
     );
     if !matches!(flow, Flow::Normal) {
         return flow;
     }
-    fire_buffer_lifecycle(runtime, access, scope, None, &[Event::BufEnter], handle)
+    fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], handle)
 }
 
 /// `:checktime` (`ex_cmds2.c` `ex_checktime` → `check_timestamps`,
@@ -20433,7 +20435,15 @@ fn run_lua_autocmd_callback<F: FileIO, E: ExEditorAccess>(
 ) -> (Flow, bool) {
     let Some(lua) = lua else {
         return (
-            error_flow(runtime, "E5108", "Lua callbacks are not installed"),
+            error_flow(
+                runtime,
+                "E5108",
+                format!(
+                    "{} Autocommands for \"{}\": Lua callback {reference} cannot run: Lua callbacks are not installed",
+                    action.event.as_str(),
+                    action.pattern,
+                ),
+            ),
             false,
         );
     };

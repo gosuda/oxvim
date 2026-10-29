@@ -451,6 +451,113 @@ fn checkhealth_missing_provider_reports_in_health_buffer() {
     );
 }
 
+/// Lua host that forces the `:checkhealth` native fallback while still
+/// serving autocmd callbacks: `execute_chunk` fails the way a re-entered
+/// host that cannot run the module does, and `invoke_callback` records.
+struct CheckhealthFallbackLua {
+    calls: RefCell<Vec<usize>>,
+}
+
+impl crate::LuaExec for CheckhealthFallbackLua {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        Err(LuaExecError::Runtime("no free Ex executor".to_owned()))
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        self.calls.borrow_mut().push(reference);
+        Ok(Object::Nil)
+    }
+}
+
+/// `:checkhealth` whose host cannot run the Lua module falls back to the
+/// native report with the host still attached, so a `FileType` Lua callback
+/// executes instead of raising `E5108`.
+#[test]
+fn checkhealth_native_fallback_runs_lua_filetype_callback_with_host() {
+    let (editor, mut executor) = setup();
+    let host = Rc::new(CheckhealthFallbackLua {
+        calls: RefCell::new(Vec::new()),
+    });
+    executor.set_lua_exec(host.clone());
+    executor
+        .scripts()
+        .io()
+        .insert("/rt/lua/vim/health.lua", "return {}");
+    executor
+        .execute_line(&editor, "set runtimepath=/rt")
+        .unwrap();
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::FileType],
+            "checkhealth",
+            &AutocmdKind::LuaCallback(7),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "checkhealth nonexistent")
+        .unwrap();
+    assert_eq!(
+        host.calls.borrow().as_slice(),
+        &[7],
+        "the native fallback must run the FileType Lua callback with the host",
+    );
+}
+
+/// Without any Lua host, a `FileType` Lua callback reached through the
+/// native `:checkhealth` path names the callback and the event instead of
+/// the generic `E5108` text.
+#[test]
+fn checkhealth_native_path_without_host_names_callback_and_event() {
+    let (editor, mut executor) = setup();
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::FileType],
+            "checkhealth",
+            &AutocmdKind::LuaCallback(9),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    match executor.execute_line(&editor, "checkhealth nonexistent") {
+        Err(ExecError::Vim(exception)) => {
+            match &exception.kind {
+                VimExceptionKind::Error(code) => assert_eq!(
+                    code, "E5108",
+                    "hostless Lua callback must stay E5108, got E{code}: {}",
+                    exception.message(),
+                ),
+                other => panic!("expected Error(E5108), got {other:?}"),
+            }
+            let message = exception.message();
+            assert!(
+                message.contains("Lua callback 9"),
+                "error must name the callback, got {message:?}",
+            );
+            assert!(
+                message.contains("FileType"),
+                "error must name the event, got {message:?}",
+            );
+        }
+        other => panic!("expected E5108, got {other:?}"),
+    }
+}
+
 /// `:write {file}` persists the current buffer's text through the `FileIO`
 /// seam, matching `ex_write` → `buf_write` in `bufwrite.c`.
 /// Upstream: `ex_docmd.c` `ex_write`.
