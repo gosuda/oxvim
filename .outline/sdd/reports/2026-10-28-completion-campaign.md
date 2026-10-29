@@ -393,3 +393,36 @@ The `-l` probe agrees between the two binaries as well: both answer
 `vim.system({'sh','-c','(sleep 0.3; printf late) & exit 0'})` when `wait(100)`
 times out, so the port matches the reference here rather than diverging from
 it. The sync expectation depends on the harness environment, not on the port.
+
+
+### Correction: system_spec counts, and two remaining timeout failures
+
+The earlier `13 of 16` was wrong. `system_spec.lua` has 17 tests. Exact
+outcomes after `ec0b16f` (`test/functional/lua/system_spec.lua`,
+`.outline/evidence/system-spec-post6.log`):
+
+| Outcome | Count |
+|---|---|
+| PASS | 13 |
+| SKIP | 1 (`always captures all content of stdout/stderr #30846`) |
+| FAIL | 2 |
+
+The two failures, with reference-binary controls through the same harness:
+
+| Test | oxvim | reference `nvim` | Reading |
+|---|---|---|---|
+| `vim.system (sync) supports timeout` | FAIL, `code 124` where the test wants `0` | FAIL, same mismatch | harness expectation, not a port defect |
+| `vim.system (async) supports timeout` | FAIL after 10.2 s | PASS in 1.15 s | open port defect |
+
+`ec0b16f` fixed a third one: `SystemObj:wait() does not process non-fast
+events #27292` failed at 1261 ms before it and passes after, and the reference
+passes it too. `vim._core.loop_poll` was draining the `vim.schedule` queue even
+when `vim.wait` asked for fast events only.
+
+For the async timeout the cause is visible in `-l`: with
+`vim.system({'sleep','10'}, {timeout=1000})`, `obj:wait()` returns at 1009 ms
+with `code 124, signal 9`, while the expectation is `signal 15`. The object's
+own timeout timer (`timer_oneshot`, `system.lua:352-360`) should fire first and
+kill with SIGTERM; instead `wait` reaches its own deadline and kills with
+SIGKILL. An extra zero-length poll after the deadline did not change that
+(still `signal 9`), so it was reverted rather than left in the tree.
