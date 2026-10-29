@@ -1197,3 +1197,21 @@ deleted because it ran inside dispatch and would have double-fired.
 The two remaining failures both fail identically at baseline and are unrelated
 to the tick: `calls watcher deleted in callback` and the `tabpagebuflist()`
 teardown case.
+
+
+### Mid-round deletion: 69 of 70
+
+`644dba0` keeps a watcher that was deleted by a callback inside the current
+round, matching `tv_dict_watcher_remove` (`eval/typval.c:1991-2024`) which only
+marks `needs_free` while busy, and `tv_dict_watcher_notify` (`:2090`) which skips
+only a busy watcher. The sweep now runs at round end.
+
+| `dict_notifications_spec` | Before | After |
+|---|---|---|
+| OK | 68 | 69 |
+| FAIL | 2 | 1 |
+
+The last failure is `tabpagebuflist() with dict watcher during buffer close/wipe`
+(grow a watcher during window/tab teardown, `E37` on `close`). It fails the same
+way on the pristine baseline, so it is a separate teardown defect rather than a
+regression from the watcher work.
