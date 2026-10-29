@@ -13682,7 +13682,16 @@ fn normalize_dir_buffer_name(path: &Path) -> String {
 /// byte order, hidden names included, no `../`
 /// (`runtime/lua/nvim/dir/fs.lua` `M.list`, `dir_spec.lua` startup listing).
 fn list_directory_entries<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> Vec<DirectoryEntry> {
-    let Ok(read) = runtime.scripts.io().read_dir(path) else {
+    collect_directory_entries(runtime.scripts.io(), path)
+}
+
+/// Directory entries for a listing, read through one [`FileIO`].
+///
+/// `:edit <dir>` and a startup directory argument both render this, so the two
+/// paths cannot drift: one reads the entries, [`directory_entry_line`] renders
+/// them, and [`directory_buffer_lines`] wraps both for a buffer.
+fn collect_directory_entries(io: &dyn FileIO, path: &Path) -> Vec<DirectoryEntry> {
+    let Ok(read) = io.read_dir(path) else {
         return Vec::new();
     };
     let mut entries: Vec<DirectoryEntry> = Vec::new();
@@ -13691,9 +13700,7 @@ fn list_directory_entries<F: FileIO>(runtime: &ExRuntime<F>, path: &Path) -> Vec
         if name == "." || name == ".." {
             continue;
         }
-        let dir = runtime
-            .scripts
-            .io()
+        let dir = io
             .metadata(&entry.path, true)
             .is_ok_and(|meta| matches!(meta.kind, crate::script::FileKind::Directory));
         entries.push(DirectoryEntry { name, dir });
@@ -13734,27 +13741,7 @@ pub fn load_directory_view(
     path: &Path,
 ) -> Result<(), crate::EditorError> {
     let display = normalize_dir_buffer_name(path);
-    let mut entries: Vec<DirectoryEntry> = std::fs::read_dir(path)
-        .map(|read| {
-            read.filter_map(std::result::Result::ok)
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name == "." || name == ".." {
-                        return None;
-                    }
-                    let dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
-                    Some(DirectoryEntry { name, dir })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    entries.sort_by(|left, right| {
-        if left.dir != right.dir {
-            return right.dir.cmp(&left.dir);
-        }
-        left.name.cmp(&right.name)
-    });
-    let line_vecs: Vec<Vec<u8>> = entries.iter().map(directory_entry_line).collect();
+    let line_vecs = directory_buffer_lines(&crate::script::RealFileIO, path);
     let text = Buffer::from_lines(&line_vecs, false)
         .map_err(|error| crate::EditorError::Buffer(error.into()))?;
     let state = editor.buffer_mut(buffer)?;
@@ -13773,6 +13760,14 @@ pub fn load_directory_view(
         OptionValue::String("directory".to_owned()),
     );
     Ok(())
+}
+
+/// Listing lines for `path`, the entries `:edit <dir>` shows.
+fn directory_buffer_lines(io: &dyn FileIO, path: &Path) -> Vec<Vec<u8>> {
+    collect_directory_entries(io, path)
+        .iter()
+        .map(directory_entry_line)
+        .collect()
 }
 
 /// Directory-buffer options matching `render_entries` + `fs.init`:
