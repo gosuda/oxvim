@@ -581,3 +581,24 @@ The port has three option setters (`Options::set_global`, `set_buffer`,
 knows a change happened, which scope it took, and the old value. Firing needs
 that knowledge, so the hook belongs above the setters, where the editor also
 holds the autocmd executor.
+
+
+### OptionSet: fired from the option API, still short of the spec
+
+`4f56421` adds the dispatch: `OptionSet` fires from `nvim_set_option_value`
+with the option's full name as the pattern, the six `v:option_*` values
+published for the callbacks and restored afterwards, a startup gate, and the
+no-nesting gate from `option.c:2102`. The test
+`set_option_value_fires_optionset_with_the_new_value` reads the values while the
+callback runs and fails when the dispatch is removed.
+
+It does not move `dir_spec`: still 7 of 38 pass, and T3/T4 report no events.
+The reason is the earlier finding, not this gap. Our `:edit <dir>` renders the
+listing in Rust, so `nvim.dir` never runs, `buftype` is never written through
+the option API, and there is nothing to announce. Once the plugin drives the
+listing, this dispatch is what makes its `buftype` write visible.
+
+`:set` and its relatives are not wired yet: `OptionAssignment`
+(`excmd_exec.rs:5702-5712`) carries the committed value and whether it changed,
+but not the old effective, local, and global values the event publishes. That
+change has to widen the record first.
