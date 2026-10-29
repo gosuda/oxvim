@@ -170,3 +170,83 @@ fn vim_wait_observes_terminal_job_output() {
         "terminal buffer has no marker after a successful wait: {text}"
     );
 }
+
+/// Both Ex slots are borrowed while `vim.wait` runs, yet the wait still
+/// observes terminal output: the outer `vim.cmd` holds one executor across
+/// its inner `:lua`, the inner `vim.cmd` holds the other across the wait, so
+/// no `try_borrow_mut` flush can run and only the borrow-free scheduler pump
+/// delivers bytes. The marker release is kernel-synchronised, not timed: the
+/// child blocks opening the FIFO for reading until the predicate opens it
+/// for writing, so the first predicate turn deterministically releases the
+/// marker and a later turn must observe it before the timeout.
+#[test]
+fn vim_wait_observes_terminal_job_output_with_both_executors_busy() {
+    let mut vim = Embedded::spawn();
+    // Wait for the server to come up (nvim_exec_lua answers once Lua runs).
+    for _ in 0..100 {
+        let probe = vim.request("nvim_exec_lua", vec![Value::from("return 1"), Value::Array(vec![])]);
+        if probe == Value::from(1) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let chunk = r#"
+        vim.cmd('enew')
+        local buf = vim.api.nvim_get_current_buf()
+        local fifo = vim.fn.tempname() .. '.fifo'
+        vim.fn.system({ 'mkfifo', fifo })
+        local job = vim.fn.jobstart(
+            { 'sh', '-c', 'read line < "' .. fifo .. '"; echo "MARKER-$line"' },
+            { term = true }
+        )
+        assert(job > 0, 'jobstart failed')
+        _G._bb_buf = buf
+        _G._bb_fifo = fifo
+        _G._bb_released = false
+        _G._bb_pred = function()
+            if not _G._bb_released then
+                local f = io.open(_G._bb_fifo, 'w')
+                if f then
+                    f:write('GO\n')
+                    f:close()
+                end
+                _G._bb_released = true
+            end
+            for _, l in ipairs(vim.api.nvim_buf_get_lines(_G._bb_buf, 0, -1, false)) do
+                if l:find('MARKER', 1, true) then
+                    return true
+                end
+            end
+            return false
+        end
+        -- Two nested `vim.cmd` levels hold both Ex executors across the wait:
+        -- the outer `:lua` keeps the first slot busy while the inner `:lua`
+        -- keeps the second, so executor-bound flushes cannot run.
+        vim.cmd('lua vim.cmd("lua _G._bb_ok = vim.wait(15000, _G._bb_pred, 20)")')
+        local seen = 'none'
+        for _, l in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
+            local m = l:match('(MARKER[^%s]*)')
+            if m then
+                seen = m
+            end
+        end
+        vim.fn.delete(fifo)
+        return 'ok=' .. tostring(_G._bb_ok) .. ' seen=' .. seen
+    "#;
+    let result = vim.request(
+        "nvim_exec_lua",
+        vec![Value::from(chunk), Value::Array(vec![])],
+    );
+    let Value::String(text) = result else {
+        panic!("expected a string summary, got {result:?}")
+    };
+    let text = text.as_str().expect("summary is utf-8");
+    assert!(
+        text.starts_with("ok=true"),
+        "vim.wait with both executors busy never observed terminal output: {text}"
+    );
+    assert!(
+        !text.contains("seen=none"),
+        "terminal buffer has no marker after a successful both-busy wait: {text}"
+    );
+}

@@ -1,6 +1,7 @@
 //! Reactor-driven child process channels used by Vimscript job control.
 
 use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::net::TcpStream;
@@ -13,6 +14,7 @@ use std::process::ChildStdin;
 #[cfg(not(unix))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::ops::Not;
 use std::time::{Duration, Instant};
 
 use ox_rpc::{IncrementalDecoder, Message, MsgidCounter};
@@ -23,6 +25,147 @@ use ox_uv::{Timer, UvLoop};
 use ox_uv::process::{self, Process, PtySize, SpawnOptions, StdioConfig};
 #[cfg(unix)]
 use ox_uv::process::{ProcessPipe, PtyHandle};
+
+/// Borrow-free terminal-display queue shared by every [`JobManager`] on one
+/// session thread: the PTY reader pushes display bytes here, and
+/// `LuaScheduler::pump_scheduled` drains it without borrowing an executor.
+/// `Arc<Mutex<..>>` (rather than `Rc<RefCell<..>>`) so the `'static` loop
+/// callbacks can capture it.
+pub type SharedPtyQueue = Arc<Mutex<VecDeque<(u64, Vec<u8>)>>>;
+/// Shared PTY reactor: every terminal job on the session registers on this
+/// one loop so a single borrow-free pump serves all managers.
+pub type SharedJobLoop = Rc<RefCell<UvLoop>>;
+
+/// Push display bytes onto the shared queue, ignoring a poisoned lock.
+pub fn push_pty_queue(queue: &SharedPtyQueue, id: u64, bytes: Vec<u8>) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = queue.lock() {
+        guard.push_back((id, bytes));
+    }
+}
+
+/// Drain every pending display chunk in FIFO order.
+pub fn drain_pty_queue(queue: &SharedPtyQueue) -> Vec<(u64, Vec<u8>)> {
+    match queue.lock() {
+        Ok(mut guard) => guard.drain(..).collect(),
+        Err(poison) => poison.into_inner().drain(..).collect(),
+    }
+}
+
+/// Drain only one channel's chunks, preserving order.
+pub fn drain_pty_queue_for(queue: &SharedPtyQueue, id: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut pending = Vec::new();
+    match queue.lock() {
+        Ok(mut guard) => {
+            for (job, bytes) in guard.drain(..) {
+                if job == id {
+                    out.extend_from_slice(&bytes);
+                } else {
+                    pending.push((job, bytes));
+                }
+            }
+            guard.extend(pending);
+        }
+        Err(poison) => {
+            let mut guard = poison.into_inner();
+            for (job, bytes) in guard.drain(..) {
+                if job == id {
+                    out.extend_from_slice(&bytes);
+                } else {
+                    pending.push((job, bytes));
+                }
+            }
+            guard.extend(pending);
+        }
+    }
+    out
+}
+
+thread_local! {
+    static THREAD_PTY_SHARE: RefCell<Option<PtyShareHandles>> = RefCell::new(None);
+}
+
+/// Cursor-query replies not yet delivered (`\x1b[1;1R` answers to a child's
+/// `\x1b[6n`): the borrow-free detector pushes here when both executors are
+/// busy, and the next borrowed flush sends them. `(channel, reply bytes)`.
+pub type SharedPtyPending = Arc<Mutex<Vec<(u64, Vec<u8>)>>>;
+/// Push a cursor-query reply onto the pending list. Bounded (1024 entries):
+/// a reply for a reaped channel can never send, and an unbounded retry list
+/// would grow it forever.
+pub fn push_pty_reply(pending: &SharedPtyPending, id: u64, reply: Vec<u8>) {
+    if let Ok(mut guard) = pending.lock() {
+        if guard.len() < 1024 {
+            guard.push((id, reply));
+        }
+    }
+}
+/// Per-terminal display flags read at process-exit time without borrowing an
+/// executor: `(has terminal binding, exit message enabled)` per channel.
+pub type SharedPtyMeta = Arc<Mutex<HashMap<u64, (bool, bool)>>>;
+
+/// The session's shared PTY handles: one display queue, one pending-reply
+/// list, one flag map, one reactor. Cloned (never moved) into every
+/// [`JobManager`] and the scheduler, so all producers and consumers meet on
+/// the same storage without executor borrows.
+#[derive(Clone, Default)]
+pub struct PtyShareHandles {
+    /// Terminal display bytes: reader and exit-text producers push here.
+    pub queue: SharedPtyQueue,
+    /// Cursor-query replies awaiting a borrowed send.
+    pub pending: SharedPtyPending,
+    /// Terminal-binding and exit-message flags per channel.
+    pub meta: SharedPtyMeta,
+    /// Reactor every terminal job registers on; pumped borrow-free.
+    pub reactor: Option<SharedJobLoop>,
+}
+pub fn take_pty_replies(pending: &SharedPtyPending) -> Vec<(u64, Vec<u8>)> {
+    match pending.lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(poison) => std::mem::take(&mut *poison.into_inner()),
+    }
+}
+
+/// Record a channel's terminal binding flag, keeping its exit-message flag
+/// (default enabled for a freshly seen channel).
+pub fn pty_meta_set_terminal(meta: &SharedPtyMeta, id: u64, terminal: bool) {
+    if let Ok(mut guard) = meta.lock() {
+        guard.entry(id).and_modify(|entry| entry.0 = terminal).or_insert((terminal, true));
+    }
+}
+
+/// Record a channel's exit-message flag, keeping its terminal flag.
+pub fn pty_meta_set_exit_message(meta: &SharedPtyMeta, id: u64, enabled: bool) {
+    if let Ok(mut guard) = meta.lock() {
+        guard.entry(id).and_modify(|entry| entry.1 = enabled).or_insert((false, enabled));
+    }
+}
+
+/// Publish the session's shared PTY handles: every [`JobManager::new`] on
+/// this thread afterwards auto-installs clones. Call once from `AppState`
+/// startup before any job starts. Managers (and their queued bytes) created
+/// earlier keep their own handles, so one live session per thread is the
+/// contract: building a second core while the first is alive would publish
+/// a new share future managers join.
+pub fn set_thread_pty_share(share: PtyShareHandles) {
+    THREAD_PTY_SHARE.with(|cell| *cell.borrow_mut() = Some(share));
+}
+
+fn thread_pty_share() -> Option<PtyShareHandles> {
+    THREAD_PTY_SHARE.with(|cell| cell.borrow().clone())
+}
+
+/// Exit status text for a reaped child, shared by the exit-text producer
+/// and the status bookkeeping in `drain_raw`.
+pub fn pty_exit_status(result: &Result<process::ProcessExit, String>) -> i64 {
+    match result {
+        Ok(exit) if exit.signal != 0 => i64::from(128 + exit.signal),
+        Ok(exit) => exit.code,
+        Err(_) => -2,
+    }
+}
 
 /// Callback values and their dictionary receiver from `jobstart()` options.
 #[derive(Clone)]
@@ -305,8 +448,6 @@ struct Job {
     pty_slave: Option<String>,
     /// Buffer that receives PTY output, when one was allocated.
     terminal_buffer: Option<ox_types::BufHandle>,
-    /// Raw PTY output accumulated for the terminal buffer.
-    pty_output: Vec<u8>,
     /// Whether the default `nvim.terminal` `TermClose` handler is active.
     terminal_exit_message: bool,
     /// `jobstart({'detach': v:true})`: upstream leaves a detached child running
@@ -361,6 +502,16 @@ pub struct JobManager {
     /// Sink for the session's client channel (`CHAN_STDIO = 1`): per
     /// session, never global, so two executors in one process stay isolated.
     client_notifier: Option<Rc<dyn Fn(&str, &[Object]) -> bool>>,
+    /// Borrow-free display queue: the PTY reader and the exit-text producer
+    /// push here; both the borrowed flush and the scheduler's borrow-free
+    /// drain consume it.
+    pty_queue: SharedPtyQueue,
+    /// Shared PTY reactor every terminal job registers on; pumped borrow-free.
+    pty_loop: Option<SharedJobLoop>,
+    /// Cursor-query replies awaiting a borrowed send.
+    pty_pending: SharedPtyPending,
+    /// Terminal-binding and exit-message flags per channel.
+    pty_meta: SharedPtyMeta,
 }
 impl JobManager {
     /// Create an isolated reactor-backed job table.
@@ -370,6 +521,7 @@ impl JobManager {
     /// Returns the reactor initialization error.
     pub fn new() -> Result<Self, String> {
         let loop_ = UvLoop::new().map_err(|error| error.to_string())?;
+        let share = thread_pty_share().unwrap_or_default();
         Ok(Self {
             loop_,
             jobs: HashMap::new(),
@@ -381,7 +533,32 @@ impl JobManager {
             next_timer_id: 1,
             timer_fired: Arc::new(Mutex::new(Vec::new())),
             client_notifier: None,
+            pty_queue: share.queue,
+            pty_loop: share.reactor,
+            pty_pending: share.pending,
+            pty_meta: share.meta,
         })
+    }
+    /// Install an explicit session share into this manager, replacing the
+    /// thread-default handles it was born with.
+    pub fn set_pty_share(&mut self, share: PtyShareHandles) {
+        self.pty_queue = share.queue;
+        self.pty_loop = share.reactor;
+        self.pty_pending = share.pending;
+        self.pty_meta = share.meta;
+    }
+    /// Clone the display-queue handle for the scheduler's borrow-free drain.
+    #[must_use]
+    pub fn pty_queue_handle(&self) -> SharedPtyQueue {
+        Arc::clone(&self.pty_queue)
+    }
+    /// Pump the shared PTY reactor without touching the job table.
+    pub fn pump_pty_loop(&self) {
+        if let Some(shared) = self.pty_loop.clone()
+            && let Ok(mut guard) = shared.try_borrow_mut()
+        {
+            let _ = guard.run_nowait();
+        }
     }
 
     /// Marks a `jobwait` Lua flush as awaiting synchronous delivery.
@@ -432,21 +609,57 @@ impl JobManager {
             StdioConfig::CreatePipe,
         ];
 
+        // Seed the borrow-free flag map from the spawn options; later
+        // `set_terminal_buffer` / `set_terminal_exit_message` calls keep it
+        // current, so the exit callback below reads exit-time flags without
+        // borrowing the manager.
+        pty_meta_set_terminal(&self.pty_meta, id, options.terminal_buffer.is_some());
         let exit_queue = Arc::clone(&self.raw);
+        let exit_display = Arc::clone(&self.pty_queue);
+        let exit_meta = Arc::clone(&self.pty_meta);
         let on_exit = move |_loop_: &mut UvLoop, result: process::ProcessExitResult| {
             let result = result.map_err(|error| error.to_string());
+            let status = pty_exit_status(&result);
+            // Exit text is a shared-queue producer like reader bytes: the
+            // borrow-free scheduler drain shows it even while both executors
+            // are held. Flags are read here, at exit time, from the shared
+            // map (the manager's job table may be unborrowable right now).
+            let show = exit_meta
+                .lock()
+                .map(|guard| guard.get(&id).is_some_and(|meta| meta.0 && meta.1))
+                .unwrap_or(false);
+            if show {
+                push_pty_queue(
+                    &exit_display,
+                    id,
+                    format!("\r\n[Process exited {status}]\r\n").into_bytes(),
+                );
+            }
             lock_queue(&exit_queue).push_back(RawEvent::Exit(id, result));
         };
 
         #[cfg(unix)]
         let (process, input, stdout_pipe, stderr_pipe, pty_slave) = if options.pty {
+            let pty_queue = Arc::clone(&self.pty_queue);
+            let shared_loop = self.pty_loop.clone();
+            // Session-shared reactor so the scheduler pumps PTY output without
+            // borrowing an executor; the private loop is the unit-test fallback.
+            let mut shared_guard =
+                shared_loop.as_ref().and_then(|shared| shared.try_borrow_mut().ok());
+            let loop_ref: &mut UvLoop = match shared_guard.as_mut() {
+                Some(guard) => guard,
+                None => &mut self.loop_,
+            };
             let mut spawned =
-                process::spawn_pty(&mut self.loop_, spawn_options, options.pty_size, on_exit)
+                process::spawn_pty(loop_ref, spawn_options, options.pty_size, on_exit)
                     .map_err(|error| error.to_string())?;
             let output_queue = Arc::clone(&self.raw);
             spawned
                 .master
-                .read_start(&mut self.loop_, move |_loop_, _handle, event| {
+                .read_start(loop_ref, move |_loop_, _handle, event| {
+                    if let NetEvent::Read(bytes) = &event {
+                        push_pty_queue(&pty_queue, id, bytes.clone());
+                    }
                     queue_stream_event(&output_queue, id, StreamKind::Stdout, event);
                 })
                 .map_err(|error| error.to_string())?;
@@ -552,7 +765,6 @@ impl JobManager {
                 rpc_msgid: MsgidCounter::new(),
                 pty_slave,
                 terminal_buffer: options.terminal_buffer,
-                pty_output: Vec::new(),
                 terminal_exit_message: true,
                 detached: options.detached,
                 pty: options.pty,
@@ -688,8 +900,15 @@ impl JobManager {
             }
             #[cfg(unix)]
             JobInput::Pty(pty) => {
-                pty.write(&mut self.loop_, data)
-                    .map_err(|error| error.to_string())?;
+                if let Some(shared) = self.pty_loop.clone()
+                    && let Ok(mut guard) = shared.try_borrow_mut()
+                {
+                    pty.write(&mut guard, data)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    pty.write(&mut self.loop_, data)
+                        .map_err(|error| error.to_string())?;
+                }
             }
         }
         Ok(true)
@@ -740,7 +959,13 @@ impl JobManager {
             // dropping the handle hangs the child up.
             #[cfg(unix)]
             JobInput::Pty(mut master) => {
-                let _ignored = master.read_stop(&mut self.loop_);
+                if let Some(shared) = self.pty_loop.clone()
+                    && let Ok(mut guard) = shared.try_borrow_mut()
+                {
+                    let _ignored = master.read_stop(&mut guard);
+                } else {
+                    let _ignored = master.read_stop(&mut self.loop_);
+                }
             }
         }
         true
@@ -1183,6 +1408,7 @@ impl JobManager {
         if let Some(job) = self.jobs.get_mut(&id) {
             job.terminal_buffer = Some(buffer);
         }
+        pty_meta_set_terminal(&self.pty_meta, id, true);
     }
 
     /// The terminal job projecting into `buffer`, if any, with whether it
@@ -1201,6 +1427,7 @@ impl JobManager {
         if let Some(job) = self.jobs.get_mut(&id) {
             job.terminal_buffer = None;
         }
+        pty_meta_set_terminal(&self.pty_meta, id, false);
     }
 
     /// Enable or disable the default terminal process-exit message.
@@ -1208,15 +1435,18 @@ impl JobManager {
         if let Some(job) = self.jobs.get_mut(&id) {
             job.terminal_exit_message = enabled;
         }
+        pty_meta_set_exit_message(&self.pty_meta, id, enabled);
     }
 
     /// Take accumulated PTY output for the terminal buffer.
     pub fn take_pty_output(&mut self, id: u64) -> Option<Vec<u8>> {
-        let job = self.jobs.get_mut(&id)?;
-        if job.pty_output.is_empty() {
+        self.pump_pty_loop();
+        let Ok(events) = self.poll() else {
             return None;
-        }
-        Some(std::mem::take(&mut job.pty_output))
+        };
+        self.defer_events(events);
+        let bytes = drain_pty_queue_for(&self.pty_queue, id);
+        bytes.is_empty().not().then_some(bytes)
     }
 
     /// Poll once and write any PTY output to the editor-owned terminal buffer.
@@ -1229,9 +1459,11 @@ impl JobManager {
         id: u64,
         editor: &mut crate::Editor,
     ) -> Result<(), String> {
+        self.pump_pty_loop();
         let events = self.poll()?;
         self.defer_events(events);
-        if let Some(bytes) = self.take_pty_output(id) {
+        let bytes = drain_pty_queue_for(&self.pty_queue, id);
+        if !bytes.is_empty() {
             editor
                 .append_terminal_buffer(id, &bytes)
                 .map_err(|error| error.to_string())?;
@@ -1247,15 +1479,10 @@ impl JobManager {
     ///
     /// Returns the reactor polling error.
     pub fn take_all_pty_output(&mut self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.pump_pty_loop();
         let events = self.poll()?;
         self.defer_events(events);
-        let output = self
-            .jobs
-            .iter_mut()
-            .filter_map(|(&id, job)| {
-                (!job.pty_output.is_empty()).then(|| (id, std::mem::take(&mut job.pty_output)))
-            })
-            .collect::<Vec<_>>();
+        let output = drain_pty_queue(&self.pty_queue);
         let cursor_queries = output
             .iter()
             .filter_map(|(id, bytes)| {
@@ -1266,7 +1493,22 @@ impl JobManager {
             })
             .collect::<Vec<_>>();
         for id in cursor_queries {
-            self.send(id, b"\x1b[1;1R".to_vec())?;
+            // A borrowed flush runs on whichever slot is free, which may not
+            // own this channel (scoped jobstarts land on either slot). Only
+            // `Ok(true)` counts as answered; anything else goes back on the
+            // shared pending list for the owning slot's next free turn.
+            match self.send(id, b"\x1b[1;1R".to_vec()) {
+                Ok(true) => {}
+                _ => push_pty_reply(&self.pty_pending, id, b"\x1b[1;1R".to_vec()),
+            }
+        }
+        // Replies the borrow-free detector could not send while both
+        // executors were held: this borrowed turn delivers the ones it owns.
+        for (id, reply) in take_pty_replies(&self.pty_pending) {
+            match self.send(id, reply.clone()) {
+                Ok(true) => {}
+                _ => push_pty_reply(&self.pty_pending, id, reply),
+            }
         }
         Ok(output)
     }
@@ -1283,10 +1525,9 @@ impl JobManager {
                     let Some(job) = self.jobs.get_mut(&id) else {
                         continue;
                     };
-                    // PTY output accumulates for the terminal buffer.
-                    if job.terminal_buffer.is_some() && matches!(stream, StreamKind::Stdout) {
-                        job.pty_output.extend_from_slice(&bytes);
-                    }
+                    // Display bytes already reached the shared queue in the
+                    // PTY reader callback, so nothing is appended here: doing
+                    // so would show every byte twice.
                     // RPC output accumulates for the request loop: unbuffered,
                     // callback-less bytes would otherwise be discarded before
                     // `rpcrequest` decodes its reply. A flooded channel closes
@@ -1340,17 +1581,11 @@ impl JobManager {
                     let Some(job) = self.jobs.get_mut(&id) else {
                         continue;
                     };
-                    let status = match result {
-                        Ok(exit) if exit.signal != 0 => i64::from(128 + exit.signal),
-                        Ok(exit) => exit.code,
-                        Err(_) => -2,
-                    };
+                    // Exit text already reached the shared queue in the exit
+                    // callback, which reads exit-time flags from the shared
+                    // map; pushing here again would show it twice.
+                    let status = pty_exit_status(&result);
                     job.status = status;
-                    if job.terminal_buffer.is_some() && job.terminal_exit_message {
-                        job.pty_output.extend_from_slice(
-                            format!("\r\n[Process exited {status}]\r\n").as_bytes(),
-                        );
-                    }
                     if let Some(callback) = job.callbacks.exit.clone() {
                         callbacks.push(JobEvent {
                             callback,
@@ -1379,7 +1614,21 @@ impl JobManager {
 impl Drop for JobManager {
     fn drop(&mut self) {
         for job in self.jobs.values() {
-            if job.status < 0 && !job.detached {
+            if job.status >= 0 || job.detached {
+                continue;
+            }
+            // PTY processes registered on the shared reactor; pipes on the
+            // private loop. Closing on the wrong loop leaves the handle alive.
+            let mut closed_shared = false;
+            if job.pty {
+                if let Some(shared) = self.pty_loop.clone() {
+                    if let Ok(mut guard) = shared.try_borrow_mut() {
+                        let _ignored = ox_uv::Handle::close(&job.process, &mut guard);
+                        closed_shared = true;
+                    }
+                }
+            }
+            if !closed_shared {
                 let _ignored = ox_uv::Handle::close(&job.process, &mut self.loop_);
             }
         }

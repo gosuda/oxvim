@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{
@@ -14,7 +15,10 @@ use ox_api::{
     LuaExecutor, Registry, close_channel, register_channel,
 };
 use ox_editor::editor::{MessageIdentity, RedrawRequest};
-use ox_editor::job::JobEvent;
+use ox_editor::job::{
+    JobEvent, PtyShareHandles, SharedJobLoop, SharedPtyPending, SharedPtyQueue, drain_pty_queue,
+    push_pty_reply, set_thread_pty_share, take_pty_replies,
+};
 use ox_editor::mode::InsertTransition;
 use ox_editor::{
     AutocmdAction, AutocmdContext, AutocmdKind, ChannelIds, CmdlineKind, Editor, Event, ExExecutor,
@@ -416,6 +420,21 @@ pub(crate) fn build_embedded_core(
     // editor through `session.with_editor*`, never a parallel `Rc`.
     let session = Rc::new(ApiSession::new(Rc::new(RefCell::new(editor))));
     let registry = Rc::new(ox_api::core().map_err(|error| AppError::Api(error.to_string()))?);
+    // Session-owned PTY share: display queue, pending cursor replies, flag
+    // map, and PTY reactor for every JobManager on this thread. Published
+    // as the thread default so lazily-created managers (including paths
+    // outside this crate) join it; the scheduler below holds explicit
+    // clones for its borrow-free drain.
+    let pty_loop: SharedJobLoop = SharedJobLoop::new(RefCell::new(
+        UvLoop::new().map_err(|error| AppError::Api(error.to_string()))?,
+    ));
+    let pty_share = PtyShareHandles {
+        queue: SharedPtyQueue::default(),
+        pending: SharedPtyPending::default(),
+        meta: Default::default(),
+        reactor: Some(pty_loop.clone()),
+    };
+    set_thread_pty_share(pty_share.clone());
     let lua_work = Rc::new(RefCell::new(VecDeque::new()));
     let ex = Rc::new(RefCell::new(ExExecutor::new()));
     let nested_ex = Rc::new(RefCell::new(ExExecutor::new()));
@@ -449,6 +468,9 @@ pub(crate) fn build_embedded_core(
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
             hostless_passes: Rc::new(Cell::new(0)),
+            pty_queue: pty_share.queue.clone(),
+            pty_loop: pty_loop.clone(),
+            pty_pending: pty_share.pending.clone(),
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -6506,6 +6528,9 @@ struct LuaScheduler {
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
     hostless_passes: Rc<Cell<usize>>,
+    pty_queue: SharedPtyQueue,
+    pty_loop: SharedJobLoop,
+    pty_pending: SharedPtyPending,
 }
 
 impl Scheduler for LuaScheduler {
@@ -6520,6 +6545,80 @@ impl Scheduler for LuaScheduler {
 
     fn pump_scheduled(&self) -> bool {
         let mut ran = drain_lua_work_queue(&self.queue, &self.session);
+        // Borrow-free terminal display pump: drive the session-shared PTY
+        // reactor, then append whatever the reader queued straight to the
+        // editor through the session. No executor is borrowed, so this works
+        // while both `ex` and `nested_ex` are held by enclosing Lua frames
+        // (the `vim.wait` both-busy case). Upstream serves the main loop on
+        // every wait turn (`LOOP_PROCESS_EVENTS`, event/loop.c); this is that
+        // turn for terminal display. Display bytes deliberately do not feed
+        // the return value (see below).
+        if let Ok(mut loop_guard) = self.pty_loop.try_borrow_mut() {
+            let _ = loop_guard.run_nowait();
+        }
+        let drained = drain_pty_queue(&self.pty_queue);
+        if !drained.is_empty() {
+            self.session.with_editor_mut(|editor| {
+                for (channel, bytes) in &drained {
+                    let _ = editor.append_terminal_buffer(*channel, bytes);
+                }
+            });
+            // Cursor-query replies (`\x1b[6n`): answer through a free slot if
+            // there is one; otherwise queue the reply on the shared pending
+            // list, which the borrowed flush below sends on the next free
+            // turn. Nothing is dropped: every detected query gets exactly one
+            // reply.
+            for (channel, bytes) in &drained {
+                if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+                    // Either slot may own the channel: only a `Ok(true)` send
+                    // counts, anything else falls through to the next slot
+                    // and finally to the pending list.
+                    let mut sent = false;
+                    if let Ok(mut guard) = self.ex.try_borrow_mut() {
+                        sent = guard.job_send(*channel, b"\x1b[1;1R").unwrap_or(false);
+                    }
+                    if !sent
+                        && let Ok(mut guard) = self.nested_ex.try_borrow_mut()
+                    {
+                        sent = guard.job_send(*channel, b"\x1b[1;1R").unwrap_or(false);
+                    }
+                    if !sent {
+                        push_pty_reply(&self.pty_pending, *channel, b"\x1b[1;1R".to_vec());
+                    }
+                }
+            }
+        }
+        // Replies queued while both slots were busy: a free slot sends them
+        // now, ahead of the display flush below. Anything still unsent goes
+        // back in order for a later turn; nothing is dropped.
+        let queued = take_pty_replies(&self.pty_pending);
+        if !queued.is_empty() {
+            let mut unsent = Vec::new();
+            for (channel, reply) in queued {
+                if !unsent.is_empty() {
+                    unsent.push((channel, reply));
+                    continue;
+                }
+                let mut sent = false;
+                if let Ok(mut guard) = self.ex.try_borrow_mut() {
+                    sent = guard.job_send(channel, &reply).unwrap_or(false);
+                }
+                if !sent
+                    && let Ok(mut guard) = self.nested_ex.try_borrow_mut()
+                {
+                    sent = guard.job_send(channel, &reply).unwrap_or(false);
+                }
+                if !sent {
+                    unsent.push((channel, reply));
+                }
+            }
+            if !unsent.is_empty() {
+                match self.pty_pending.lock() {
+                    Ok(mut guard) => guard.extend(unsent),
+                    Err(poison) => poison.into_inner().extend(unsent),
+                }
+            }
+        }
         // Pump terminal-job output so `vim.wait()` observes it: upstream
         // serves the main loop on every wait turn (`LOOP_PROCESS_EVENTS`,
         // event/loop.c), while the server otherwise only flushes PTY output
