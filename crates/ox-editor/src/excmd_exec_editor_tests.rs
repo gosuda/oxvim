@@ -13082,6 +13082,125 @@ fn recover_restores_swapfile_content() {
     assert_vim_error(clean_executor.execute_line(&clean, "recover"), "E305");
 }
 
+/// `:edit` runs the `findswapname` swapfile check before reading: a
+/// `SwapExists` `v:swapchoice` of `r` recovers the swapfile text, `q` aborts
+/// the open, and no choice prints `E325` and proceeds as Edit-anyway.
+/// Upstream: `findswapname` (`memline.c:3480+`).
+#[test]
+fn edit_detects_existing_swapfile_before_reading() {
+    fn editor_with_swap(recovered: &[u8]) -> (TestEditorAccess, ExExecutor<MemoryFileIO>) {
+        let io = MemoryFileIO::new();
+        io.insert("Xfile", "original\n");
+        let snapshot = Buffer::from_lines(&[recovered.to_vec()], true).unwrap();
+        let mut swap = Vec::new();
+        ox_text::SwapFile::new("Xfile", snapshot)
+            .write(&mut swap)
+            .unwrap();
+        io.insert_blob(".Xfile.swp", swap);
+        let editor = TestEditorAccess::new(Editor::new());
+        let buffer = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (editor, ExExecutor::with_io(io))
+    }
+
+    // `r` recovers the swapfile text instead of reading the file.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor
+        .execute_line(&editor, "autocmd SwapExists Xfile let v:swapchoice='r'")
+        .unwrap();
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["recovered"]);
+
+    // `q` aborts the open and leaves the current buffer alone.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor
+        .execute_line(&editor, "autocmd SwapExists Xfile let v:swapchoice='q'")
+        .unwrap();
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(
+        editor.editor().current_buffer().and_then(|handle| editor
+            .editor()
+            .buffer(handle)
+            .ok()
+            .map(|state| state.name().to_string_lossy().into_owned())),
+        Some(String::new()),
+    );
+
+    // No choice (a default-written swapfile carries pid 0, so the live
+    // default stays quiet) prints `E325` and proceeds as Edit-anyway.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["original"]);
+    assert!(
+        editor.editor().messages().iter().any(|message| match &message.content {
+            ox_types::Object::String(text) =>
+                text.to_string_lossy().contains("E325: ATTENTION"),
+            _ => false,
+        }),
+        "expected E325, got {:?}",
+        editor.editor().messages(),
+    );
+}
+/// The `nvim.swapfile` default skips the prompt with `W325` when the recorded
+/// pid names a live process: meta written for the current process and user.
+/// Upstream: `defaults.lua` `SwapExists` handler.
+#[test]
+fn edit_ignores_swapfile_from_running_process_with_w325() {
+    let user = current_login_for_test();
+    if user.is_empty() {
+        return;
+    }
+    let io = MemoryFileIO::new();
+    io.insert("Xfile", "original\n");
+    let snapshot = Buffer::from_lines(&[b"recovered".to_vec()], true).unwrap();
+    let meta = ox_text::SwapMeta {
+        pid: std::process::id(),
+        user,
+        ..Default::default()
+    };
+    let mut swap = Vec::new();
+    ox_text::SwapFile::new("Xfile", snapshot)
+        .with_meta(meta)
+        .write(&mut swap)
+        .unwrap();
+    io.insert_blob(".Xfile.swp", swap);
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["original"]);
+    assert!(
+        editor.editor().messages().iter().any(|message| match &message.content {
+            ox_types::Object::String(text) =>
+                text.to_string_lossy().contains("W325: Ignoring swapfile"),
+            _ => false,
+        }),
+        "expected W325, got {:?}",
+        editor.editor().messages(),
+    );
+}
+
+#[cfg(unix)]
+fn current_login_for_test() -> String {
+    let uid = ox_sys::unix::real_uid();
+    ox_sys::unix::passwd_entry(uid)
+        .ok()
+        .flatten()
+        .map_or_else(String::new, |entry| entry.name)
+}
+
+#[cfg(not(unix))]
+fn current_login_for_test() -> String {
+    String::new()
+}
+
 /// `:diffsplit {file}` splits like `:split` and enables diff mode in both
 /// windows; a bare `:diffsplit` re-shows the current buffer in diff mode.
 /// Upstream: `ex_diffsplit` (`diff.c:1510-1558`); oldtest

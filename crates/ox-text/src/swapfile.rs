@@ -523,14 +523,54 @@ impl SwapFile {
         let mut lines = Vec::new();
         let mut visited = BTreeSet::new();
         read_block(&bytes, page_size, 1, 1, &mut visited, &mut lines, 0)?;
+        // Block-zero identity (`ml_open`, memline.c:337-346): the same cells
+        // `block_zero` fills above. The magic check already proved the first
+        // 1023 bytes exist, so these offsets cannot run past the end.
+        let nul_string = |range: std::ops::Range<usize>| {
+            let end = bytes[range.clone()]
+                .iter()
+                .position(|&byte| byte == 0)
+                .map_or(range.end, |index| range.start + index);
+            String::from_utf8_lossy(&bytes[range.start..end]).into_owned()
+        };
+        let mtime = u32::from_le_bytes(bytes[16..20].try_into().unwrap_or([0; 4]));
+        let inode = u32::from_le_bytes(bytes[20..24].try_into().unwrap_or([0; 4]));
+        let pid = u32::from_le_bytes(bytes[24..28].try_into().unwrap_or([0; 4]));
+        let user = nul_string(B0_UNAME..B0_UNAME + B0_UNAME_SIZE);
+        let host = nul_string(B0_HNAME..B0_HNAME + B0_HNAME_SIZE);
+        let flags = bytes.get(B0_FLAGS).copied().unwrap_or(0);
+        let dirty = bytes.get(B0_DIRTY).is_some_and(|&byte| byte != 0);
+        let file_encoding = if flags & B0_HAS_FENC != 0 {
+            let area_end = B0_FNAME + B0_FNAME_SIZE_NOCRYPT;
+            let tail = &bytes[B0_FNAME..area_end];
+            tail.iter()
+                .rposition(|&byte| byte == 0)
+                .map_or_else(String::new, |nul| {
+                    String::from_utf8_lossy(&tail[nul + 1..])
+                        .trim_end_matches('\0')
+                        .to_owned()
+                })
+        } else {
+            String::new()
+        };
+        let meta = SwapMeta {
+            mtime,
+            inode,
+            pid,
+            user,
+            host,
+            dirty,
+            same_dir: flags & B0_SAME_DIR != 0,
+            file_encoding,
+            fileformat: flags & B0_FF_MASK,
+        };
         let buffer = Buffer::from_lines(&lines, true)?;
         Ok(Self {
             file_name,
-            meta: SwapMeta::default(),
+            meta,
             buffer,
         })
-    }
-
+}
     /// Builds block zero exactly as `ml_open` fills it (`memline.c:326-346`).
     fn block_zero(&self) -> Result<Vec<u8>, SwapError> {
         let mut block = vec![0; ZERO_BLOCK_SIZE];

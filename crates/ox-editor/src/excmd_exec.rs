@@ -9324,6 +9324,41 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
         Ok((handle, origin)) => (handle, origin),
         Err(flow) => return flow,
     };
+    // `findswapname` (memline.c:3480+) runs before the file is read: an
+    // existing swapfile fires `SwapExists`, honors `v:swapchoice`, and falls
+    // back to the `nvim.swapfile` default. Only a freshly staged buffer can
+    // trip it; a reused buffer already resolved its swapfile at creation.
+    if origin.is_created() {
+        match decide_swapfile_open(runtime, access, scope, lua, &path) {
+            SwapOpenDecision::Abort => {
+                let _ = access.with_ex_editor(|editor| editor.wipe_buffer(handle));
+                return Flow::Normal;
+            }
+            SwapOpenDecision::Recover { swap } => {
+                if load_swap_recovery(runtime, access, handle, &swap).is_err() {
+                    let _ = access.with_ex_editor(|editor| editor.wipe_buffer(handle));
+                    return error_flow(
+                        runtime,
+                        "E306",
+                        format!("Cannot open {}", swap.display()),
+                    );
+                }
+            }
+            SwapOpenDecision::Proceed { readonly } => {
+                if readonly {
+                    let _ = access.with_ex_editor(|editor| {
+                        editor.options_mut().set_buffer(
+                            handle,
+                            "readonly",
+                            OptionValue::Boolean(true),
+                        )
+                    });
+                }
+            }
+        }
+    }
+    // Computed after the swapfile decision on purpose: a recovery already
+    // loaded the buffer, so the file read below must not overwrite it.
     let unloaded = !access.with_ex_editor(|editor| {
         editor
             .buffer(handle)
@@ -10023,15 +10058,103 @@ fn tab_showing(editor: &Editor, handle: BufHandle) -> Option<(TabHandle, WinHand
     None
 }
 
-fn swap_path_for(path: &std::path::Path) -> PathBuf {
-    let file_name = path.file_name().unwrap_or_default();
-    let mut name = std::ffi::OsString::from(".");
-    name.push(file_name);
-    name.push(".swp");
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(name),
-        _ => PathBuf::from(name),
+/// One buffer open's swapfile decision (`findswapname`, memline.c:3480+):
+/// how an existing swapfile resolves before the file is read.
+enum SwapOpenDecision {
+    /// Read the file normally; `readonly` mirrors `SEA_CHOICE_READONLY`.
+    Proceed { readonly: bool },
+    /// Load `swap` instead of the file (`SEA_CHOICE_RECOVER`).
+    Recover { swap: PathBuf },
+    /// Leave the current buffer alone (`SEA_CHOICE_QUIT`/`ABORT`).
+    Abort,
+}
+
+/// `findswapname`'s existing-file scan (memline.c:3499-3560) without the
+/// modal dialog: every 'directory' entry's `makeswapname` permutation chain
+/// plus the trailing `modname(fname, ".swp")` fallback (`recover_names`,
+/// memline.c:1392-1401).
+fn find_existing_swapfile<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    file_name: &str,
+) -> Option<PathBuf> {
+    for dir in swap_directories(editor) {
+        let Some(base) = makeswapname(file_name, &dir) else {
+            continue;
+        };
+        let mut current = Some(base);
+        while let Some(path) = current {
+            if runtime.scripts.io().exists(&path) {
+                return Some(path);
+            }
+            current = permute_swap_name(&path);
+        }
     }
+    if let Some(path) = modname(file_name, ".swp", true)
+        && runtime.scripts.io().exists(&path)
+    {
+        return Some(path);
+    }
+    None
+}
+
+/// Whether `pid` names a live process: the `swapfile_proc_running`
+/// (memline.c:1432+) answer without the start-time refinement, enough to
+/// tell a live session's swapfile from a stale one.
+fn swap_process_running(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        ox_sys::unix::process_alive(pid)
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable probe here; assume a foreign pid is stale so the
+        // ATTENTION path (never silent loss) runs instead of `W325`.
+        false
+    }
+}
+
+/// This login's canonical name: the password-file entry for the real uid,
+/// like `os_get_username`/`uv_os_get_passwd` upstream (memline.c:341-344),
+/// never the easily-unset `$USER` environment row.
+fn current_login_name() -> String {
+    #[cfg(unix)]
+    {
+        let uid = ox_sys::unix::real_uid();
+        ox_sys::unix::passwd_entry(uid)
+            .ok()
+            .flatten()
+            .map_or_else(String::new, |entry| entry.name)
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .unwrap_or_default()
+    }
+}
+
+/// The `nvim.swapfile` default handler's user guard (defaults.lua): an empty
+/// recorded user never matches, otherwise the login names must agree.
+fn swap_user_matches(meta_user: &str) -> bool {
+    if meta_user.is_empty() {
+        return false;
+    }
+    let current = current_login_name();
+    !current.is_empty() && meta_user == current
+}
+
+/// Emit one history-kept `wmsg`-kind message: `arm_echo_identity` carries the
+/// kind past `MessageIdentity::of` without touching the shared message plumbing.
+fn push_warning_message(editor: &mut Editor, text: String) {
+    editor.arm_echo_identity(OxStr::from("wmsg"), Object::Nil);
+    push_text_message(editor, text, false, true);
 }
 
 fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
@@ -10041,17 +10164,41 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     path: &std::path::Path,
 ) -> Option<Flow> {
-    if !runtime.scripts.io().exists(&swap_path_for(path)) {
-        return None;
+    match decide_swapfile_open(runtime, access, scope, lua, path) {
+        SwapOpenDecision::Proceed { .. } | SwapOpenDecision::Recover { .. } => None,
+        SwapOpenDecision::Abort => Some(Flow::Normal),
     }
+}
+
+/// The `findswapname` ATTENTION branch (memline.c:3562-3660) minus the modal
+/// dialog: fire `SwapExists`, honor `v:swapchoice`, run the `nvim.swapfile`
+/// default (`W325` for a live session's swapfile), and otherwise print the
+/// `E325` text and proceed as Edit-anyway. The no-dialog deviation is
+/// structural — the synchronous executor cannot suspend for a keypress —
+/// and is recorded here rather than hidden.
+fn decide_swapfile_open<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    path: &std::path::Path,
+) -> SwapOpenDecision {
+    let file_name = path.to_string_lossy().into_owned();
+    let Some(swap) =
+        access.with_ex_editor(|editor| find_existing_swapfile(runtime, editor, &file_name))
+    else {
+        return SwapOpenDecision::Proceed { readonly: false };
+    };
+    let swap_display = swap.to_string_lossy().into_owned();
+    scope.replace_pair(
+        ScopeKind::Vim,
+        "swapname",
+        Typval::String(OxStr::from(swap_display.as_str())),
+    );
     scope.replace_pair(
         ScopeKind::Vim,
         "swapchoice",
         Typval::String(OxStr::from("")),
-    );
-    let name = path.file_name().map_or_else(
-        || path.to_string_lossy().into_owned(),
-        |name| name.to_string_lossy().into_owned(),
     );
     let buffer = access.with_ex_editor(|editor| editor.current_buffer());
     let plan = access.with_ex_editor(|editor| {
@@ -10059,23 +10206,127 @@ fn swap_choice_aborts<F: FileIO, E: ExEditorAccess>(
             Event::SwapExists,
             AutocmdContext {
                 buffer,
-                file_name: Some(name.as_bytes()),
+                file_name: Some(file_name.as_bytes()),
                 match_name: None,
                 nested: true,
                 data: None,
             },
         )
     });
-
     let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    let choice = scope
+        .get_scoped(ScopeKind::Vim, b"swapchoice", 0)
+        .ok()
+        .and_then(|value| match value {
+            Typval::String(text) => text
+                .as_bytes()
+                .first()
+                .map(|byte| byte.to_ascii_lowercase()),
+            _ => None,
+        });
+    // `do_swapexists` resets `VV_SWAPNAME` after the handlers run while the
+    // choice persists for the opener below (memline.c:3423-3462).
+    scope.replace_pair(
+        ScopeKind::Vim,
+        "swapname",
+        Typval::String(OxStr::from("")),
+    );
     if !matches!(&flow, &Flow::Normal) {
-        return Some(flow);
+        return SwapOpenDecision::Abort;
     }
-    matches!(
-        scope.get_scoped(ScopeKind::Vim, b"swapchoice", 0),
-        Ok(Typval::String(value)) if value.as_bytes().first().is_some_and(|byte| byte.eq_ignore_ascii_case(&b'q'))
-    )
-    .then_some(Flow::Normal)
+    match choice {
+        Some(b'r') => return SwapOpenDecision::Recover { swap },
+        Some(b'e') => return SwapOpenDecision::Proceed { readonly: false },
+        Some(b'o') => return SwapOpenDecision::Proceed { readonly: true },
+        Some(b'd') => {
+            let _ = std::fs::remove_file(&swap);
+            return SwapOpenDecision::Proceed { readonly: false };
+        }
+        Some(b'q') | Some(b'a') => return SwapOpenDecision::Abort,
+        _ => {}
+    }
+    // The `nvim.swapfile` default handler (defaults.lua `SwapExists`): active
+    // until the user clears the group, it skips the prompt when a running
+    // session owns the swapfile. A natively-fired marker is unnecessary: an
+    // absent group means "defaults intact", an emptied one "user cleared".
+    let default_active = access.with_ex_editor(|editor| {
+        editor
+            .autocmds()
+            .group("nvim.swapfile")
+            .is_none_or(|group| {
+                !editor
+                    .autocmds()
+                    .query(&crate::autocmd::AutocmdFilter {
+                        group: Some(group),
+                        ..crate::autocmd::AutocmdFilter::default()
+                    })
+                    .is_empty()
+            })
+    });
+    if default_active
+        && let Ok(bytes) = runtime.scripts.io().read_bytes(&swap)
+        && let Ok(snapshot) = SwapFile::read(&bytes[..])
+        && swap_process_running(snapshot.meta.pid)
+        && swap_user_matches(&snapshot.meta.user)
+    {
+        let pid = snapshot.meta.pid;
+        access.with_ex_editor(|editor| {
+            push_warning_message(
+                editor,
+                format!("W325: Ignoring swapfile from Nvim process {pid}"),
+            );
+        });
+        return SwapOpenDecision::Proceed { readonly: false };
+    }
+    // No handler resolved the swapfile: print the `E325` ATTENTION text
+    // (`attention_message`, memline.c:3380-3421) and continue as Edit-anyway.
+    access.with_ex_editor(|editor| {
+        push_text_message(
+            editor,
+            "E325: ATTENTION".to_owned(),
+            true,
+            true,
+        );
+        push_warning_message(
+            editor,
+            format!(
+                "Found a swap file by the name \"{}\"\nWhile opening file \"{file_name}\"",
+                swap.display(),
+            ),
+        );
+    });
+    SwapOpenDecision::Proceed { readonly: false }
+}
+
+/// Load `swap` into `buffer` for the `SEA_CHOICE_RECOVER` open path: the
+/// `ml_recover` body (memline.c:838+) without the file-argument renaming,
+/// which the opener already performed. Marks the buffer loaded so the
+/// pending file read does not overwrite the recovered text.
+fn load_swap_recovery<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    buffer: BufHandle,
+    swap: &Path,
+) -> Result<(), ()> {
+    let bytes = runtime.scripts.io().read_bytes(swap).map_err(|_| ())?;
+    let snapshot = SwapFile::read(&bytes[..]).map_err(|_| ())?;
+    let recovered = snapshot.buffer.to_bytes();
+    let differs = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .and_then(|state| state.text().ok())
+            .is_none_or(|text| text.to_bytes() != recovered)
+    });
+    access.with_ex_editor(|editor| {
+        if let Ok(state) = editor.buffer_mut(buffer) {
+            state.load(snapshot.buffer);
+            state
+                .flags
+                .set(crate::BufferFlags::MODIFIED, differs);
+        }
+    });
+    Ok(())
 }
 
 // ---------- swapfile names and lifecycle ----------
@@ -10374,11 +10625,10 @@ fn swap_meta(editor: &Editor, buffer: BufHandle, candidate: &SwapBuffer, name: &
             .map_or(0, |duration| u32::try_from(duration.as_secs()).unwrap_or(0));
         (mtime, swap_inode(&info))
     });
-    // `os_get_username`/`os_get_hostname` (memline.c:341-344): environment
-    // approximations — the fields are informational for recovery.
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_default();
+    // `os_get_username`/`os_get_hostname` (memline.c:341-344): the canonical
+    // login and node names, informational for recovery and decisive for the
+    // `nvim.swapfile` default's same-user guard.
+    let user = current_login_name();
     let host = swap_host_name();
     let same_dir = name.parent() == Path::new(&candidate.file_name).parent();
     let file_encoding = match editor.options().get_buffer(buffer, "fileencoding") {
@@ -10696,12 +10946,16 @@ fn recover_from_swap_file<F: FileIO, E: ExEditorAccess>(
             );
         });
     }
+    // `ml_recover` completion (memline.c:939-948, 1261-1269): the swap and
+    // original names arrive as one `wmsg` flush, then the recovery summary
+    // follows the buffer load so `differs` is known.
     access.with_ex_editor(|editor| {
-        push_text_message(
+        push_warning_message(
             editor,
-            format!("Using swap file \"{}\"", swap_path.display()),
-            false,
-            true,
+            format!(
+                "Using swap file \"{}\"\nOriginal file \"{original}\"",
+                swap_path.display(),
+            ),
         );
     });
     let recovered = snapshot.buffer.to_bytes();
@@ -10718,6 +10972,19 @@ fn recover_from_swap_file<F: FileIO, E: ExEditorAccess>(
             state
                 .flags
                 .set(crate::BufferFlags::MODIFIED, differs);
+        }
+        if differs {
+            push_warning_message(
+                editor,
+                "Recovery completed. You should check if everything is OK.\n(You might want to write out this file under another name\nand run diff with the original file to check for changes)\nYou may want to delete the .swp file now."
+                    .to_owned(),
+            );
+        } else {
+            push_warning_message(
+                editor,
+                "Recovery completed. Buffer contents equals file contents.\nYou may want to delete the .swp file now."
+                    .to_owned(),
+            );
         }
     });
     Flow::Normal
@@ -22207,16 +22474,19 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
     if args.is_empty() {
         return Flow::Normal;
     }
-    if (args == "nvim.terminal"
-        || args
-            .strip_prefix("nvim.terminal")
-            .is_some_and(|tail| tail.starts_with(char::is_whitespace)))
-        && access.with_ex_editor(|editor| editor.autocmds().group("nvim.terminal").is_none())
-    {
-        let created = access
-            .with_ex_editor(|editor| editor.autocmds_mut().create_group("nvim.terminal", false));
-        if let Err(error) = created {
-            return error_flow(runtime, "E936", error.to_string());
+    for lazy_group in ["nvim.terminal", "nvim.swapfile"] {
+        if (args == lazy_group
+            || args
+                .strip_prefix(lazy_group)
+                .is_some_and(|tail| tail.starts_with(char::is_whitespace)))
+            && access.with_ex_editor(|editor| editor.autocmds().group(lazy_group).is_none())
+        {
+            let created = access.with_ex_editor(|editor| {
+                editor.autocmds_mut().create_group(lazy_group, false)
+            });
+            if let Err(error) = created {
+                return error_flow(runtime, "E936", error.to_string());
+            }
         }
     }
     if command.bang
