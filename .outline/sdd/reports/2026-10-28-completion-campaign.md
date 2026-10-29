@@ -731,3 +731,18 @@ Both runs are full `just oldtest` passes over the same 236 files. The failure
 count drops by 309; the block count rises by 6, so part of the change is tests
 that now reach a later, unsupported feature instead of failing at the handler.
 `test_cmdline.vim` accounts for 243 of the drop.
+
+
+### `:doautocmd`
+
+`49a2ebc` adds `:doautocmd [group] {event}[,{event}] [fname]`
+(`do_doautocmd`, autocmd.c:1141), which the port lacked entirely. It rejects
+`*` with E217, fails before firing on an unknown name (E216), accepts
+`<nomodeline>` without running modelines, and reports
+"No matching autocommands: {arg}" when nothing matched. The regression covers a
+firing event and a miss.
+
+This is the first item from the E492 census. The census itself over-counts
+missing built-ins because it also contains user-defined names such as `xxx`,
+`one`, and `foo2`, so each remaining candidate still needs a registry check
+before it is implemented.
