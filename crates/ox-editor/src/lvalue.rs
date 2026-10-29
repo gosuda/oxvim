@@ -234,6 +234,24 @@ pub(crate) fn assign_lvalue<F: FileIO, E: ExEditorAccess>(
             && subs.len() == 1
             && let BoundSub::Key(key) = &subs[0] =>
         {
+            // `get_lval_dict_item` (eval.c:949): a read-only scope entry
+            // (e.g. `b:changedtick`) refuses the write with E46, the same
+            // refusal the plain spelling meets in `assign_target`.
+            // `set_scoped` only consults value/variable locks, so without
+            // this the scope-dict spelling silently rewrites the entry and
+            // fires watchers for a change upstream rejects.
+            if let Some((flags, _)) = ox_eval::scope::scope_entry_flags(kind, key.as_bytes())
+                && flags.intersects(DictEntryFlags::READ_ONLY)
+            {
+                return Err(lvalue_error(
+                    runtime,
+                    "E46",
+                    format!(
+                        "Cannot change read-only variable \"{}\"",
+                        rendered_target(*scope_kind, b"", subs)
+                    ),
+                ));
+            }
             // `g:['k'] = v` writes the scope variable itself. `scope_dict`
             // hands back a per-read snapshot, so assigning into that would
             // drop the value; the scope setter is the live path.
@@ -300,7 +318,30 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             // `scope_dict` hands back would remove it from a copy. A missing
             // key is E716 quoting the key, not the E108 a bare name gets
             // (`ex_unlet`, ex_docmds.c:5544-5560).
+            // A subscripted target resolves as a dict item (`do_unlet_var`,
+            // eval/vars.c:1653): a read-only entry refuses with E46 and a
+            // locked value with E741, before anything is removed. The flag
+            // check is metadata-based like the plain-name pre-check in
+            // `command_unlet`; the lock check runs only when the key exists
+            // so a missing key still reports E716.
+            if let Some((flags, _)) = ox_eval::scope::scope_entry_flags(kind, key.as_bytes())
+                && flags.intersects(DictEntryFlags::READ_ONLY)
+            {
+                return Err(lvalue_error(
+                    runtime,
+                    "E46",
+                    format!(
+                        "Cannot change read-only variable \"{}\"",
+                        rendered_target(*scope_kind, b"", subs)
+                    ),
+                ));
+            }
             let old = scope.get_scoped(kind, key.as_bytes(), 0).ok().cloned();
+            if old.is_some() {
+                scope
+                    .check_value_lock(&scoped_lock_name(Some(kind), key.as_bytes()), 0)
+                    .map_err(|error| eval_error(runtime, error))?;
+            }
             let removed = scope.remove_pair(kind, key.as_bytes());
             if removed {
                 push_scope_watch_event(runtime, kind, key.as_bytes(), old, None);

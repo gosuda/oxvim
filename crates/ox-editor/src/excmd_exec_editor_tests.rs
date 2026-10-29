@@ -11979,6 +11979,381 @@ fn dictwatcher_fires_on_scope_dict_subscript() {
         vec![("k".to_owned(), 1, 0), ("k".to_owned(), 0, 1)]
     );
 }
+
+fn recorded_strings(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<String> {
+    global_list(executor, name)
+        .iter()
+        .map(|value| match value {
+            ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+            other => panic!("expected a String in g:{name}, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Reads a `g:` list of recorded keys as raw bytes, lossless for non-UTF-8 keys.
+fn recorded_keys(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<Vec<u8>> {
+    global_list(executor, name)
+        .iter()
+        .map(|value| match value {
+            ox_types::Typval::String(text) => text.as_bytes().to_vec(),
+            other => panic!("expected a String in g:{name}, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Reads a `g:` number for before/after comparisons.
+fn global_number(executor: &ExExecutor<MemoryFileIO>, name: &str) -> i64 {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::Number(value)) => value,
+        other => panic!("expected a Number in g:{name}, got {other:?}"),
+    }
+}
+
+/// Assumption 1: a watcher callback that removes its own watcher mid-round.
+/// The round must not call a removed watcher afterwards, and the registry
+/// must not keep it alive (`dictwatcher_finish` sweeps `needs_free`).
+/// `WatchFirst` deletes both `WatchSecond` and itself, then fires; only its
+/// own record may appear, and a later mutation must fire nothing at all.
+#[test]
+fn dictwatcher_self_removal_skips_pending_and_frees_registry() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_selfdel.vim",
+            "function! WatchFirst(d, k, c)\n  call dictwatcherdel(g:d, '*', 'WatchSecond')\n  call dictwatcherdel(g:d, '*', 'WatchFirst')\n  call add(g:fires, 'first:' . a:k)\nendfunction\nfunction! WatchSecond(d, k, c)\n  call add(g:fires, 'second:' . a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchFirst')\ncall dictwatcheradd(g:d, '*', 'WatchSecond')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.a = 1").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "fires"),
+        vec!["first:a".to_owned()]
+    );
+    // Both registrations were swept at round end: a second mutation fires
+    // nothing, and deleting again reports no match.
+    executor.execute_line(&editor, "let g:d.b = 2").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "fires"),
+        vec!["first:a".to_owned()]
+    );
+    assert!(
+        executor
+            .execute_line(&editor, "call dictwatcherdel(g:d, '*', 'WatchFirst')")
+            .is_err()
+    );
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            let data = dict.borrow();
+            assert_eq!(data.get(b"a"), Some(&ox_types::Typval::Number(1)));
+            assert_eq!(data.get(b"b"), Some(&ox_types::Typval::Number(2)));
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 2: a watcher callback that raises an error. The remaining
+/// watchers in the same round still run, and the mutation stays committed.
+#[test]
+fn dictwatcher_erroring_callback_spares_rest_and_keeps_mutation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_throw.vim",
+            "function! WatchBad(d, k, c)\n  throw 'boom'\nendfunction\nfunction! WatchGood(d, k, c)\n  call add(g:fires, a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchBad')\ncall dictwatcheradd(g:d, '*', 'WatchGood')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "fires"), vec!["k".to_owned()]);
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            assert_eq!(
+                dict.borrow().get(b"k"),
+                Some(&ox_types::Typval::Number(1))
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 3: pattern matching. An exact key fires only for that key, a
+/// trailing `*` matches a prefix, and the empty key `g:['']` matches only the
+/// empty pattern among exact patterns (`*` still matches everything).
+#[test]
+fn dictwatcher_pattern_exact_prefix_and_empty() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_pattern.vim",
+            "function! WatchExact(d, k, c)\n  call add(g:exact, a:k)\nendfunction\nfunction! WatchPrefix(d, k, c)\n  call add(g:prefix, a:k)\nendfunction\nfunction! WatchEmpty(d, k, c)\n  call add(g:empty, a:k)\nendfunction\nfunction! WatchStar(d, k, c)\n  call add(g:star, a:k)\nendfunction\nlet g:d = {}\nlet g:exact = []\nlet g:prefix = []\nlet g:empty = []\nlet g:star = []\ncall dictwatcheradd(g:d, 'k', 'WatchExact')\ncall dictwatcheradd(g:d, 'k*', 'WatchPrefix')\ncall dictwatcheradd(g:d, '', 'WatchEmpty')\ncall dictwatcheradd(g:d, '*', 'WatchStar')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(recorded_strings(&executor, "prefix"), vec!["k".to_owned()]);
+    assert!(recorded_strings(&executor, "empty").is_empty());
+    assert_eq!(recorded_strings(&executor, "star"), vec!["k".to_owned()]);
+    executor.execute_line(&editor, "let g:d.key = 2").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    executor.execute_line(&editor, "let g:d.other = 3").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    executor.execute_line(&editor, "let g:d[''] = 4").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    assert_eq!(recorded_strings(&executor, "empty"), vec![String::new()]);
+    assert_eq!(
+        recorded_strings(&executor, "star"),
+        vec![
+            "k".to_owned(),
+            "key".to_owned(),
+            "other".to_owned(),
+            String::new()
+        ]
+    );
+}
+
+/// Assumption 4: `old`/`new` shape. An added key carries `new` and no `old`,
+/// a changed key carries both, and `unlet` carries `old` and no `new` — the
+/// `dictwatcher_arguments` contract (only present values get an entry).
+#[test]
+fn dictwatcher_change_shape_new_old_per_mutation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_shape.vim",
+            "function! WatchShape(d, k, c)\n  call add(g:rows, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:newvals, get(a:c, 'new', 'MISSING'))\n  call add(g:oldvals, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {}\nlet g:rows = []\nlet g:newvals = []\nlet g:oldvals = []\ncall dictwatcheradd(g:d, '*', 'WatchShape')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![("k".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "let g:d.k = 2").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 1, 1)]
+    );
+    let newvals = global_list(&executor, "newvals");
+    assert!(
+        matches!(
+            &newvals[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+        ),
+        "unexpected newvals: {newvals:?}"
+    );
+    executor.execute_line(&editor, "unlet g:d.k").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![
+            ("k".to_owned(), 1, 0),
+            ("k".to_owned(), 1, 1),
+            ("k".to_owned(), 0, 1)
+        ]
+    );
+    let oldvals = global_list(&executor, "oldvals");
+    assert!(
+        matches!(
+            &oldvals[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected oldvals: {oldvals:?}"
+    );
+}
+
+/// Assumption 5: a scope watcher registered on `g:` must not fire for a `b:`
+/// write, and vice versa. Watch targets key by namespace, not by key text.
+#[test]
+fn dictwatcher_scope_namespace_isolation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_isolation.vim",
+            "function! WatchG(d, k, c)\n  call add(g:g_fires, a:k)\nendfunction\nfunction! WatchB(d, k, c)\n  call add(g:b_fires, a:k)\nendfunction\nlet g:g_fires = []\nlet g:b_fires = []\ncall dictwatcheradd(g:, '*', 'WatchG')\ncall dictwatcheradd(b:, '*', 'WatchB')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "g_fires"), vec!["x".to_owned()]);
+    assert!(recorded_strings(&executor, "b_fires").is_empty());
+    executor.execute_line(&editor, "let b:y = 2").unwrap();
+    assert_eq!(recorded_strings(&executor, "g_fires"), vec!["x".to_owned()]);
+    assert_eq!(recorded_strings(&executor, "b_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "unlet g:x").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "g_fires"),
+        vec!["x".to_owned(), "x".to_owned()]
+    );
+    assert_eq!(recorded_strings(&executor, "b_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "unlet b:y").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "g_fires"),
+        vec!["x".to_owned(), "x".to_owned()]
+    );
+    assert_eq!(
+        recorded_strings(&executor, "b_fires"),
+        vec!["y".to_owned(), "y".to_owned()]
+    );
+}
+
+/// Assumption 6: `:let g:x = 1` where the write fails (locked E741,
+/// read-only E46) must fire nothing. Covers the plain scope-variable path,
+/// the scope read-only entry, and the locked-dict-item path.
+#[test]
+fn dictwatcher_failed_write_fires_nothing() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_fail.vim",
+            "function! WatchLock(d, k, c)\n  call add(g:lock_fires, a:k)\nendfunction\nfunction! WatchB2(d, k, c)\n  call add(g:b2_fires, a:k)\nendfunction\nfunction! WatchDict(d, k, c)\n  call add(g:dict_fires, a:k)\nendfunction\nlet g:lock_fires = []\nlet g:b2_fires = []\nlet g:dict_fires = []\nlet g:d = {'k': 1}\ncall dictwatcheradd(g:, '*', 'WatchLock')\ncall dictwatcheradd(b:, '*', 'WatchB2')\ncall dictwatcheradd(g:d, '*', 'WatchDict')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "lock_fires"),
+        vec!["x".to_owned()]
+    );
+    executor.execute_line(&editor, "lockvar g:x").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "let g:x = 2"), "E741");
+    assert_eq!(
+        recorded_strings(&executor, "lock_fires"),
+        vec!["x".to_owned()]
+    );
+    assert_eq!(global_number(&executor, "x"), 1);
+    assert_vim_error(
+        executor.execute_line(&editor, "let b:changedtick = 9"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "b2_fires").is_empty());
+    executor.execute_line(&editor, "lockvar g:d").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "let g:d.k = 2"), "E741");
+    assert!(recorded_strings(&executor, "dict_fires").is_empty());
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            assert_eq!(
+                dict.borrow().get(b"k"),
+                Some(&ox_types::Typval::Number(1))
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 7: the empty-key and non-UTF-8 key boundaries through the
+/// scope-dict form. Both round-trip as scope variables and notify a `g:`
+/// watcher with the exact key bytes.
+#[test]
+fn dictwatcher_scope_dict_empty_and_non_utf8_keys() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scopekey.vim",
+            "function! WatchScopeKey(d, k, c)\n  call add(g:scope_keys, a:k)\nendfunction\nlet g:scope_keys = []\ncall dictwatcheradd(g:, '*', 'WatchScopeKey')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:[''] = 1").unwrap();
+    assert_eq!(recorded_keys(&executor, "scope_keys"), vec![Vec::<u8>::new()]);
+    executor.execute_line(&editor, "let b:probe = g:['']").unwrap();
+    assert_eq!(
+        executor.scope().get_scoped(ox_eval::scope::ScopeKind::Buffer, b"probe", 0),
+        Ok(&ox_types::Typval::Number(1))
+    );
+    executor.execute_line(&editor, "unlet g:['']").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new()]
+    );
+    executor.execute_line(&editor, "let g:[\"\\xff\"] = 1").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new(), vec![0xff]]
+    );
+    executor.execute_line(&editor, "let b:probe2 = g:[\"\\xff\"]").unwrap();
+    assert_eq!(
+        executor.scope().get_scoped(ox_eval::scope::ScopeKind::Buffer, b"probe2", 0),
+        Ok(&ox_types::Typval::Number(1))
+    );
+    executor.execute_line(&editor, "unlet g:[\"\\xff\"]").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new(), vec![0xff], vec![0xff]]
+    );
+}
+
+/// Advisory: `let b:['changedtick']` must refuse with E46 like the plain
+/// `let b:changedtick` spelling does. The scope-dict lvalue branch bypasses
+/// the `scoped_target_flags` read-only check that `assign_target` performs,
+/// and `set_scoped` does not consult fixed flags — so the write silently
+/// succeeds and fires watchers. Same for the `unlet` spelling.
+#[test]
+fn dictwatcher_scope_dict_readonly_refuses_with_e46() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_e46.vim",
+            "function! WatchRo(d, k, c)\n  call add(g:ro_fires, a:k)\nendfunction\nlet g:ro_fires = []\ncall dictwatcheradd(b:, '*', 'WatchRo')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:before = b:changedtick").unwrap();
+    assert_vim_error(
+        executor.execute_line(&editor, "let b:['changedtick'] = 999"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "ro_fires").is_empty());
+    executor.execute_line(&editor, "let g:after = b:changedtick").unwrap();
+    assert_eq!(
+        global_number(&executor, "before"),
+        global_number(&executor, "after")
+    );
+    assert_vim_error(
+        executor.execute_line(&editor, "unlet b:['changedtick']"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "ro_fires").is_empty());
+    executor.execute_line(&editor, "let g:still = b:changedtick").unwrap();
+    assert_eq!(
+        global_number(&executor, "before"),
+        global_number(&executor, "still")
+    );
+}
+
+/// Advisory: check the lock before removing a scope variable. A locked
+/// `:unlet` must fail instead of succeeding and firing watchers. The
+/// scope-dict spelling routes through `remove_lvalue` (owned); the plain
+/// spelling routes through `remove_target` (see report).
+#[test]
+fn dictwatcher_locked_scope_unlet_refuses_without_firing() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_unlock.vim",
+            "function! WatchUn(d, k, c)\n  call add(g:un_fires, a:k)\nendfunction\nlet g:un_fires = []\ncall dictwatcheradd(g:, '*', 'WatchUn')\nlet g:y = 1\n",
+        )
+        .unwrap();
+    assert_eq!(recorded_strings(&executor, "un_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "lockvar g:y").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "unlet g:['y']"), "E741");
+    assert_eq!(recorded_strings(&executor, "un_fires"), vec!["y".to_owned()]);
+    assert_eq!(global_number(&executor, "y"), 1);
+}
 // ---------------------------------------------------------------------------
 // :pwd / :list / :number / :uptime / :tabs
 // ---------------------------------------------------------------------------
