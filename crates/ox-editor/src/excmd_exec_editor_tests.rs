@@ -12799,6 +12799,74 @@ fn dictwatcher_fires_on_buffer_text_changedtick() {
         _ => unreachable!(),
     }
 }
+
+/// `dict_notifications_spec.lua` "for b:changedtick" wipe half: a `bwipe!`
+/// inside the watcher callback fails with E937 (`can_unload_buffer`,
+/// `buffer.c:517`) instead of deleting the buffer in use. The drain consumes
+/// the failure so the round continues, but the `semsg` text still lands in
+/// `v:errmsg`.
+#[test]
+fn dictwatcher_tick_callback_wipe_fails_e937() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick_wipe.vim",
+            "function! OnTickWipe(d, k, c)\n  call execute('bwipe!')\nendfunction\ncall dictwatcheradd(b:, 'changedtick', 'OnTickWipe')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call feedkeys(\"iT\\<Esc>\", 'x')")
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:wipe_errmsg = v:errmsg")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "wipe_errmsg"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from(
+            "E937: Attempt to delete a buffer that is in use: [No Name]"
+        ))),
+    );
+    // The wipe did not happen: the buffer is still current and alive.
+    assert!(editor.editor().current_buffer().is_some());
+}
+
+/// `dict_notifications_spec.lua` "for b:changedtick" split half: deleting a
+/// buffer notifies its `changedtick` watchers from inside the removal, and a
+/// window command inside that callback fails with E565 (`text_locked()`,
+/// `ex_docmd.c:1777`). The failure aborts the removal with the callback's
+/// error.
+#[test]
+fn dictwatcher_tick_callback_split_fails_e565() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "call setline(1, 'x')").unwrap();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick_split.vim",
+            "call dictwatcheradd(b:, 'changedtick', {-> execute('split')})\n",
+        )
+        .unwrap();
+    let error = executor.execute_line(&editor, "bdelete!").unwrap_err();
+    match error {
+        crate::excmd_exec::ExecError::Vim(exception) => {
+            // `execute()` wraps the callback failure port-wide (`E605`), so
+            // the split's E565 rides inside the message — exactly what the
+            // functional `matches()` anchors on.
+            let rendered = exception.message();
+            assert!(
+                rendered.contains("E565: Not allowed to change text or change window: split"),
+                "unexpected split error: {rendered}"
+            );
+            assert!(
+                rendered.ends_with(": split"),
+                "unexpected split error: {rendered}"
+            );
+        }
+        other => panic!("expected E565, got {other:?}"),
+    }
+}
 // ---------------------------------------------------------------------------
 // :pwd / :list / :number / :uptime / :tabs
 // ---------------------------------------------------------------------------

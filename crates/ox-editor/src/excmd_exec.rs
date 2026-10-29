@@ -864,6 +864,12 @@ pub(crate) struct ExRuntime<F: FileIO> {
     /// `text_locked()` depth: non-zero while an expression that must not
     /// change text (a substitute replacement) is being evaluated.
     pub(crate) textlock: usize,
+    /// Buffer locked by an in-progress dictionary-watcher notification round
+    /// (`buf->b_locked` around `tv_dict_watcher_notify`, `buffer.c:4284`):
+    /// unloading, deleting, or wiping the notified buffer from inside its
+    /// own watcher callback fails with E937. Saved and restored around
+    /// nested drains.
+    pub(crate) notify_locked: Option<BufHandle>,
     /// Monotonic counter giving every script-source and function-call
     /// frame a push order; `throwpoint` merges both stacks through it,
     /// matching upstream's single `estack` list.
@@ -905,6 +911,7 @@ impl<F: FileIO> ExRuntime<F> {
             mode_machine: None,
             swap_names: Rc::new(RefCell::new(HashMap::new())),
             swap_written: Rc::new(RefCell::new(BTreeSet::new())),
+            notify_locked: None,
             preserve_exit: Rc::new(RefCell::new(false)),
             frame_order: Cell::new(0),
             dict_watch_events: Vec::new(),
@@ -1851,6 +1858,9 @@ impl<F: FileIO> ExExecutor<F> {
         access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         self.runtime.try_depth += 1;
         let lua = self.lua.clone();
+        // Direct API builtin calls bypass the instruction dispatch hook, so
+        // record this entry's own tick movement for the same watcher event.
+        let tick_before = current_script_tick(access);
         let result = call_builtin_dispatch(
             &mut self.runtime,
             access,
@@ -1858,6 +1868,13 @@ impl<F: FileIO> ExExecutor<F> {
             lua.as_ref(),
             name,
             &args,
+        );
+        record_changedtick_movement(
+            &mut self.runtime,
+            access,
+            &mut self.scope,
+            lua.as_ref(),
+            tick_before,
         );
         self.runtime.try_depth -= 1;
         access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
@@ -2530,6 +2547,10 @@ impl<F: FileIO> ExExecutor<F> {
             )
         });
         self.runtime.try_depth += 1;
+        // Insert-mode text lands through the mode machine, never through an
+        // expression builtin: snapshot the tick around the whole typeahead
+        // drain so the round reports one coalesced old/new pair.
+        let tick_before = current_script_tick(access);
         let mut flow = drain_typeahead(
             &mut self.runtime,
             access,
@@ -2537,6 +2558,13 @@ impl<F: FileIO> ExExecutor<F> {
             self.lua.as_ref(),
             machine,
             budget,
+        );
+        record_changedtick_movement(
+            &mut self.runtime,
+            access,
+            &mut self.scope,
+            self.lua.as_ref(),
+            tick_before,
         );
         let after = access.with_ex_editor(|editor| {
             let buffer = editor.current_buffer();
@@ -3860,8 +3888,19 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
             _ => {}
         }
 
+        // `b:changedtick` is owned by the buffer, not the variable dict, so a
+        // text mutation leaves no typval sink event: snapshot the script-visible
+        // tick around each dispatch so one `|`-separated command reports exactly
+        // its own movement. Upstream notifies synchronously from
+        // `buf_set_changedtick` (`buffer.c:4284`); the queued event waits in
+        // `dict_watch_events` until the boundary drain below fires it.
+        let tick_before = current_script_tick(access);
         let message_start = access.with_ex_editor(|editor| editor.messages().len());
         let flow = dispatch(runtime, access, scope, lua, command);
+        // Mode-machine text (`:normal`, insert) and expression builtins
+        // (`setline()`) both land here; insert-mode rounds that never enter a
+        // dispatch are covered by the `run_typeahead` boundary instead.
+        record_changedtick_movement(runtime, access, scope, lua, tick_before);
         if let Err(capture_flow) = access.with_ex_editor(|editor| {
             capture_command_messages(runtime, editor, scope, command, message_start)
         }) {
@@ -4777,51 +4816,11 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
             return self.api_call(&name_text, &args, scope);
         }
         if let Some(family) = crate::builtins::route(&name_text) {
-            // `b:changedtick` is owned by the buffer, not the variable dict,
-            // so a buffer-text mutation must queue its own watcher event: the
-            // start-of-command `sync_buffer_scope` ran before the mutation,
-            // and this family bypasses the typval-only sink drain below.
-            // Recorded here, the event waits in `dict_watch_events` until the
-            // post-command `drain_dict_watchers` fires it, matching upstream's
-            // synchronous `buf_set_changedtick` notify (`buffer.c:4284`).
-            // Gated on `has_dictwatchers()`; only a real tick change queues.
-            let watch_tick = matches!(family, crate::builtins::Family::Buffer)
-                && self.runtime.functions.has_dictwatchers();
-            let before = watch_tick
-                .then(|| {
-                    self.access.with_ex_editor(|editor| {
-                        editor
-                            .current_buffer()
-                            .and_then(|buffer| editor.buffer(buffer).ok())
-                            .map(|state| {
-                                i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
-                            })
-                    })
-                })
-                .flatten();
-            let result = crate::builtins::call(self, family, &name_text, &args, scope);
-            if let Some(before) = before {
-                let after = self.access.with_ex_editor(|editor| {
-                    editor
-                        .current_buffer()
-                        .and_then(|buffer| editor.buffer(buffer).ok())
-                        .map(|state| {
-                            i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
-                        })
-                });
-                if let Some(after) = after
-                    && after != before
-                {
-                    push_scope_watch_event(
-                        &mut *self.runtime,
-                        ScopeKind::Buffer,
-                        b"changedtick",
-                        Some(Typval::Number(before)),
-                        Some(Typval::Number(after)),
-                    );
-                }
-            }
-            return result;
+            // Tick recording lives at the command boundaries (per-`dispatch`,
+            // `run_typeahead`, `call_builtin`): this call runs inside a
+            // dispatched command, so recording here would queue a second event
+            // for the same tick change.
+            return crate::builtins::call(self, family, &name_text, &args, scope);
         }
         let sid = self.runtime.scripts.current_sid().unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
@@ -6115,10 +6114,51 @@ fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
 ) {
+    let locked = access.with_ex_editor(|editor| editor.current_buffer());
+    drain_dict_watchers_inner(runtime, access, scope, lua, false, locked);
+}
+
+/// Variant of [`drain_dict_watchers`] that stops at the first failing watcher
+/// callback and returns its flow so the caller — a buffer removal notifying
+/// watchers of its own tick movement — fails with the callback's error,
+/// matching upstream's `aborting()` check after the notify. Nothing is
+/// displayed or recorded on that path; the error propagates instead.
+///
+/// `locked` names the buffer under notification (`buf->b_locked` around
+/// `tv_dict_watcher_notify`, `buffer.c:4284`): a removal of exactly this
+/// buffer from inside its own watcher callback fails with E937. The removal
+/// knows its target; every other caller passes the current buffer.
+fn drain_dict_watchers_strict<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    locked: Option<BufHandle>,
+) -> Option<Flow> {
+    drain_dict_watchers_inner(runtime, access, scope, lua, true, locked)
+}
+/// Shared watcher-notification loop. When `propagate` is set the first
+/// failing callback aborts the round and its flow is returned; otherwise
+/// failures display like `emsg` and the round continues. `locked` names the
+/// buffer under notification (`notify_locked`), saved and restored around
+/// nested drains.
+fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    propagate: bool,
+    locked: Option<BufHandle>,
+) -> Option<Flow> {
     if !runtime.functions.has_dictwatchers() {
         runtime.dict_watch_events.clear();
-        return;
+        return None;
     }
+    // Lock the buffer under notification (`buf->b_locked` around
+    // `tv_dict_watcher_notify`, `buffer.c:4284`): a removal of this buffer
+    // from inside its own watcher callback fails with E937.
+    let saved_lock = runtime.notify_locked;
+    runtime.notify_locked = locked;
     let events = std::mem::take(&mut runtime.dict_watch_events);
     for event in events {
         // A scope namespace has no live `Dict` identity to pass along, so its
@@ -6173,11 +6213,22 @@ fn drain_dict_watchers<F: FileIO, E: ExEditorAccess>(
                 WatchCallback::None => continue,
             };
             if let Err(flow) = outcome {
+                if propagate {
+                    runtime.notify_locked = saved_lock;
+                    runtime.functions.dictwatcher_finish(&event.target);
+                    return Some(flow);
+                }
+                // A watcher callback failure is consumed, never propagated:
+                // the round continues with the remaining watchers. Upstream
+                // records `v:errmsg` at the original `emsg` site, so nothing
+                // is (re)recorded here from a wrapped error.
                 display_error_message(runtime, access, &flow);
             }
         }
         runtime.functions.dictwatcher_finish(&event.target);
     }
+    runtime.notify_locked = saved_lock;
+    None
 }
 
 /// Queues one scope-namespace mutation for watcher notification.
@@ -6200,6 +6251,58 @@ pub(crate) fn push_scope_watch_event<F: FileIO>(
         old,
         new,
     });
+}
+
+/// Script-visible `b:changedtick` of the current buffer, when one exists.
+///
+/// Snapshotted around each command boundary (per-[`dispatch`] in
+/// [`run_instructions`], [`ExExecutor::run_typeahead`], and
+/// [`ExExecutor::call_builtin`]): one input round slurps many keystrokes, so
+/// the boundary coalesces them into a single old/new pair instead of queuing
+/// an event per keystroke.
+fn current_script_tick<E: ExEditorAccess>(access: &E) -> Option<(BufHandle, i64)> {
+    access.with_ex_editor(|editor| {
+        let buffer = editor.current_buffer()?;
+        let tick = editor.buffer(buffer).ok().map(|state| {
+            i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
+        })?;
+        Some((buffer, tick))
+    })
+}
+
+/// Queues the `b:changedtick` watcher event for one boundary's tick movement
+/// and drains it, so the notification fires in the same command round.
+///
+/// Only a real tick change on a watched buffer queues: a buffer switch or an
+/// untouched round reports nothing. No last-reported cache — each boundary
+/// compares its own before/after pair, so consecutive edits each fire once
+/// with exact old/new values.
+fn record_changedtick_movement<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    before: Option<(BufHandle, i64)>,
+) {
+    if !runtime.functions.has_dictwatchers() {
+        return;
+    }
+    let (Some((buffer_before, tick_before)), Some((buffer_after, tick_after))) =
+        (before, current_script_tick(access))
+    else {
+        return;
+    };
+    if buffer_before != buffer_after || tick_before == tick_after {
+        return;
+    }
+    push_scope_watch_event(
+        runtime,
+        ScopeKind::Buffer,
+        b"changedtick",
+        Some(Typval::Number(tick_before)),
+        Some(Typval::Number(tick_after)),
+    );
+    drain_dict_watchers(runtime, access, scope, lua);
 }
 
 /// Invokes one `Funcref`/`Partial` watcher callback through the evaluator, the
@@ -11772,6 +11875,28 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
                         format!("Buffer {} does not exist", i64::from(*target)),
                     ));
                 }
+                // `can_unload_buffer` (`buffer.c:517`): a buffer locked by an
+                // in-progress watcher notification round cannot be closed
+                // while its own callback runs; the removal fails with E937.
+                if runtime.notify_locked == Some(*target) {
+                    let name = editor
+                        .buffer(*target)
+                        .map(|state| state.name().to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let message = format!(
+                        "Attempt to delete a buffer that is in use: {}",
+                        if name.is_empty() { "[No Name]" } else { &name }
+                    );
+                    // Upstream `semsg`s here, so the failure lands in
+                    // `v:errmsg` even though the watcher drain consumes the
+                    // error instead of displaying it.
+                    let text = OxStr(format!("E937: {message}").into_bytes());
+                    editor
+                        .vvars_mut()
+                        .insert(OxStr::from("errmsg"), Object::String(text.clone()));
+                    scope.replace_pair(ScopeKind::Vim, "errmsg", Typval::String(text));
+                    return Err(error_flow(runtime, "E937", message));
+                }
                 if !command.bang
                     && editor
                         .buffer(*target)
@@ -11812,6 +11937,15 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         }) else {
             continue;
         };
+        // Snapshot the target's script-visible tick up front: the unload in
+        // Phase 3 releases the text and bumps it, and lifecycle handlers in
+        // between may edit too. Compared after the unload, one event covers
+        // the removal's whole movement.
+        let tick_before = access.with_ex_editor(|editor| {
+            editor.buffer(target).ok().map(|state| {
+                i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
+            })
+        });
         if modified && !command.bang {
             if matches!(&final_flow, &Flow::Normal) {
                 final_flow = error_flow(
@@ -11910,6 +12044,41 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
         });
         if !matches!(flow, Flow::Normal) {
             return flow;
+        }
+        // Releasing the text bumps the tick (`unchanged` with
+        // `always_inc_changedtick`, `change.c:623-640` via `buf_clear_file`),
+        // so a watcher on `b:changedtick` observes the removal. Upstream
+        // notifies synchronously from inside the close (`textlock++` around
+        // `buf_clear_file`, `buffer.c:780-783`): the callback runs here, a
+        // window command inside it fails with E565, and that error aborts
+        // the removal — so this drain propagates instead of consuming.
+        if kind != BufferRemoveKind::Wipe
+            && let Some(before) = tick_before
+            && let Some(after) = access.with_ex_editor(|editor| {
+                editor.buffer(target).ok().map(|state| {
+                    i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
+                })
+            })
+            && after != before
+            && runtime.functions.has_dictwatchers()
+        {
+            runtime.textlock += 1;
+            push_scope_watch_event(
+                runtime,
+                ScopeKind::Buffer,
+                b"changedtick",
+                Some(Typval::Number(before)),
+                Some(Typval::Number(after)),
+            );
+            // Lock exactly the buffer being closed: a bare `bwipe` inside a
+            // callback targets the current buffer, which migrated away, and
+            // stays legal — only this buffer is in use by the notify.
+            let failed =
+                drain_dict_watchers_strict(runtime, access, scope, lua, Some(target));
+            runtime.textlock = runtime.textlock.saturating_sub(1);
+            if let Some(flow) = failed {
+                return flow;
+            }
         }
         if kind == BufferRemoveKind::Wipe {
             // Wiping fires `BufDelete` then `BufWipeout` before the buffer is
@@ -13396,6 +13565,21 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     vertical: bool,
 ) -> Flow {
+    // `text_locked()` gate (`ex_docmd.c:1777`): no window command runs while
+    // text is locked — here, while a buffer removal notifies watchers of its
+    // tick movement. Upstream appends the command line to the message
+    // (`append_command` under `DOCMD_VERBOSE`, `ex_docmd.c:3233`), which is
+    // how `execute('split')` reports `E565: ...: split`.
+    if runtime.textlock > 0 {
+        return error_flow(
+            runtime,
+            "E565",
+            format!(
+                "Not allowed to change text or change window: {}",
+                command.command.name()
+            ),
+        );
+    }
     // `P_VERT` on `:split`/`:new` splits vertically too (`ex_splitview`,
     // ex_docmd.c:7890-7896: `cmdmod.split & WSP_VERT`).
     let vertical = vertical
