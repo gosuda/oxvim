@@ -1143,3 +1143,24 @@ appears in either run.
 Scope: `ox-types` only. A Miri run over `ox-editor` was started earlier and
 killed after 15 minutes with an empty log, so it is not evidence; the wider
 suite has not been checked under Miri.
+
+
+### Watcher completion: 67 of 70
+
+`e791900` shared the watcher registry across the executor pair, repaired
+`v:_null_dict` through the editor-to-scope rebuild, and recorded API scoped
+writes for `b:`/`w:`/`t:`.
+
+| `dict_notifications_spec` | Before | After |
+|---|---|---|
+| OK | 66 | 67 |
+| FAIL | 4 | 3 |
+
+The null-dict case passes. Three remain, each with a measured cause:
+
+- `for b:changedtick`: the unit test passes through buffer-family builtins, but
+  the spec mutates with `insert('t')`, an input-path mutation the changedtick
+  recorder does not cover.
+- `calls watcher deleted in callback`: still red after the shared registry.
+- `tabpagebuflist()` teardown: still red; it needs watcher delivery during
+  window/tab teardown, not only during a command.
