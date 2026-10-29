@@ -1263,3 +1263,30 @@ numbering offset.
 `8a99bd9` fixed a real defect on the swapfile path (`SwapFile::read` dropped the
 block-zero metadata, so a live owner looked stale and W325 could not fire), which
 moved one test; the rest of that spec needs the dialog and display layers.
+
+
+### `dir_spec` and float rendering
+
+| Change | Commit | Measure |
+|---|---|---|
+| delete the Rust directory renderer; the `nvim.dir` plugin drives | `c9cd14d` | `dir_spec` 8 of 38 → 18 of 38 |
+| render floats per `TYPVAL_ENCODE_CONV_FLOAT` | `b5edebc` | `echo_spec` float cases fixed in ox-types; the editor call sites still need to delegate |
+
+The 20 remaining `dir_spec` failures, each with its observed cause:
+
+| # | Failure | Cause |
+|---|---|---|
+| 1 | custom provider errors | the `notify_error` message never lands in `:messages` |
+| 2 | failed open repeats the error | `vim.uv.getuid` is unimplemented |
+| 3 | replaces listing providers | `maparg` dict lacks `buffer` |
+| 4 | `[count]-` opens directories | the count loop runs past the parent |
+| 5 | `<Plug>(nvim-dir-up)` | path normalization keeps a `/./` segment |
+| 6 | preserves modified unnamed buffer | the current buffer is not switched |
+| 7 | does not shadow startup mappings | `vim.fs.mkdir` hits E745 |
+| 8 | preserves alternate buffer | `bufnr('#')` returns -1 |
+| 9, 13, 14 | open an entry from the listing | the window buffer does not switch |
+| 10 | follows global `'hidden'` | the buffer stays loaded under `nohidden` |
+| 11 | reloads directory buffers | `:syntax` is not implemented |
+| 12 | reload of a removed directory | `ENOENT` message not captured |
+| 15 | coexists with netrw | netrw's autoload hits E488 |
+| 16-20 | `:browse edit/split/vsplit/tabedit/tabnew` | `:browse` is unsupported |
