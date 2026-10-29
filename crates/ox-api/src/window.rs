@@ -1086,6 +1086,11 @@ pub fn nvim_win_set_var(
     value: Object,
 ) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.set_window_var(session, win, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         editor
             .window_variables_mut(win)
@@ -1102,6 +1107,11 @@ pub fn nvim_win_set_var(
 )]
 pub fn nvim_win_del_var(session: &ApiSession, win: WinHandle, name: OxStr) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.del_window_var(session, win, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         let variables = editor.window_variables_mut(win).map_err(exception)?;
         let Some(index) = variables

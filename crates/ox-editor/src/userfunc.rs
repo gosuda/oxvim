@@ -237,17 +237,31 @@ pub struct FunctionSignature {
     pub flags: UserFuncFlags,
 }
 
-/// Executor-owned user-function definitions and active call stack.
+/// Session-shared dictionary-watcher registrations (`dictwatcheradd()`).
+///
+/// One `Rc` per session executor pair: primary and nested executors hold the
+/// same table through [`UserFunctions::share_watchers_from`], so a watcher
+/// installed through either executor fires when the other drains a mutation,
+/// and a `dictwatcherdel()` on either is dead on both. Never global, never
+/// shared across sessions. The [`UserFunctions::call_stack`] stays
+/// per-executor: only registrations (and their [`DictWatcher`] identity
+/// counter, so ids stay unique across the pair) are shared.
 #[derive(Clone, Debug, Default)]
-pub struct UserFunctions {
-    functions: Rc<RefCell<BTreeMap<String, UserFunc>>>,
-    call_stack: Vec<CallFrame>,
-    /// `dictwatcheradd()` registrations by target. Session state like the
-    /// function table itself: never global, never shared across sessions.
+struct WatcherRegistry {
+    /// `dictwatcheradd()` registrations by target.
     watchers: HashMap<WatchTarget, Vec<DictWatcher>>,
     /// Monotonic identity source for [`DictWatcher`] ids.
     next_watcher_id: u64,
 }
+
+ /// Executor-owned user-function definitions and active call stack.
+ #[derive(Clone, Debug, Default)]
+ pub struct UserFunctions {
+     functions: Rc<RefCell<BTreeMap<String, UserFunc>>>,
+     call_stack: Vec<CallFrame>,
+    /// Shared watcher registrations; per-executor call frames stay local.
+    watchers: Rc<RefCell<WatcherRegistry>>,
+ }
 
 impl UserFunctions {
     /// Creates an empty registry.
@@ -401,6 +415,15 @@ impl UserFunctions {
         self.functions = Rc::clone(&other.functions);
     }
 
+    /// Shares watcher registrations with another executor without sharing
+    /// call frames: both registries observe the same table, so an add or a
+    /// deletion on either is live on both. The in-flight `busy`/`needs_free`
+    /// flags live in the shared table too, so a round opened on one executor
+    /// still guards (and sweeps) watchers touched from the other.
+    pub fn share_watchers_from(&mut self, other: &Self) {
+        self.watchers = Rc::clone(&other.watchers);
+    }
+
     /// Registers a dictionary watcher (`tv_dict_watcher_add`). Multiple
     /// watchers may share one target, key, and callback.
     pub fn dictwatcher_add(
@@ -409,9 +432,11 @@ impl UserFunctions {
         pattern: OxStr,
         callback: WatchCallback,
     ) {
-        let id = self.next_watcher_id;
-        self.next_watcher_id = self.next_watcher_id.wrapping_add(1);
-        self.watchers
+        let mut registry = self.watchers.borrow_mut();
+        let id = registry.next_watcher_id;
+        registry.next_watcher_id = registry.next_watcher_id.wrapping_add(1);
+        registry
+            .watchers
             .entry(target)
             .or_default()
             .push(DictWatcher {
@@ -433,7 +458,8 @@ impl UserFunctions {
         pattern: &[u8],
         callback: &WatchCallback,
     ) -> bool {
-        let Some(watchers) = self.watchers.get_mut(target) else {
+        let mut registry = self.watchers.borrow_mut();
+        let Some(watchers) = registry.watchers.get_mut(target) else {
             return false;
         };
         let position = watchers.iter().position(|watcher| {
@@ -450,7 +476,7 @@ impl UserFunctions {
             watchers.remove(position);
         }
         if watchers.is_empty() {
-            self.watchers.remove(target);
+            registry.watchers.remove(target);
         }
         true
     }
@@ -460,7 +486,7 @@ impl UserFunctions {
     /// nothing watches.
     #[must_use]
     pub fn has_dictwatchers(&self) -> bool {
-        !self.watchers.is_empty()
+        !self.watchers.borrow().watchers.is_empty()
     }
 
     /// Begins a notification round for one key change
@@ -471,13 +497,13 @@ impl UserFunctions {
     /// user code runs), skipping watchers that
     /// [`Self::dictwatcher_is_live`] no longer reports, then closes the
     /// round with [`Self::dictwatcher_finish`]. Errors from one watcher do
-    /// not stop the rest, matching upstream's continue-on-error loop.
     pub fn dictwatcher_begin(
         &mut self,
         target: &WatchTarget,
         key: &[u8],
     ) -> Option<WatchRound> {
-        let watchers = self.watchers.get_mut(target)?;
+        let mut registry = self.watchers.borrow_mut();
+        let watchers = registry.watchers.get_mut(target)?;
         let mut pending = Vec::new();
         for watcher in watchers.iter_mut() {
             // Upstream's notify loop fires only `!watcher->busy`
@@ -512,7 +538,7 @@ impl UserFunctions {
     /// one twin leaves the other live.
     #[must_use]
     pub fn dictwatcher_is_live(&self, target: &WatchTarget, id: u64) -> bool {
-        self.watchers.get(target).is_some_and(|watchers| {
+        self.watchers.borrow().watchers.get(target).is_some_and(|watchers| {
             watchers
                 .iter()
                 .any(|watcher| watcher.id == id && !watcher.needs_free)
@@ -520,15 +546,15 @@ impl UserFunctions {
     }
 
     /// Ends a notification round: clears `busy` and sweeps removals that
-    /// landed mid-round.
     pub fn dictwatcher_finish(&mut self, target: &WatchTarget) {
-        if let Some(watchers) = self.watchers.get_mut(target) {
+        let mut registry = self.watchers.borrow_mut();
+        if let Some(watchers) = registry.watchers.get_mut(target) {
             for watcher in watchers.iter_mut() {
                 watcher.busy = false;
             }
             watchers.retain(|watcher| !watcher.needs_free);
             if watchers.is_empty() {
-                self.watchers.remove(target);
+                registry.watchers.remove(target);
             }
         }
     }
@@ -1027,5 +1053,85 @@ mod g_scope_tests {
             &WatchCallback::Name(OxStr::from("g:Other")),
         ));
         assert!(!functions.has_dictwatchers());
+    }
+}
+
+#[cfg(test)]
+mod shared_watcher_registry_tests {
+    use super::*;
+
+    /// A watcher installed on one registry is visible to the other after
+    /// `share_watchers_from`: a round opened on the second registry fires
+    /// for it, the way shared function definitions resolve on both.
+    #[test]
+    fn watcher_installed_on_one_registry_fires_on_the_other() {
+        let mut primary = UserFunctions::new();
+        let mut nested = UserFunctions::new();
+        nested.share_watchers_from(&primary);
+        let target = WatchTarget::Scope(ScopeKind::Global);
+        primary.dictwatcher_add(
+            target,
+            OxStr::from("watched"),
+            WatchCallback::Name(OxStr::from("Changed")),
+        );
+        assert!(nested.has_dictwatchers());
+        let round = nested
+            .dictwatcher_begin(&target, b"watched")
+            .expect("shared watcher matches the other registry's round");
+        assert_eq!(round.pending.len(), 1);
+        let id = round.pending[0].0;
+        assert!(primary.dictwatcher_is_live(&target, id));
+        nested.dictwatcher_finish(&target);
+        // The shared id counter hands out distinct ids across the pair.
+        nested.dictwatcher_add(
+            target,
+            OxStr::from("watched"),
+            WatchCallback::Name(OxStr::from("Other")),
+        );
+        let round = primary
+            .dictwatcher_begin(&target, b"watched")
+            .expect("both shared watchers match");
+        assert_eq!(round.pending.len(), 2);
+        assert_ne!(round.pending[0].0, round.pending[1].0);
+        primary.dictwatcher_finish(&target);
+    }
+
+    /// A watcher deleted mid-round through one registry is dead on both:
+    /// not live for the rest of the round and swept before the next one.
+    #[test]
+    fn watcher_deleted_mid_round_is_dead_on_both_registries() {
+        let mut primary = UserFunctions::new();
+        let mut nested = UserFunctions::new();
+        nested.share_watchers_from(&primary);
+        let target = WatchTarget::Dict(7);
+        primary.dictwatcher_add(
+            target,
+            OxStr::from("*"),
+            WatchCallback::Name(OxStr::from("First")),
+        );
+        primary.dictwatcher_add(
+            target,
+            OxStr::from("*"),
+            WatchCallback::Name(OxStr::from("Second")),
+        );
+        let round = primary
+            .dictwatcher_begin(&target, b"key")
+            .expect("both watchers match");
+        assert_eq!(round.pending.len(), 2);
+        let second = round.pending[1].0;
+        assert!(nested.dictwatcher_remove(
+            &target,
+            b"*",
+            &WatchCallback::Name(OxStr::from("Second")),
+        ));
+        assert!(!primary.dictwatcher_is_live(&target, second));
+        assert!(!nested.dictwatcher_is_live(&target, second));
+        primary.dictwatcher_finish(&target);
+        let round = nested
+            .dictwatcher_begin(&target, b"key")
+            .expect("survivor still matches on the other registry");
+        assert_eq!(round.pending.len(), 1);
+        assert!(matches!(&round.pending[0].2, WatchCallback::Name(name) if name.as_bytes() == b"First"));
+        nested.dictwatcher_finish(&target);
     }
 }

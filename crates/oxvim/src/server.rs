@@ -5297,6 +5297,147 @@ fn write_global_var(
             .map_err(map_api_exec_error),
     }
 }
+/// Writes or deletes one `b:` variable through the live executor pair, so a
+/// scope watcher registered on `b:` fires the way `:let`/`unlet` fire it.
+///
+/// Tiering, error mapping, and the drain discipline match [`write_global_var`]:
+/// the primary executor runs the write when it is free, otherwise the nested
+/// one. `nvim_buf_set_var`'s read-only/locked/key errors are all validation
+/// errors, so both arms remap through [`map_buffer_var_error`].
+fn write_buffer_var(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    buffer: BufHandle,
+    name: &OxStr,
+    value: Option<Object>,
+) -> Result<(), ApiError> {
+    if let Ok(mut guard) = ex.try_borrow_mut() {
+        return match value {
+            Some(value) => guard
+                .set_buffer_var(session, buffer, name, value)
+                .map_err(map_api_exec_error)
+                .map_err(map_buffer_var_error),
+            None => guard
+                .remove_buffer_var(session, buffer, name)
+                .map_err(map_api_exec_error)
+                .map_err(map_buffer_var_error),
+        };
+    }
+    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
+        return Err(ApiError::exception(
+            "no free Ex executor for a nested command",
+        ));
+    };
+    match value {
+        Some(value) => nested
+            .set_buffer_var(session, buffer, name, value)
+            .map_err(map_api_exec_error)
+            .map_err(map_buffer_var_error),
+        None => nested
+            .remove_buffer_var(session, buffer, name)
+            .map_err(map_api_exec_error)
+            .map_err(map_buffer_var_error),
+    }
+}
+
+/// Writes or deletes one `w:` variable through the live executor pair, so a
+/// scope watcher registered on `w:` fires the way `:let`/`unlet` fire it.
+///
+/// Tiering and the drain discipline match [`write_global_var`]. Every
+/// `nvim_win_*_var` failure is already an exception, so no validation remap
+/// applies here.
+fn write_window_var(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    window: WinHandle,
+    name: &OxStr,
+    value: Option<Object>,
+) -> Result<(), ApiError> {
+    if let Ok(mut guard) = ex.try_borrow_mut() {
+        return match value {
+            Some(value) => guard
+                .set_window_var(session, window, name, value)
+                .map_err(map_api_exec_error),
+            None => guard
+                .remove_window_var(session, window, name)
+                .map_err(map_api_exec_error),
+        };
+    }
+    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
+        return Err(ApiError::exception(
+            "no free Ex executor for a nested command",
+        ));
+    };
+    match value {
+        Some(value) => nested
+            .set_window_var(session, window, name, value)
+            .map_err(map_api_exec_error),
+        None => nested
+            .remove_window_var(session, window, name)
+            .map_err(map_api_exec_error),
+    }
+}
+
+/// Writes or deletes one `t:` variable through the live executor pair, so a
+/// scope watcher registered on `t:` fires the way `:let`/`unlet` fire it.
+///
+/// Tiering and the drain discipline match [`write_global_var`]. Only the
+/// delete-missing-key error remaps to validation, through
+/// [`map_del_global_var_error`].
+fn write_tabpage_var(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    tabpage: TabHandle,
+    name: &OxStr,
+    value: Option<Object>,
+) -> Result<(), ApiError> {
+    if let Ok(mut guard) = ex.try_borrow_mut() {
+        return match value {
+            Some(value) => guard
+                .set_tabpage_var(session, tabpage, name, value)
+                .map_err(map_api_exec_error),
+            None => guard
+                .remove_tabpage_var(session, tabpage, name)
+                .map_err(map_api_exec_error)
+                .map_err(map_del_global_var_error),
+        };
+    }
+    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
+        return Err(ApiError::exception(
+            "no free Ex executor for a nested command",
+        ));
+    };
+    match value {
+        Some(value) => nested
+            .set_tabpage_var(session, tabpage, name, value)
+            .map_err(map_api_exec_error),
+        None => nested
+            .remove_tabpage_var(session, tabpage, name)
+            .map_err(map_api_exec_error)
+            .map_err(map_del_global_var_error),
+    }
+}
+
+/// Restores the `nvim_buf_set_var`/`nvim_buf_del_var` validation errors for
+/// read-only, locked, and missing keys. The executor reports them as
+/// [`ExecError::Editor`] failures, which [`map_api_exec_error`] turns into
+/// exceptions; the legacy silent path (and upstream) reports `Validation`,
+/// so remap those messages and leave every other executor error untouched.
+fn map_buffer_var_error(error: ApiError) -> ApiError {
+    match error {
+        ApiError::Exception(message)
+            if message.starts_with("Key is read-only")
+                || message.starts_with("Key is locked")
+                || message.starts_with("Key not found") =>
+        {
+            ApiError::validation(message)
+        }
+        other => other,
+    }
+}
 
 /// Restores `nvim_del_var`'s validation error for a missing key. The
 /// executor reports it as an [`ExecError::Editor`] failure, which
@@ -5589,6 +5730,84 @@ impl CommandExecutor for ServerCommandHost {
             .map_err(map_del_global_var_error)
     }
 
+    fn set_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        write_buffer_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            buffer,
+            &name,
+            Some(value),
+        )
+    }
+
+    fn del_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        write_buffer_var(session, &self.ex, &self.nested_ex, buffer, &name, None)
+    }
+
+    fn set_window_var(
+        &mut self,
+        session: &ApiSession,
+        window: WinHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        write_window_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            window,
+            &name,
+            Some(value),
+        )
+    }
+
+    fn del_window_var(
+        &mut self,
+        session: &ApiSession,
+        window: WinHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        write_window_var(session, &self.ex, &self.nested_ex, window, &name, None)
+    }
+
+    fn set_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        write_tabpage_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            tabpage,
+            &name,
+            Some(value),
+        )
+    }
+
+    fn del_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        write_tabpage_var(session, &self.ex, &self.nested_ex, tabpage, &name, None)
+    }
+
     fn fork(&self) -> Option<Box<dyn CommandExecutor>> {
         let (ex, nested_ex) = fresh_executors(
             &self.lua,
@@ -5698,6 +5917,78 @@ impl CommandExecutor for ExApiExecutor<'_> {
     fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
         self.executor
             .remove_global_var(session, &name)
+            .map_err(map_api_exec_error)
+            .map_err(map_del_global_var_error)
+    }
+
+    fn set_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .set_buffer_var(session, buffer, &name, value)
+            .map_err(map_api_exec_error)
+            .map_err(map_buffer_var_error)
+    }
+
+    fn del_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .remove_buffer_var(session, buffer, &name)
+            .map_err(map_api_exec_error)
+            .map_err(map_buffer_var_error)
+    }
+
+    fn set_window_var(
+        &mut self,
+        session: &ApiSession,
+        window: WinHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .set_window_var(session, window, &name, value)
+            .map_err(map_api_exec_error)
+    }
+
+    fn del_window_var(
+        &mut self,
+        session: &ApiSession,
+        window: WinHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .remove_window_var(session, window, &name)
+            .map_err(map_api_exec_error)
+    }
+
+    fn set_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .set_tabpage_var(session, tabpage, &name, value)
+            .map_err(map_api_exec_error)
+    }
+
+    fn del_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        self.executor
+            .remove_tabpage_var(session, tabpage, &name)
             .map_err(map_api_exec_error)
             .map_err(map_del_global_var_error)
     }

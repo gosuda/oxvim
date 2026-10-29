@@ -183,6 +183,214 @@ pub trait CommandExecutor {
             Ok(())
         })
     }
+    /// Writes one `b:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `b:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Buffer)` event and drain it after the editor
+    /// borrow is released. `buffer` is already resolved to a live buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key is read-only or locked, or the host
+    /// cannot perform the write.
+    fn set_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            if name.as_bytes() == b"changedtick" {
+                return Err(ApiError::validation(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            if state.is_var_locked(&name) {
+                return Err(ApiError::validation(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            state.variables_mut().insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `b:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `b:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Buffer)` event and drain it after the editor
+    /// borrow is released. `buffer` is already resolved to a live buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            if name.as_bytes() == b"changedtick" {
+                return Err(ApiError::validation(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            if state.is_var_locked(&name) {
+                return Err(ApiError::validation(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let variables = state.variables_mut();
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Writes one `w:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `w:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Window)` event and drain it after the editor
+    /// borrow is released. `win` is already resolved to a live window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_window_var(
+        &mut self,
+        session: &ApiSession,
+        win: WinHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor
+                .window_variables_mut(win)
+                .map_err(|error| ApiError::exception(error.to_string()))?
+                .insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `w:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `w:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Window)` event and drain it after the editor
+    /// borrow is released. `win` is already resolved to a live window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_window_var(
+        &mut self,
+        session: &ApiSession,
+        win: WinHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor
+                .window_variables_mut(win)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            let Some(index) = variables
+                .iter()
+                .position(|(candidate, _)| candidate == &name)
+            else {
+                return Err(ApiError::exception(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Writes one `t:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `t:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Tab)` event and drain it after the editor
+    /// borrow is released. `tabpage` is already resolved to a live tabpage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ApiError::exception(error.to_string()))?
+                .insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `t:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `t:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Tab)` event and drain it after the editor
+    /// borrow is released. `tabpage` is already resolved to a live tabpage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
 
     /// Changes the process working directory globally.
     ///
@@ -1088,7 +1296,7 @@ pub fn nvim_set_vvar(session: &ApiSession, name: OxStr, value: Object) -> Result
 /// Whether an Ex-command host is installed (or forkable from the prototype),
 /// so `g:` writes go through the evaluator and notify scope watchers instead
 /// of mutating the editor map silently.
-fn host_present(session: &ApiSession) -> bool {
+pub(crate) fn host_present(session: &ApiSession) -> bool {
     session.with_state(|state| {
         state.command_depth < state.command_pool.len() || state.command_prototype.is_some()
     })
@@ -4300,11 +4508,87 @@ mod api_scope_watch_tests {
                 .remove_global_var(session, &name)
                 .map_err(Self::api_error)
         }
+
+        fn set_buffer_var(
+            &mut self,
+            session: &ApiSession,
+            buffer: BufHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_buffer_var(session, buffer, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_buffer_var(
+            &mut self,
+            session: &ApiSession,
+            buffer: BufHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_buffer_var(session, buffer, &name)
+                .map_err(Self::api_error)
+        }
+
+        fn set_window_var(
+            &mut self,
+            session: &ApiSession,
+            window: WinHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_window_var(session, window, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_window_var(
+            &mut self,
+            session: &ApiSession,
+            window: WinHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_window_var(session, window, &name)
+                .map_err(Self::api_error)
+        }
+
+        fn set_tabpage_var(
+            &mut self,
+            session: &ApiSession,
+            tabpage: TabHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_tabpage_var(session, tabpage, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_tabpage_var(
+            &mut self,
+            session: &ApiSession,
+            tabpage: TabHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_tabpage_var(session, tabpage, &name)
+                .map_err(Self::api_error)
+        }
     }
 
-    fn session_with_live_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>) {
+    fn session_with_live_buffer_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>, BufHandle)
+    {
         let mut editor = Editor::new();
-        editor.create_buffer(true).unwrap();
+        let buffer = editor.create_buffer(true).unwrap();
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
         let executor = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
         crate::set_command_executor(
@@ -4316,6 +4600,11 @@ mod api_scope_watch_tests {
                 executor: Rc::clone(&executor),
             }),
         );
+        (session, executor, buffer)
+    }
+
+    fn session_with_live_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>) {
+        let (session, executor, _) = session_with_live_buffer_host();
         (session, executor)
     }
 
@@ -4400,5 +4689,79 @@ mod api_scope_watch_tests {
             error.to_string().contains("Key not found"),
             "missing key keeps its error: {error:?}"
         );
+    }
+
+    fn install_buffer_watcher(
+        session: &ApiSession,
+        executor: &RefCell<ox_editor::ExExecutor>,
+        pattern: &str,
+    ) {
+        // Same recording callback as the `g:` watcher, but registered on the
+        // `b:` namespace the API writes below target.
+        executor
+            .borrow_mut()
+            .execute_script(
+                session,
+                "buffer_watch_setup.vim",
+                &format!(
+                    "function! Changed(d, k, c)\n  call add(g:seen, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:seen = []\ncall dictwatcheradd(b:, '{pattern}', 'Changed')"
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn nvim_buf_set_var_fires_buffer_scope_watcher_with_new() {
+        let (session, executor, buffer) = session_with_live_buffer_host();
+        install_buffer_watcher(&session, &executor, "watched");
+        crate::buffer::nvim_buf_set_var(
+            &session,
+            buffer,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        // The write itself lands where `nvim_buf_get_var` reads it.
+        assert_eq!(
+            crate::buffer::nvim_buf_get_var(&session, buffer, OxStr::from("watched")).unwrap(),
+            Object::String(OxStr::from("test"))
+        );
+        // The API write notifies with `new` and no `old`, exactly like the
+        // `:let b:` write the reference reports.
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 1, 0)]));
+        // Deleting the same key then reports the API-written value as `old`.
+        crate::buffer::nvim_buf_del_var(&session, buffer, OxStr::from("watched")).unwrap();
+        assert!(crate::buffer::nvim_buf_get_var(&session, buffer, OxStr::from("watched")).is_err());
+        assert_eq!(
+            seen(&session),
+            Object::Array(vec![row("watched", 1, 0), row("watched", 0, 1)])
+        );
+    }
+
+    #[test]
+    fn nvim_buf_failed_writes_record_nothing() {
+        let (session, executor, buffer) = session_with_live_buffer_host();
+        install_buffer_watcher(&session, &executor, "*");
+        // Deleting a missing key keeps the `Key not found` error and fires no
+        // watcher round.
+        let error =
+            crate::buffer::nvim_buf_del_var(&session, buffer, OxStr::from("watched")).unwrap_err();
+        assert!(
+            error.to_string().contains("Key not found"),
+            "missing key keeps its error: {error:?}"
+        );
+        // A read-only key refuses the write the same silent way.
+        let error = crate::buffer::nvim_buf_set_var(
+            &session,
+            buffer,
+            OxStr::from("changedtick"),
+            Object::Integer(1),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("read-only"),
+            "read-only key keeps its error: {error:?}"
+        );
+        assert_eq!(seen(&session), Object::Array(vec![]));
     }
 }

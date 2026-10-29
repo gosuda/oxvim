@@ -1513,11 +1513,20 @@ impl<F: FileIO> ExExecutor<F> {
         self.runtime.user_commands = Rc::clone(&other.runtime.user_commands);
     }
 
-    /// Shares durable user-function definitions without sharing call frames.
+    /// Shares durable user-function definitions and dictionary-watcher
+    /// registrations without sharing call frames or per-command event
+    /// queues. Shared: the function table and the watcher table (including
+    /// the watcher id counter, so ids stay unique across the pair, and the
+    /// in-flight `busy`/`needs_free` round flags). Local to each executor:
+    /// the `UserFunctions` call stack and `ExRuntime::dict_watch_events`
+    /// (each command drains only the mutations it recorded).
     pub fn share_user_functions_from<G: FileIO>(&mut self, other: &ExExecutor<G>) {
         self.runtime
             .functions
             .share_definitions_from(&other.runtime.functions);
+        self.runtime
+            .functions
+            .share_watchers_from(&other.runtime.functions);
     }
 
     /// Copies runtime search roots from `other` without sharing mutable
@@ -1936,6 +1945,306 @@ impl<F: FileIO> ExExecutor<F> {
             None,
         );
         access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+    /// Writes one `b:` variable on behalf of the API surface
+    /// (`nvim_buf_set_var`), recording a scope-namespace watch event carrying
+    /// `old` (`None` for a new key) and `new`, the same change shape as a
+    /// scope-namespace write through the evaluator.
+    ///
+    /// The write lands directly on the target buffer's editor map (the scope
+    /// only mirrors the current buffer), then the scope resyncs from the
+    /// editor so the drain builds its callback dict from fresh maps. Guards
+    /// mirror the silent API path: `changedtick` stays read-only and locked
+    /// keys refuse the write. A refused write records nothing. Firing follows
+    /// [`Self::set_global_var`]: no editor borrow is held across the drain,
+    /// and a final sync keeps callback mutations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] for an unknown buffer, a read-only or
+    /// locked key, or the scope sync failure.
+    pub fn set_buffer_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        buffer: BufHandle,
+        name: &OxStr,
+        value: Object,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let new = object_to_typval(&value);
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            if name.as_bytes() == b"changedtick" {
+                return Err(ExecError::Editor(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            if state.is_var_locked(name) {
+                return Err(ExecError::Editor(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let old = state.variables().get(name).map(object_to_typval);
+            state.variables_mut().insert(name.clone(), value);
+            Ok(old)
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Buffer,
+            name.as_bytes(),
+            old,
+            Some(new),
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Deletes one `b:` variable on behalf of the API surface
+    /// (`nvim_buf_del_var`), recording a scope-namespace watch event carrying
+    /// `old` and no `new`, the same change shape as `remove()` on a scope
+    /// namespace.
+    ///
+    /// Firing follows [`Self::set_buffer_var`]: the editor borrow is released
+    /// before the drain, and a missing key records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] naming the missing key, or the scope
+    /// sync failure.
+    pub fn remove_buffer_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        buffer: BufHandle,
+        name: &OxStr,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            if name.as_bytes() == b"changedtick" {
+                return Err(ExecError::Editor(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            if state.is_var_locked(name) {
+                return Err(ExecError::Editor(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let variables = state.variables_mut();
+            let Some(index) = variables.iter().position(|(key, _)| key == name) else {
+                return Err(ExecError::Editor(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            let old = variables.0.remove(index).1;
+            Ok(object_to_typval(&old))
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Buffer,
+            name.as_bytes(),
+            Some(old),
+            None,
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Writes one `w:` variable on behalf of the API surface
+    /// (`nvim_win_set_var`), recording a scope-namespace watch event carrying
+    /// `old` (`None` for a new key) and `new`.
+    ///
+    /// Firing follows [`Self::set_buffer_var`]: the editor borrow is released
+    /// before the drain, and a failed write records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] for an unknown window, or the scope
+    /// sync failure.
+    pub fn set_window_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        window: WinHandle,
+        name: &OxStr,
+        value: Object,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let new = object_to_typval(&value);
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let old = editor
+                .window_variables(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .get(name)
+                .map(object_to_typval);
+            editor
+                .window_variables_mut(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .insert(name.clone(), value);
+            Ok(old)
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Window,
+            name.as_bytes(),
+            old,
+            Some(new),
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Deletes one `w:` variable on behalf of the API surface
+    /// (`nvim_win_del_var`), recording a scope-namespace watch event carrying
+    /// `old` and no `new`.
+    ///
+    /// Firing follows [`Self::set_buffer_var`]: the editor borrow is released
+    /// before the drain, and a missing key records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] naming the missing key, or the scope
+    /// sync failure.
+    pub fn remove_window_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        window: WinHandle,
+        name: &OxStr,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let variables = editor
+                .window_variables_mut(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let Some(index) = variables.iter().position(|(key, _)| key == name) else {
+                return Err(ExecError::Editor(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            let old = variables.0.remove(index).1;
+            Ok(object_to_typval(&old))
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Window,
+            name.as_bytes(),
+            Some(old),
+            None,
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Writes one `t:` variable on behalf of the API surface
+    /// (`nvim_tabpage_set_var`), recording a scope-namespace watch event
+    /// carrying `old` (`None` for a new key) and `new`.
+    ///
+    /// Firing follows [`Self::set_buffer_var`]: the editor borrow is released
+    /// before the drain, and a failed write records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] for an unknown tabpage, or the scope
+    /// sync failure.
+    pub fn set_tabpage_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        tabpage: TabHandle,
+        name: &OxStr,
+        value: Object,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let new = object_to_typval(&value);
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let old = editor
+                .tabpage_variables(tabpage)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .get(name)
+                .map(object_to_typval);
+            editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ExecError::Editor(error.to_string()))?
+                .insert(name.clone(), value);
+            Ok(old)
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Tab,
+            name.as_bytes(),
+            old,
+            Some(new),
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let lua = self.lua.clone();
+        drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
+        access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
+        Ok(())
+    }
+
+    /// Deletes one `t:` variable on behalf of the API surface
+    /// (`nvim_tabpage_del_var`), recording a scope-namespace watch event
+    /// carrying `old` and no `new`.
+    ///
+    /// Firing follows [`Self::set_buffer_var`]: the editor borrow is released
+    /// before the drain, and a missing key records nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecError::Editor`] naming the missing key, or the scope
+    /// sync failure.
+    pub fn remove_tabpage_var<E: ExEditorAccess>(
+        &mut self,
+        access: &E,
+        tabpage: TabHandle,
+        name: &OxStr,
+    ) -> Result<(), ExecError> {
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
+        let old = access.with_ex_editor(|editor| -> Result<_, ExecError> {
+            let variables = editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let Some(index) = variables.iter().position(|(key, _)| key == name) else {
+                return Err(ExecError::Editor(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            let old = variables.0.remove(index).1;
+            Ok(object_to_typval(&old))
+        })?;
+        push_scope_watch_event(
+            &mut self.runtime,
+            ScopeKind::Tab,
+            name.as_bytes(),
+            Some(old),
+            None,
+        );
+        access.with_ex_editor(|editor| sync_editor_into_scope(editor, &mut self.scope))?;
         let lua = self.lua.clone();
         drain_dict_watchers(&mut self.runtime, access, &mut self.scope, lua.as_ref());
         access.with_ex_editor(|editor| sync_scope_into_editor(editor, &mut self.scope))?;
@@ -4468,7 +4777,51 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
             return self.api_call(&name_text, &args, scope);
         }
         if let Some(family) = crate::builtins::route(&name_text) {
-            return crate::builtins::call(self, family, &name_text, &args, scope);
+            // `b:changedtick` is owned by the buffer, not the variable dict,
+            // so a buffer-text mutation must queue its own watcher event: the
+            // start-of-command `sync_buffer_scope` ran before the mutation,
+            // and this family bypasses the typval-only sink drain below.
+            // Recorded here, the event waits in `dict_watch_events` until the
+            // post-command `drain_dict_watchers` fires it, matching upstream's
+            // synchronous `buf_set_changedtick` notify (`buffer.c:4284`).
+            // Gated on `has_dictwatchers()`; only a real tick change queues.
+            let watch_tick = matches!(family, crate::builtins::Family::Buffer)
+                && self.runtime.functions.has_dictwatchers();
+            let before = watch_tick
+                .then(|| {
+                    self.access.with_ex_editor(|editor| {
+                        editor
+                            .current_buffer()
+                            .and_then(|buffer| editor.buffer(buffer).ok())
+                            .map(|state| {
+                                i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
+                            })
+                    })
+                })
+                .flatten();
+            let result = crate::builtins::call(self, family, &name_text, &args, scope);
+            if let Some(before) = before {
+                let after = self.access.with_ex_editor(|editor| {
+                    editor
+                        .current_buffer()
+                        .and_then(|buffer| editor.buffer(buffer).ok())
+                        .map(|state| {
+                            i64::try_from(state.script_changedtick()).unwrap_or(i64::MAX)
+                        })
+                });
+                if let Some(after) = after
+                    && after != before
+                {
+                    push_scope_watch_event(
+                        &mut *self.runtime,
+                        ScopeKind::Buffer,
+                        b"changedtick",
+                        Some(Typval::Number(before)),
+                        Some(Typval::Number(after)),
+                    );
+                }
+            }
+            return result;
         }
         let sid = self.runtime.scripts.current_sid().unwrap_or(0);
         if self.runtime.functions.contains(&name_text, sid) || name_text.contains('#') {
@@ -23495,6 +23848,20 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     ) {
         scope.replace_pair(ScopeKind::Vim, "_null_blob", Typval::Blob(Vec::new()));
     }
+    // The `v:_null_dict` repair mirrors the `_null_blob` one above: the
+    // editor round-trips the null-dict sentinel as an empty `Object::Dict`,
+    // so a rebuilt `v:` map needs the real sentinel put back and written
+    // out again. When the cached map already carries it (no rebuild
+    // happened) the repair is a no-op and `v:` stays clean, which keeps the
+    // steady-state sync write-free. The write-back is safe because
+    // `scope_to_dict` maps the sentinel back to an empty `Object::Dict`,
+    // which is what the editor already stores.
+    if !matches!(
+        scope.vim.iter().find(|(key, _)| key.as_bytes() == b"_null_dict").map(|(_, value)| value),
+        Some(value) if value.is_null_dict()
+    ) {
+        scope.replace_pair(ScopeKind::Vim, "_null_dict", Typval::null_dict());
+    }
     let register_version = editor.registers().version();
     if scope.synced.registers() != register_version {
         scope.registers.clear();
@@ -27014,5 +27381,206 @@ fn run_shada_command<F: FileIO, E: ExEditorAccess>(
     match outcome {
         Ok(()) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
+    }
+}
+
+#[cfg(test)]
+mod shared_watcher_pair_tests {
+    use super::*;
+    use crate::TestEditorAccess;
+
+    /// `share_user_functions_from` shares watcher registrations the way it
+    /// shares definitions: a watcher installed on the primary fires for a
+    /// mutation round opened on the nested executor.
+    #[test]
+    fn watcher_added_on_primary_fires_for_round_on_nested() {
+        let mut primary = ExExecutor::new();
+        let mut nested = ExExecutor::new();
+        nested.share_user_functions_from(&primary);
+        let target = WatchTarget::Scope(ScopeKind::Global);
+        primary.runtime.functions.dictwatcher_add(
+            target,
+            OxStr::from("watched"),
+            WatchCallback::Name(OxStr::from("Changed")),
+        );
+        assert!(nested.runtime.functions.has_dictwatchers());
+        let round = nested
+            .runtime
+            .functions
+            .dictwatcher_begin(&target, b"watched")
+            .expect("watcher installed on primary matches on nested");
+        assert_eq!(round.pending.len(), 1);
+        let id = round.pending[0].0;
+        assert!(primary.runtime.functions.dictwatcher_is_live(&target, id));
+        nested.runtime.functions.dictwatcher_finish(&target);
+    }
+
+    /// A watcher deleted mid-round through one executor is dead on both:
+    /// skipped for the rest of the round and swept before the next one.
+    /// Call frames stay per-executor: sharing registrations must not share
+    /// the active call stack.
+    #[test]
+    fn watcher_deleted_mid_round_is_dead_on_both_executors() {
+        let mut primary = ExExecutor::new();
+        let mut nested = ExExecutor::new();
+        nested.share_user_functions_from(&primary);
+        let target = WatchTarget::Dict(7);
+        primary.runtime.functions.dictwatcher_add(
+            target,
+            OxStr::from("*"),
+            WatchCallback::Name(OxStr::from("First")),
+        );
+        primary.runtime.functions.dictwatcher_add(
+            target,
+            OxStr::from("*"),
+            WatchCallback::Name(OxStr::from("Second")),
+        );
+        let round = primary
+            .runtime
+            .functions
+            .dictwatcher_begin(&target, b"key")
+            .expect("both watchers match");
+        assert_eq!(round.pending.len(), 2);
+        let second = round.pending[1].0;
+        assert!(nested.runtime.functions.dictwatcher_remove(
+            &target,
+            b"*",
+            &WatchCallback::Name(OxStr::from("Second")),
+        ));
+        assert!(!primary.runtime.functions.dictwatcher_is_live(&target, second));
+        assert!(!nested.runtime.functions.dictwatcher_is_live(&target, second));
+        primary.runtime.functions.dictwatcher_finish(&target);
+        let round = nested
+            .runtime
+            .functions
+            .dictwatcher_begin(&target, b"key")
+            .expect("survivor still matches on the other executor");
+        assert_eq!(round.pending.len(), 1);
+        assert!(matches!(&round.pending[0].2, WatchCallback::Name(name) if name.as_bytes() == b"First"));
+        nested.runtime.functions.dictwatcher_finish(&target);
+        assert!(primary.runtime.functions.call_stack().is_empty());
+        assert!(nested.runtime.functions.call_stack().is_empty());
+    }
+    /// Harness for the drain-level tests: an editor with one displayed
+    /// buffer plus a primary executor, mirroring the editor-integration
+    /// setup without depending on its module.
+    fn pair_setup() -> (TestEditorAccess, ExExecutor<StubFileIO>) {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (
+            TestEditorAccess::new(editor),
+            ExExecutor::with_io(StubFileIO),
+        )
+    }
+
+    /// Filesystem seam for the drain-level tests: no script touches the
+    /// filesystem, so every operation reports absence.
+    #[derive(Clone, Copy, Debug, Default)]
+    struct StubFileIO;
+
+    impl crate::script::FileIO for StubFileIO {
+        fn read_to_string(&self, _path: &std::path::Path) -> std::io::Result<String> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no files in drain tests",
+            ))
+        }
+
+        fn write_string(&self, _path: &std::path::Path, _contents: &str) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no files in drain tests",
+            ))
+        }
+
+        fn exists(&self, _path: &std::path::Path) -> bool {
+            false
+        }
+
+        fn canonicalize(&self, path: &std::path::Path) -> std::path::PathBuf {
+            path.to_path_buf()
+        }
+    }
+
+    /// Strings recorded in a `g:` list, read back from an executor's scope.
+    fn recorded(executor: &ExExecutor<StubFileIO>, name: &str) -> Vec<String> {
+        let Some(value) = executor
+            .scope()
+            .global
+            .iter()
+            .find(|(key, _)| key.as_bytes() == name.as_bytes())
+            .map(|(_, value)| value.clone())
+        else {
+            return Vec::new();
+        };
+        match value {
+            ox_types::Typval::List(list) => list
+                .borrow()
+                .items
+                .iter()
+                .map(|item| match item {
+                    ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+                    other => panic!("expected a String in g:{name}, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected a List in g:{name}, got {other:?}"),
+        }
+    }
+
+    /// A real `g:` write drained by the nested executor notifies a watcher
+    /// installed on the primary: the mutation event, the shared registry
+    /// lookup, the callback dispatch, and the round completion all run on
+    /// the nested side while definitions and registrations come from the
+    /// primary side.
+    #[test]
+    fn cross_executor_scope_write_fires_shared_watcher_through_drain() {
+        let (editor, mut primary) = pair_setup();
+        let mut nested = ExExecutor::with_io(StubFileIO);
+        nested.share_user_functions_from(&primary);
+        primary
+            .execute_script(
+                &editor,
+                "watch_pair_drain.vim",
+                "function! Changed(d, k, c)\n  call add(g:log, a:k)\nendfunction\n\
+                 let g:log = []\n\
+                 call dictwatcheradd(g:, 'watched', 'Changed')\n",
+            )
+            .unwrap();
+        nested.execute_line(&editor, "let g:watched = 1").unwrap();
+        assert_eq!(recorded(&nested, "log"), vec!["watched".to_owned()]);
+        nested.execute_line(&editor, "let g:other = 1").unwrap();
+        assert_eq!(recorded(&nested, "log"), vec!["watched".to_owned()]);
+    }
+
+    /// A real `dictwatcherdel()` inside a callback removes the watcher from
+    /// the shared table: a pending watcher later in the same round is
+    /// skipped (`dictwatcher_is_live` fails it) and the round-end sweep
+    /// frees it, so the next round on either executor fires only survivors.
+    #[test]
+    fn cross_executor_callback_deletion_skips_pending_and_sweeps() {
+        let (editor, mut primary) = pair_setup();
+        let mut nested = ExExecutor::with_io(StubFileIO);
+        nested.share_user_functions_from(&primary);
+        primary
+            .execute_script(
+                &editor,
+                "watch_pair_delete.vim",
+                "function! First(d, k, c)\n  call add(g:fires, 'first:' . a:k)\n\
+                 \u{20} call dictwatcherdel(g:, '*', 'Second')\n\
+                 \u{20} call dictwatcherdel(g:, '*', 'First')\nendfunction\n\
+                 function! Second(d, k, c)\n  call add(g:fires, 'second:' . a:k)\nendfunction\n\
+                 let g:fires = []\n\
+                 call dictwatcheradd(g:, '*', 'First')\n\
+                 call dictwatcheradd(g:, '*', 'Second')\n",
+            )
+            .unwrap();
+        nested.execute_line(&editor, "let g:key = 1").unwrap();
+        assert_eq!(recorded(&nested, "fires"), vec!["first:key".to_owned()]);
+        nested.execute_line(&editor, "let g:key = 2").unwrap();
+        assert_eq!(recorded(&nested, "fires"), vec!["first:key".to_owned()]);
+        assert!(!nested.runtime.functions.has_dictwatchers());
     }
 }

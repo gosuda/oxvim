@@ -302,6 +302,11 @@ pub fn nvim_tabpage_set_var(
     value: Object,
 ) -> Result<(), ApiError> {
     let tabpage = resolve_tabpage(session, tabpage)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.set_tabpage_var(session, tabpage, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         editor
             .tabpage_variables_mut(tabpage)
@@ -322,6 +327,11 @@ pub fn nvim_tabpage_del_var(
     name: OxStr,
 ) -> Result<(), ApiError> {
     let tabpage = resolve_tabpage(session, tabpage)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.del_tabpage_var(session, tabpage, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         let variables = editor.tabpage_variables_mut(tabpage).map_err(exception)?;
         let Some(index) = variables.iter().position(|(key, _)| key == &name) else {

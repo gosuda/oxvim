@@ -867,6 +867,11 @@ pub fn nvim_buf_set_var(
     value: Object,
 ) -> Result<(), ApiError> {
     let buffer = resolve_buffer(session, buffer)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.set_buffer_var(session, buffer, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         if name.as_bytes() == b"changedtick" {
             return Err(ApiError::validation(format!(
@@ -899,6 +904,11 @@ pub fn nvim_buf_del_var(
     name: OxStr,
 ) -> Result<(), ApiError> {
     let buffer = resolve_buffer(session, buffer)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.del_buffer_var(session, buffer, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         if name.as_bytes() == b"changedtick" {
             return Err(ApiError::validation(format!(

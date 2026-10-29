@@ -12711,6 +12711,94 @@ fn dictwatcher_locked_scope_unlet_refuses_without_firing() {
     assert_eq!(recorded_strings(&executor, "un_fires"), vec!["y".to_owned()]);
     assert_eq!(global_number(&executor, "y"), 1);
 }
+
+/// `dict_notifications_spec.lua` "errors out when adding to v:_null_dict":
+/// `dictwatcheradd()` on the null-dict sentinel must refuse with E46 naming
+/// the argument (`eval/funcs.c` `f_dictwatcheradd` rejects a null dict as a
+/// read-only variable). The `v:_null_dict` value must survive the `v:` scope
+/// sync as [`ox_types::Typval::null_dict`], not a plain empty dict.
+#[test]
+fn dictwatcher_add_null_dict_refuses_with_e46() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_nulldict.vim",
+            "function! g:Watcher1(dict, key, value)\nendfunction\n",
+        )
+        .unwrap();
+    match executor.execute_line(
+        &editor,
+        "call dictwatcheradd(v:_null_dict, \"x\", \"g:Watcher1\")",
+    ) {
+        Err(ExecError::Vim(exception)) => {
+            assert!(
+                matches!(&exception.kind, VimExceptionKind::Error(code) if code == "E46"),
+                "expected E46, got {:?}: {}",
+                exception.kind,
+                exception.message()
+            );
+            assert!(
+                exception.message().contains("dictwatcheradd() argument"),
+                "unexpected E46 message: {}",
+                exception.message()
+            );
+        }
+        other => panic!("expected E46 refusal, got {other:?}"),
+    }
+}
+
+/// `dict_notifications_spec.lua` "for b:changedtick": a watcher registered
+/// on `b:` for key `changedtick` observes text edits, with `old`/`new`
+/// carrying the script-visible tick before and after the edit. Upstream
+/// `buf_set_changedtick` (`buffer.c:4284`) notifies `b:` watchers
+/// synchronously on every text change; the port must queue the equivalent
+/// [`crate::userfunc::WatchTarget::Scope`] buffer event before the
+/// post-command drain.
+#[test]
+fn dictwatcher_fires_on_buffer_text_changedtick() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick.vim",
+            "function! OnTickChanged(d, k, c)\n  call add(g:tick_rows, [a:k, get(a:c, 'old', 'MISSING'), get(a:c, 'new', 'MISSING')])\nendfunction\nlet g:tick_rows = []\ncall dictwatcheradd(b:, 'changedtick', 'OnTickChanged')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:tick_before = b:changedtick")
+        .unwrap();
+    executor
+        .execute_line(&editor, "call setline(1, 't')")
+        .unwrap();
+    let before = global_number(&executor, "tick_before");
+    let rows = global_list(&executor, "tick_rows");
+    assert!(
+        matches!(
+            &rows[..],
+            [ox_types::Typval::List(row)] if row.borrow().items.len() == 3
+        ),
+        "expected one changedtick notification, got {rows:?}"
+    );
+    match &rows[..] {
+        [ox_types::Typval::List(row)] => {
+            let items = row.borrow();
+            assert_eq!(
+                items.items.first(),
+                Some(&ox_types::Typval::String(ox_types::OxStr::from("changedtick"))),
+            );
+            assert_eq!(
+                items.items.get(1),
+                Some(&ox_types::Typval::Number(before)),
+            );
+            assert_eq!(
+                items.items.last(),
+                Some(&ox_types::Typval::Number(before + 1)),
+            );
+        }
+        _ => unreachable!(),
+    }
+}
 // ---------------------------------------------------------------------------
 // :pwd / :list / :number / :uptime / :tabs
 // ---------------------------------------------------------------------------
