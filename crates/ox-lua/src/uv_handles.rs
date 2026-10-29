@@ -860,6 +860,22 @@ impl UserData for LuaProcessPipe {
                 let lua = this.lua.clone();
                 let fast = this.fast.clone();
                 let access = this.access.clone();
+                // A zero-length write has nothing to flush, so luv answers its
+                // callback at once. `vim.system` writes '' to flush before it
+                // shuts the child's stdin down, and a queued empty write would
+                // never complete, leaving the child waiting on a stdin that
+                // never closes.
+                if data.is_empty() {
+                    let access = this.access.clone();
+                    this.access.apply(Box::new(move |uv_loop| {
+                        if let Some(callback) = callback {
+                            access.callback(uv_loop, move || {
+                                invoke(&lua, &fast, &callback, MultiValue::new());
+                            });
+                        }
+                    }));
+                    return Ok(true);
+                }
                 this.access.apply(Box::new(move |uv_loop| {
                     if let Some(callback) = callback {
                         callbacks.borrow_mut().pending_write = Some(callback);
@@ -918,11 +934,27 @@ impl UserData for LuaProcessPipe {
             },
         );
         methods.add_method("shutdown", |_, this, callback: Option<Function>| {
-            this.callbacks.borrow_mut().shutdown = callback;
+            let lua = this.lua.clone();
+            let fast = this.fast.clone();
+            let access = this.access.clone();
             let inner = this.inner.clone();
             this.access.apply(Box::new(move |uv_loop| {
-                if let Some(pipe) = inner.borrow_mut().as_mut() {
+                let taken = inner.borrow_mut().take();
+                if let Some(mut pipe) = taken {
                     let _ = pipe.shutdown(uv_loop);
+                    let mut slot = inner.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(pipe);
+                    }
+                }
+                // `uv_shutdown` on a pipe closes the write side at once;
+                // `vim.system` closes the handle from this callback, so an
+                // answer that never comes strands the child's stdin and the
+                // child waits for an end-of-file that never arrives.
+                if let Some(callback) = callback {
+                    access.callback(uv_loop, move || {
+                        invoke(&lua, &fast, &callback, MultiValue::new());
+                    });
                 }
             }));
             Ok(true)

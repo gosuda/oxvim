@@ -392,6 +392,22 @@ fn extra_stdio_create_pipe_is_typed_unsupported() {
     );
 }
 
+/// A pipe pair must not leak its ends into a spawned child: without
+/// `O_CLOEXEC` the child keeps a writer to its own stdin and never sees
+/// end-of-file, so `vim.system({'cat'}, { stdin = ... })` hangs forever.
+#[cfg(unix)]
+#[test]
+fn pipe_pair_ends_are_close_on_exec() {
+    let (reader, writer) = crate::net::pipe_pair(false).expect("create pipe pair");
+    for fd in [&reader, &writer] {
+        let flags = rustix::io::fcntl_getfd(fd).expect("read descriptor flags");
+        assert!(
+            flags.contains(rustix::io::FdFlags::CLOEXEC),
+            "pipe end {fd:?} must not survive exec"
+        );
+    }
+}
+
 /// A caller-owned descriptor reaches the child's slot: `uv.spawn` in luv takes
 /// ownership of a numeric `stdio` entry, so the parent copy must close with the
 /// spawn and the child's output must arrive through the other end.

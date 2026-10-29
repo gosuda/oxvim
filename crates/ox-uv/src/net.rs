@@ -2479,7 +2479,12 @@ impl Handle for Udp {
 /// numbers to Lua, as luv does.
 #[cfg(unix)]
 pub fn pipe_pair(nonblock: bool) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    let (reader, writer) = rustix::pipe::pipe()?;
+    // `O_CLOEXEC` on both ends: a spawned child must not inherit the parent's
+    // ends. Without it the child keeps a writer to its own stdin and never
+    // sees end-of-file, so `vim.system({'cat'}, { stdin = ... })` hangs. The
+    // descriptor handed to the child is `dup2`-ed onto the standard slot, which
+    // clears the flag for that copy only.
+    let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
     if nonblock {
         rustix::io::ioctl_fionbio(&reader, true)?;
         rustix::io::ioctl_fionbio(&writer, true)?;
