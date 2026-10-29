@@ -1164,3 +1164,19 @@ The null-dict case passes. Three remain, each with a measured cause:
 - `calls watcher deleted in callback`: still red after the shared registry.
 - `tabpagebuflist()` teardown: still red; it needs watcher delivery during
   window/tab teardown, not only during a command.
+
+
+### `ex_cmds` group after the watcher completion
+
+Same command, same 2400 s cap, run against the binary built from `e791900`:
+
+| Measure | Before watcher completion | After |
+|---|---|---|
+| OK | 76 | 125 |
+| FAIL | 321 | 272 |
+| run | 405 | 405 |
+
+The 49-test jump comes from the shared watcher registry and the API scoped
+writes, not from a new command: `dict_notifications_spec` alone accounts for one
+of them, so the rest are group tests whose setup or teardown needed a watcher
+notification to arrive.
