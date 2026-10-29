@@ -3474,6 +3474,24 @@ impl Editor {
         self.split_window(tab, target, buffer, SplitDirection::Below, enter)
     }
 
+    /// Splits the tabpage horizontally and displays `buffer` across the
+    /// bottom, spanning every existing window.
+    ///
+    /// This is the `:botright` split that `:copen` needs, where upstream
+    /// splits the outermost frame instead of the current column.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Editor::split_horizontal`].
+    pub fn split_root_horizontal(
+        &mut self,
+        tab: TabHandle,
+        buffer: BufHandle,
+        enter: bool,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window_root(tab, buffer, enter)
+    }
+
     /// Splits a tiled window vertically and displays `buffer` to the left.
     ///
     /// # Errors
@@ -4753,6 +4771,67 @@ impl Editor {
         }
         self.windows.insert(window, tab);
         self.options.copy_window_options(target, window);
+        self.apply_effective_directory();
+        Ok(window)
+    }
+
+    /// Bottom split of the whole tabpage: the new window spans the width and
+    /// every existing window keeps its buffer and view above it.
+    fn split_window_root(
+        &mut self,
+        tab: TabHandle,
+        buffer: BufHandle,
+        enter: bool,
+    ) -> Result<WinHandle, EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        let buffer = self.resolve_buffer_handle(buffer)?;
+        self.require_buffer(buffer)?;
+        self.require_tabpage(tab)?;
+        let windows = self
+            .tabpages
+            .get(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .layout()
+            .windows();
+        let first = *windows
+            .first()
+            .ok_or(EditorError::UnknownWindow(WinHandle::CURRENT))?;
+        let (cursor, local_directory, previous_directory) = {
+            let state = self
+                .tabpages
+                .get(&tab)
+                .ok_or(EditorError::UnknownTabpage(tab))?
+                .window(first)?;
+            (
+                state.cursor,
+                state.local_directory.clone(),
+                state.previous_directory.clone(),
+            )
+        };
+        let previous = self.current_window();
+        let window = allocate_window_handle(&mut self.next_window)?;
+        let mut state = WindowState::new(buffer, Position { lnum: 1, col: 0 });
+        state.local_directory = local_directory;
+        state.previous_directory = previous_directory;
+        let _ = cursor;
+        if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
+            buffer_state.attach()?;
+        }
+        let tabpage = self
+            .tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        if let Err(error) = tabpage.split_root_horizontal(window, state, enter) {
+            if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
+                buffer_state.detach(true);
+            }
+            return Err(error.into());
+        }
+        if enter {
+            self.previous_window = previous.filter(|current| *current != window);
+        }
+        self.windows.insert(window, tab);
+        self.options.copy_window_options(first, window);
         self.apply_effective_directory();
         Ok(window)
     }

@@ -517,6 +517,63 @@ impl Layout {
         self.split(target, window, state, SplitAxis::Horizontal, enter)
     }
 
+    /// Splits the whole layout horizontally, placing `window` below every
+    /// existing window.
+    ///
+    /// This is what `:botright` needs: upstream `win_split` with `WSP_BOT`
+    /// splits the outermost frame, so the new window spans the tabpage width
+    /// instead of nesting inside the current column (`win_split_ins`,
+    /// window.c:1290-1360).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, or an equalization failure when the split cannot fill
+    /// the root rectangle.
+    pub fn split_root_horizontal(
+        &mut self,
+        window: WinHandle,
+        state: WindowState,
+        enter: bool,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if find_leaf(&self.root, window).is_some() {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        let geometry = self.root.geometry();
+        if geometry.height < 2 {
+            return Err(LayoutError::InsufficientSpace {
+                available: geometry.height,
+                children: 2,
+            });
+        }
+        let old_root = std::mem::replace(
+            &mut self.root,
+            Frame::Leaf(LeafFrame {
+                window,
+                state,
+                geometry,
+            }),
+        );
+        let new_leaf = std::mem::replace(
+            &mut self.root,
+            Frame::Column {
+                geometry,
+                children: Vec::new(),
+            },
+        );
+        self.root = Frame::Column {
+            geometry,
+            children: vec![old_root, new_leaf],
+        };
+        equalize_frame(&mut self.root, geometry)?;
+        if enter {
+            self.current = window;
+        }
+        Ok(())
+    }
+
     /// Splits `target` vertically, placing `window` to its left.
     ///
     /// # Errors
@@ -1515,6 +1572,34 @@ impl TabpageState {
         Ok(())
     }
 
+    /// Splits the whole tabpage horizontally, placing `window` across the
+    /// bottom. See [`Layout::split_root_horizontal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, or an equalization failure when the split
+    /// cannot fill the root rectangle.
+    pub fn split_root_horizontal(
+        &mut self,
+        window: WinHandle,
+        state: WindowState,
+        enter: bool,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if self.contains(window) {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        self.layout.split_root_horizontal(window, state, enter)?;
+        self.window_api.insert(window, WindowApiState::new());
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
+        Ok(())
+    }
+
     /// Splits a tiled window horizontally.
     ///
     /// # Errors
@@ -2315,6 +2400,37 @@ mod tests {
             WinHandle::try_from(1001).unwrap(),
             WinHandle::try_from(1002).unwrap(),
         )
+    }
+
+    /// `:botright` splits the outermost frame, so a bottom window spans the
+    /// whole tabpage instead of the current column (`win_split_ins` with
+    /// `WSP_BOT`, window.c:1290-1360). `:copen` relies on it.
+    #[test]
+    fn root_split_spans_the_tabpage_width() {
+        let (left, right, bottom) = handles();
+        let layout = Layout::new(left, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        tabpage
+            .split_vertical(left, right, state(), false)
+            .unwrap();
+        tabpage
+            .split_root_horizontal(bottom, state(), true)
+            .unwrap();
+
+        let geometry = |window| tabpage.window_geometry(window).unwrap();
+        let (left_rect, right_rect, bottom_rect) =
+            (geometry(left), geometry(right), geometry(bottom));
+        assert_eq!(bottom_rect.width, 80, "the bottom window spans the tabpage");
+        assert_eq!(bottom_rect.row, 12, "and sits below both columns");
+        assert_eq!(left_rect.width, 40, "the columns keep half the width");
+        assert_eq!(right_rect.width, 40);
+        assert_eq!(left_rect.row, 0, "the columns stay on the first row");
+        assert_eq!(right_rect.col, 40, "and keep their left-to-right order");
+        assert_eq!(
+            tabpage.layout().windows(),
+            vec![left, right, bottom],
+            "window order puts the two columns before the bottom row"
+        );
     }
 
     #[test]

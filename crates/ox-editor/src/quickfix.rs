@@ -1439,9 +1439,13 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
         return Ok(window);
     }
     let window =
-        if let (Some(tab), Some(current)) = (editor.current_tabpage(), editor.current_window()) {
+        if let (Some(tab), Some(_current)) = (editor.current_tabpage(), editor.current_window()) {
+            // `:botright copen` splits the outermost frame at the bottom
+            // (`qf_open` uses `win_split(0, WSP_BOT)`, quickfix.c:3869-3890),
+            // so the list window spans the tabpage width instead of nesting
+            // inside the current column.
             editor
-                .split_horizontal(tab, current, buffer, true)
+                .split_root_horizontal(tab, buffer, true)
                 .map_err(|error| QuickfixError::editor(&error))?
         } else {
             let tab = editor
