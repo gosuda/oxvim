@@ -426,3 +426,34 @@ own timeout timer (`timer_oneshot`, `system.lua:352-360`) should fire first and
 kill with SIGTERM; instead `wait` reaches its own deadline and kills with
 SIGKILL. An extra zero-length poll after the deadline did not change that
 (still `signal 9`), so it was reverted rather than left in the tree.
+
+
+### Async timeout: timer precision at the deadline
+
+The remaining difference is sub-millisecond timer behaviour, measured on both
+binaries with a timer due exactly at the wait deadline:
+
+```lua
+local t = vim.uv.new_timer()
+t:start(500, 0, function() fired = true end)
+local ok = vim.wait(500, function() return fired end, nil, true)
+```
+
+| Binary | Timer fired | `vim.wait` |
+|---|---|---|
+| reference `nvim` | 499.95 ms | true |
+| oxvim | 500.33 ms | false |
+
+The reference fires fractionally early, so `remaining` is still positive when
+its poll returns and the predicate is checked again. The port fires about
+0.3 ms late, so `vim.wait` reaches its post-poll deadline check first and
+answers false even though the event has arrived. The same shift explains
+`vim.system({'sleep','10'}, {timeout=1000})`: the object's own timeout timer
+loses the race to `wait`'s deadline, and the kill therefore comes from
+`wait`'s SIGKILL path (`signal 9`) instead of the object timer's SIGTERM
+(`signal 15`).
+
+Two attempts were measured and reverted rather than left in the tree: an extra
+zero-length poll after the deadline, and a two-millisecond margin on the wake
+timer. Neither changed the outcome, and both touched the hot wait path without
+proof. The fix belongs in timer expiry precision, not in `vim.wait`.
