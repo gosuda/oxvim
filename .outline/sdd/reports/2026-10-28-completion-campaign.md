@@ -1038,3 +1038,19 @@ scope mapping itself (`remove(g:, 'k')`, `extend(g:, {...})`), not a dictionary
 variable, so the new producers record a `WatchTarget::Dict` event while the
 watcher is registered as `WatchTarget::Scope(Global)`. The builtin routes need
 the same scope-identity mapping that `dictwatcheradd` already uses.
+
+
+### `:checkhealth` after the host seam
+
+`a32f365` removed the E5108 failure mode: the health spec no longer contains a
+single `E5108` line (it had 16 before), and the Lua callbacks registered on
+`FileType/checkhealth` now run.
+
+Before, from the plugin-group run that covered this file: 41 failures and 16
+`E5108` lines. After, measured alone: 44 run, 4 OK, 40 FAIL, zero `E5108`
+lines. The OK count before was not measured alone, so it is not claimed here.
+
+The remaining failures are assertions about behaviour the port has not matched,
+starting with T1 `:checkhealth detects invalid $VIMRUNTIME` (expected false,
+actual true) and T2 for `'runtimepath'`, then `getcompletion()` and cmdline
+completion. Those are separate defects from the callback path.
