@@ -1078,3 +1078,27 @@ throws before notifying.
 The fix is structural: a scope namespace needs one stable dictionary identity
 per session (upstream's `vimvardict`), with `set_scoped` keeping it current,
 instead of a snapshot rebuilt on every evaluation.
+
+
+### Scope identity: the fix that moved the spec
+
+`646eecc` caches one `DictRef` per scope kind for the session, so the dictionary
+a watch callback receives is the object `g:` evaluates to. The probe logs
+`identity-mismatch` before and `identity-ok` after; the reference logs
+`identity-ok`.
+
+| `dict_notifications_spec` | Before | After |
+|---|---|---|
+| OK | 28 | 64 |
+| FAIL | 42 | 6 |
+
+The six remaining failures, each its own cause:
+
+| Test | What it needs |
+|---|---|
+| `remove()` when updated with `nvim_*_var` | the scope producer for `nvim_set_var`/`nvim_del_var` writes, which go through the API rather than the Ex lvalue path |
+| `remove()` when updated with `vim.g` | the same, through the Lua `vim.g` assignment path |
+| `errors out when adding to v:_null_dict` | the null-dict guard raising the reference's error |
+| `for b:changedtick` | `b:changedtick` as a synthetic scope key that notifies |
+| `calls watcher deleted in callback` | a watcher removed by an earlier callback in the same round must not run |
+| `tabpagebuflist() with dict watcher during buffer close/wipe` | watcher firing during window/tab teardown without a live executor |
