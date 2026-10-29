@@ -2065,6 +2065,9 @@ pub(crate) fn install(
             // Descriptors that came out of the registry and move into a child
             // slot here; `None` leaves the slot's `StdioConfig` in charge.
             let mut owned_slots: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
+            // Numbers to mark as spawned, applied only after the spawn starts
+            // so a rejected `stdio` table leaves no marker behind.
+            let mut owned_descriptors: Vec<i32> = Vec::new();
             if let Some(stdio) = stdio {
                 for (index, target) in pipe_targets.iter_mut().enumerate() {
                     match stdio.raw_get::<Value>(index + 1)? {
@@ -2094,7 +2097,7 @@ pub(crate) fn install(
                                     "stdio entries must be pipe handles, false, nil, or descriptors 0, 1, or 2",
                                 ));
                             };
-                            spawn_registry.borrow_mut().mark_spawned(descriptor);
+                            owned_descriptors.push(descriptor);
                             spawn_options.stdio[index] = StdioConfig::Ignore;
                             owned_slots[index] = Some(owned);
                         }
@@ -2108,6 +2111,11 @@ pub(crate) fn install(
             }
             let completion = Arc::new(ProcessCompletion::default()); let waiter = completion.clone();
             let spawned = process::spawn_with_owned_stdio(&mut spawn_loop.borrow_mut(), spawn_options, process::OwnedStdio(owned_slots), move |_, result| { let value = result.map(|exit| (exit.code, exit.signal)).map_err(|error| error.to_string()); if let Ok(mut slot) = waiter.result.lock() { *slot = Some(value); } }).map_err(mlua::Error::external)?;
+            // The spawn took the descriptors; record the numbers the Lua side
+            // still closes so `fs_close` answers once and then `EBADF`.
+            for descriptor in owned_descriptors {
+                spawn_registry.borrow_mut().mark_spawned(descriptor);
+            }
             let mut pipes = spawned.pipes;
             if let (Some(target), Some(pipe)) = (&pipe_targets[0], pipes.stdin.take()) { target.install_endpoint(pipe); }
             if let (Some(target), Some(pipe)) = (&pipe_targets[1], pipes.stdout.take()) { target.install_endpoint(pipe); }
