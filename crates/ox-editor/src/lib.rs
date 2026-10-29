@@ -101,6 +101,7 @@ pub use mode::{
 pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
 pub use ops::{EditRange, Operator, OperatorError, OperatorRequest, OperatorResult};
 pub use options::{
+    option_value_object,
     OPTION_COUNT, OPTION_METADATA, OptionDefault, OptionDefaultValue, OptionError, OptionListKind,
     OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue, option_metadata,
 };

@@ -2259,11 +2259,7 @@ pub(crate) fn structured_option_value(
 }
 
 fn option_value_to_object(value: &OptionValue) -> Object {
-    match value {
-        OptionValue::Boolean(value) => Object::Boolean(*value),
-        OptionValue::Number(value) => Object::Integer(*value),
-        OptionValue::String(value) => Object::String(OxStr::from(value.as_str())),
-    }
+    ox_editor::option_value_object(value)
 }
 
 fn comma_items(text: &str) -> impl Iterator<Item = &str> {

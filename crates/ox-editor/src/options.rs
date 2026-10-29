@@ -5,6 +5,20 @@ use std::collections::HashMap;
 use ox_types::{BufHandle, WinHandle};
 use thiserror::Error;
 
+/// The option value as the `v:option_*` variables carry it (`opt_to_tv`,
+/// option.c:2107): a Boolean, a Number, or a String, never a structured key
+/// dictionary.
+#[must_use]
+pub fn option_value_object(value: &OptionValue) -> ox_types::Object {
+    match value {
+        OptionValue::Boolean(value) => ox_types::Object::Boolean(*value),
+        OptionValue::Number(value) => ox_types::Object::Integer(*value),
+        OptionValue::String(value) => {
+            ox_types::Object::String(ox_types::OxStr::from(value.as_str()))
+        }
+    }
+}
+
 /// A layer on which an option may be read or written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptionScope {
