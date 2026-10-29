@@ -469,3 +469,47 @@ Rust-side oracle comparison is `keyparse_reports_the_oracle_chords`
 (`crates/ox-eval/src/builtins_tests.rs`) with seven notations. There is no
 upstream functional spec for `keyparse`; the reference test tree has none, so
 the Lua group cannot carry this coverage.
+
+
+### Dict watchers: why firing is not a two-line hook
+
+The registry is complete and already models upstream's in-flight rules
+(`crates/ox-editor/src/userfunc.rs`: `busy`, `needs_free`, `WatchRound`,
+`dictwatcher_begin`/`is_live`/`arguments`/`finish`). What is missing is the
+notification calls. Address every upstream site, not just the obvious one:
+
+| Upstream site | Mutation |
+|---|---|
+| `eval/typval.c:2831`, `:2838`, `:2864` | `extend()` adds, replaces, and overwrites keys |
+| `eval/typval.c:3447` | `remove()` deletes a key |
+| `eval/vars.c:1694` | `unlet` and scope-dict removal |
+| `buffer.c:4304` | a `b:` variable write |
+| `lua/stdlib.c:395`, `:438` | the Lua table path that deletes and updates a key |
+
+`tv_dict_watcher_notify` (`eval/typval.c:2054`) passes three arguments: the
+dictionary, the key, and a dictionary that carries `new` and/or `old`. A busy
+watcher is skipped, so a callback that mutates the same dictionary cannot
+re-enter that watcher, but other watchers in the same round still run.
+
+The port cannot call the hook from the mutation leaves as they stand. Firing a
+Vimscript callback needs `&mut ExRuntime` plus `access`, `scope`, and `lua`
+(`call_user_function_with_self`, `crates/ox-editor/src/excmd_exec.rs:5054`),
+while the delete path is threaded as `&ExRuntime` from `remove_subscript_chain`
+down to `dict_remove_key` (`crates/ox-editor/src/lvalue.rs:815-850`, `:911`),
+and the set path (`dict_set_key`, `:880`) has `&mut` but none of the call
+context.
+
+Two designs follow, and the faithful one costs more than it looks:
+
+1. Record events into a queue owned by `ExRuntime` and drain them after the Ex
+   command finishes. Small, keeps the borrow rule, but batches. One command
+   that writes two keys then fires both callbacks, where upstream fires each
+   callback at its own mutation and the callback can observe the intermediate
+   dictionary.
+2. Thread the call context into the lvalue leaves and fire per mutation. This
+   matches upstream ordering, and it changes four signatures plus their
+   callers, in one coherent change with tests.
+
+Design 2 is the one to build; design 1 is cheaper and observably different, so
+it is not a shortcut worth taking. The Lua-side `lua/stdlib.c` sites also need
+the Lua-to-dict conversion path, which is separate work again.
