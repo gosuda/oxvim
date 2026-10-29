@@ -151,6 +151,39 @@ fn immediate_timer_callback_can_close_its_handle() {
         .unwrap();
 }
 
+/// `vim._core.keyparse` (`nlua_keyparse`, lua/stdlib.c:692) answers one table
+/// per chord with the modifier list in `mod_mask_table` order, the bare key,
+/// the `keytrans` spelling, and the alternate name. `vim.keycode(keys, true)`
+/// builds on this, so the Lua shape is the contract.
+#[test]
+fn keyparse_reports_modifiers_and_both_spellings() {
+    let (host, _scheduler) = host();
+    host.lua()
+        .load(
+            r"
+            local chrome = vim._core.keyparse('\1')
+            assert(#chrome == 1, 'one chord')
+            assert(vim.deep_equal(chrome[1].mod, { 'C' }), vim.inspect(chrome[1].mod))
+            assert(chrome[1].key == 'a', chrome[1].key)
+            assert(chrome[1].keys == '<C-A>', chrome[1].keys)
+            assert(chrome[1].key_alt == 'A', tostring(chrome[1].key_alt))
+
+            -- A plain lowercase key carries no modifiers; an uppercase
+            -- letter is the shifted form, which the oracle reports as 'S'.
+            local plain = vim._core.keyparse('a')
+            assert(#plain[1].mod == 0, 'no modifiers on a lowercase key')
+            assert(plain[1].key == 'a', plain[1].key)
+            assert(plain[1].keys == 'a', plain[1].keys)
+
+            local shifted = vim._core.keyparse('A')
+            assert(vim.deep_equal(shifted[1].mod, { 'S' }), 'uppercase is shifted')
+            assert(shifted[1].key == 'a', shifted[1].key)
+            ",
+        )
+        .exec()
+        .expect("vim._core.keyparse answers the Lua shape");
+}
+
 /// A read callback may stop reading on the same pipe. The callback used to run
 /// with the pipe's callback state still borrowed, so `read_stop` panicked and
 /// `difftool` lost its output.
