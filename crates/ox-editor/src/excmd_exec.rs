@@ -1308,6 +1308,9 @@ impl<F: FileIO> ExExecutor<F> {
     /// Creates an executor using an injected IO seam.
     #[must_use]
     pub fn with_io(io: F) -> Self {
+        // First executor built: anchor `:uptime`'s process start (see
+        // `START_TIME`); later executors are already-initialized no-ops.
+        std::sync::LazyLock::force(&START_TIME);
         Self {
             runtime: ExRuntime::new(io),
             scope: Scope::new(),
@@ -3766,6 +3769,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         }
         "messages" => access.with_ex_editor(command_messages),
         "version" => access.with_ex_editor(command_version),
+        // `:uptime` (`ex_uptime`, `ex_docmd.c:8177-8180`): elapsed wall time
+        // since process start, rendered by `fmt_rtime`.
+        "uptime" => access.with_ex_editor(command_uptime),
         "help" => command_help(runtime, access, scope, lua, command),
         "eval" => match eval_text(runtime, access, scope, lua, skipwhite_trim(&command.args)) {
             Ok(_) => Flow::Normal,
@@ -3808,6 +3814,11 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "lcd" | "bcd" | "tcd" | "tchdir" => access.with_ex_editor(|editor| {
             command_cd(runtime, editor, &command.args, DirectoryScope::Window)
         }),
+        // `:pwd` (`ex_pwd`, `ex_docmd.c:6460-6484`): print the effective
+        // working directory. A bang never reaches this arm: the `pwd` spec
+        // carries no `EX_BANG`, so the parser reports `E477` first
+        // (`ex_docmd.c:2201-2202`).
+        "pwd" => access.with_ex_editor(|editor| command_pwd(runtime, editor)),
         "swapname" => {
             access.with_ex_editor(|editor| {
                 // `ex_swapname` (ex_docmd.c:6099-6103): `msg(mf_fname)` or
@@ -3912,6 +3923,11 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "tabclose" | "tabc" => {
             access.with_ex_editor(|editor| command_tabclose(runtime, editor, command))
         }
+        // `:tabs` (`ex_tabs`, `ex_docmd.c:5812-5870`): one `Tab page N`
+        // header per tabpage plus one row per window, the active one
+        // marked `>`. The spec carries no `EX_BANG`, so `:tabs!` is `E477`
+        // from the parser (`ex_docmd.c:2201-2202`).
+        "tabs" => access.with_ex_editor(|editor| command_tabs(editor)),
 
         "undo" => access.with_ex_editor(|editor| command_undo(runtime, editor, command)),
         "redo" => access.with_ex_editor(|editor| command_redo(runtime, editor)),
@@ -4016,6 +4032,15 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "put" => command_put(runtime, access, scope, lua, command),
         "iput" => command_iput(runtime, access, scope, lua, command),
         "print" => access.with_ex_editor(|editor| command_print(runtime, editor, command)),
+        // `:list` and `:number` share `command_print`: upstream `ex_print`
+        // (`ex_docmd.c:5476-5493`) forces `list` for `CMD_list` and `number`
+        // for `CMD_number`, with the same range handling as `:print`. Bangs
+        // never reach this arm: neither spec carries `EX_BANG`, so the
+        // parser reports `E477` first (`ex_docmd.c:2201-2202`), exactly as
+        // for `:print!`.
+        "list" | "number" => {
+            access.with_ex_editor(|editor| command_print(runtime, editor, command))
+        }
         "delete" => access.with_ex_editor(|editor| command_delete(runtime, editor, command)),
         "yank" => access.with_ex_editor(|editor| command_yank(runtime, editor, command)),
         "join" => access.with_ex_editor(|editor| command_join(runtime, editor, command)),
@@ -6191,6 +6216,53 @@ fn command_version(editor: &mut Editor) -> Flow {
     Flow::Normal
 }
 
+/// Process start for `:uptime`, mirroring `vim.v.starttime`: the first
+/// executor built in the process forces it (`ExExecutor::with_io`), and a
+/// first `:uptime` before any executor forces it lazily instead.
+static START_TIME: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// `:uptime` (`ex_uptime`, `ex_docmd.c:8177-8180`, implemented by
+/// `vim._core.ex_cmd` `ex_cmd.lua:266-272`): echo `Up <pretty time>`, where
+/// the duration is `fmt_rtime` (`_core/time.lua:24-44`): nonzero days,
+/// hours, and minutes joined with `, `, always ending in seconds, so a
+/// just-started process reports `Up 0 seconds`.
+fn command_uptime(editor: &mut Editor) -> Flow {
+    let seconds = std::time::Instant::now()
+        .duration_since(*START_TIME)
+        .as_secs();
+    push_text_message(editor, format!("Up {}", fmt_rtime(seconds)), false, true);
+    Flow::Normal
+}
+
+/// `fmt_rtime` (`_core/time.lua:24-44`, via `time_part`): pretty-prints a
+/// duration in seconds, skipping zero days/hours/minutes but always
+/// rendering seconds.
+fn fmt_rtime(total: u64) -> String {
+    const UNITS: [(u64, &str, &str); 4] = [
+        (86_400, "1 day", "{} days"),
+        (3_600, "1 hour", "{} hours"),
+        (60, "1 minute", "{} minutes"),
+        (1, "1 second", "{} seconds"),
+    ];
+    let mut parts: Vec<String> = Vec::new();
+    let mut remaining = total;
+    for (unit, singular, plural) in UNITS {
+        let value = remaining / unit;
+        // `time_part`: a unit renders when it is nonzero, when a larger
+        // unit already rendered, or (for seconds) always.
+        if value != 0 || !parts.is_empty() || unit == 1 {
+            parts.push(if value == 1 {
+                singular.to_owned()
+            } else {
+                plural.replace("{}", &value.to_string())
+            });
+        }
+        remaining %= unit;
+    }
+    parts.join(", ")
+}
+
 fn command_help<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -6954,6 +7026,24 @@ fn command_cd<F: FileIO>(
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, error.code, error.message),
     }
+}
+
+/// `:pwd` (`ex_pwd`, `ex_docmd.c:6460-6484`): print the effective working
+/// directory — the window-local directory, else the global one, else the
+/// process directory. `change_directory` records `std::env::current_dir()`
+/// after the chdir, so like upstream's `os_dirname` (`uv_cwd`) this is the
+/// resolved physical path; `E187: Unknown` when it cannot be read.
+fn command_pwd<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
+    let tracked = editor
+        .current_window()
+        .and_then(|window| editor.window_local_directory(window).ok().flatten())
+        .or_else(|| editor.global_directory().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok());
+    let Some(directory) = tracked else {
+        return error_flow(runtime, "E187", "Unknown");
+    };
+    push_text_message(editor, directory.display().to_string(), false, false);
+    Flow::Normal
 }
 
 fn directory_target(
@@ -17814,6 +17904,52 @@ fn command_checktime<F: FileIO, E: ExEditorAccess>(
     Flow::Normal
 }
 
+/// `:tabs` (`ex_tabs`, `ex_docmd.c:5812-5870`): one `Tab page N` header per
+/// tabpage, then one row per window in that tabpage. The row marks the
+/// current window with `>`, adds `+` for a modified buffer, and shows the
+/// buffer name with `$HOME` replaced by `~` (`home_replace`, `path.c`).
+/// Upstream also marks the last-used window `#` and skips un-focusable or
+/// hidden windows; this port tracks neither state, so every window lists
+/// with a blank last-used column.
+fn command_tabs(editor: &mut Editor) -> Flow {
+    let current_window = editor.current_window();
+    let mut rows: Vec<String> = Vec::new();
+    for (index, tab) in editor.tabpages().into_iter().enumerate() {
+        rows.push(format!("Tab page {}", index + 1));
+        let Ok(windows) = editor.tabpage_windows(tab) else {
+            continue;
+        };
+        for window in windows {
+            let Ok(view) = editor.window(window) else {
+                continue;
+            };
+            let buffer = view.buffer;
+            let mark = if Some(window) == current_window { '>' } else { ' ' };
+            let (plus, name) = match editor.buffer(buffer) {
+                Ok(state) => {
+                    let plus = if state.flags.contains(crate::BufferFlags::MODIFIED) {
+                        '+'
+                    } else {
+                        ' '
+                    };
+                    let name = home_replaced_name(&state.name().to_string_lossy());
+                    // `ex_tabs` prints `buf_spname` (`buffer.c:4137-4165`),
+                    // which falls back to `buf_get_fname` (`buffer.c:4167-4175`):
+                    // `"[No Name]"` when the buffer has no file name.
+                    let name = if name.is_empty() { "[No Name]".to_owned() } else { name };
+                    (plus, name)
+                }
+                Err(_) => (' ', String::new()),
+            };
+            rows.push(format!("{mark} {plus} {name}"));
+        }
+    }
+    for row in rows {
+        push_text_message(editor, row, false, false);
+    }
+    Flow::Normal
+}
+
 /// `:tabfirst`/`:tabrewind` (`ex_docmd.c` `ex_tabnext`): go to the first
 /// tabpage. A single tabpage is a silent no-op.
 fn command_tabfirst<F: FileIO, E: ExEditorAccess>(
@@ -17884,6 +18020,12 @@ fn command_helpclose<F: FileIO>(
 /// line with its right-aligned line number padded to the width of the last
 /// line number (`number_width`). An empty buffer raises E749 first, and the
 /// cursor lands on the last printed line.
+///
+/// `:list` and `:number` share this handler: upstream `ex_print`
+/// (`ex_docmd.c:5482-5485`) forces list rendering for `CMD_list` and
+/// numbering for `CMD_number`, keeping `:print`'s range, E749, and cursor
+/// behavior. A bang on any of the three is `E477` from the parser, so
+/// `command.bang` is always false here.
 fn command_print<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
@@ -17903,14 +18045,26 @@ fn command_print<F: FileIO>(
         Ok(range) => range,
         Err(message) => return error_flow(runtime, "E16", message),
     };
-    let number = matches!(
-        option_value(editor, "number", SetLayer::Effective),
-        Some(OptionValue::Boolean(true))
-    );
+    let name = command.command.name();
+    // Upstream `ex_print` (`ex_docmd.c:5482-5485`): `CMD_number` numbers
+    // like the 'number' option or the `#` flag; `CMD_list` lists like the
+    // `l` flag. Rendered through `msg_prt_line` (`message.c:2176`) with
+    // this port's default tabstop (no `'listchars'` option exists here).
+    let number = name == "number"
+        || matches!(
+            option_value(editor, "number", SetLayer::Effective),
+            Some(OptionValue::Boolean(true))
+        );
+    let list = name == "list";
+    let tabstop = buffer_number_option(editor, buffer, "tabstop").unwrap_or(8);
     let width = lines.len().to_string().len();
     let last = end.min(lines.len());
     for lnum in start..=last {
-        let text = String::from_utf8_lossy(&lines[lnum - 1]).into_owned();
+        let text = if list {
+            render_list_line(&lines[lnum - 1], tabstop)
+        } else {
+            String::from_utf8_lossy(&lines[lnum - 1]).into_owned()
+        };
         let message = if number {
             format!("{lnum:>width$} {text}")
         } else {
@@ -17924,6 +18078,86 @@ fn command_print<F: FileIO>(
         return error_flow(runtime, "E16", error.to_string());
     }
     Flow::Normal
+}
+
+/// `:list` line rendering for Neovim's default `'listchars'`
+/// (`tab:> ,trail:-,nbsp:+`, `options.lua:5610`) applied through
+/// `msg_prt_line` (`message.c:2176-...`): tabs expand to `>` plus padding
+/// spaces, trailing whitespace shows as `-`, non-breaking spaces as `+`,
+/// and other control bytes use caret notation. An empty line renders as a
+/// lone space when no `eol` char is set (the default). This port has no
+/// `'list'`/`'listchars'` options, so only the defaults are rendered.
+fn render_list_line(line: &[u8], tabstop: usize) -> String {
+    if line.is_empty() {
+        return " ".to_owned();
+    }
+    let tabstop = tabstop.max(1);
+    // Start of trailing whitespace (`message.c` `trail` scan): spaces at or
+    // past it show as `-`; tabs keep their `>` expansion everywhere.
+    let mut trail = line.len();
+    while trail > 0 && (line[trail - 1] == b' ' || line[trail - 1] == b'\t') {
+        trail -= 1;
+    }
+    let mut out = String::new();
+    let mut col = 0_usize;
+    let mut index = 0_usize;
+    while index < line.len() {
+        let byte = line[index];
+        if byte == b'\t' {
+            let pad = tabstop - col % tabstop;
+            out.push('>');
+            for _ in 1..pad {
+                out.push(' ');
+            }
+            col += pad;
+            index += 1;
+        } else if byte == b' ' && index >= trail {
+            out.push('-');
+            col += 1;
+            index += 1;
+        } else if byte < 0x20 || byte == 0x7f {
+            // `transchar_byte`: caret notation for control bytes.
+            out.push('^');
+            out.push(char::from(if byte == 0x7f { b'?' } else { byte + 0x40 }));
+            col += 2;
+            index += 1;
+        } else if byte < 0x80 {
+            out.push(char::from(byte));
+            col += 1;
+            index += 1;
+        } else {
+            // Pass through one UTF-8 sequence (or one byte when invalid),
+            // mapping non-breaking spaces to `+` like the default `nbsp`.
+            let len = utf8_sequence_len(byte, line.len() - index);
+            let sequence = &line[index..index + len];
+            // Non-breaking spaces (`U+00A0`, `U+202F`) show as `+` under the
+            // default `nbsp` listchar; compare raw bytes so the source stays
+            // ASCII-visible.
+            if sequence == [0xC2, 0xA0] || sequence == [0xE2, 0x80, 0xAF] {
+                out.push('+');
+            } else {
+                out.push_str(&String::from_utf8_lossy(sequence));
+            }
+            col += 1;
+            index += len;
+        }
+    }
+    out
+}
+
+/// Length of the UTF-8 sequence starting with `first`, clamped to the
+/// bytes remaining in the line; invalid leading bytes count as one.
+fn utf8_sequence_len(first: u8, remaining: usize) -> usize {
+    let want = if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    };
+    want.min(remaining).max(1)
 }
 
 #[expect(

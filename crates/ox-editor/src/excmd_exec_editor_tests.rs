@@ -11979,3 +11979,133 @@ fn dictwatcher_fires_on_scope_dict_subscript() {
         vec![("k".to_owned(), 1, 0), ("k".to_owned(), 0, 1)]
     );
 }
+// ---------------------------------------------------------------------------
+// :pwd / :list / :number / :uptime / :tabs
+// ---------------------------------------------------------------------------
+
+/// Restores the process working directory and removes the scratch directory
+/// on drop, mirroring `CwdFixture` in `excmd_exec_state_tests.rs` (that
+/// type is module-private, so cwd-touching tests here carry their own).
+struct PwdFixture {
+    original: PathBuf,
+    directory: PathBuf,
+}
+
+impl PwdFixture {
+    fn new(name: &str) -> Self {
+        let original = std::env::current_dir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("ox-editor-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        // `getcwd(3)` answers the resolved path, so fixtures hold canonical
+        // paths, the only form a working-directory comparison can trust.
+        Self {
+            original: original.canonicalize().unwrap(),
+            directory: directory.canonicalize().unwrap(),
+        }
+    }
+}
+
+impl Drop for PwdFixture {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// `:pwd` prints the effective working directory set by `:cd`.
+/// Upstream: `ex_docmd.c` `ex_pwd` prints `os_dirname`, `E187` when it
+/// fails. A bang is `E477` from the parser (the spec carries no `EX_BANG`,
+/// `ex_docmd.c:2201-2202`).
+#[test]
+fn pwd_prints_directory_set_by_cd() {
+    let _guard = crate::lock_process_state();
+    let fixture = PwdFixture::new("pwd");
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, &format!("cd {}", fixture.directory.display()))
+        .unwrap();
+    executor.execute_line(&editor, "pwd").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec![fixture.directory.display().to_string()]
+    );
+}
+
+/// `:list` renders each addressed line with Neovim's default listchars:
+/// tabs expand to `>` plus padding spaces and trailing whitespace shows
+/// as `-`, while plain lines pass through unchanged.
+/// Upstream: `ex_docmd.c` `ex_print` with `CMD_list` through `msg_prt_line`
+/// (`message.c:2176`) under the default `'listchars'` (`options.lua:5610`).
+#[test]
+fn list_renders_tabs_and_trailing_whitespace() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a\tb".to_vec(),
+        b"x  ".to_vec(),
+        b"plain".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%list").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["a>      b", "x--", "plain"]
+    );
+}
+
+/// `:number` prefixes each addressed line with its right-aligned line
+/// number even when the `'number'` option is unset.
+/// Upstream: `ex_docmd.c` `ex_print` with `CMD_number` through
+/// `print_line_no_prefix` (`ex_cmds.c:1686`).
+#[test]
+fn number_prefixes_lines_without_number_option() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&editor, "%number").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["1 one", "2 two", "3 three"]);
+}
+
+/// `:uptime` echoes `Up <pretty time>` for the elapsed wall time since
+/// process start, always ending in seconds (`Up 0 seconds` at startup).
+/// Upstream: `ex_docmd.c:8177-8180` via `vim._core.ex_cmd` `ex_cmd.lua:266`
+/// with `fmt_rtime` (`_core/time.lua:24-44`).
+#[test]
+fn uptime_echoes_elapsed_pretty_time() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "uptime").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(messages.len(), 1);
+    // The executor anchors process start at creation, so only a whole
+    // stalled second between setup and the command could tick past zero.
+    assert!(
+        messages[0] == "Up 0 seconds" || messages[0] == "Up 1 second",
+        "unexpected uptime text: {:?}",
+        messages[0]
+    );
+}
+
+/// `:tabs` lists one `Tab page N` header per tabpage plus one row per
+/// window, marking the active window's row with `>`.
+/// Upstream: `ex_tabs` (`ex_docmd.c:5812-5870`).
+#[test]
+fn tabs_lists_each_tabpage_marking_the_active_window() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "file foo.txt").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "file bar.txt").unwrap();
+    executor.execute_line(&editor, "tabs").unwrap();
+    // `:file` reports each rename first; the listing is the tail.
+    let messages = echo_messages(&editor);
+    assert_eq!(
+        &messages[messages.len() - 4..],
+        &["Tab page 1", "    foo.txt", "Tab page 2", ">   bar.txt",]
+    );
+    // An unnamed buffer lists as `[No Name]` (`buffer.c` `buf_spname` via
+    // `buf_get_fname`, `ex_docmd.c:5848-5849`).
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabs").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(&messages[messages.len() - 2..], &["Tab page 3", ">   [No Name]"]);
+}
