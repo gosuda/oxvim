@@ -865,3 +865,31 @@ plain variable called `g:` (E121), and the removal went through the snapshot
 Both fixes are single-key forms. A multi-key path such as
 `let g:['a']['b'] = 1` still resolves through the snapshot and is untested;
 `dict_notifications_spec.lua` writes only single keys.
+
+
+### `dict_notifications_spec` after the scope-dict fixes
+
+Partial run, 300 seconds, exit 124 (killed during T34):
+
+| Outcome | Count |
+|---|---|
+| run | 34 |
+| OK | 0 |
+| FAIL | 33 |
+
+Setup now succeeds where it used to abort on the first line, so the spec reaches
+its assertions. The first failure is not the watcher: T1 reports
+`Vim(call):E475: Invalid argument: Channel doesn't exist` from the spec's own
+`rpcnotify`, and its `after_each` then reports
+`Couldn't find a watcher matching key and callback`. T2 and later compare the
+expected notification payload and get nothing, which is the watcher gap.
+
+So two causes remain, in this order:
+
+1. `rpcnotify` cannot reach the client channel. `process.rs:919` resolves ids
+   through the job list, while the client channel is registered in the session
+   (`session.rs:113`), so the two id spaces never meet. Every `rpcnotify` from
+   Vimscript fails with E475 until one lookup covers both.
+2. The watchers never fire, which is the round described above.
+
+The run is a lower bound for the same timeout reason as the group measurement.
