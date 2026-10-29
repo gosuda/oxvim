@@ -1123,3 +1123,23 @@ Recorded gap from the same work: watcher registrations are per executor, and a
 `g:` write that lands on the nested executor drains against an empty watcher
 map, so it notifies nobody where upstream notifies. One shared registry across
 the pair is the fix, and it is a design change rather than a patch.
+
+
+### Sanitizer gate: Miri on the foundation crate
+
+`cargo +nightly miri test -p ox-types`, nightly 2026-10-27, Miri 0.1.0:
+
+| Run | Result |
+|---|---|
+| default flags | 20 passed, 0 failed, then `error: memory leaked` for two allocations |
+| `MIRIFLAGS=-Zmiri-ignore-leaks` | 20 passed, 0 failed, exit 0, no undefined behavior reported |
+
+The leak is real and expected: `clone_shares_container_and_equality_handles_cycles`
+builds a self-referential `Rc<RefCell<DictData>>` cycle on purpose
+(`typval.rs:495-500`), and `Rc` cannot free a cycle. It is a property of the data
+model, not of a change in this round, and no `Undefined Behavior` diagnostic
+appears in either run.
+
+Scope: `ox-types` only. A Miri run over `ox-editor` was started earlier and
+killed after 15 minutes with an empty log, so it is not evidence; the wider
+suite has not been checked under Miri.
