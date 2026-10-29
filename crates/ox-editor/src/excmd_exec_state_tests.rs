@@ -1652,6 +1652,30 @@ fn execute_builtin_captures_nested_command_output() {
     assert!(editor.editor().messages().is_empty());
 }
 
+// `execute('echon "ab"')` captures `"ab"` with no leading newline, while
+// `execute('echo "a"')` captures `"\na"`: `:echon` continues the current
+// line, `:echo` starts a new one (echo_spec `StringN` vs `String`).
+#[test]
+fn execute_builtin_capture_distinguishes_echon_continuation() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&editor, "let g:echon_cap = execute('echon \"ab\"')")
+        .unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"echon_cap", 0),
+        Ok(&Typval::String(OxStr::from("ab"))),
+    );
+
+    exec.execute_line(&editor, "let g:echo_cap = execute('echo \"a\"')")
+        .unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"echo_cap", 0),
+        Ok(&Typval::String(OxStr::from("\na"))),
+    );
+    assert!(editor.editor().messages().is_empty());
+}
+
 // ── normal ─────────────────────────────────────────────────────────────
 
 // ex_docmd.c:ex_normal — `:normal` requires keys and completes after queuing them.

@@ -306,7 +306,12 @@ fn call_execute_builtin<F: FileIO, E: ExEditorAccess>(
         let Object::String(text) = &message.content else {
             continue;
         };
-        if message.leading_newline || !output.is_empty() {
+        // Upstream captures raw redirected output: a message contributes its
+        // separator only when it starts a new line (`:echo`/`:echomsg` do,
+        // `:echon` continues the current one). A continuation appends
+        // directly even after earlier output (`echo "a" | echon "b"` captures
+        // `"\nab"`, not `"\na\nb"`).
+        if message.leading_newline {
             output.push('\n');
         }
         output.push_str(&text.to_string_lossy());

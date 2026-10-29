@@ -6837,12 +6837,16 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
 fn push_echo_command_message(editor: &mut Editor, name: &str, text: String) {
     let kind = if name == "echon" { "echo" } else { name };
     editor.arm_echo_identity(OxStr::from(kind.as_bytes()), Object::Nil);
-    push_text_message(
-        editor,
-        text,
-        name == "echoerr",
-        name == "echomsg" || name == "echoerr",
-    );
+    if name == "echon" {
+        push_text_message_continued(editor, text, false);
+    } else {
+        push_text_message(
+            editor,
+            text,
+            name == "echoerr",
+            name == "echomsg" || name == "echoerr",
+        );
+    }
 }
 
 fn command_messages(editor: &mut Editor) -> Flow {
@@ -26653,6 +26657,17 @@ fn typval_matches_object(value: &Typval, object: &Object) -> bool {
 /// Converts one Vimscript [`Typval`] to an API [`Object`].
 #[must_use]
 pub fn typval_to_object(value: &Typval) -> Object {
+    typval_to_object_inner(value, &mut Vec::new())
+}
+
+/// Recursion-guarded conversion: a container already on the active path has
+/// no finite wire form (e.g. `add(l, l)` returns `l` containing itself), so
+/// it degrades to NIL instead of overflowing the stack and killing the
+/// daemon mid-`nvim_eval`. The guard threads through partial arguments as
+/// well (`encode_funcref`), since a cycle can pass through bound args back
+/// into its own container. Siblings sharing one container still expand
+/// fully — only the active path is tracked, popped on the way out.
+fn typval_to_object_inner(value: &Typval, seen: &mut Vec<(u8, *const ())>) -> Object {
     match value {
         Typval::Number(value) => Object::Integer(*value),
         Typval::Float(value) => Object::Float(*value),
@@ -26663,19 +26678,47 @@ pub fn typval_to_object(value: &Typval) -> Object {
                 .map(|byte| Object::Integer(i64::from(*byte)))
                 .collect(),
         ),
-        Typval::List(value) => value.try_borrow().map_or(Object::Nil, |data| {
-            Object::Array(data.items.iter().map(typval_to_object).collect())
-        }),
-        Typval::Dict(value) => value.try_borrow().map_or(Object::Nil, |data| {
-            Object::Dict(Dict(
-                data.entries
-                    .iter()
-                    .map(|entry| (entry.key.clone(), typval_to_object(&entry.value)))
-                    .collect(),
-            ))
-        }),
-        Typval::Funcref(value) => encode_funcref(value, false),
-        Typval::Partial(value) => encode_funcref(value, true),
+        Typval::List(value) => {
+            let identity = (0u8, Rc::as_ptr(value).cast());
+            if seen.contains(&identity) {
+                return Object::Nil;
+            }
+            seen.push(identity);
+            let converted = value.try_borrow().map_or(Object::Nil, |data| {
+                Object::Array(
+                    data.items
+                        .iter()
+                        .map(|item| typval_to_object_inner(item, seen))
+                        .collect(),
+                )
+            });
+            seen.pop();
+            converted
+        }
+        Typval::Dict(value) => {
+            let identity = (1u8, Rc::as_ptr(value).cast());
+            if seen.contains(&identity) {
+                return Object::Nil;
+            }
+            seen.push(identity);
+            let converted = value.try_borrow().map_or(Object::Nil, |data| {
+                Object::Dict(Dict(
+                    data.entries
+                        .iter()
+                        .map(|entry| {
+                            (
+                                entry.key.clone(),
+                                typval_to_object_inner(&entry.value, seen),
+                            )
+                        })
+                        .collect(),
+                ))
+            });
+            seen.pop();
+            converted
+        }
+        Typval::Funcref(value) => encode_funcref(value, false, seen),
+        Typval::Partial(value) => encode_funcref(value, true, seen),
         Typval::Bool(value) => Object::Boolean(*value),
         Typval::Special(Special::Null) => Object::Nil,
         Typval::Channel(value) | Typval::Job(value) => {
@@ -26689,7 +26732,11 @@ pub fn typval_to_object(value: &Typval) -> Object {
 /// `let g:F = function('setqflist')` became type 1).
 const FUNCREF_MARK: &[u8] = b"\x01oxvim_funcref";
 
-fn encode_funcref(function: &Funcref, partial: bool) -> Object {
+fn encode_funcref(
+    function: &Funcref,
+    partial: bool,
+    seen: &mut Vec<(u8, *const ())>,
+) -> Object {
     Object::Dict(Dict(vec![
         (
             OxStr::from(FUNCREF_MARK),
@@ -26707,7 +26754,13 @@ fn encode_funcref(function: &Funcref, partial: bool) -> Object {
         ),
         (
             OxStr::from("args"),
-            Object::Array(function.args.iter().map(typval_to_object).collect()),
+            Object::Array(
+                function
+                    .args
+                    .iter()
+                    .map(|item| typval_to_object_inner(item, seen))
+                    .collect(),
+            ),
         ),
     ]))
 }
@@ -26744,6 +26797,23 @@ fn decode_funcref_dict(values: &Dict) -> Option<Typval> {
 /// Appends one text message to the message area, optionally flagged as an
 /// error and recorded in message history.
 pub fn push_text_message(editor: &mut Editor, text: String, error: bool, history: bool) {
+    push_message_impl(editor, text, error, history, true);
+}
+
+/// [`push_text_message`] for output that continues the current line:
+/// `:echon` carries no leading newline, so its capture reads
+/// `execute('echon "x"')` → `"x"` instead of `:echo`'s `"\nx"`.
+pub fn push_text_message_continued(editor: &mut Editor, text: String, history: bool) {
+    push_message_impl(editor, text, false, history, false);
+}
+
+fn push_message_impl(
+    editor: &mut Editor,
+    text: String,
+    error: bool,
+    history: bool,
+    leading_newline: bool,
+) {
     editor.push_message(Message {
         kind: if error {
             MessageKind::Error
@@ -26752,9 +26822,10 @@ pub fn push_text_message(editor: &mut Editor, text: String, error: bool, history
         },
         content: Object::String(OxStr(text.into_bytes())),
         history,
-        leading_newline: true,
+        leading_newline,
     });
 }
+
 
 /// Output of an informative listing command (`:print`, `:number`, `:list`,
 /// `:set` display), upstream's `info_message` messages: `print_line`
