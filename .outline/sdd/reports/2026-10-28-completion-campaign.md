@@ -660,6 +660,15 @@ one. Two mechanisms fit and a measurement separates them: run the same
 `:checkhealth` through the embedded server with only one executor slot occupied,
 and see whether the providers run. Until then the cause stays unconfirmed.
 
+Host availability is ruled out for one evidence set only, and the chain was
+checked end to end: the oldtest runner invokes `oxvim ... --headless`
+(`tests/oldtest/run.sh:75`), which reaches `server::run_stdio`
+(`main.rs:141-143`), and that path installs a Lua host (`server.rs:636`). So the
+99 E5108 hits in that census are real Lua errors. `run_batch` (`main.rs:134`,
+selected by `-e`/`-s`) and `run_lua` (`main.rs:119-121`) do lack a host, and
+those are the paths where a probe answers "no Ex-command host is installed".
+The two evidence sets stay separate.
+
 
 ### Full `just oldtest`, measured
 
