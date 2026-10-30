@@ -1572,6 +1572,96 @@ fn cd_minus_toggles_and_returns_previous_directory() {
     );
     std::fs::remove_dir(&target).unwrap();
 }
+#[test]
+fn bcd_buffer_local_directory_survives_edit_bang_on_new_file() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("bcd-edit-bang");
+    let bufdir = fixture.child("bufdir");
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+
+    let nonexistent = fixture.directory.join("nonexistent_test_file");
+    exec.execute_line(&editor, &format!("edit {}", nonexistent.display()))
+        .unwrap();
+    exec.execute_line(&editor, &format!("bcd {}", bufdir.display()))
+        .unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), bufdir);
+
+    // Re-editing a buffer whose file does not exist on disk must not raise E484
+    // and must preserve the buffer-local directory.
+    exec.execute_line(&editor, "let b:kept = 1").unwrap();
+    exec.execute_line(&editor, "edit!").unwrap();
+    let curbuf = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor.editor().buffer_local_directory(curbuf).unwrap(),
+        Some(bufdir.clone())
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Buffer, b"kept", 0),
+        Ok(&Typval::Number(1))
+    );
+}
+
+#[test]
+fn hidden_buffer_call_lcd_does_not_pollute_caller_window_directory() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("hidden-buffer-lcd");
+    let windir = fixture.child("windir");
+    let (mut editor, _, caller_window) = editor_with_window();
+    let hidden = editor.create_buffer(true).unwrap();
+
+    let result = editor.with_buffer_context(hidden, |ed| {
+        let editor_access = TestEditorAccess::new(std::mem::take(ed));
+        let mut exec = ExExecutor::new();
+        let res = exec.execute_line(&editor_access, &format!("lcd {}", windir.display()));
+        *ed = editor_access.into_inner();
+        res
+    });
+    result.unwrap().unwrap();
+
+    // :lcd targeted the temporary context and must not leak into caller window
+    assert_eq!(
+        editor.window_local_directory(caller_window).unwrap(),
+        None
+    );
+    assert_eq!(std::env::current_dir().unwrap(), fixture.original);
+}
+
+#[test]
+fn autochdir_switches_directory_on_edit_and_preserves_window_local_dir() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("autochdir-edit");
+    let sub = fixture.child("sub");
+    let (editor, _, window) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&editor, "set autochdir").unwrap();
+    let file_in_sub = sub.join("testfile.txt");
+    exec.execute_line(&editor, &format!("edit {}", file_in_sub.display()))
+        .unwrap();
+    // Autochdir moved the process cwd to sub
+    assert_eq!(std::env::current_dir().unwrap(), sub);
+    // Window-local directory was not set by autochdir
+    assert_eq!(editor.editor().window_local_directory(window).unwrap(), None);
+
+    // Setting lcd sets window-local directory
+    exec.execute_line(&editor, &format!("lcd {}", fixture.directory.display()))
+        .unwrap();
+    assert_eq!(
+        editor.editor().window_local_directory(window).unwrap(),
+        Some(fixture.directory.clone())
+    );
+
+    // Re-editing runs autochdir to sub, while window-local directory is preserved
+    exec.execute_line(&editor, "edit").unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), sub);
+    assert_eq!(
+        editor.editor().window_local_directory(window).unwrap(),
+        Some(fixture.directory.clone())
+    );
+}
 
 /// `:cd` back out of a working directory that has been deleted underneath the
 /// process still works, and the directory it left behind is reported as empty.

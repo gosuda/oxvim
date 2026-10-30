@@ -6873,6 +6873,9 @@ fn command_set<F: FileIO, E: ExEditorAccess>(
         // The assignment stays committed when a handler fails, and later
         // arguments of this `:set` are abandoned with its flow.
         if let Some(assignment) = &assignment {
+            if assignment.name == "autochdir" {
+                access.with_ex_editor(|editor| editor.do_autochdir());
+            }
             let flow = if assignment.name == "filetype" {
                 let flow = fire_filetype_autocmd(runtime, access, scope, lua, assignment);
                 if matches!(flow, Flow::Normal) {
@@ -8911,7 +8914,15 @@ fn stage_buffer_from_file<F: FileIO>(
         Ok(handle) => handle,
         Err(error) => return Err(error_flow(runtime, "E948", error.to_string())),
     };
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
     let result = editor.buffer_mut(handle).and_then(|buffer| {
+        buffer.file_path = Some(abs_path);
         buffer.set_name(OxStr::from(path.to_string_lossy().as_ref()));
         buffer.mark_saved();
         buffer.unload().map_err(EditorError::from)
@@ -9279,6 +9290,35 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
         }
         return fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], buffer);
     }
+    let new_file = match runtime.scripts.io().read_to_string(path) {
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            return error_flow(
+                runtime,
+                "E484",
+                format!("Can't open file {}: {error}", path.display()),
+            );
+        }
+    };
+    if new_file {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.load(Buffer::new());
+                state.mark_saved();
+                state.flags.set(crate::BufferFlags::NOTEDITED, false);
+                editor.do_autochdir();
+            }
+        });
+        return fire_buffer_lifecycle(
+            runtime,
+            access,
+            scope,
+            lua,
+            &[Event::BufNewFile, Event::BufEnter],
+            buffer,
+        );
+    }
     let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufReadPre], buffer);
     if !matches!(flow, Flow::Normal) {
         return flow;
@@ -9301,6 +9341,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
         if let Ok(state) = editor.buffer_mut(buffer) {
             state.load(text);
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
+            editor.do_autochdir();
         }
     });
     fire_buffer_lifecycle(

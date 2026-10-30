@@ -439,6 +439,17 @@ pub struct TerminalChannelInfo {
     pub replies: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct ContextDirsSnapshot {
+    window: WinHandle,
+    target_buffer: BufHandle,
+    window_local_dir: Option<PathBuf>,
+    window_prev_dir: Option<PathBuf>,
+    tab: Option<TabHandle>,
+    tab_local_dir: Option<PathBuf>,
+    global_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+}
 /// All mutable editor state under a single `&mut self` discipline.
 ///
 /// No state is process-global. Event-loop and RPC layers can serialize their
@@ -570,7 +581,7 @@ pub struct Editor {
     /// to the process cwd on first tabpage creation; `None` in a fresh
     /// editor with no tabpage so [`Editor::new`] stays cwd-inert.
     global_directory: Option<PathBuf>,
-
+    context_dirs_stack: Vec<ContextDirsSnapshot>,
     next_buffer: i64,
     next_window: i64,
     next_tabpage: i64,
@@ -795,7 +806,7 @@ impl Editor {
             // An unreadable cwd leaves it `None`, and later reapplies then
             // leave the process cwd unchanged.
             global_directory: std::env::current_dir().ok(),
-
+            context_dirs_stack: Vec::new(),
             next_buffer: 1,
             next_window: LOWEST_WINDOW_ID,
             next_tabpage: 1,
@@ -1233,16 +1244,17 @@ impl Editor {
         let Some(buffer) = self.current_buffer() else {
             return;
         };
-        let name = match self.buffer(buffer) {
-            Ok(state) => state.name().clone(),
+        let path = match self.buffer(buffer) {
+            Ok(state) => {
+                if state.name().as_bytes().is_empty() {
+                    return;
+                }
+                state.file_path.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(expand_buffer_name(&state.name()).to_string_lossy().as_ref())
+                })
+            }
             Err(_) => return,
         };
-        if name.as_bytes().is_empty() {
-            return;
-        }
-        // `vim_chdirfile`: strip the filename tail, keeping the directory.
-        let name_lossy = name.to_string_lossy();
-        let path = std::path::Path::new(name_lossy.as_ref());
         let Some(parent) = path.parent() else {
             return;
         };
@@ -1254,7 +1266,7 @@ impl Editor {
         }
         // WHY: `vim_chdirfile` ignores the `os_chdir` failure — the buffer
         // switch that triggered it has already committed.
-        std::mem::drop(std::env::set_current_dir(parent));
+        Self::apply_current_dir(parent);
     }
 
     /// Returns an immutable live tabpage state.
@@ -1352,6 +1364,7 @@ impl Editor {
             .set_current(resolved)?;
         self.current_tab = Some(tab);
         self.apply_effective_directory();
+        self.do_autochdir();
         Ok(())
     }
 
@@ -2207,10 +2220,29 @@ impl Editor {
         if let Some(state) = self.buffers.get_mut(&old_buffer) {
             state.detach(release == BufferRelease::KeepLoaded);
         }
+        if let Some(snapshot) = self.context_dirs_stack.pop() {
+            if snapshot.window == window && buffer != snapshot.target_buffer {
+                if let Ok(w) = self.window_mut(window) {
+                    w.local_directory = snapshot.window_local_dir;
+                    w.previous_directory = snapshot.window_prev_dir;
+                }
+                let tab_local_dir_after =
+                    snapshot.tab.and_then(|t| self.tab_local_directory(t).ok().flatten());
+                if tab_local_dir_after == snapshot.tab_local_dir {
+                    self.global_directory = snapshot.global_dir;
+                    if let Some(cwd) = snapshot.cwd {
+                        Self::apply_current_dir(&cwd);
+                    }
+                }
+            } else {
+                self.context_dirs_stack.push(snapshot);
+            }
+        }
         // Reapply the current window's effective cwd after the buffer swap
         // has committed, matching upstream `update_cwd(kCdCauseBuffer)`.
         if self.current_window() == Some(window) {
             self.apply_effective_directory();
+            self.do_autochdir();
         }
         Ok(())
     }
@@ -2225,6 +2257,24 @@ impl Editor {
         let state = self.buffer_mut(buffer)?;
         if !state.residency.is_loaded() {
             state.load(Buffer::new());
+        }
+        if let Some(caller) = self.current_window() {
+            let window_local_dir = self.window(caller).ok().and_then(|w| w.local_directory.clone());
+            let window_prev_dir = self.window(caller).ok().and_then(|w| w.previous_directory.clone());
+            let tab = self.current_tab;
+            let tab_local_dir = tab.and_then(|t| self.tab_local_directory(t).ok().flatten());
+            let global_dir = self.global_directory.clone();
+            let cwd = std::env::current_dir().ok();
+            self.context_dirs_stack.push(ContextDirsSnapshot {
+                window: caller,
+                target_buffer: buffer,
+                window_local_dir,
+                window_prev_dir,
+                tab,
+                tab_local_dir,
+                global_dir,
+                cwd,
+            });
         }
         self.set_current_buffer(buffer, BufferRelease::KeepLoaded)
     }

@@ -420,6 +420,8 @@ pub struct BufferState {
     /// buffer with a non-empty value and no reset has run since. `:setf` is a
     /// silent no-op while set; `did_filetype()` reads it.
     did_filetype: bool,
+    /// Absolute file path resolved when the buffer was loaded/staged.
+    pub file_path: Option<std::path::PathBuf>,
     /// Buffer-local working directory set by `:bcd` (`b_localdir`); `None`
     /// means the buffer follows the window/tab/global chain. This port owns
     /// the field on `BufferState` (upstream keeps it on `buf_T`) so the Ex
@@ -494,6 +496,7 @@ impl BufferState {
             forced_modified: false,
             attachments: 0,
             did_filetype: false,
+            file_path: None,
             local_directory: None,
             previous_directory: None,
             changedtick_diag: 0,
