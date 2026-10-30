@@ -26685,14 +26685,6 @@ pub(crate) fn typval_to_text(value: &Typval) -> String {
     }
 }
 
-fn vim_float_text(value: f64) -> String {
-    let mut text = value.to_string();
-    if value.is_finite() && !text.contains(['.', 'e', 'E']) {
-        text.push_str(".0");
-    }
-    text
-}
-
 fn typval_to_display(value: &Typval, quoted_strings: bool) -> String {
     typval_to_display_inner(value, quoted_strings, &mut Vec::new())
 }
@@ -26719,7 +26711,7 @@ fn typval_to_display_inner(
     }
     let display = match value {
         Typval::Number(value) => value.to_string(),
-        Typval::Float(value) => vim_float_text(*value),
+        Typval::Float(value) => ox_types::vim_float_text(*value),
         Typval::String(value) => {
             let text = value.to_string_lossy();
             if quoted_strings {

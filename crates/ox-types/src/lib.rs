@@ -17,7 +17,8 @@ pub use handle::{BufHandle, HandleError, TabHandle, WinHandle};
 pub use object::{Dict, EXT_TYPE_BUFFER, EXT_TYPE_TABPAGE, EXT_TYPE_WINDOW, Object};
 pub use path::{has_drive_letter, path_with_url};
 pub use typval::{
-    DictData, DictEntry, DictEntryFlags, DictRef, EntryValueLock, Funcref, ListData, ListRef,
-    LockScope, LockState, Special, Typval, VAR_BLOB, VAR_BOOL, VAR_DICT, VAR_FLOAT, VAR_FUNC,
-    VAR_LIST, VAR_NUMBER, VAR_PARTIAL, VAR_SPECIAL, VAR_STRING, VAR_UNKNOWN,
+    echo_text, echo_text_quoted, vim_float_text, DictData, DictEntry, DictEntryFlags, DictRef,
+    EntryValueLock, Funcref, ListData, ListRef, LockScope, LockState, Special, Typval, VAR_BLOB,
+    VAR_BOOL, VAR_DICT, VAR_FLOAT, VAR_FUNC, VAR_LIST, VAR_NUMBER, VAR_PARTIAL, VAR_SPECIAL,
+    VAR_STRING, VAR_UNKNOWN,
 };

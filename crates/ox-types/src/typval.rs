@@ -365,14 +365,16 @@ pub fn vim_float_text(value: f64) -> String {
         return format!("{sign}str2float('inf')");
     }
     let abs = value.abs();
-    if abs == 0.0 || (abs >= 0.001 && abs < 10_000_000.0) {
+    if abs == 0.0 || (0.001..10_000_000.0).contains(&abs) {
         let mut text = format!("{value:.6}");
         strip_float_zeros(&mut text);
         text
     } else {
         let rendered = format!("{value:.6e}");
-        let (mantissa, exponent) =
-            rendered.split_once('e').expect("exponential format always has an exponent");
+        let (mantissa, exponent) = match rendered.split_once('e') {
+            Some((m, e)) => (m, e),
+            None => (rendered.as_str(), ""),
+        };
         let mut mantissa = mantissa.to_owned();
         strip_float_zeros(&mut mantissa);
         let exponent = normalize_float_exponent(exponent);
@@ -758,6 +760,46 @@ mod tests {
         assert_eq!(Typval::Float(2.000_000_1).to_string(), "2.0");
         assert_eq!(Typval::Float(1.999_999_999_9).to_string(), "2.0");
         assert_eq!(Typval::Float(9_999_999.5).to_string(), "9999999.5");
+    }
+
+    #[test]
+    fn echo_spec_table_float_values_render_per_reference() {
+        // Exact table from `test/functional/ex_cmds/echo_spec.lua` lines 54-107:
+        // "used to represent floating-point values"
+        let table = [
+            // NaN values
+            (f64::NAN, "str2float('nan')"),
+            (-f64::NAN, "str2float('nan')"),
+            // Infinite values
+            (f64::INFINITY, "str2float('inf')"),
+            (f64::NEG_INFINITY, "-str2float('inf')"),
+            // Regular values
+            (1.5, "1.5"),
+            (1.56000e-020, "1.56e-20"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            // At most six digits after the decimal point
+            (1.23456789123456789123456789e-020, "1.234568e-20"),
+            (1.23456789123456789123456789, "1.234568"),
+            // At most seven digits before the decimal point
+            (1234567.89123456789123456789, "1234567.891235"),
+            (12345678.9123456789123456789, "1.234568e7"),
+            // Negative values
+            (-1.5, "-1.5"),
+            (-1.56000e-020, "-1.56e-20"),
+            (-1.23456789123456789123456789e-020, "-1.234568e-20"),
+            (-1.23456789123456789123456789, "-1.234568"),
+            (-1234567.89123456789123456789, "-1234567.891235"),
+            (-12345678.9123456789123456789, "-1.234568e7"),
+        ];
+
+        for (val, expected) in table {
+            let tv = Typval::Float(val);
+            assert_eq!(super::vim_float_text(val), expected);
+            assert_eq!(tv.to_string(), expected);
+            assert_eq!(super::echo_text(&tv), expected);
+            assert_eq!(super::echo_text_quoted(&tv), expected);
+        }
     }
 
     #[test]
