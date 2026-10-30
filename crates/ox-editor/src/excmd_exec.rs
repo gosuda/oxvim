@@ -4807,7 +4807,9 @@ fn eval_condition<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     text: &str,
 ) -> Result<bool, Flow> {
-    let value = eval_text(runtime, access, scope, lua, text)?;
+    let text = strip_expression_comment(text);
+    let text = expand_curly_target(runtime, access, scope, lua, text)?;
+    let value = eval_text(runtime, access, scope, lua, &text)?;
     match value {
         Typval::Number(number) => Ok(number != 0),
         Typval::Bool(value) => Ok(value),

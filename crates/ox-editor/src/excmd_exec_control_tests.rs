@@ -1010,6 +1010,20 @@ fn the_emptiness_test_and_the_comment_cut_see_the_carriage_return_too() {
     assert_eq!(gnum(&executor, "v"), 4);
 }
 
+#[test]
+fn if_condition_supports_trailing_comment() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut executor = ExExecutor::new();
+    executor
+        .execute_script(
+            &editor,
+            "t.vim",
+            "if 1 \" inline comment\nlet g:ok = 1\nendif",
+        )
+        .unwrap();
+    assert_eq!(gnum(&executor, "ok"), 1);
+}
+
 /// The block-opening commands read their condition from a different place
 /// (`find_if`, the `:while` loop head, `split_for`), so they need their own
 /// rows. Oracle: `Vim(if)`, `Vim(while)` and `Vim(for)` all raise E488.
