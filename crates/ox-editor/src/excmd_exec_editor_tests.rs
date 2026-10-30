@@ -379,6 +379,23 @@ fn edit_updates_alternate_buffer_without_keepalt() {
     );
 }
 
+#[test]
+fn edit_decodes_sentinel_newline_in_filename() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("line\nbreak.txt", "newline content");
+    executor
+        .execute_line(&editor, "edit line\0break.txt")
+        .unwrap();
+    let e = editor.editor();
+    let current = e.current_buffer().unwrap();
+    let state = e.buffer(current).unwrap();
+    assert_eq!(state.name().to_string_lossy(), "line\nbreak.txt");
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"newline content".to_vec()
+    );
+}
+
 /// `:edit` with no file argument raises E32 ("No file name").
 /// Upstream: `ex_docmd.c` `ex_edit` — `*e_fname == NUL` → E32.
 #[test]

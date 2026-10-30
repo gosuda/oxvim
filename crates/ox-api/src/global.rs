@@ -558,6 +558,7 @@ fn build_nvim_cmd(cmd: &Dict, opts: &Dict) -> Result<(String, bool), ApiError> {
                     ));
                 }
             };
+            let text = text.replace('\n', "\0");
             line.push(' ');
             if magic_bar {
                 line.push_str(&text);

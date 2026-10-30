@@ -6351,11 +6351,16 @@ fn scoped_failure_multi(lua: &Lua, error: impl std::fmt::Display) -> mlua::Resul
 /// would leave the `on_exit/on_stdout` closures dangling and deliver the wrong
 /// callback. This leaves a known, bounded leak: those refs are not freed when
 /// the job is dropped until a future lifetime pass is added.
+struct ScopedExecutors<'a> {
+    ex: &'a Rc<RefCell<ExExecutor>>,
+    nested_ex: &'a Rc<RefCell<ExExecutor>>,
+    overflow: &'a ExecutorOverflow,
+}
+
 fn dispatch_scoped_builtin(
     lua: &Lua,
     session: &ApiSession,
-    ex: &Rc<RefCell<ExExecutor>>,
-    nested_ex: &Rc<RefCell<ExExecutor>>,
+    executors: &ScopedExecutors<'_>,
     name: &[u8],
     args: &[Value],
 ) -> mlua::Result<(bool, Value)> {
@@ -6392,22 +6397,36 @@ fn dispatch_scoped_builtin(
             return scoped_failure(lua, error);
         }
     }
-    let (result, owner) = match ex.try_borrow_mut() {
+    let (result, owner) = match executors.ex.try_borrow_mut() {
         Ok(mut guard) => {
             let result = guard.call_builtin(session, &name, converted);
-            (result, Rc::clone(ex))
+            (result, Rc::clone(executors.ex))
         }
-        Err(_) => match nested_ex.try_borrow_mut() {
+        Err(_) => match executors.nested_ex.try_borrow_mut() {
             Ok(mut guard) => {
                 let result = guard.call_builtin(session, &name, converted);
-                (result, Rc::clone(nested_ex))
+                (result, Rc::clone(executors.nested_ex))
             }
-            Err(_) => (
-                Err(ExecError::Editor(
-                    "no free Ex executor for a Vimscript builtin call".into(),
-                )),
-                Rc::clone(ex),
-            ),
+            Err(_) => match (executors.overflow)() {
+                Some(overflow_ex) => match overflow_ex.try_borrow_mut() {
+                    Ok(mut guard) => {
+                        let result = guard.call_builtin(session, &name, converted);
+                        (result, overflow_ex.clone())
+                    }
+                    Err(_) => (
+                        Err(ExecError::Editor(
+                            "no free Ex executor for a Vimscript builtin call".into(),
+                        )),
+                        Rc::clone(executors.ex),
+                    ),
+                },
+                None => (
+                    Err(ExecError::Editor(
+                        "no free Ex executor for a Vimscript builtin call".into(),
+                    )),
+                    Rc::clone(executors.ex),
+                ),
+            },
         },
     };
     let is_jobstart = name.as_bytes() == b"jobstart";
@@ -6426,7 +6445,7 @@ fn dispatch_scoped_builtin(
     // before the builtin returns (multiqueue_process_events,
     // funcs.c:3668/3721); the executor borrow is released here, so this is
     // the first boundary that can run them.
-    deliver_pending_lua_flush(session, &owner, ex, nested_ex);
+    deliver_pending_lua_flush(session, &owner, executors.ex, executors.nested_ex);
     scoped_typval(lua, &result)
 }
 
@@ -6779,16 +6798,21 @@ fn with_scoped_editor_api<T>(
         // Ex code can never be running inside a fast callback.
         let call_ex = ex.clone();
         let call_nested = nested_ex.clone();
+        let call_overflow = overflow.clone();
         let call_ctx = context.clone();
         vim.set(
             "call",
             shim.call::<Function>(lua.create_function(
                 move |lua, (name, args): (mlua::LuaString, Variadic<Value>)| {
+                    let executors = ScopedExecutors {
+                        ex: &call_ex,
+                        nested_ex: &call_nested,
+                        overflow: &call_overflow,
+                    };
                     dispatch_scoped_builtin(
                         lua,
                         call_ctx.session(),
-                        &call_ex,
-                        &call_nested,
+                        &executors,
                         &name.as_bytes(),
                         args.as_slice(),
                     )
@@ -6797,6 +6821,7 @@ fn with_scoped_editor_api<T>(
         )?;
         let fn_ex = ex.clone();
         let fn_nested = nested_ex.clone();
+        let fn_overflow = overflow.clone();
         let fn_table = lua.create_table()?;
         let fn_metatable = lua.create_table()?;
         let fn_shim = shim.clone();
@@ -6806,14 +6831,19 @@ fn with_scoped_editor_api<T>(
             lua.create_function(move |lua, (_table, name): (Table, mlua::LuaString)| {
                 let ex = fn_ex.clone();
                 let nested_ex = fn_nested.clone();
+                let overflow = fn_overflow.clone();
                 let name = name.as_bytes().to_vec();
                 let native_ctx = fn_ctx.clone();
                 let native = lua.create_function(move |lua, args: Variadic<Value>| {
+                    let executors = ScopedExecutors {
+                        ex: &ex,
+                        nested_ex: &nested_ex,
+                        overflow: &overflow,
+                    };
                     dispatch_scoped_builtin(
                         lua,
                         native_ctx.session(),
-                        &ex,
-                        &nested_ex,
+                        &executors,
                         &name,
                         args.as_slice(),
                     )

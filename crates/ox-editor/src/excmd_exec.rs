@@ -9395,7 +9395,7 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
                 .unwrap_or_default()
         })
     } else {
-        PathBuf::from(command.args.as_str())
+        PathBuf::from(command.args.replace('\0', "\n"))
     };
     if path.as_os_str().is_empty() {
         return error_flow(runtime, "E32", "No file name");
