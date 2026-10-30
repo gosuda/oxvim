@@ -2469,24 +2469,31 @@ impl Handle for Udp {
 /// detached from Rust ownership with `into_raw_fd`: the Lua side owns them and
 /// closes them through `uv.new_pipe(...):open(fd)`.
 ///
-/// # Errors
-///
-/// Returns [`NetError::Io`] when the system pipe call fails.
-/// Creates a blocking or non-blocking pipe pair.
-///
 /// The descriptors come back owned, so the caller decides where ownership
 /// goes: the Lua host records them in its pipe registry and answers bare
 /// numbers to Lua, as luv does.
+///
+/// # Errors
+///
+/// Returns [`NetError::Io`] when the system pipe call fails.
 #[cfg(unix)]
-pub fn pipe_pair(nonblock: bool) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+pub fn pipe_pair(
+    read_nonblock: bool,
+    write_nonblock: bool,
+) -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
     // `O_CLOEXEC` on both ends: a spawned child must not inherit the parent's
     // ends. Without it the child keeps a writer to its own stdin and never
     // sees end-of-file, so `vim.system({'cat'}, { stdin = ... })` hangs. The
     // descriptor handed to the child is `dup2`-ed onto the standard slot, which
     // clears the flag for that copy only.
     let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
-    if nonblock {
+    // `luvref.txt:2148-2165` sets `nonblock` per endpoint: `vim.system`
+    // asks for a nonblocking parent reader but a blocking child writer, so
+    // a child that fills the pipe blocks instead of failing on `EAGAIN`.
+    if read_nonblock {
         rustix::io::ioctl_fionbio(&reader, true)?;
+    }
+    if write_nonblock {
         rustix::io::ioctl_fionbio(&writer, true)?;
     }
     Ok((reader, writer))

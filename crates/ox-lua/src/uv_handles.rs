@@ -2040,10 +2040,22 @@ pub(crate) fn install(
                                 },
                             )?));
                         }
-                        let nonblock = options
-                            .as_ref()
-                            .is_some_and(|options| options.get::<Option<bool>>("nonblock").ok().flatten() == Some(true));
-                        let (reader, writer) = ox_uv::net::pipe_pair(nonblock)
+                        // `uv.pipe({read_flags}, {write_flags})` sets
+                        // `nonblock` per endpoint (luvref.txt:2148-2165):
+                        // `vim.system` asks for a nonblocking parent reader
+                        // and a blocking child writer, so the child blocks
+                        // on a full pipe instead of failing on `EAGAIN`.
+                        let flag = |flags: Option<&Table>| {
+                            flags.is_some_and(|flags| {
+                                flags.get::<Option<bool>>("nonblock").ok().flatten() == Some(true)
+                            })
+                        };
+                        let read_nonblock = flag(options.as_ref());
+                        let write_nonblock = match &stream {
+                            Some(Value::Table(write_flags)) => flag(Some(write_flags)),
+                            _ => false,
+                        };
+                        let (reader, writer) = ox_uv::net::pipe_pair(read_nonblock, write_nonblock)
                             .map_err(mlua::Error::external)?;
                         // The host owns both halves until Lua spends them:
                         // `pipe:open` takes one, `uv.spawn` takes the other.

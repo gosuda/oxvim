@@ -398,7 +398,7 @@ fn extra_stdio_create_pipe_is_typed_unsupported() {
 #[cfg(unix)]
 #[test]
 fn pipe_pair_ends_are_close_on_exec() {
-    let (reader, writer) = crate::net::pipe_pair(false).expect("create pipe pair");
+    let (reader, writer) = crate::net::pipe_pair(false, false).expect("create pipe pair");
     for fd in [&reader, &writer] {
         let flags = rustix::io::fcntl_getfd(fd).expect("read descriptor flags");
         assert!(
