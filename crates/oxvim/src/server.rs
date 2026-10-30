@@ -546,12 +546,18 @@ pub(crate) fn build_embedded_core(
     let ui_fast = lua.fast_callbacks();
     ox_lua::bind_ui_events(lua.lua(), &ui_context, &ui_fast)
         .map_err(|error| AppError::Lua(error.to_string()))?;
+    let event_loop = lua.event_loop_pump();
     bind_variables(
         lua.lua(),
         Rc::new(ServerVariables {
             session: session.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
+            lua: lua.lua().clone(),
+            registry: registry.clone(),
+            channel_ids: channel_ids.clone(),
+            event_loop: event_loop.clone(),
         }),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -571,7 +577,6 @@ pub(crate) fn build_embedded_core(
             deferred: Rc::new(Cell::new(0)),
         }),
     );
-    let event_loop = lua.event_loop_pump();
     builtins.set_fresh(FreshExecutorSource {
         lua: lua.lua().clone(),
         registry: registry.clone(),
@@ -661,6 +666,8 @@ pub(crate) fn build_embedded_core(
             registry: registry.clone(),
             ex: ex.clone(),
             nested_ex: nested_ex.clone(),
+            fork_seed: fork_seed.clone(),
+            channel_ids: channel_ids.clone(),
             event_loop: event_loop.clone(),
             user_code_depth: user_code_depth.clone(),
         })
@@ -4587,6 +4594,29 @@ struct ServerVariables {
     session: Rc<ApiSession>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    /// An executor no frame ever executes on, kept so `vim.g` writes can
+    /// mint an overflow pair while both pool members are mid-dispatch — the
+    /// `:lua` inside `vim.cmd` inside `:lua` case.
+    fork_seed: Rc<RefCell<ExExecutor>>,
+    lua: Lua,
+    registry: Rc<Registry>,
+    channel_ids: ChannelIds,
+    event_loop: EventLoopPump,
+}
+
+impl ServerVariables {
+    /// [`ExecutorOverflow`] minted from this host's seed — the third tier
+    /// `vim.g` writes fall back to while both pool members are busy.
+    fn overflow(&self) -> ExecutorOverflow {
+        overflow_factory(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
+    }
 }
 
 impl VariableHost for ServerVariables {
@@ -4625,8 +4655,16 @@ impl VariableHost for ServerVariables {
             {
                 return Ok(());
             }
-            return write_global_var(&self.session, &self.ex, &self.nested_ex, &name, value)
-                .map_err(|error| error.to_string());
+            let overflow = self.overflow();
+            return write_global_var(
+                &self.session,
+                &self.ex,
+                &self.nested_ex,
+                &overflow,
+                &name,
+                value,
+            )
+            .map_err(|error| error.to_string());
         }
         self.session.with_editor_mut(|editor| {
             let variables = variables_mut(editor, scope, handle)?;
@@ -4707,8 +4745,29 @@ struct ServerLuaExec {
     registry: Rc<Registry>,
     ex: Rc<RefCell<ExExecutor>>,
     nested_ex: Rc<RefCell<ExExecutor>>,
+    /// An executor no frame ever executes on, kept so scoped bindings can
+    /// mint an overflow pair while both pool members are mid-dispatch — the
+    /// `:lua` inside `vim.cmd` inside `:lua` case [`ServerAutocmdHost`]
+    /// documents.
+    fork_seed: Rc<RefCell<ExExecutor>>,
+    channel_ids: ChannelIds,
     event_loop: EventLoopPump,
     user_code_depth: Rc<Cell<u32>>,
+}
+
+impl ServerLuaExec {
+    /// [`ExecutorOverflow`] minted from this host's seed — the third tier
+    /// scoped `vim.g` writes fall back to while both pool members are busy.
+    fn overflow(&self) -> ExecutorOverflow {
+        overflow_factory(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
+    }
 }
 
 impl LuaExec for ServerLuaExec {
@@ -4724,6 +4783,7 @@ impl LuaExec for ServerLuaExec {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             &self.session,
             code,
             &args,
@@ -4738,6 +4798,7 @@ impl LuaExec for ServerLuaExec {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             &self.session,
             || {
                 let loadfile: Function = lua
@@ -4781,6 +4842,7 @@ impl LuaExec for ServerLuaExec {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             &self.session,
             || {
                 let value = object_to_lua(lua, &Object::LuaRef(reference))
@@ -4837,6 +4899,7 @@ impl LuaExec for ServerLuaExec {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             &self.session,
             || {
                 // lua/executor.c nlua_call_luaeval wraps the expression exactly
@@ -4874,6 +4937,7 @@ impl LuaExec for ServerLuaExec {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             &self.session,
             || {
                 self.event_loop
@@ -4888,16 +4952,21 @@ impl LuaExec for ServerLuaExec {
 /// scoped API bindings. Shared by the Ex executor's `LuaExec` host and the
 /// API-level [`LuaExecutor`], so nested `nvim_exec_lua` observes the same
 /// editor and bindings whichever surface it arrives through.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the executor pair, its overflow seed, and the session are one dispatch context"
+)]
 fn exec_api_chunk(
     lua: &Lua,
     registry: &Registry,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
     session: &ApiSession,
     code: &str,
     args: &[Object],
 ) -> Result<Object, LuaExecError> {
-    with_scoped_editor_api(lua, registry, ex, nested_ex, session, || {
+    with_scoped_editor_api(lua, registry, ex, nested_ex, overflow, session, || {
         let function = lua
             .load(code)
             .set_name("<nvim>")
@@ -4991,6 +5060,8 @@ fn fresh_executors(
             registry: registry.clone(),
             ex: primary.clone(),
             nested_ex: nested.clone(),
+            fork_seed: source.clone(),
+            channel_ids: channel_ids.clone(),
             event_loop: event_loop.clone(),
             user_code_depth: user_code_depth.clone(),
         })
@@ -5015,6 +5086,21 @@ struct ApiLuaExecutor {
     event_loop: EventLoopPump,
 }
 
+impl ApiLuaExecutor {
+    /// [`ExecutorOverflow`] minted from this host's seed — the third tier
+    /// scoped `vim.g` writes fall back to while both pool members are busy.
+    fn overflow(&self) -> ExecutorOverflow {
+        overflow_factory(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
+    }
+}
+
 impl LuaExecutor for ApiLuaExecutor {
     fn exec(
         &mut self,
@@ -5032,6 +5118,7 @@ impl LuaExecutor for ApiLuaExecutor {
             &self.registry,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             session,
             code,
             &args,
@@ -5053,29 +5140,38 @@ impl LuaExecutor for ApiLuaExecutor {
         let reference = i32::try_from(reference)
             .map_err(|_| "Lua callback reference is out of range".to_owned())?;
         let (lua, registry, ex, nested_ex) = (&self.lua, &self.registry, &self.ex, &self.nested_ex);
-        with_scoped_editor_api(lua, registry, ex, nested_ex, session, || {
-            let value = object_to_lua(lua, &Object::LuaRef(reference))
-                .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
-            let Value::Function(function) = value else {
-                return Err(LuaExecError::Conversion(
-                    "Lua callback reference is not a function".into(),
-                ));
-            };
-            let args = args
-                .iter()
-                .map(|argument| {
-                    object_to_lua(lua, argument)
-                        .map_err(|error| LuaExecError::Conversion(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into();
-            let mut values = call_with_traceback(lua, &function, args)
-                .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
-            let Some(value) = values.pop_front() else {
-                return Ok(Object::Nil);
-            };
-            lua_to_object(lua, &value).map_err(|error| LuaExecError::Conversion(error.to_string()))
-        })
+        with_scoped_editor_api(
+            lua,
+            registry,
+            ex,
+            nested_ex,
+            &self.overflow(),
+            session,
+            || {
+                let value = object_to_lua(lua, &Object::LuaRef(reference))
+                    .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
+                let Value::Function(function) = value else {
+                    return Err(LuaExecError::Conversion(
+                        "Lua callback reference is not a function".into(),
+                    ));
+                };
+                let args = args
+                    .iter()
+                    .map(|argument| {
+                        object_to_lua(lua, argument)
+                            .map_err(|error| LuaExecError::Conversion(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into();
+                let mut values = call_with_traceback(lua, &function, args)
+                    .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+                let Some(value) = values.pop_front() else {
+                    return Ok(Object::Nil);
+                };
+                lua_to_object(lua, &value)
+                    .map_err(|error| LuaExecError::Conversion(error.to_string()))
+            },
+        )
         .map_err(lua_exec_error_text)
     }
 
@@ -5091,37 +5187,45 @@ impl LuaExecutor for ApiLuaExecutor {
         let reference = i32::try_from(reference)
             .map_err(|_| "Lua callback reference is out of range".to_owned())?;
         let (lua, registry, ex, nested_ex) = (&self.lua, &self.registry, &self.ex, &self.nested_ex);
-        with_scoped_editor_api(lua, registry, ex, nested_ex, session, || {
-            let value = object_to_lua(lua, &Object::LuaRef(reference))
-                .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
-            let Value::Function(function) = value else {
-                return Err(LuaExecError::Conversion(
-                    "Lua callback reference is not a function".into(),
-                ));
-            };
-            let args = args
-                .iter()
-                .map(|argument| {
-                    object_to_lua(lua, argument)
-                        .map_err(|error| LuaExecError::Conversion(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into();
-            let values = call_with_traceback(lua, &function, args)
-                .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
-            let mut converted = Vec::new();
-            for value in values {
-                match lua_to_object_ref(lua, &value) {
-                    Ok(object) => converted.push(object),
-                    Err(error) => {
-                        // None of the refs converted so far has an owner yet.
-                        free_object_refs(lua, &Object::Array(converted));
-                        return Err(LuaExecError::Conversion(error.to_string()));
+        with_scoped_editor_api(
+            lua,
+            registry,
+            ex,
+            nested_ex,
+            &self.overflow(),
+            session,
+            || {
+                let value = object_to_lua(lua, &Object::LuaRef(reference))
+                    .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
+                let Value::Function(function) = value else {
+                    return Err(LuaExecError::Conversion(
+                        "Lua callback reference is not a function".into(),
+                    ));
+                };
+                let args = args
+                    .iter()
+                    .map(|argument| {
+                        object_to_lua(lua, argument)
+                            .map_err(|error| LuaExecError::Conversion(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into();
+                let values = call_with_traceback(lua, &function, args)
+                    .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+                let mut converted = Vec::new();
+                for value in values {
+                    match lua_to_object_ref(lua, &value) {
+                        Ok(object) => converted.push(object),
+                        Err(error) => {
+                            // None of the refs converted so far has an owner yet.
+                            free_object_refs(lua, &Object::Array(converted));
+                            return Err(LuaExecError::Conversion(error.to_string()));
+                        }
                     }
                 }
-            }
-            Ok(converted)
-        })
+                Ok(converted)
+            },
+        )
         .map_err(lua_exec_error_text)
     }
 
@@ -5200,6 +5304,19 @@ impl ServerAutocmdHost {
             .map(|_| AutocmdExecution::Keep)
             .map_err(|error| format_autocmd_exec_error(action, &error))
     }
+    /// [`ExecutorOverflow`] minted from this host's seed — the third tier
+    /// scoped `vim.g` writes fall back to while the action's pair is busy.
+    fn overflow(&self) -> ExecutorOverflow {
+        overflow_factory(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
+    }
+
     /// Mints a fresh executor pair from the never-executed seed, refreshing
     /// its runtime search roots from the live 'runtimepath' the way
     /// `sync_runtime_roots` keeps searches glued to `p_rtp`; an unset or
@@ -5253,30 +5370,40 @@ impl AutocmdExecutor for ServerAutocmdHost {
                     .map_err(|_| "autocmd Lua reference is out of range".to_owned())?;
                 let args = action.callback_args().map_err(|error| error.to_string())?;
                 let (lua, registry) = (&self.lua, &self.registry);
-                with_scoped_editor_api(lua, registry, &pair.0, &pair.1, session, || {
-                    let value = object_to_lua(lua, &Object::LuaRef(reference))
-                        .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
-                    let Value::Function(function) = value else {
-                        return Err(LuaExecError::Conversion(
-                            "autocmd Lua reference is not a function".into(),
-                        ));
-                    };
-                    let args = args
-                        .iter()
-                        .map(|argument| {
-                            object_to_lua(lua, argument)
-                                .map_err(|error| LuaExecError::Conversion(error.to_string()))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into();
-                    let mut values = call_with_traceback(lua, &function, args)
-                        .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
-                    let outcome = match values.pop_front() {
-                        None | Some(Value::Nil | Value::Boolean(false)) => AutocmdExecution::Keep,
-                        Some(_) => AutocmdExecution::Delete,
-                    };
-                    Ok(outcome)
-                })
+                with_scoped_editor_api(
+                    lua,
+                    registry,
+                    &pair.0,
+                    &pair.1,
+                    &self.overflow(),
+                    session,
+                    || {
+                        let value = object_to_lua(lua, &Object::LuaRef(reference))
+                            .map_err(|error| LuaExecError::Conversion(error.to_string()))?;
+                        let Value::Function(function) = value else {
+                            return Err(LuaExecError::Conversion(
+                                "autocmd Lua reference is not a function".into(),
+                            ));
+                        };
+                        let args = args
+                            .iter()
+                            .map(|argument| {
+                                object_to_lua(lua, argument)
+                                    .map_err(|error| LuaExecError::Conversion(error.to_string()))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?
+                            .into();
+                        let mut values = call_with_traceback(lua, &function, args)
+                            .map_err(|error| LuaExecError::Runtime(error.to_string()))?;
+                        let outcome = match values.pop_front() {
+                            None | Some(Value::Nil | Value::Boolean(false)) => {
+                                AutocmdExecution::Keep
+                            }
+                            Some(_) => AutocmdExecution::Delete,
+                        };
+                        Ok(outcome)
+                    },
+                )
                 .map_err(lua_exec_error_text)
             }
         }
@@ -5371,45 +5498,92 @@ fn map_parse_error(error: ExecError) -> ApiError {
     }
 }
 
-/// Writes or deletes one `g:` variable through the live executor pair, so a
-/// scope watcher registered on `g:` fires the way `:let`/`unlet` fire it.
-///
-/// The primary executor runs the write when it is free, otherwise the nested
-/// one -- the same tiering [`ServerCommandHost`] uses for reentrant commands.
-/// `None` deletes; a missing key there is the caller's silent no-op or error
-/// to report. The write drains its watcher round with no editor borrow held
-/// (inside [`ExExecutor::set_global_var`]/[`ExExecutor::remove_global_var`]),
-/// exactly like the `:let` path, so no `deliver_pending_lua_flush` follows.
-fn write_global_var(
-    session: &ApiSession,
+/// Mints an overflow executor through the same seed [`ServerCommandHost::fork`]
+/// uses — for the third tier of [`on_free_executor`].
+type ExecutorOverflow = Rc<dyn Fn() -> Option<Rc<RefCell<ExExecutor>>>>;
+
+/// Captures the never-checked-out fork seed and its companions into a callable
+/// [`ExecutorOverflow`].
+fn overflow_factory(
+    lua: &Lua,
+    registry: &Rc<Registry>,
+    session: &Rc<ApiSession>,
+    fork_seed: &Rc<RefCell<ExExecutor>>,
+    channel_ids: &ChannelIds,
+    event_loop: &EventLoopPump,
+) -> ExecutorOverflow {
+    let (lua, registry, session, fork_seed, channel_ids, event_loop) = (
+        lua.clone(),
+        Rc::clone(registry),
+        Rc::clone(session),
+        Rc::clone(fork_seed),
+        channel_ids.clone(),
+        event_loop.clone(),
+    );
+    Rc::new(move || {
+        fresh_executors(
+            &lua,
+            &registry,
+            &session,
+            &fork_seed,
+            &channel_ids,
+            &event_loop,
+        )
+        .map(|(primary, _)| primary)
+    })
+}
+
+/// Runs `run` on the first free executor: the primary, then the nested, then an
+/// overflow minted from `overflow`. Depth-three reentry — an outer `:lua`
+/// holds `ex` while its `vim.cmd` dispatches onto `nested_ex`, and a chunk that
+/// still writes `vim.g` — overflows onto the seed pair instead of failing on
+/// the two-slot error upstream never had because it does not guard executors.
+fn on_free_executor(
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
-    name: &OxStr,
-    value: Option<Object>,
+    overflow: &ExecutorOverflow,
+    run: impl FnOnce(&mut ExExecutor) -> Result<(), ApiError>,
 ) -> Result<(), ApiError> {
-    if let Ok(mut guard) = ex.try_borrow_mut() {
-        return match value {
-            Some(value) => guard
-                .set_global_var(session, name, value)
-                .map_err(map_api_exec_error),
-            None => guard
-                .remove_global_var(session, name)
-                .map_err(map_api_exec_error),
-        };
+    if let Ok(mut executor) = ex.try_borrow_mut() {
+        return run(&mut executor);
     }
-    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
+    if let Ok(mut executor) = nested_ex.try_borrow_mut() {
+        return run(&mut executor);
+    }
+    let Some(overflow) = overflow() else {
         return Err(ApiError::exception(
             "no free Ex executor for a nested command",
         ));
     };
-    match value {
-        Some(value) => nested
+    run(&mut overflow.borrow_mut())
+}
+
+/// Writes or deletes one `g:` variable through the live executor pair, so a
+/// scope watcher registered on `g:` fires the way `:let`/`unlet` fire it.
+///
+/// The primary executor runs the write when it is free, otherwise the nested
+/// one, otherwise an overflow minted through `overflow` — the same tiering
+/// [`ServerCommandHost`] uses for reentrant commands. `None` deletes; a
+/// missing key there is the caller's silent no-op or error to report. The
+/// write drains its watcher round with no editor borrow held (inside
+/// [`ExExecutor::set_global_var`]/[`ExExecutor::remove_global_var`]), exactly
+/// like the `:let` path, so no `deliver_pending_lua_flush` follows.
+fn write_global_var(
+    session: &ApiSession,
+    ex: &Rc<RefCell<ExExecutor>>,
+    nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
+    name: &OxStr,
+    value: Option<Object>,
+) -> Result<(), ApiError> {
+    on_free_executor(ex, nested_ex, overflow, |executor| match value {
+        Some(value) => executor
             .set_global_var(session, name, value)
             .map_err(map_api_exec_error),
-        None => nested
+        None => executor
             .remove_global_var(session, name)
             .map_err(map_api_exec_error),
-    }
+    })
 }
 /// Writes or deletes one `b:` variable through the live executor pair, so a
 /// scope watcher registered on `b:` fires the way `:let`/`unlet` fire it.
@@ -5422,37 +5596,21 @@ fn write_buffer_var(
     session: &ApiSession,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
     buffer: BufHandle,
     name: &OxStr,
     value: Option<Object>,
 ) -> Result<(), ApiError> {
-    if let Ok(mut guard) = ex.try_borrow_mut() {
-        return match value {
-            Some(value) => guard
-                .set_buffer_var(session, buffer, name, value)
-                .map_err(map_api_exec_error)
-                .map_err(map_buffer_var_error),
-            None => guard
-                .remove_buffer_var(session, buffer, name)
-                .map_err(map_api_exec_error)
-                .map_err(map_buffer_var_error),
-        };
-    }
-    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
-        return Err(ApiError::exception(
-            "no free Ex executor for a nested command",
-        ));
-    };
-    match value {
-        Some(value) => nested
+    on_free_executor(ex, nested_ex, overflow, |executor| match value {
+        Some(value) => executor
             .set_buffer_var(session, buffer, name, value)
             .map_err(map_api_exec_error)
             .map_err(map_buffer_var_error),
-        None => nested
+        None => executor
             .remove_buffer_var(session, buffer, name)
             .map_err(map_api_exec_error)
             .map_err(map_buffer_var_error),
-    }
+    })
 }
 
 /// Writes or deletes one `w:` variable through the live executor pair, so a
@@ -5465,33 +5623,19 @@ fn write_window_var(
     session: &ApiSession,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
     window: WinHandle,
     name: &OxStr,
     value: Option<Object>,
 ) -> Result<(), ApiError> {
-    if let Ok(mut guard) = ex.try_borrow_mut() {
-        return match value {
-            Some(value) => guard
-                .set_window_var(session, window, name, value)
-                .map_err(map_api_exec_error),
-            None => guard
-                .remove_window_var(session, window, name)
-                .map_err(map_api_exec_error),
-        };
-    }
-    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
-        return Err(ApiError::exception(
-            "no free Ex executor for a nested command",
-        ));
-    };
-    match value {
-        Some(value) => nested
+    on_free_executor(ex, nested_ex, overflow, |executor| match value {
+        Some(value) => executor
             .set_window_var(session, window, name, value)
             .map_err(map_api_exec_error),
-        None => nested
+        None => executor
             .remove_window_var(session, window, name)
             .map_err(map_api_exec_error),
-    }
+    })
 }
 
 /// Writes or deletes one `t:` variable through the live executor pair, so a
@@ -5504,35 +5648,20 @@ fn write_tabpage_var(
     session: &ApiSession,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
     tabpage: TabHandle,
     name: &OxStr,
     value: Option<Object>,
 ) -> Result<(), ApiError> {
-    if let Ok(mut guard) = ex.try_borrow_mut() {
-        return match value {
-            Some(value) => guard
-                .set_tabpage_var(session, tabpage, name, value)
-                .map_err(map_api_exec_error),
-            None => guard
-                .remove_tabpage_var(session, tabpage, name)
-                .map_err(map_api_exec_error)
-                .map_err(map_del_global_var_error),
-        };
-    }
-    let Ok(mut nested) = nested_ex.try_borrow_mut() else {
-        return Err(ApiError::exception(
-            "no free Ex executor for a nested command",
-        ));
-    };
-    match value {
-        Some(value) => nested
+    on_free_executor(ex, nested_ex, overflow, |executor| match value {
+        Some(value) => executor
             .set_tabpage_var(session, tabpage, name, value)
             .map_err(map_api_exec_error),
-        None => nested
+        None => executor
             .remove_tabpage_var(session, tabpage, name)
             .map_err(map_api_exec_error)
             .map_err(map_del_global_var_error),
-    }
+    })
 }
 
 /// Restores the `nvim_buf_set_var`/`nvim_buf_del_var` validation errors for
@@ -5587,6 +5716,19 @@ impl ServerCommandHost {
         context
             .ensure_textlock_allows()
             .map_err(ApiError::exception)
+    }
+
+    /// [`ExecutorOverflow`] minted from this host's seed — the third tier every
+    /// scoped `*_var` write falls back to while both pool members are busy.
+    fn overflow(&self) -> ExecutorOverflow {
+        overflow_factory(
+            &self.lua,
+            &self.registry,
+            &self.session,
+            &self.fork_seed,
+            &self.channel_ids,
+            &self.event_loop,
+        )
     }
 }
 
@@ -5836,12 +5978,26 @@ impl CommandExecutor for ServerCommandHost {
         name: OxStr,
         value: Object,
     ) -> Result<(), ApiError> {
-        write_global_var(session, &self.ex, &self.nested_ex, &name, Some(value))
+        write_global_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            &self.overflow(),
+            &name,
+            Some(value),
+        )
     }
 
     fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
-        write_global_var(session, &self.ex, &self.nested_ex, &name, None)
-            .map_err(map_del_global_var_error)
+        write_global_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            &self.overflow(),
+            &name,
+            None,
+        )
+        .map_err(map_del_global_var_error)
     }
 
     fn set_buffer_var(
@@ -5855,6 +6011,7 @@ impl CommandExecutor for ServerCommandHost {
             session,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             buffer,
             &name,
             Some(value),
@@ -5867,7 +6024,15 @@ impl CommandExecutor for ServerCommandHost {
         buffer: BufHandle,
         name: OxStr,
     ) -> Result<(), ApiError> {
-        write_buffer_var(session, &self.ex, &self.nested_ex, buffer, &name, None)
+        write_buffer_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            &self.overflow(),
+            buffer,
+            &name,
+            None,
+        )
     }
 
     fn set_window_var(
@@ -5881,6 +6046,7 @@ impl CommandExecutor for ServerCommandHost {
             session,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             window,
             &name,
             Some(value),
@@ -5893,7 +6059,15 @@ impl CommandExecutor for ServerCommandHost {
         window: WinHandle,
         name: OxStr,
     ) -> Result<(), ApiError> {
-        write_window_var(session, &self.ex, &self.nested_ex, window, &name, None)
+        write_window_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            &self.overflow(),
+            window,
+            &name,
+            None,
+        )
     }
 
     fn set_tabpage_var(
@@ -5907,6 +6081,7 @@ impl CommandExecutor for ServerCommandHost {
             session,
             &self.ex,
             &self.nested_ex,
+            &self.overflow(),
             tabpage,
             &name,
             Some(value),
@@ -5919,7 +6094,15 @@ impl CommandExecutor for ServerCommandHost {
         tabpage: TabHandle,
         name: OxStr,
     ) -> Result<(), ApiError> {
-        write_tabpage_var(session, &self.ex, &self.nested_ex, tabpage, &name, None)
+        write_tabpage_var(
+            session,
+            &self.ex,
+            &self.nested_ex,
+            &self.overflow(),
+            tabpage,
+            &name,
+            None,
+        )
     }
 
     fn fork(&self) -> Option<Box<dyn CommandExecutor>> {
@@ -6436,6 +6619,7 @@ fn with_scoped_editor_api<T>(
     registry: &Registry,
     ex: &Rc<RefCell<ExExecutor>>,
     nested_ex: &Rc<RefCell<ExExecutor>>,
+    overflow: &ExecutorOverflow,
     session: &ApiSession,
     run: impl FnOnce() -> Result<T, LuaExecError>,
 ) -> Result<T, LuaExecError> {
@@ -6515,6 +6699,7 @@ fn with_scoped_editor_api<T>(
         )?;
         let setvar_ex = ex.clone();
         let setvar_nested = nested_ex.clone();
+        let setvar_overflow = overflow.clone();
         let setvar_ctx = context.clone();
         vim.set(
             "_setvar",
@@ -6559,9 +6744,14 @@ fn with_scoped_editor_api<T>(
                         {
                             return Ok((true, Value::Nil));
                         }
-                        if let Err(error) =
-                            write_global_var(session, &setvar_ex, &setvar_nested, &name, value)
-                        {
+                        if let Err(error) = write_global_var(
+                            session,
+                            &setvar_ex,
+                            &setvar_nested,
+                            &setvar_overflow,
+                            &name,
+                            value,
+                        ) {
                             return scoped_failure(lua, error);
                         }
                         return Ok((true, Value::Nil));
