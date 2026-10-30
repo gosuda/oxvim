@@ -1351,6 +1351,15 @@ pub fn closure_index(name: &[u8]) -> Option<usize> {
     text.parse().ok()
 }
 
+/// Reads one dictionary member.
+///
+/// A callable read out of a dictionary is a partial bound to that dictionary
+/// (`set_selfdict`, `eval.c:6057-6070`): `{"f": Fn}.f` and `d.f` are the same
+/// function with `self` set, unless the member is already bound explicitly.
+///
+/// # Errors
+///
+/// Returns E715 when `value` is not a dictionary and E716 when `key` is absent.
 fn dict_lookup(
     value: &Typval,
     key: &[u8],
@@ -1360,15 +1369,13 @@ fn dict_lookup(
     let Typval::Dict(entries) = value else {
         return Err(EvalError::new("E715", offset, "Dictionary required"));
     };
-    let entries = entries
+    let found = entries
         .try_borrow()
         .map_err(|_| borrow_error(offset))?
         .entries
-        .clone();
-    entries
+        .clone()
         .into_iter()
         .find(|entry| entry.key.as_bytes() == key)
-        .map(|entry| Evaluated::plain(entry.value))
         .ok_or_else(|| {
             EvalError::new(
                 "E716",
@@ -1378,7 +1385,23 @@ fn dict_lookup(
                     String::from_utf8_lossy(key)
                 ),
             )
-        })
+        })?;
+    Ok(Evaluated::plain(bind_self_dict(found.value, entries)))
+}
+
+/// Gives an unbound callable `self = dictionary`, keeping an explicit binding.
+fn bind_self_dict(value: Typval, dict: &ox_types::DictRef) -> Typval {
+    match value {
+        Typval::Funcref(funcref) => Typval::Partial(Funcref {
+            dict: Some(Rc::clone(dict)),
+            ..funcref
+        }),
+        Typval::Partial(funcref) if funcref.dict.is_none() => Typval::Partial(Funcref {
+            dict: Some(Rc::clone(dict)),
+            ..funcref
+        }),
+        value => value,
+    }
 }
 
 fn numeric_binary(op: BinaryOp, lhs: &Typval, rhs: &Typval, offset: usize) -> Result<Evaluated> {
