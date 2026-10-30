@@ -430,23 +430,24 @@ fn maparg<F: FileIO, E: ExEditorAccess>(
     if want_dict {
         return Ok(fill_dict(&mapping, local));
     }
-    match &mapping.action {
-        MappingAction::Callback(reference) => {
-            Ok(Typval::String(OxStr::from(format!("<Lua {reference}>").as_str())))
-        }
-        _ => {
-            let Some(replaced) = mapping.action.replaced_keys() else {
-                return Ok(empty());
-            };
-            // `get_maparg`'s string form (`mapping.c:2200-2210`): an empty right-hand
-            // side prints as the literal `<Nop>`, everything else through
-            // `str2special` with neither spaces nor `<` replaced.
-            Ok(Typval::String(if replaced.is_empty() {
-                OxStr::from("<Nop>")
-            } else {
-                OxStr::from(special_notation(replaced, false, false).as_str())
-            }))
-        }
+    match check_string(&mapping.action) {
+        Some(text) => Ok(Typval::String(OxStr::from(text.as_str()))),
+        None => Ok(empty()),
+    }
+}
+
+/// The string form of a mapping's right-hand side, shared by `maparg` and
+/// `mapcheck` (`get_maparg` at `mapping.c:2233-2245`): a Lua callback renders as
+/// its function reference, an empty right-hand side as `<Nop>`, and keys through
+/// `str2special` with neither spaces nor `<` replaced.
+fn check_string(action: &MappingAction) -> Option<String> {
+    match action {
+        MappingAction::Callback(reference) => Some(format!("<Lua {reference}>")),
+        _ => match action.replaced_keys() {
+            None => None,
+            Some(replaced) if replaced.is_empty() => Some("<Nop>".to_owned()),
+            Some(replaced) => Some(special_notation(replaced, false, false)),
+        },
     }
 }
 
@@ -509,14 +510,12 @@ fn mapcheck<F: FileIO, E: ExEditorAccess>(
             .filter(|(mapping, _)| mapping.lhs.as_bytes().starts_with(lhs.as_bytes()))
             // `map_check` prefers the exact lhs over any longer one.
             .min_by_key(|(mapping, _)| mapping.lhs.as_bytes().len())
-            .and_then(|(mapping, _)| mapping.action.replaced_keys().map(<[u8]>::to_vec))
+            .and_then(|(mapping, _)| check_string(&mapping.action))
     });
-    let Some(replaced) = found else {
+    let Some(text) = found else {
         return Ok(Typval::String(OxStr::from("")));
     };
-    Ok(Typval::String(OxStr::from(
-        special_notation(&replaced, false, false).as_str(),
-    )))
+    Ok(Typval::String(OxStr::from(text.as_str())))
 }
 
 /// `f_hasmapto` (`mapping.c:1980-2022`): 1 when any mapping's right-hand
