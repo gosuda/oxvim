@@ -6936,9 +6936,18 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     name: &str,
     args: &str,
 ) -> Flow {
+    // `:echomsg` and `:echoerr` differ from `:echo` in one place: a top-level
+    // Funcref or Partial is spelled `function('name')` rather than its bare
+    // name (`encode.c:898-901`). Strings stay unquoted at the top level, and
+    // nested values render as `:echo` renders them.
+    let message = matches!(name, "echomsg" | "echoerr");
+    let render = |value: &Typval| match value {
+        Typval::Funcref(_) | Typval::Partial(_) if message => typval_to_display(value, true),
+        _ => typval_to_display(value, false),
+    };
     let mut pieces = Vec::new();
     if let Ok(value) = eval_text(runtime, access, scope, lua, args) {
-        pieces.push(typval_to_display(&value, false));
+        pieces.push(render(&value));
     } else {
         let expressions = match ExprParser::new(args.as_bytes()).parse_many() {
             Ok(expressions) => expressions,
@@ -6956,7 +6965,7 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
                 Ok(value) => value,
                 Err(flow) => return flow,
             };
-            pieces.push(typval_to_display(&value, false));
+            pieces.push(render(&value));
         }
     }
     let separator = if name == "echon" { "" } else { " " };
