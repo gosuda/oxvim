@@ -1308,3 +1308,20 @@ The 14 remaining, grouped by cause:
 | buffer lifecycle | follows global `'hidden'` when abandoned |
 | messages capture | provider errors, reload of a removed directory |
 | missing subsystems | `:syntax` (`reloads directory buffers`), netrw coexistence (`E488` inside netrw's autoload), `vim.fs.mkdir` (`E745`), `[count]-` overshoot |
+
+
+### `dir_spec` after the activation attempt: 25 of 38
+
+`23754bb` fixed two cases and named the rest. Verified on the rebased tree with a
+fresh release build: 25 OK, 13 FAIL.
+
+| Case | Status | Cause |
+|---|---|---|
+| `<Plug>(nvim-dir-up)` | passes | the plugin used a pattern search; it now scans for the exact line |
+| modified unnamed buffer | still fails, but past the guard | the guard now precedes the modified check; the case fails later at `bufnr('#')`, which returns -1 |
+| alternate buffer | fails | no alternate-buffer tracking |
+| `[count]-` | fails | the global working directory resolves to `/` |
+| navigates / displays / encodes | fail | activating an entry still leaves the listing buffer in the window |
+
+A previous attempt on the same task failed on an infrastructure 403 after 45
+minutes and was reverted; its residue was not merged.
