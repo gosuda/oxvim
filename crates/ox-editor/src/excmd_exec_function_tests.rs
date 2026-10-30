@@ -1025,6 +1025,20 @@ fn nested_source_restores_caller_sid_and_script_scope() {
     assert_eq!(names, vec![(1, "/outer.vim"), (2, "/inner.vim")]);
 }
 
+#[test]
+fn computed_name_script_variable_assignment_visible_to_later_read() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &editor,
+        "test.vim",
+        "function! s:Init(n, v)\n  let {a:n} = a:v\nendfunction\ncall s:Init('s:foo', 42)\ncall s:Init('g:bar', 99)\nlet g:val = s:foo",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "val"), Some(42));
+    assert_eq!(global_number(exec.scope(), "bar"), Some(99));
+}
+
 // ---------------------------------------------------------------------------
 // Family: command resolution happens when a line runs, and re-sourcing a
 // script reuses its SID (ex_docmd.c find_ex_command / do_one_cmd;
