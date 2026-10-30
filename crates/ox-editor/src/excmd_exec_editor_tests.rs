@@ -5031,6 +5031,95 @@ fn filetype_rejects_unknown_argument_with_e475() {
     assert_vim_error(executor.execute_line(&editor, "filetype nope"), "E475");
 }
 
+#[test]
+fn syntax_rejects_unknown_subcommand_with_e410() {
+    let (editor, mut executor) = setup();
+    assert_vim_error(
+        executor.execute_line(&editor, "syntax invalidSubcmd"),
+        "E410",
+    );
+}
+
+#[test]
+fn syntax_on_and_off_toggles_global_var() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "syntax on").unwrap();
+    assert!(global_flag(&executor, "syntax_on"));
+    executor.execute_line(&editor, "syntax off").unwrap();
+    assert!(!global_flag(&executor, "syntax_on"));
+    executor.execute_line(&editor, "syntax enable").unwrap();
+    assert!(global_flag(&executor, "syntax_on"));
+}
+
+#[test]
+fn syntax_match_and_list_via_syn_abbreviation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, r#"syn match directoryDirectory ".*/$""#)
+        .unwrap();
+    let buf = editor.editor().current_buffer().unwrap();
+    let has_group = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .has_group("directoryDirectory");
+    assert!(has_group);
+
+    let list_out = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .format_list(Some("directoryDirectory"))
+        .unwrap();
+    assert!(list_out.contains("directoryDirectory xxx match +.*/$+  "));
+}
+
+#[test]
+fn syntax_keyword_and_region_dispatch() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "syntax keyword cType int char float")
+        .unwrap();
+    executor
+        .execute_line(&editor, r#"syntax region cComment start="/*" end="*/""#)
+        .unwrap();
+    let buf = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cType"));
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cComment"));
+
+    executor.execute_line(&editor, "syntax clear cType").unwrap();
+    assert!(!editor.editor().buffer(buf).unwrap().syntax.has_group("cType"));
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cComment"));
+
+    executor.execute_line(&editor, "syntax clear").unwrap();
+    assert!(editor.editor().buffer(buf).unwrap().syntax.is_empty());
+}
+
+#[test]
+fn filetype_setter_loads_directory_syntax() {
+    let (editor, mut executor) = setup();
+    let io = executor.scripts().io().clone();
+    io.insert(
+        "rt/syntax/directory.vim",
+        r#"syn match directoryDirectory ".*/$""#,
+    );
+    executor.execute_line(&editor, "set rtp+=rt").unwrap();
+    executor
+        .execute_line(&editor, "setlocal filetype=directory")
+        .unwrap();
+
+    let buf = editor.editor().current_buffer().unwrap();
+    let has_group = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .has_group("directoryDirectory");
+    assert!(has_group);
+}
+
 // ---------------------------------------------------------------------------
 // :read / :read !cmd / :write !cmd
 // Citations: ex_docmd.c ex_read:6163-6195, ex_cmds.c do_filter:1430-1436,

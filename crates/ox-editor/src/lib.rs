@@ -37,6 +37,7 @@ pub mod script;
 pub mod search;
 pub mod server;
 pub mod shada;
+pub mod syntax;
 pub mod tags;
 pub mod terminal_screen;
 pub mod textobject;
@@ -101,9 +102,9 @@ pub use mode::{
 pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
 pub use ops::{EditRange, Operator, OperatorError, OperatorRequest, OperatorResult};
 pub use options::{
-    option_value_object,
     OPTION_COUNT, OPTION_METADATA, OptionDefault, OptionDefaultValue, OptionError, OptionListKind,
     OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue, option_metadata,
+    option_value_object,
 };
 pub use register::{
     ClipboardProvider, RegisterContent, RegisterError, RegisterKind, Registers, Selection,

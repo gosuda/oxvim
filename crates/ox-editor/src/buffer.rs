@@ -432,6 +432,10 @@ pub struct BufferState {
     pub changedtick_diag: u64,
     /// Text generation last consumed by fold computation.
     pub changedtick_fold: u64,
+    /// Per-buffer syntax group registry.
+    pub syntax: crate::syntax::SyntaxRegistry,
+    /// Loaded syntax file name, preventing redundant re-sourcing.
+    pub loaded_syntax: Option<String>,
 }
 
 impl Default for BufferState {
@@ -494,6 +498,8 @@ impl BufferState {
             previous_directory: None,
             changedtick_diag: 0,
             changedtick_fold: 0,
+            syntax: crate::syntax::SyntaxRegistry::default(),
+            loaded_syntax: None,
         }
     }
 

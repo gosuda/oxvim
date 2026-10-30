@@ -4276,7 +4276,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         ),
         "setlocal" => command_set(runtime, access, scope, lua, &command.args, SetLayer::Local),
         "setglobal" => command_set(runtime, access, scope, lua, &command.args, SetLayer::Global),
-        "syntax" if matches!(command.args.trim(), "on" | "off") => Flow::Normal,
+        "syntax" => command_syntax(runtime, access, scope, lua, command),
         "filetype" => command_filetype(runtime, access, scope, lua, command),
         "setfiletype" => command_setfiletype(runtime, access, scope, lua, command),
         "insert" => Flow::Normal,
@@ -6874,7 +6874,14 @@ fn command_set<F: FileIO, E: ExEditorAccess>(
         // arguments of this `:set` are abandoned with its flow.
         if let Some(assignment) = &assignment {
             let flow = if assignment.name == "filetype" {
-                fire_filetype_autocmd(runtime, access, scope, lua, assignment)
+                let flow = fire_filetype_autocmd(runtime, access, scope, lua, assignment);
+                if matches!(flow, Flow::Normal) {
+                    wire_filetype_syntax(runtime, access, scope, lua, assignment)
+                } else {
+                    flow
+                }
+            } else if assignment.name == "syntax" {
+                fire_syntax_set(runtime, access, scope, lua, assignment)
             } else {
                 Flow::Normal
             };
@@ -21616,6 +21623,269 @@ fn command_filetype<F: FileIO, E: ExEditorAccess>(
         other => error_flow(runtime, "E475", format!("Invalid argument: {other}")),
     }
 }
+/// `:syntax` (`syntax.c` `ex_syntax`).
+fn command_syntax<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let raw_args = command.args.trim_start();
+    let subcmd_end = raw_args
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(raw_args.len());
+    let subcmd = &raw_args[..subcmd_end];
+    let rest = raw_args[subcmd_end..].trim_start();
+
+    match subcmd {
+        "" | "list" => {
+            let group = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.split_ascii_whitespace().next().unwrap_or(rest))
+            };
+            let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+            let Some(buffer) = buffer else {
+                return Flow::Normal;
+            };
+            let result = access.with_ex_editor(|editor| {
+                editor
+                    .buffer(buffer)
+                    .map_err(|e| crate::syntax::SyntaxError::NoSuchGroup(e.to_string()))
+                    .and_then(|state| state.syntax.format_list(group))
+            });
+            match result {
+                Ok(formatted) => {
+                    access.with_ex_editor(|editor| push_info_text_message(editor, formatted));
+                    Flow::Normal
+                }
+                Err(crate::syntax::SyntaxError::NoSuchGroup(target)) => {
+                    error_flow(runtime, "E28", format!("No such highlight group name: {target}"))
+                }
+                Err(err) => error_flow(runtime, "E400", err.to_string()),
+            }
+        }
+        "clear" => {
+            let group = if rest.is_empty() {
+                None
+            } else {
+                Some(rest.split_ascii_whitespace().next().unwrap_or(rest))
+            };
+            let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+            if let Some(buffer) = buffer {
+                access.with_ex_editor(|editor| {
+                    if let Ok(state) = editor.buffer_mut(buffer) {
+                        state.syntax.clear(group);
+                    }
+                });
+            }
+            Flow::Normal
+        }
+        "match" => {
+            match crate::syntax::parse_match_args(rest) {
+                Ok((group, pattern)) => {
+                    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+                    if let Some(buffer) = buffer {
+                        access.with_ex_editor(|editor| {
+                            if let Ok(state) = editor.buffer_mut(buffer) {
+                                state.syntax.add_match(&group, pattern);
+                            }
+                        });
+                    }
+                    Flow::Normal
+                }
+                Err(crate::syntax::SyntaxError::MissingPattern(p)) => {
+                    error_flow(runtime, "E400", format!("Missing pattern: {p}"))
+                }
+                Err(err) => error_flow(runtime, "E400", err.to_string()),
+            }
+        }
+        "keyword" => {
+            match crate::syntax::parse_keyword_args(rest) {
+                Ok((group, words)) => {
+                    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+                    if let Some(buffer) = buffer {
+                        access.with_ex_editor(|editor| {
+                            if let Ok(state) = editor.buffer_mut(buffer) {
+                                state.syntax.add_keyword(&group, words);
+                            }
+                        });
+                    }
+                    Flow::Normal
+                }
+                Err(err) => error_flow(runtime, "E400", err.to_string()),
+            }
+        }
+        "region" => {
+            match crate::syntax::parse_region_args(rest) {
+                Ok((group, def)) => {
+                    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+                    if let Some(buffer) = buffer {
+                        access.with_ex_editor(|editor| {
+                            if let Ok(state) = editor.buffer_mut(buffer) {
+                                state.syntax.add_region(&group, def);
+                            }
+                        });
+                    }
+                    Flow::Normal
+                }
+                Err(err) => error_flow(runtime, "E400", err.to_string()),
+            }
+        }
+        "on" | "enable" => {
+            let _ = scope.set_scoped(
+                ScopeKind::Global,
+                b"syntax_on",
+                0,
+                Typval::Number(1),
+            );
+            let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+            if let Some(buffer) = buffer {
+                let syn_opt = access.with_ex_editor(|editor| {
+                    match editor.options().get_buffer(buffer, "syntax") {
+                        Ok(OptionValue::String(s)) if !s.is_empty() => Some(s.clone()),
+                        _ => None,
+                    }
+                });
+                if let Some(syntax_name) = syn_opt {
+                    let _ = load_buffer_syntax(runtime, access, scope, lua, buffer, &syntax_name);
+                }
+            }
+            Flow::Normal
+        }
+        "off" => {
+            let _ = remove_target(runtime, scope, "g:syntax_on");
+            let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+            if let Some(buffer) = buffer {
+                access.with_ex_editor(|editor| {
+                    if let Ok(state) = editor.buffer_mut(buffer) {
+                        state.syntax.clear(None);
+                        state.loaded_syntax = None;
+                    }
+                });
+            }
+            Flow::Normal
+        }
+        "case" | "cluster" | "conceal" | "foldlevel" | "include" | "iskeyword" | "manual"
+        | "reset" | "spell" | "sync" => Flow::Normal,
+        _ => error_flow(
+            runtime,
+            "E410",
+            format!("Invalid :syntax subcommand: {subcmd}"),
+        ),
+    }
+}
+
+fn load_buffer_syntax<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    syntax_name: &str,
+) -> Flow {
+    if syntax_name.is_empty() {
+        return Flow::Normal;
+    }
+    let already_loaded = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .and_then(|s| s.loaded_syntax.as_deref())
+            == Some(syntax_name)
+    });
+    if already_loaded {
+        return Flow::Normal;
+    }
+
+    let name = access.with_ex_editor(|editor| {
+        editor
+            .buffer(buffer)
+            .ok()
+            .map(|state| state.name().to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    let plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::Syntax,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: Some(name.as_bytes()),
+                match_name: Some(syntax_name.as_bytes()),
+                nested: true,
+                ..AutocmdContext::default()
+            },
+        )
+    });
+    let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+
+    let flow = source_runtime_all(runtime, access, scope, lua, &format!("syntax/{syntax_name}.vim"));
+    if matches!(flow, Flow::Normal) {
+        access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(buffer) {
+                state.loaded_syntax = Some(syntax_name.to_string());
+            }
+        });
+    }
+    flow
+}
+
+fn fire_syntax_set<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    assignment: &OptionAssignment,
+) -> Flow {
+    let Some(buffer) = assignment.buffer else {
+        return Flow::Normal;
+    };
+    let OptionValue::String(syntax) = &assignment.value else {
+        return Flow::Normal;
+    };
+    load_buffer_syntax(runtime, access, scope, lua, buffer, syntax)
+}
+
+fn wire_filetype_syntax<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    assignment: &OptionAssignment,
+) -> Flow {
+    let Some(buffer) = assignment.buffer else {
+        return Flow::Normal;
+    };
+    let OptionValue::String(filetype) = &assignment.value else {
+        return Flow::Normal;
+    };
+    if filetype.is_empty() {
+        return Flow::Normal;
+    }
+    let syntax_unset = access.with_ex_editor(|editor| {
+        matches!(
+            editor.options().get_buffer(buffer, "syntax"),
+            Ok(OptionValue::String(s)) if s.is_empty()
+        )
+    });
+    if syntax_unset {
+        let _ = access.with_ex_editor(|editor| {
+            editor.options_mut().set_buffer(
+                buffer,
+                "syntax",
+                OptionValue::String(filetype.clone()),
+            )
+        });
+        load_buffer_syntax(runtime, access, scope, lua, buffer, filetype)
+    } else {
+        Flow::Normal
+    }
+}
+
 
 /// `:setfiletype` (`ex_docmd.c` `ex_setfiletype`).
 ///
