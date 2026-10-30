@@ -1431,3 +1431,31 @@ Two remain:
 
 - `reloads directory buffers` calls `syntax list directoryDirectory`, so it needs a syntax registry populated by `runtime/syntax/directory.vim`, plus a loader that sources syntax files. The port has none; `:syntax` accepts only `on`/`off`.
 - `coexists with netrw and can be disabled` now reaches its second assertion: after `:Explore .`, the buffer reports `filetype=directory` where the reference reports `netrw`, so a second setter overrides netrw's.
+
+
+### `dir_spec`: 37 of 38
+
+The netrw case took five more defects out of the interpreter, each found by
+instrumenting the bundled autoload and reading where it stopped:
+
+| Commit | Change |
+|---|---|
+| `435bd8d` | a trailing `"` comment is stripped from an `:if` condition |
+| `9d79f27` | `@@=` is not the expression register, so `let @@= x` parses |
+| `1a15c66` | `@@` names the unnamed register `"` |
+| `3992e5d` | a function-local `const` is keyed by call frame, so a second call does not raise E46 |
+| `8007299` | `readdir()` |
+| `fd4ccc6` | a script's map survives nested `:source`, user commands, and Ex-string autocommands |
+| `d4d8130` | `buflisted()` |
+
+Before these, `:Explore .` left `filetype` empty and one line; it now lists the
+directory and sets `filetype=netrw`, as the reference does.
+
+One measurement trap, recorded because it cost time: a release binary built
+before these commits reported a stale result, and the functional count was wrong
+until it was rebuilt.
+
+The last case, `reloads directory buffers`, needs `:syntax list <group>` to
+answer for a group that `runtime/syntax/directory.vim` defines. The port has no
+syntax loader, no group registry, and `:syntax` accepts only `on`/`off`, so this
+is a subsystem, not a command.
