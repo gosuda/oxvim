@@ -13625,3 +13625,19 @@ fn browse_modifier_without_file_opens_current_directory() {
         .into_owned();
     assert_eq!(name, expected);
 }
+
+#[test]
+fn call_with_trailing_comment_containing_parentheses() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "call_comment.vim",
+            "function! Foo(arg)\n  let g:arg = a:arg\nendfunction\ncall Foo(\"bar\") \" note (x)\n",
+        )
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "arg"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("bar")))
+    );
+}

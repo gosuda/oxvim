@@ -7959,7 +7959,7 @@ fn command_call<F: FileIO, E: ExEditorAccess>(
     let Some(open) = text.find('(') else {
         return error_flow(runtime, "E107", "Missing parentheses: :call");
     };
-    let Some(close) = text.rfind(')') else {
+    let Some(close) = find_closing_paren(text, open) else {
         return error_flow(runtime, "E107", "Missing parentheses: :call");
     };
     // ex_call: only text that `ends_excmd` rejects is trailing — a `"`
