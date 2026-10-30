@@ -3697,6 +3697,14 @@ fn split_assignment_at_equal_register_splits_at_second_equals() {
     assert_eq!(expr, r#"'"abc"'"#);
 }
 
+#[test]
+fn split_assignment_at_at_no_space_finds_equals() {
+    let (target, op, expr) = crate::excmd_exec::split_assignment("@@= ykeep").unwrap();
+    assert_eq!(target, "@@");
+    assert_eq!(op, "=");
+    assert_eq!(expr, "ykeep");
+}
+
 /// Item (c): setreg append with LineWise-incoming into CharacterWise-existing
 /// must concatenate the first incoming line onto the last existing line,
 /// then extend, then set kind=LineWise.

@@ -25383,7 +25383,12 @@ pub(crate) fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {
             index += 1;
             continue;
         }
-        if depth == 0 && byte == b'=' && index > 0 && bytes[index - 1] == b'@' {
+        if depth == 0
+            && byte == b'='
+            && index > 0
+            && bytes[index - 1] == b'@'
+            && bytes.get(index.wrapping_sub(2)) != Some(&b'@')
+        {
             // `@=` is the expression register name, not an assignment
             // operator. Skip this `=` so the real `=` later is found.
             index += 1;
