@@ -3592,6 +3592,23 @@ fn check_stl_option(statusline: &[u8]) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn eval_statusline_expression(
+    session: &ApiSession,
+    source: &str,
+) -> Result<Typval, ApiError> {
+    if let Some(lua_source) = source.strip_prefix("v:lua.") {
+        let code = format!("return {lua_source}");
+        let value = with_lua_executor(session, |session, lua| {
+            lua.exec(session, &code, Vec::new())
+                .map_err(ApiError::exception)
+        })?;
+        return object_to_typval(&value, 0);
+    }
+    with_command_executor(session, |session, executor| {
+        executor.evaluate(session, source)
+    })
+}
+
 fn cell_width(text: &[u8]) -> usize {
     String::from_utf8_lossy(text).width()
 }
@@ -3727,8 +3744,17 @@ pub fn nvim_eval_statusline(
         };
         let modified = buffer.flags.contains(ox_editor::BufferFlags::MODIFIED);
         let modifiable = !buffer.flags.contains(ox_editor::BufferFlags::READONLY);
+        let readonly = buffer.flags.contains(ox_editor::BufferFlags::READONLY);
         let name = buffer.name().clone();
         let handle = state.buffer;
+        let help = matches!(
+            editor.options().get_buffer(handle, "buftype"),
+            Ok(OptionValue::String(value)) if value == "help"
+        );
+        let preview = matches!(
+            editor.options().get_window(window, "previewwindow"),
+            Ok(OptionValue::Boolean(true))
+        );
         Ok(StatuslineContext {
             cursor,
             line_count,
@@ -3737,7 +3763,9 @@ pub fn nvim_eval_statusline(
             modifiable,
             name,
             handle,
-            readonly: false,
+            help,
+            preview,
+            readonly,
             filetype: String::new(),
             arglist: (0, 0),
         })
@@ -3809,9 +3837,7 @@ pub fn nvim_eval_statusline(
                 }
                 let source = std::str::from_utf8(format.get(offset..end).unwrap_or_default())
                     .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
-                let value = with_command_executor(session, |_, executor| {
-                    executor.evaluate(session, source)
-                })?;
+                let value = eval_statusline_expression(session, source)?;
                 let rendered = match &value {
                     Typval::Number(number) => number.to_string().into_bytes(),
                     Typval::String(text) => text.as_bytes().to_vec(),
@@ -3832,9 +3858,7 @@ pub fn nvim_eval_statusline(
             b'!' => {
                 let source = std::str::from_utf8(format.get(offset..).unwrap_or_default())
                     .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
-                let value = with_command_executor(session, |_, executor| {
-                    executor.evaluate(session, source)
-                })?;
+                let value = eval_statusline_expression(session, source)?;
                 let rendered = match &value {
                     Typval::Number(number) => number.to_string().into_bytes(),
                     Typval::String(text) => text.as_bytes().to_vec(),
@@ -4000,6 +4024,26 @@ pub fn nvim_eval_statusline(
                                 b",RO".to_vec()
                             } else {
                                 b"[RO]".to_vec()
+                            };
+                        }
+                    }
+                    b'h' | b'H' => {
+                        fillable = false;
+                        if context.help {
+                            piece = if target == b'H' {
+                                b",HLP".to_vec()
+                            } else {
+                                b"[Help]".to_vec()
+                            };
+                        }
+                    }
+                    b'w' | b'W' => {
+                        fillable = false;
+                        if context.preview {
+                            piece = if target == b'W' {
+                                b",PRV".to_vec()
+                            } else {
+                                b"[Preview]".to_vec()
                             };
                         }
                     }
@@ -4192,8 +4236,9 @@ fn highlight_entry(start: usize, groups: &[OxStr]) -> Object {
 fn fillchar_width(fillchar: &[u8]) -> usize {
     String::from_utf8_lossy(fillchar)
         .chars()
-        .map(char::width_usize)
-        .sum()
+        .next()
+        .map(CharWidth::width_usize)
+        .unwrap_or(1)
 }
 
 fn truncate_cells(text: &mut Vec<u8>, max_cells: usize) {
@@ -4229,6 +4274,8 @@ struct StatuslineContext {
     modifiable: bool,
     name: OxStr,
     handle: BufHandle,
+    help: bool,
+    preview: bool,
     readonly: bool,
     filetype: String,
     arglist: (usize, usize),

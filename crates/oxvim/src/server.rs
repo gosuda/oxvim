@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
@@ -323,6 +323,29 @@ pub struct AppState {
     /// Long-lived render state: the layer stack and its grid buffers, rebuilt
     /// in place on each redraw rather than reconstructed.
     compositor: Compositor,
+    statusline_cache: Option<StatuslineCache>,
+}
+
+struct StatuslineCache {
+    cwd: Option<PathBuf>,
+    formats: Vec<(
+        WinHandle,
+        String,
+        BufHandle,
+        OxStr,
+        u64,
+        bool,
+        usize,
+        bool,
+        usize,
+        i64,
+    )>,
+    rendered: HashMap<WinHandle, String>,
+}
+
+enum StatuslineCachePolicy {
+    Reuse,
+    Refresh,
 }
 
 /// The two independent effects of one queued `nvim__redraw` batch.
@@ -334,14 +357,14 @@ pub struct AppState {
 struct RedrawPlan {
     update_screen: bool,
     flush_ui: bool,
+    refresh_statuslines: bool,
 }
-
 impl RedrawPlan {
     const NORMAL: Self = Self {
         update_screen: true,
         flush_ui: true,
+        refresh_statuslines: false,
     };
-
     fn from_requests(requests: &[RedrawRequest]) -> Self {
         if requests.is_empty() {
             return Self::NORMAL;
@@ -349,9 +372,11 @@ impl RedrawPlan {
         let mut plan = Self {
             update_screen: false,
             flush_ui: false,
+            refresh_statuslines: false,
         };
         for request in requests {
             let statusline_redraw = request.statusline || request.statuscolumn || request.winbar;
+            plan.refresh_statuslines |= statusline_redraw;
             let resolved_flush = request
                 .flush
                 .unwrap_or(request.valid.is_some() || request.range.is_some())
@@ -757,6 +782,7 @@ impl AppState {
             channel_output,
             emitter: Emitter::new(),
             compositor: Compositor::new(1, 1),
+            statusline_cache: None,
         };
         state.run_startup(cli, timer)?;
         // main.c writes startup message output before the process waits on
@@ -1606,6 +1632,102 @@ impl AppState {
         }
         Ok(())
     }
+    fn render_statuslines(&mut self) -> HashMap<WinHandle, String> {
+        self.render_statuslines_with_policy(StatuslineCachePolicy::Reuse)
+    }
+
+    fn refresh_statuslines(&mut self) -> HashMap<WinHandle, String> {
+        self.render_statuslines_with_policy(StatuslineCachePolicy::Refresh)
+    }
+
+    /// Evaluates each active window's effective `'statusline'` before the
+    /// compositor borrows the editor snapshot. This keeps `%` expressions and
+    /// `%!` callbacks on the editor/executor path instead of the pure renderer.
+    fn render_statuslines_with_policy(
+        &mut self,
+        policy: StatuslineCachePolicy,
+    ) -> HashMap<WinHandle, String> {
+        let cwd = std::env::current_dir().ok();
+        let formats = self.session.with_editor(|editor| {
+            let Some(tab) = editor.current_tabpage() else {
+                return Vec::new();
+            };
+            editor
+                .tabpage_windows(tab)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|window| {
+                    let Ok(OptionValue::String(value)) =
+                        editor.options().get_window(window, "statusline")
+                    else {
+                        return None;
+                    };
+                    if value.is_empty() {
+                        return None;
+                    }
+                    let state = editor.window(window).ok()?;
+                    let buffer = editor.buffer(state.buffer).ok()?;
+                    Some((
+                        window,
+                        value.clone(),
+                        state.buffer,
+                        buffer.name().clone(),
+                        buffer.changedtick(),
+                        buffer.flags.contains(ox_editor::BufferFlags::MODIFIED),
+                        state.cursor.lnum,
+                        buffer.flags.contains(ox_editor::BufferFlags::READONLY),
+                        state.cursor.col,
+                        editor.window_epoch(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        });
+        if matches!(policy, StatuslineCachePolicy::Reuse)
+            && let Some(cache) = &self.statusline_cache
+            && cache.cwd == cwd
+            && cache.formats == formats
+        {
+            return cache.rendered.clone();
+        }
+        let Some((_, evaluate)) = self.registry.get("nvim_eval_statusline") else {
+            self.statusline_cache = Some(StatuslineCache {
+                cwd,
+                formats,
+                rendered: HashMap::new(),
+            });
+            return HashMap::new();
+        };
+        let mut rendered = HashMap::with_capacity(formats.len());
+        for entry in &formats {
+            let window = entry.0;
+            let format = &entry.1;
+            let Ok(output) = evaluate(
+                &self.session,
+                &[
+                    Object::String(OxStr::from(format.as_bytes())),
+                    Object::Dict(Dict(vec![(
+                        OxStr::from("winid"),
+                        Object::Integer(i64::from(window)),
+                    )])),
+                ],
+            ) else {
+                continue;
+            };
+            let Object::Dict(output) = output else {
+                continue;
+            };
+            let Some(Object::String(value)) = output.get(&OxStr::from("str")) else {
+                continue;
+            };
+            rendered.insert(window, value.to_string_lossy().into_owned());
+        }
+        self.statusline_cache = Some(StatuslineCache {
+            cwd,
+            formats,
+            rendered: rendered.clone(),
+        });
+        rendered
+    }
 
     fn redraw(&mut self) -> Result<BTreeMap<u64, Vec<u8>>, ApiError> {
         let plan = self.drain_redraws();
@@ -1613,6 +1735,11 @@ impl AppState {
         self.publish_messages()
             .map_err(|error| ApiError::exception(error.to_string()))?;
         if plan.update_screen {
+            let statuslines = if plan.refresh_statuslines {
+                self.refresh_statuslines()
+            } else {
+                self.render_statuslines()
+            };
             let (width, height) = self.session.with_render_state(|ui_channels, _, _| {
                 ui_channels
                     .iter()
@@ -1625,8 +1752,13 @@ impl AppState {
             self.session
                 .with_editor(|editor| {
                     self.session.with_render_state(|_, highlights, _| {
-                        self.compositor
-                            .refresh_from_editor(editor, width, height, highlights)
+                        self.compositor.refresh_from_editor_with_statuslines(
+                            editor,
+                            width,
+                            height,
+                            highlights,
+                            &statuslines,
+                        )
                     })
                 })
                 .map_err(|error| ApiError::exception(error.to_string()))?;
@@ -7213,6 +7345,7 @@ impl Scheduler for LuaScheduler {
                 {
                     sent = guard.job_send(channel, &reply).unwrap_or(false);
                 }
+
                 if !sent {
                     unsent.push((channel, reply));
                 }
@@ -7272,8 +7405,78 @@ impl Scheduler for LuaScheduler {
 mod tests {
     use ox_rpc::decode;
     use ox_types::Funcref;
-
     use super::*;
+
+    #[test]
+    fn rendered_window_statusline_is_replaced_and_cleared_value_restores_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AppState::new(&Cli::default(), &mut StartupTimer::start())?;
+        let window = state.session.with_editor_mut(|editor| {
+            let tab = editor.current_tabpage().ok_or("missing tabpage")?;
+            let current = editor.current_window().ok_or("missing window")?;
+            let buffer = editor.current_buffer().ok_or("missing buffer")?;
+            editor.split_above(tab, current, buffer, true)?;
+            let window = editor.current_window().ok_or("missing split window")?;
+            editor.options_mut().set_window(
+                window,
+                "statusline",
+                OptionValue::String("SET".to_owned()),
+            )?;
+            Ok::<_, Box<dyn std::error::Error>>(window)
+        })?;
+        let statuslines = state.render_statuslines();
+        assert_eq!(statuslines.get(&window).map(String::as_str), Some("SET"));
+        state.session.with_editor(|editor| {
+            state.session.with_render_state(|_, highlights, _| {
+                state.compositor.refresh_from_editor_with_statuslines(
+                    editor,
+                    80,
+                    24,
+                    highlights,
+                    &statuslines,
+                )
+            })
+        })?;
+        let rendered = state
+            .compositor
+            .layers()
+            .iter()
+            .find_map(|layer| (layer.window == Some(window)).then(|| layer.statusline.clone()))
+            .flatten()
+            .ok_or("missing rendered statusline")?;
+        assert!(rendered.0.starts_with("SET"));
+
+        state.session.with_editor_mut(|editor| {
+            editor.options_mut().set_window(
+                window,
+                "statusline",
+                OptionValue::String(String::new()),
+            )
+        })?;
+        let statuslines = state.render_statuslines();
+        assert!(!statuslines.contains_key(&window));
+        state.session.with_editor(|editor| {
+            state.session.with_render_state(|_, highlights, _| {
+                state.compositor.refresh_from_editor_with_statuslines(
+                    editor,
+                    80,
+                    24,
+                    highlights,
+                    &statuslines,
+                )
+            })
+        })?;
+        let restored = state
+            .compositor
+            .layers()
+            .iter()
+            .find_map(|layer| (layer.window == Some(window)).then(|| layer.statusline.clone()))
+            .flatten()
+            .ok_or("missing restored statusline")?;
+        assert!(restored.0.starts_with("[No Name]"));
+        Ok(())
+    }
+
 
     #[test]
     fn multiple_uis_redraw_at_the_shared_minimum_after_resize_and_detach()

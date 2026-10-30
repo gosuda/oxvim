@@ -1,19 +1,19 @@
 //! Server-side grid layering modeled after Neovim's UI compositor.
 
+use std::collections::{BTreeSet, HashMap};
+
 use ox_editor::{
     BufferStateError, Editor, EditorError, Extmark, Geometry, LayoutError, OptionValue,
     extmark::ExtmarkHighlightMode,
+    terminal_screen::{CellFlags, TermColor},
 };
 use ox_text::BufferError;
 use ox_types::{OxStr, WinHandle};
 use thiserror::Error;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use std::collections::BTreeSet;
-
 use crate::grid::{Grid, GridError};
 use crate::hl::{Highlight, HlAttrs, HlError, HlEvent, HlState};
-use ox_editor::terminal_screen::{CellFlags, TermColor};
 
 /// Fixed stacking priority of the message grid.
 pub const MESSAGE_ZINDEX: u32 = 200;
@@ -248,6 +248,34 @@ impl Compositor {
         width: usize,
         height: usize,
         highlights: &mut HlState,
+    ) -> Result<(), CompositorError> {
+        let statuslines = HashMap::new();
+        self.refresh_from_editor_with_statuslines(
+            editor,
+            width,
+            height,
+            highlights,
+            &statuslines,
+        )
+    }
+
+    /// Rebuilds the layer stack using statusline values already rendered by
+    /// the editor server. Expression evaluation belongs to that caller, not
+    /// to this compositor.
+    ///
+    /// # Errors
+    /// As [`Self::refresh_from_editor`].
+    #[expect(
+        clippy::too_many_lines,
+        reason = "window rendering is an order-sensitive pass over editor state"
+    )]
+    pub fn refresh_from_editor_with_statuslines(
+        &mut self,
+        editor: &Editor,
+        width: usize,
+        height: usize,
+        highlights: &mut HlState,
+        statuslines: &HashMap<WinHandle, String>,
     ) -> Result<(), CompositorError> {
         let tab_handle = editor
             .current_tabpage()
@@ -673,20 +701,22 @@ impl Compositor {
             layer.window = Some(window);
             layer.watched_extmarks = watched_extmarks;
             if !is_float && tiled_split {
-                let name = if buffer_state.name().as_bytes().is_empty() {
-                    "[No Name]".to_owned()
-                } else {
-                    String::from_utf8_lossy(buffer_state.name().as_bytes()).into_owned()
-                };
-                let modified = if buffer_state
-                    .flags
-                    .contains(ox_editor::BufferFlags::MODIFIED)
-                {
-                    " [+]"
-                } else {
-                    ""
-                };
-                let mut statusline = format!("{name}{modified}");
+                let mut statusline = statuslines.get(&window).cloned().unwrap_or_else(|| {
+                    let name = if buffer_state.name().as_bytes().is_empty() {
+                        "[No Name]".to_owned()
+                    } else {
+                        String::from_utf8_lossy(buffer_state.name().as_bytes()).into_owned()
+                    };
+                    let modified = if buffer_state
+                        .flags
+                        .contains(ox_editor::BufferFlags::MODIFIED)
+                    {
+                        " [+]"
+                    } else {
+                        ""
+                    };
+                    format!("{name}{modified}")
+                });
                 statusline.extend(std::iter::repeat_n(
                     ' ',
                     geometry.width.saturating_sub(statusline.len()),

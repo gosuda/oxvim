@@ -1098,6 +1098,13 @@ impl Editor {
         self.windows.keys().copied().collect()
     }
 
+    /// Returns the next window handle, which advances whenever a window is
+    /// allocated and therefore identifies layout mutations across redraws.
+    #[must_use]
+    pub const fn window_epoch(&self) -> i64 {
+        self.next_window
+    }
+
     /// Returns live tabpage handles in tab order.
     #[must_use]
     pub fn tabpages(&self) -> Vec<TabHandle> {
