@@ -1241,13 +1241,21 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
         }
         let mapping = machine.borrow_mut().take_mapping_action();
         if let Some((action, options)) = mapping {
-            if let crate::mode::Mode::Normal(state) = &mut machine.borrow_mut().mode {
-                state.count = 0;
+            // A callback/command mapping consumes the typed count itself.
+            // Key-producing mappings keep it pending so it prefixes the
+            // replacement keys (for example, `2<F4>` with `3w` becomes `23w`).
+            let consumes_count = matches!(
+                action,
+                MappingAction::Callback(_)
+                    | MappingAction::ExCommands { .. }
+                    | MappingAction::Nop
+            );
+            if consumes_count {
+                if let crate::mode::Mode::Normal(state) = &mut machine.borrow_mut().mode {
+                    state.count = 0;
+                }
             }
             let flow = run_mapping_action(runtime, access, scope, lua, action, &options);
-            if let crate::mode::Mode::Normal(state) = &mut machine.borrow_mut().mode {
-                state.count = 0;
-            }
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
