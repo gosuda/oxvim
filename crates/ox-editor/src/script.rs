@@ -1007,13 +1007,6 @@ impl<F: FileIO> ScriptCtx<F> {
     pub fn allocate_sid(&mut self, name: &str) -> Sid {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.saturating_add(1);
-        if let Ok(path) = std::env::var("OXVIM_LOG_ALLOC_SID") {
-            use std::io::Write;
-            let bt = std::backtrace::Backtrace::force_capture();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = writeln!(f, "ALLOC SID {sid} for {name:?}\n{bt}");
-            }
-        }
         self.scripts.insert(
             sid,
             ScriptInfo {
