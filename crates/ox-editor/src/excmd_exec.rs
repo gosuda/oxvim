@@ -9366,6 +9366,39 @@ fn set_current_buffer_for_edit(
     Ok(())
 }
 
+/// Determines the buffer release policy when switching away from an old buffer
+/// during `:edit`, honoring `'bufhidden'`, global `'hidden'`, and `:hide` modifier
+/// (`buf_hide`, `buffer.c:4120-4133`).
+fn buffer_release_for_edit(
+    editor: &Editor,
+    old: Option<BufHandle>,
+    command: &ExCommand,
+) -> BufferRelease {
+    let Some(old) = old else {
+        return BufferRelease::KeepLoaded;
+    };
+    if let Ok(OptionValue::String(value)) = editor.options().get_buffer(old, "bufhidden") {
+        match value.as_str() {
+            "hide" => return BufferRelease::KeepLoaded,
+            "unload" | "delete" | "wipe" => return BufferRelease::Unload,
+            _ => {}
+        }
+    }
+    let hide = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::Hide);
+    let hidden = matches!(
+        editor.options().get_global("hidden"),
+        Ok(OptionValue::Boolean(true))
+    ) || hide;
+    if hidden {
+        BufferRelease::KeepLoaded
+    } else {
+        BufferRelease::Unload
+    }
+}
+
 fn command_edit<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -9479,8 +9512,8 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             .buffer(handle)
             .is_ok_and(|state| state.residency.is_loaded())
     });
+    let old = access.with_ex_editor(|editor| editor.current_buffer());
     let outcome = if unloaded {
-        let old = access.with_ex_editor(|editor| editor.current_buffer());
         let old_window = access.with_ex_editor(|editor| editor.current_window());
         let old_alternate = old_window.and_then(|window| {
             access.with_ex_editor(|editor| {
@@ -9502,10 +9535,11 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             |_runtime| {
                 if has_window {
                     access.with_ex_editor(|editor| {
+                        let release = buffer_release_for_edit(editor, editor.current_buffer(), command);
                         set_current_buffer_for_edit(
                             editor,
                             handle,
-                            BufferRelease::KeepLoaded,
+                            release,
                             keepalt,
                         )
                         .map_err(LoadSwitchError::Editor)
@@ -9562,10 +9596,11 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     } else if matches!(outcome, LoadSwitchOutcome::Resident)
         && let Err(error) = access
             .with_ex_editor(|editor| {
+                let release = buffer_release_for_edit(editor, editor.current_buffer(), command);
                 set_current_buffer_for_edit(
                     editor,
                     handle,
-                    BufferRelease::KeepLoaded,
+                    release,
                     keepalt,
                 )
             })

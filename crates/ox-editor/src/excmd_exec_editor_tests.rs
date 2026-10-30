@@ -379,6 +379,47 @@ fn edit_updates_alternate_buffer_without_keepalt() {
     );
 }
 
+/// Abandoning a buffer during `:edit` respects `'hidden'` and `'bufhidden'`
+/// (`do_ecmd` -> `close_buffer`, `buffer.c:4120-4133`).
+#[test]
+fn edit_abandoned_buffer_follows_hidden_and_bufhidden() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+    executor.scripts().io().insert("third.txt", "third");
+
+    // Default 'hidden' is true: leaving first.txt retains it loaded in the background.
+    executor.execute_line(&editor, "set hidden").unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(first).unwrap().residency.is_loaded());
+
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+    assert!(editor.editor().buffer(first).unwrap().residency.is_loaded());
+
+    // With 'nohidden': leaving second.txt unloads it when abandoned.
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(second).unwrap().residency.is_loaded());
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert!(!editor.editor().buffer(second).unwrap().residency.is_loaded());
+
+    // 'bufhidden=hide' keeps the buffer loaded even with 'nohidden'.
+    let third = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(
+            third,
+            "bufhidden",
+            crate::OptionValue::String("hide".into()),
+        )
+        .unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    assert!(editor.editor().buffer(third).unwrap().residency.is_loaded());
+}
+
 #[test]
 fn edit_decodes_sentinel_newline_in_filename() {
     let (editor, mut executor) = setup();
