@@ -9,6 +9,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+use ox_eval::builtins::number_arg;
 use ox_eval::{EvalError, builtin_spec};
 use ox_types::{OxStr, Typval};
 
@@ -964,14 +965,6 @@ fn value_bytes(value: &Typval) -> ox_eval::Result<Vec<u8>> {
         _ => Err(EvalError::new("E745", 0, "Using a non-String as a String")),
     }
 }
-fn number_arg(value: &Typval) -> ox_eval::Result<i64> {
-    match value {
-        Typval::Number(value) => Ok(*value),
-        Typval::Bool(value) => Ok(i64::from(*value)),
-        _ => Err(EvalError::new("E745", 0, "Using a non-Number as a Number")),
-    }
-}
-
 fn bool_arg(value: &Typval) -> ox_eval::Result<bool> {
     number_arg(value).map(|value| value != 0)
 }

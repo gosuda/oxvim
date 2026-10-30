@@ -13667,6 +13667,55 @@ fn browse_modifier_without_file_opens_current_directory() {
     assert_eq!(name, expected);
 }
 
+/// `f_mkdir` reads its mode through `tv_get_number`, which coerces a string:
+/// `vim.fs.mkdir` passes `tostring(opts.mode or 493)`
+/// (`runtime/lua/vim/fs.lua:941`). A string mode must therefore create the
+/// directory, and a Float mode must still raise E805. This runs against the real
+/// filesystem so the assertion is the created directory, not a stub's reply.
+#[test]
+fn mkdir_coerces_a_string_mode_and_rejects_a_float_mode() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(editor);
+    let mut executor = ExExecutor::with_io(crate::script::RealFileIO);
+    let root = std::env::temp_dir().join(format!("oxvim-mkdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let nested = root.join("nested");
+    executor
+        .execute_script(
+            &editor,
+            "mkdir.vim",
+            &format!(
+                "let g:made = mkdir('{}', 'p', '493')\n",
+                nested.display()
+            ),
+        )
+        .unwrap();
+    assert!(
+        nested.is_dir(),
+        "a string mode creates the directory: {}",
+        nested.display()
+    );
+    let rejected = executor
+        .execute_script(
+            &editor,
+            "mkdir_float.vim",
+            &format!(
+                "let g:made = mkdir('{}', 'p', 1.5)\n",
+                root.join("float").display()
+            ),
+        )
+        .expect_err("a Float mode is rejected");
+    assert!(
+        format!("{rejected:?}").contains("E805"),
+        "a Float mode still raises E805: {rejected:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn call_with_trailing_comment_containing_parentheses() {
     let (editor, mut executor) = setup();
