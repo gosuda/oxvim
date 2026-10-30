@@ -6919,10 +6919,7 @@ fn command_messages(editor: &mut Editor) -> Flow {
         .messages()
         .iter()
         .filter(|message| message.history)
-        .filter_map(|message| match &message.content {
-            Object::String(text) => Some(text.to_string_lossy().into_owned()),
-            _ => None,
-        })
+        .filter_map(Message::text_lossy)
         .collect::<Vec<_>>()
         .join("\n");
     let output = if history.contains('\n') {
@@ -7748,7 +7745,7 @@ fn capture_command_messages<F: FileIO>(
             .min(editor.messages().len());
         let mut chunk = String::new();
         for (index, message) in editor.messages()[start..].iter().enumerate() {
-            let Object::String(text) = &message.content else {
+            let Some(text) = message.text_lossy() else {
                 continue;
             };
             if (!redirection.output.is_empty() || !chunk.is_empty())
@@ -7756,7 +7753,7 @@ fn capture_command_messages<F: FileIO>(
             {
                 chunk.push('\n');
             }
-            chunk.push_str(&text.to_string_lossy());
+            chunk.push_str(&text);
         }
         redirection.output.push_str(&chunk);
         redirection.seen_messages = editor.messages().len();

@@ -141,6 +141,35 @@ pub struct Message {
     pub leading_newline: bool,
 }
 
+impl Message {
+    /// Returns the text content of this message, whether stored as a plain
+    /// string or as an array of `nvim_echo` highlight chunks.
+    #[must_use]
+    pub fn text_lossy(&self) -> Option<String> {
+        match &self.content {
+            Object::String(text) => Some(text.to_string_lossy().into_owned()),
+            Object::Array(chunks) => {
+                let mut out = String::new();
+                for chunk in chunks {
+                    match chunk {
+                        Object::Array(pair) => {
+                            if let Some(Object::String(text)) = pair.first() {
+                                out.push_str(&text.to_string_lossy());
+                            }
+                        }
+                        Object::String(text) => {
+                            out.push_str(&text.to_string_lossy());
+                        }
+                        _ => {}
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// `nvim_echo` identity retained parallel to the message sink: the
 /// `ui-messages` kind the call emits and the message id it returned
 /// (`runtime/doc/api.txt:707-710`). Ids share one address space — an
@@ -2882,10 +2911,10 @@ impl Editor {
     /// with the sink decision that applies to it.
     pub fn push_message(&mut self, message: Message) {
         if message.kind == MessageKind::Error
-            && let Object::String(text) = &message.content
+            && let Some(text) = message.text_lossy()
         {
             self.vvars_mut()
-                .insert(OxStr::from("errmsg"), Object::String(text.clone()));
+                .insert(OxStr::from("errmsg"), Object::String(OxStr::from(text.as_str())));
         }
         let kind = message.kind;
         let destination = self.message_destination();
