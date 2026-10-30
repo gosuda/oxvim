@@ -1814,6 +1814,13 @@ fn install_aux(
     clippy::too_many_lines,
     reason = "binds the vim.uv surface as one unit: every registration closure shares the loop access, scheduler, and fast-callback context, so splitting would thread a five-field bundle through artificial helpers"
 )]
+#[cfg_attr(
+    not(unix),
+    expect(
+        unused_variables,
+        reason = "every pipe_registry consumer is #[cfg(unix)]"
+    )
+)]
 pub(crate) fn install(
     lua: &Lua,
     uv: &Table,

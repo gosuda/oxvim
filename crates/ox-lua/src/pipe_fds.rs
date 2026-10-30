@@ -23,14 +23,21 @@
 //! the same time.
 
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::rc::Rc;
 
 /// Numbers one Lua host owns, and numbers that moved into a child slot.
+/// Both kinds only exist where `uv.pipe`, `pipe:open` and `uv.spawn`'s stdio
+/// path run — all `#[cfg(unix)]` — so on other platforms the registry is
+/// empty by construction and `fs_close`'s consult always reports `EBADF`.
 #[derive(Default)]
 pub(crate) struct Registry {
+    #[cfg(unix)]
     owned: HashMap<i32, OwnedFd>,
+    #[cfg(unix)]
     awaiting_close: HashSet<i32>,
 }
 
@@ -44,6 +51,7 @@ impl Registry {
     }
 
     /// Stores both halves of a fresh pair and answers their numbers.
+    #[cfg(unix)]
     pub(crate) fn register_pair(&mut self, reader: OwnedFd, writer: OwnedFd) -> (i64, i64) {
         let read = reader.as_raw_fd();
         let write = writer.as_raw_fd();
@@ -57,6 +65,7 @@ impl Registry {
     }
 
     /// Takes a stored descriptor out, for a handle or a child slot to own.
+    #[cfg(unix)]
     pub(crate) fn take(&mut self, descriptor: i32) -> Option<OwnedFd> {
         self.awaiting_close.remove(&descriptor);
         self.owned.remove(&descriptor)
@@ -64,6 +73,7 @@ impl Registry {
 
     /// Records that `descriptor` moved into a child slot, so the close Lua
     /// owes it answers success exactly once.
+    #[cfg(unix)]
     pub(crate) fn mark_spawned(&mut self, descriptor: i32) {
         self.awaiting_close.insert(descriptor);
     }
@@ -73,12 +83,20 @@ impl Registry {
     /// A live entry is dropped, which closes it, and a spawned entry is
     /// retired; both count as a successful close. Anything else is not ours,
     /// and the caller keeps its existing `EBADF`.
+    #[cfg(unix)]
     pub(crate) fn close(&mut self, descriptor: i32) -> bool {
         let live = self.owned.remove(&descriptor);
         // Drop any marker for the same number either way: a reused number
         // must not keep a stale success path.
         self.awaiting_close.remove(&descriptor);
         live.is_some()
+    }
+
+    /// No number can be one of this host's pipe halves here: the pipe
+    /// constructors are `#[cfg(unix)]`, so `fs_close` keeps its `EBADF`.
+    #[cfg(not(unix))]
+    pub(crate) fn close(&mut self, _descriptor: i32) -> bool {
+        false
     }
 }
 
