@@ -1459,3 +1459,19 @@ The last case, `reloads directory buffers`, needs `:syntax list <group>` to
 answer for a group that `runtime/syntax/directory.vim` defines. The port has no
 syntax loader, no group registry, and `:syntax` accepts only `on`/`off`, so this
 is a subsystem, not a command.
+
+
+### `dir_spec`: 38 of 38
+
+`:syntax` now has a real core: dispatch for `on`, `off`, `enable`, `clear`,
+`list`, `match`, `keyword`, and `region`; a per-buffer group registry; the
+reference's `list` layout; and loading of `$VIMRUNTIME/syntax/<ft>.vim` when a
+buffer's `'syntax'` is set. Highlight attributes are not implemented, and nothing
+is coloured.
+
+One change was made and reverted with evidence: the loader's
+`filetype=directory` assignment is not in upstream (verified with `-u NONE`,
+where the reference leaves the option empty and the port now matched), but
+removing it cost three `dir_spec` cases because the bundled plugin needs the
+option set before its own `FileType` handling runs. The revert is `1f92945`'s
+inverse; the divergence and its cause are recorded here rather than dropped.
