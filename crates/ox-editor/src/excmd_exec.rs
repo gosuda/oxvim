@@ -9333,7 +9333,16 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     if path.as_os_str().is_empty() {
         return error_flow(runtime, "E32", "No file name");
     }
-    if let Some(current) = access.with_ex_editor(|editor| editor.current_buffer())
+    let target_is_directory = !reload_current && is_directory_path(runtime, &path);
+    let modified_directory_allowed = target_is_directory
+        && access.with_ex_editor(|editor| {
+            editor
+                .current_buffer()
+                .and_then(|buffer| editor.buffer(buffer).ok())
+                .is_some_and(|buffer| buffer.name().as_bytes().is_empty())
+        });
+    if !modified_directory_allowed
+        && let Some(current) = access.with_ex_editor(|editor| editor.current_buffer())
         && access.with_ex_editor(|editor| {
             !editor.is_terminal_buffer(current)
                 && editor
@@ -9348,7 +9357,10 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             "No write since last change (add ! to override)",
         );
     }
-    if !reload_current && let Some(flow) = edit_winfixbuf_guard(runtime, access, command) {
+    if !reload_current
+        && !target_is_directory
+        && let Some(flow) = edit_winfixbuf_guard(runtime, access, command)
+    {
         return flow;
     }
     if reload_current {

@@ -64,7 +64,12 @@ end
 ---@param entry nvim.dir.Entry
 local function select_entry(entry)
   local line = entry_line(entry)
-  vim.fn.search([[\C\m^\V]] .. vim.fn.escape(line, [[\]]) .. [[\m$]], 'cw')
+  for index, candidate in ipairs(api.nvim_buf_get_lines(0, 0, -1, false)) do
+    if candidate == line then
+      api.nvim_win_set_cursor(0, { index, 0 })
+      return
+    end
+  end
 end
 
 ---@param buf integer
