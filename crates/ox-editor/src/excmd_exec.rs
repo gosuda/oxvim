@@ -5099,14 +5099,87 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
         }
     }
 
-    /// Calls one `nvim_*` API function through the installed Lua host, the
-    /// same way a `function('nvim_…')` reaches upstream's C dispatch.
+    /// Dispatches an `nvim_*` API function called from Vimscript. Direct
+    /// variable and expression evaluation fast paths operate on the active
+    /// execution scope to preserve container identity; other API calls route
+    /// through the installed Lua host the way `function('nvim_…')` does.
     fn api_call(
         &mut self,
         name: &str,
         args: &[Typval],
         scope: &mut Scope,
     ) -> ox_eval::Result<Typval> {
+        if name == "nvim_eval" && args.len() == 1 {
+            let Typval::String(expr) = &args[0] else {
+                return Err(EvalError::new(
+                    "E1174",
+                    0,
+                    "String required for argument 1",
+                ));
+            };
+            let expr = expr.to_string_lossy();
+            self.runtime.try_depth += 1;
+            let result = eval_text(
+                self.runtime,
+                self.access,
+                scope,
+                self.lua,
+                &expr,
+            );
+            self.runtime.try_depth -= 1;
+            self.access
+                .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
+                .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
+            return result.map_err(|flow| flow_to_eval_error(flow, "nvim_eval"));
+        }
+        if name == "nvim_set_var" && args.len() == 2 {
+            let Typval::String(var_name) = &args[0] else {
+                return Err(EvalError::new(
+                    "E1174",
+                    0,
+                    "String required for argument 1",
+                ));
+            };
+            let old = scope
+                .get_scoped(ScopeKind::Global, var_name.as_bytes(), 0)
+                .ok()
+                .cloned();
+            let value =
+                ox_eval::scope::snapshot_value(&args[1]).unwrap_or_else(|_| args[1].clone());
+            scope.set_scoped(
+                ScopeKind::Global,
+                var_name.as_bytes(),
+                0,
+                value.clone(),
+            )?;
+            push_scope_watch_event(
+                self.runtime,
+                ScopeKind::Global,
+                var_name.as_bytes(),
+                old,
+                Some(value),
+            );
+            self.access
+                .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
+                .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
+            drain_dict_watchers(self.runtime, self.access, scope, self.lua);
+            self.access
+                .with_ex_editor(|editor| sync_scope_into_editor(editor, scope))
+                .map_err(|error| EvalError::new("E5108", 0, error.to_string()))?;
+            return Ok(Typval::Special(Special::Null));
+        }
+        if name == "nvim_get_var" && args.len() == 1 {
+            let Typval::String(var_name) = &args[0] else {
+                return Err(EvalError::new(
+                    "E1174",
+                    0,
+                    "String required for argument 1",
+                ));
+            };
+            return scope
+                .get_scoped(ScopeKind::Global, var_name.as_bytes(), 0)
+                .cloned();
+        }
         let Some(lua) = self.lua else {
             return Err(EvalError::new(
                 "E117",
@@ -24804,7 +24877,8 @@ fn refresh_scope_mirror_map(
         .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
     {
         match slots.get(key.as_bytes()).copied() {
-            Some(index) if mirror[index].1 == *value => {}
+            Some(index)
+                if typval_matches_object(&mirror[index].1, &typval_to_object(value)) => {}
             Some(index) => {
                 mirror[index].1 = ox_eval::scope::snapshot_value(value).map_err(ExecError::Eval)?;
             }
@@ -24854,7 +24928,7 @@ fn merge_scope_map_into_editor(
         .filter(|(key, _)| mirrored_key(kind, key.as_bytes()))
     {
         let changed = match baseline.get(key.as_bytes()) {
-            Some(previous) => **previous != *value,
+            Some(previous) => !typval_matches_object(previous, &typval_to_object(value)),
             None => true,
         };
         if changed {
@@ -24995,8 +25069,9 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     // its dirty flag is cleared; a scope-side write sets it again.
     let global_version = editor.gvars_version();
     if scope.synced.get(ScopeKind::Global) != global_version {
-        scope.global = dict_to_scope(editor.gvars());
-        refresh_scope_mirror(scope, ScopeKind::Global)?;
+        let live = editor.gvars();
+        let mut mirror = scope.global_mirror.borrow_mut();
+        pull_scope_map_from_editor(live, &mut scope.global, &mut mirror, ScopeKind::Global)?;
         scope.synced.set(ScopeKind::Global, global_version);
         scope.synced.clear_dirty(ScopeKind::Global);
     }
@@ -25006,12 +25081,11 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
             .window_variables_version(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
         if scope.synced.get(ScopeKind::Window) != window_version {
-            scope.window = dict_to_scope(
-                editor
-                    .window_variables(window)
-                    .map_err(|error| ExecError::Editor(error.to_string()))?,
-            );
-            refresh_scope_mirror(scope, ScopeKind::Window)?;
+            let live = editor
+                .window_variables(window)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(live, &mut scope.window, &mut mirror, ScopeKind::Window)?;
             scope.synced.set(ScopeKind::Window, window_version);
             scope.synced.clear_dirty(ScopeKind::Window);
         }
@@ -25021,12 +25095,11 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
             .tabpage_variables_version(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
         if scope.synced.get(ScopeKind::Tab) != tab_version {
-            scope.tab = dict_to_scope(
-                editor
-                    .tabpage_variables(tab)
-                    .map_err(|error| ExecError::Editor(error.to_string()))?,
-            );
-            refresh_scope_mirror(scope, ScopeKind::Tab)?;
+            let live = editor
+                .tabpage_variables(tab)
+                .map_err(|error| ExecError::Editor(error.to_string()))?;
+            let mut mirror = scope.global_mirror.borrow_mut();
+            pull_scope_map_from_editor(live, &mut scope.tab, &mut mirror, ScopeKind::Tab)?;
             scope.synced.set(ScopeKind::Tab, tab_version);
             scope.synced.clear_dirty(ScopeKind::Tab);
         }
@@ -27408,9 +27481,23 @@ pub(crate) fn object_to_typval(value: &Object) -> Typval {
 // Compare in Object space without allocating the converted container tree.
 // Blob/List and Funcref/Dict are intentionally not Typval-space equivalents.
 fn typval_matches_object(value: &Typval, object: &Object) -> bool {
+    typval_matches_object_inner(value, object, &mut Vec::new())
+}
+
+fn typval_matches_object_inner(
+    value: &Typval,
+    object: &Object,
+    seen: &mut Vec<(u8, *const ())>,
+) -> bool {
     match (value, object) {
         (Typval::List(list), object) => {
-            list.try_borrow()
+            let identity = (0u8, Rc::as_ptr(list).cast());
+            if seen.contains(&identity) {
+                return matches!(object, Object::Nil);
+            }
+            seen.push(identity);
+            let matched = list
+                .try_borrow()
                 .map_or(matches!(object, Object::Nil), |data| match object {
                     Object::Array(items) => {
                         data.items.len() == items.len()
@@ -27418,22 +27505,32 @@ fn typval_matches_object(value: &Typval, object: &Object) -> bool {
                                 .items
                                 .iter()
                                 .zip(items)
-                                .all(|(a, b)| typval_matches_object(a, b))
+                                .all(|(a, b)| typval_matches_object_inner(a, b, seen))
                     }
                     _ => false,
-                })
+                });
+            seen.pop();
+            matched
         }
         (Typval::Dict(dict), object) => {
-            dict.try_borrow()
+            let identity = (1u8, Rc::as_ptr(dict).cast());
+            if seen.contains(&identity) {
+                return matches!(object, Object::Nil);
+            }
+            seen.push(identity);
+            let matched = dict
+                .try_borrow()
                 .map_or(matches!(object, Object::Nil), |data| match object {
                     Object::Dict(items) => {
                         data.entries.len() == items.0.len()
                             && data.entries.iter().zip(&items.0).all(|(a, (key, b))| {
-                                a.key == *key && typval_matches_object(&a.value, b)
+                                a.key == *key && typval_matches_object_inner(&a.value, b, seen)
                             })
                     }
                     _ => false,
-                })
+                });
+            seen.pop();
+            matched
         }
         (Typval::Blob(bytes), Object::Array(items)) => {
             bytes.len() == items.len()
@@ -27471,7 +27568,7 @@ fn typval_matches_object(value: &Typval, object: &Object) -> bool {
                                     .args
                                     .iter()
                                     .zip(items)
-                                    .all(|(a, b)| typval_matches_object(a, b))
+                                    .all(|(a, b)| typval_matches_object_inner(a, b, seen))
                     )
                 })
         }

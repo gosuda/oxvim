@@ -13977,3 +13977,60 @@ fn single_quoted_doubled_quote_unquotes_in_assignment() {
         Some(ox_types::Typval::String(ox_types::OxStr::from("it's")))
     );
 }
+
+#[test]
+fn api_set_container_retains_self_reference_after_eval_append() {
+    let (editor, mut executor) = setup();
+    executor
+        .set_global_var(
+            &editor,
+            &ox_types::OxStr::from("l"),
+            ox_types::Object::Array(vec![]),
+        )
+        .unwrap();
+    executor
+        .evaluate_expression(&editor, "add(l, l)")
+        .unwrap();
+    let val = executor.evaluate_expression(&editor, "l").unwrap();
+    let ox_types::Typval::List(l) = &val else {
+        panic!("expected List, got {val:?}");
+    };
+    let item0 = l.borrow().items[0].clone();
+    let ox_types::Typval::List(inner) = &item0 else {
+        panic!("expected inner item to be List, got {item0:?}");
+    };
+    assert!(
+        std::rc::Rc::ptr_eq(l, inner),
+        "item 0 must reference the list itself"
+    );
+
+    executor
+        .set_global_var(
+            &editor,
+            &ox_types::OxStr::from("d"),
+            ox_types::Object::Dict(ox_types::Dict(Vec::new())),
+        )
+        .unwrap();
+    executor
+        .evaluate_expression(&editor, "extend(d, {'d': d})")
+        .unwrap();
+    let d_val = executor.evaluate_expression(&editor, "d").unwrap();
+    let ox_types::Typval::Dict(d) = &d_val else {
+        panic!("expected Dict, got {d_val:?}");
+    };
+    let d_inner = d
+        .borrow()
+        .entries
+        .iter()
+        .find(|e| e.key.as_bytes() == b"d")
+        .unwrap()
+        .value
+        .clone();
+    let ox_types::Typval::Dict(inner_dict) = &d_inner else {
+        panic!("expected inner entry to be Dict, got {d_inner:?}");
+    };
+    assert!(
+        std::rc::Rc::ptr_eq(d, inner_dict),
+        "entry 'd' must reference the dict itself"
+    );
+}
