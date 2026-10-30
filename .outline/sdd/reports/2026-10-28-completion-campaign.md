@@ -1418,3 +1418,16 @@ Three remain:
 - `does not shadow startup plugin mappings` expects zero and gets one.
 - `reloads directory buffers` needs `:syntax list` and a group a syntax file defines; the port has no syntax loader, so this is a subsystem.
 - `coexists with netrw` now gets past the autoload's init section and dies in `netrw#Explore` at `E171: Missing :endif`.
+
+
+### `dir_spec`: 36 of 38
+
+| Commit | Change | Cases |
+|---|---|---|
+| `8978060` | `:unlet` ends at a bar, so `if ... \| unlet ... \| endif` closes | netrw `E171` |
+| `708dbb7` | `mapcheck` answers a callback mapping's function reference (`mapping.c:2233-2245`); `runtime/lua/nvim/dir.lua` back to upstream text | startup mapping precedence |
+
+Two remain:
+
+- `reloads directory buffers` calls `syntax list directoryDirectory`, so it needs a syntax registry populated by `runtime/syntax/directory.vim`, plus a loader that sources syntax files. The port has none; `:syntax` accepts only `on`/`off`.
+- `coexists with netrw and can be disabled` now reaches its second assertion: after `:Explore .`, the buffer reports `filetype=directory` where the reference reports `netrw`, so a second setter overrides netrw's.
