@@ -607,15 +607,7 @@ fn bind_function_arguments(mut function: Funcref, args: &[Typval]) -> ox_eval::R
                 );
             }
             Typval::Dict(reference) if args.len() == 1 => {
-                dictionary = Some(
-                    reference
-                        .try_borrow()
-                        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.key.clone(), entry.value.clone()))
-                        .collect(),
-                );
+                dictionary = Some(reference.clone());
             }
             _ => {
                 return Err(EvalError::new(
@@ -630,15 +622,7 @@ fn bind_function_arguments(mut function: Funcref, args: &[Typval]) -> ox_eval::R
         let Typval::Dict(reference) = third else {
             return Err(EvalError::new("E922", 0, "Expected a dict"));
         };
-        dictionary = Some(
-            reference
-                .try_borrow()
-                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                .entries
-                .iter()
-                .map(|entry| (entry.key.clone(), entry.value.clone()))
-                .collect(),
-        );
+        dictionary = Some(reference.clone());
     }
     if let Some(mut values) = bound {
         function.args.append(&mut values);

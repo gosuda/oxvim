@@ -3897,7 +3897,7 @@ fn recursive_containers_have_finite_display_text() {
 
     assert_eq!(
         crate::excmd_exec::typval_to_text(&dictionary),
-        "{'self': {...}}"
+        "{'self': {...@0}}"
     );
 
     let reversed = Typval::dict(vec![

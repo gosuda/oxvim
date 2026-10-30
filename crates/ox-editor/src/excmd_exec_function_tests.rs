@@ -2871,9 +2871,10 @@ fn function_builtin_constructs_named_and_bound_references() {
         panic!("expected bound Partial")
     };
     assert_eq!(bound.args, vec![Typval::Number(1)]);
-    assert!(
-        matches!(bound.dict.as_deref(), Some([(key, Typval::Number(42))]) if key == &OxStr::from("answer"))
-    );
+    let dict = bound.dict.as_ref().unwrap().borrow();
+    assert_eq!(dict.entries.len(), 1);
+    assert_eq!(dict.entries[0].key, OxStr::from("answer"));
+    assert_eq!(dict.entries[0].value, Typval::Number(42));
 }
 
 #[test]

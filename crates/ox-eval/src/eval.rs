@@ -1189,16 +1189,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     bound.append(&mut args);
                     args = bound;
                 }
-                let receiver = funcref.dict.as_ref().map(|entries| {
-                    let entries = entries
-                        .iter()
-                        .map(|(key, value)| ox_types::DictEntry::new(key.clone(), value.clone()))
-                        .collect();
-                    match Typval::dict_with_entries(entries) {
-                        Typval::Dict(reference) => reference,
-                        _ => unreachable!("a dictionary typval always holds a reference"),
-                    }
-                });
+                let receiver = funcref.dict.clone();
                 if receiver.is_some() {
                     self.host.set_call_receiver(receiver);
                 }

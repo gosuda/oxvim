@@ -216,16 +216,31 @@ pub type DictRef = Rc<RefCell<DictData>>;
 
 /// A function reference — plain named function or registered closure.
 /// Named function or registered closure reference.
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Funcref {
     /// Function name.
     pub name: OxStr,
     /// Bound arguments.
     pub args: Vec<Typval>,
     /// Optional bound self dictionary.
-    pub dict: Option<Vec<(OxStr, Typval)>>,
+    pub dict: Option<DictRef>,
     /// Closure registry identity, for lambdas.
     pub registry: Option<usize>,
+}
+
+impl PartialEq for Funcref {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.args == other.args
+            && match (&self.dict, &other.dict) {
+                (Some(a), Some(b)) => {
+                    Rc::ptr_eq(a, b) || Typval::Dict(a.clone()) == Typval::Dict(b.clone())
+                }
+                (None, None) => true,
+                _ => false,
+            }
+            && self.registry == other.registry
+    }
 }
 
 /// A Vimscript value (`typval_T`).
@@ -406,16 +421,24 @@ fn normalize_float_exponent(exponent: &str) -> String {
     format!("{sign}{digits}")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConvStackFrame {
+    Dict(*const ()),
+    List(*const ()),
+    Partial,
+    PartialList,
+}
+
 impl Typval {
-    /// `:echo` spelling of this value: top-level strings render raw, nested
-    /// strings render single-quoted, matching `typval_to_display(value,
-    /// false)` in `excmd_exec.rs`. Container cycles render as `[...]`/`{...}`
-    /// instead of recursing forever.
+    /// `:echo` spelling of this value: top-level strings and funcrefs render raw,
+    /// nested strings and funcrefs render quoted, matching `encode_tv2echo` / `encode_vim_to_echo`
+    /// in `encode.c`. Container cycles render as `[...@N]`/`{...@N}` mirroring
+    /// `TYPVAL_ENCODE_CONV_RECURSE`.
     fn fmt_echo(
         &self,
         formatter: &mut fmt::Formatter<'_>,
         quoted_strings: bool,
-        seen: &mut Vec<(u8, *const ())>,
+        stack: &mut Vec<ConvStackFrame>,
     ) -> fmt::Result {
         match self {
             Self::Number(value) => write!(formatter, "{value}"),
@@ -437,37 +460,45 @@ impl Typval {
                 Ok(())
             }
             Self::List(list) => {
-                let identity = (VAR_LIST, Rc::as_ptr(list).cast::<()>());
-                if seen.contains(&identity) {
-                    return formatter.write_str("[...]");
-                }
                 let items = list
                     .try_borrow()
                     .map_err(|_| fmt::Error)?
                     .items
                     .clone();
-                seen.push(identity);
+                // Empty lists dump immediately without cycle tracking (typval_encode.c.h:375).
+                if items.is_empty() {
+                    return formatter.write_str("[]");
+                }
+                let ptr = Rc::as_ptr(list).cast::<()>();
+                if let Some(backref) = stack.iter().position(|f| *f == ConvStackFrame::List(ptr)) {
+                    return write!(formatter, "[...@{backref}]");
+                }
+                stack.push(ConvStackFrame::List(ptr));
                 formatter.write_str("[")?;
                 for (index, item) in items.iter().enumerate() {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    item.fmt_echo(formatter, true, seen)?;
+                    item.fmt_echo(formatter, true, stack)?;
                 }
-                seen.pop();
+                stack.pop();
                 formatter.write_str("]")
             }
             Self::Dict(dict) => {
-                let identity = (VAR_DICT, Rc::as_ptr(dict).cast::<()>());
-                if seen.contains(&identity) {
-                    return formatter.write_str("{...}");
-                }
                 let entries = dict
                     .try_borrow()
                     .map_err(|_| fmt::Error)?
                     .entries
                     .clone();
-                seen.push(identity);
+                // Empty dictionaries dump immediately without cycle tracking (typval_encode.c.h:414).
+                if entries.is_empty() {
+                    return formatter.write_str("{}");
+                }
+                let ptr = Rc::as_ptr(dict).cast::<()>();
+                if let Some(backref) = stack.iter().position(|f| *f == ConvStackFrame::Dict(ptr)) {
+                    return write!(formatter, "{{...@{backref}}}");
+                }
+                stack.push(ConvStackFrame::Dict(ptr));
                 formatter.write_str("{")?;
                 for (index, entry) in entries.iter().enumerate() {
                     if index != 0 {
@@ -478,16 +509,55 @@ impl Typval {
                         "'{}': ",
                         entry.key.to_string_lossy().replace('\'', "''")
                     )?;
-                    entry.value.fmt_echo(formatter, true, seen)?;
+                    entry.value.fmt_echo(formatter, true, stack)?;
                 }
-                seen.pop();
+                stack.pop();
                 formatter.write_str("}")
             }
-            Self::Funcref(function) | Self::Partial(function) => write!(
-                formatter,
-                "function('{}')",
-                function.name.to_string_lossy()
-            ),
+            Self::Funcref(function) => {
+                // encode.c:898: in encode_tv2echo, top-level VAR_FUNC prints the raw function name.
+                // When quoted/nested, it outputs function('name').
+                if quoted_strings {
+                    write!(
+                        formatter,
+                        "function('{}')",
+                        function.name.to_string_lossy().replace('\'', "''")
+                    )
+                } else {
+                    formatter.write_str(&function.name.to_string_lossy())
+                }
+            }
+            Self::Partial(function) => {
+                // typval_encode.c.h:353 & 739: VAR_PARTIAL is always converted with function('name'[, args][, dict])
+                stack.push(ConvStackFrame::Partial);
+                write!(
+                    formatter,
+                    "function('{}'",
+                    function.name.to_string_lossy().replace('\'', "''")
+                )?;
+                if !function.args.is_empty() {
+                    // TYPVAL_ENCODE_CONV_FUNC_BEFORE_ARGS (encode.c:393)
+                    formatter.write_str(", ")?;
+                    stack.push(ConvStackFrame::PartialList);
+                    formatter.write_str("[")?;
+                    for (index, arg) in function.args.iter().enumerate() {
+                        if index != 0 {
+                            formatter.write_str(", ")?;
+                        }
+                        arg.fmt_echo(formatter, true, stack)?;
+                    }
+                    formatter.write_str("]")?;
+                    stack.pop();
+                }
+                if let Some(dict_ref) = &function.dict {
+                    // TYPVAL_ENCODE_CONV_FUNC_BEFORE_SELF (encode.c:400)
+                    formatter.write_str(", ")?;
+                    Self::Dict(dict_ref.clone()).fmt_echo(formatter, true, stack)?;
+                }
+                formatter.write_str(")")?;
+                stack.pop();
+                Ok(())
+            }
             Self::Bool(value) => formatter.write_str(if *value { "v:true" } else { "v:false" }),
             Self::Special(Special::Null) => formatter.write_str("v:null"),
             Self::Channel(id) | Self::Job(id) => write!(formatter, "{id}"),
@@ -602,11 +672,17 @@ impl PartialEq for Typval {
 
 impl fmt::Debug for Funcref {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        struct DictRefDebug<'a>(&'a DictRef);
+        impl fmt::Debug for DictRefDebug<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Dict@{:p}", Rc::as_ptr(self.0))
+            }
+        }
         formatter
             .debug_struct("Funcref")
             .field("name", &self.name)
             .field("args", &self.args)
-            .field("dict", &self.dict)
+            .field("dict", &self.dict.as_ref().map(DictRefDebug))
             .field("registry", &self.registry)
             .finish()
     }
@@ -826,6 +902,261 @@ mod tests {
         assert_eq!(
             super::echo_text_quoted(&Typval::String(OxStr::from("it's"))),
             "'it''s'"
+        );
+    }
+    #[test]
+    fn echo_spec_funcref_and_partial_cluster_table() {
+        // T16: built-in function references
+        let fn_builtin = Typval::Funcref(Funcref {
+            name: OxStr::from("function"),
+            args: vec![],
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&fn_builtin), "function");
+        assert_eq!(super::echo_text_quoted(&fn_builtin), "function('function')");
+
+        // T17: user functions
+        let fn_user1 = Typval::Funcref(Funcref {
+            name: OxStr::from("Test1"),
+            args: vec![],
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&fn_user1), "Test1");
+        assert_eq!(super::echo_text_quoted(&fn_user1), "function('Test1')");
+
+        let fn_user3 = Typval::Funcref(Funcref {
+            name: OxStr::from("g:Test3"),
+            args: vec![],
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&fn_user3), "g:Test3");
+        assert_eq!(super::echo_text_quoted(&fn_user3), "function('g:Test3')");
+
+        // T18: script functions
+        let fn_script = Typval::Funcref(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: vec![],
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&fn_script), "<SNR>1_Test2");
+        assert_eq!(super::echo_text_quoted(&fn_script), "function('<SNR>1_Test2')");
+
+        // T20: partials with self referencing a partial
+        let Typval::Dict(d_t20) = Typval::dict(vec![]) else { unreachable!() };
+        let tdr = Typval::Partial(Funcref {
+            name: OxStr::from("TestDict"),
+            args: vec![],
+            dict: Some(d_t20.clone()),
+            registry: None,
+        });
+        d_t20.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("tdr"), tdr.clone()));
+        assert_eq!(
+            super::echo_text(&tdr),
+            "function('TestDict', {'tdr': function('TestDict', {...@1})})"
+        );
+
+        // T21: automatically created partials
+        let Typval::Dict(d_auto1) = Typval::dict(vec![(OxStr::from("f"), fn_script.clone())]) else { unreachable!() };
+        let p_auto1 = Typval::Partial(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: vec![],
+            dict: Some(d_auto1),
+            registry: None,
+        });
+        assert_eq!(
+            super::echo_text(&p_auto1),
+            "function('<SNR>1_Test2', {'f': function('<SNR>1_Test2')})"
+        );
+
+        let p_inner = Typval::Partial(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: vec![Typval::Number(1)],
+            dict: None,
+            registry: None,
+        });
+        let Typval::Dict(d_auto2) = Typval::dict(vec![(OxStr::from("f"), p_inner)]) else { unreachable!() };
+        let p_auto2 = Typval::Partial(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: vec![Typval::Number(1)],
+            dict: Some(d_auto2),
+            registry: None,
+        });
+        assert_eq!(
+            super::echo_text(&p_auto2),
+            "function('<SNR>1_Test2', [1], {'f': function('<SNR>1_Test2', [1])})"
+        );
+
+        // T22: manually created partials
+        let Typval::Dict(empty_dict) = Typval::dict(vec![]) else { unreachable!() };
+        let p_args_dict = Typval::Partial(Funcref {
+            name: OxStr::from("Test3"),
+            args: vec![Typval::Number(1), Typval::Number(2)],
+            dict: Some(empty_dict.clone()),
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&p_args_dict), "function('Test3', [1, 2], {})");
+
+        let p_args_only = Typval::Partial(Funcref {
+            name: OxStr::from("Test3"),
+            args: vec![Typval::Number(1), Typval::Number(2)],
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&p_args_only), "function('Test3', [1, 2])");
+
+        let p_dict_only = Typval::Partial(Funcref {
+            name: OxStr::from("Test3"),
+            args: vec![],
+            dict: Some(empty_dict.clone()),
+            registry: None,
+        });
+        assert_eq!(super::echo_text(&p_dict_only), "function('Test3', {})");
+
+        // T23: partials referencing the same dictionary
+        let same_empty = Typval::list(vec![
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(empty_dict.clone()),
+                registry: None,
+            }),
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(empty_dict.clone()),
+                registry: None,
+            }),
+        ]);
+        assert_eq!(super::echo_text(&same_empty), "[function('tr', {}), function('tr', {})]");
+
+        let Typval::Dict(d_with_a) = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]) else { unreachable!() };
+        let same_populated = Typval::list(vec![
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(d_with_a.clone()),
+                registry: None,
+            }),
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(d_with_a),
+                registry: None,
+            }),
+        ]);
+        assert_eq!(
+            super::echo_text(&same_populated),
+            "[function('tr', {'a': 1}), function('tr', {'a': 1})]"
+        );
+
+        // T24: reference cycles in self
+        let Typval::Dict(d_t24) = Typval::dict(vec![]) else { unreachable!() };
+        let p_self = Typval::Partial(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: vec![],
+            dict: Some(d_t24.clone()),
+            registry: None,
+        });
+        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("p"), p_self));
+        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("f"), fn_script.clone()));
+        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("v"), Typval::Bool(true)));
+        assert_eq!(
+            super::echo_text(&Typval::Dict(d_t24)),
+            "{'p': function('<SNR>1_Test2', {...@0}), 'f': function('<SNR>1_Test2'), 'v': v:true}"
+        );
+
+        // T25: reference cycles in arguments
+        let Typval::List(l_t25) = Typval::list(vec![]) else { unreachable!() };
+        l_t25.borrow_mut().items.push(Typval::List(l_t25.clone()));
+        let p_arg_self = Typval::Partial(Funcref {
+            name: OxStr::from("Test1"),
+            args: l_t25.borrow().items.clone(),
+            dict: None,
+            registry: None,
+        });
+        l_t25.borrow_mut().items.push(p_arg_self);
+        let query_t25 = Typval::Partial(Funcref {
+            name: OxStr::from("Test1"),
+            args: l_t25.borrow().items.clone(),
+            dict: None,
+            registry: None,
+        });
+        assert_eq!(
+            super::echo_text(&query_t25),
+            "function('Test1', [[[...@2], function('Test1', [[...@2]])], function('Test1', [[[...@4], function('Test1', [[...@4]])]])])"
+        );
+
+        // T26: reference cycles in self and arguments
+        let Typval::Dict(d_t26) = Typval::dict(vec![(OxStr::from("v"), Typval::Bool(true))]) else { unreachable!() };
+        let Typval::List(l_t26) = Typval::list(vec![]) else { unreachable!() };
+        l_t26.borrow_mut().items.push(Typval::List(l_t26.clone()));
+        let p_l1 = Typval::Partial(Funcref {
+            name: OxStr::from("Test1"),
+            args: l_t26.borrow().items.clone(),
+            dict: None,
+            registry: None,
+        });
+        l_t26.borrow_mut().items.push(p_l1);
+        let p_l2 = Typval::Partial(Funcref {
+            name: OxStr::from("Test1"),
+            args: vec![],
+            dict: Some(d_t26.clone()),
+            registry: None,
+        });
+        l_t26.borrow_mut().items.push(p_l2);
+        let p_d_f = Typval::Partial(Funcref {
+            name: OxStr::from("<SNR>1_Test2"),
+            args: l_t26.borrow().items.clone(),
+            dict: Some(d_t26.clone()),
+            registry: None,
+        });
+        d_t26.borrow_mut().entries.insert(0, super::DictEntry::new(OxStr::from("f"), fn_script));
+        d_t26.borrow_mut().entries.insert(0, super::DictEntry::new(OxStr::from("p"), p_d_f));
+        assert_eq!(
+            super::echo_text(&Typval::Dict(d_t26)),
+            "{'p': function('<SNR>1_Test2', [[[...@3], function('Test1', [[...@3]]), function('Test1', {...@0})], function('Test1', [[[...@5], function('Test1', [[...@5]]), function('Test1', {...@0})]]), function('Test1', {...@0})], {...@0}), 'f': function('<SNR>1_Test2'), 'v': v:true}"
+        );
+
+        // T34: two equal empty dictionaries, also in partials
+        let t34_list = Typval::list(vec![Typval::Dict(empty_dict.clone()), Typval::Dict(empty_dict.clone())]);
+        assert_eq!(super::echo_text(&t34_list), "[{}, {}]");
+        let t34_part_first = Typval::list(vec![
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(empty_dict.clone()),
+                registry: None,
+            }),
+            Typval::Dict(empty_dict.clone()),
+        ]);
+        assert_eq!(super::echo_text(&t34_part_first), "[function('tr', {}), {}]");
+        let t34_part_second = Typval::list(vec![
+            Typval::Dict(empty_dict.clone()),
+            Typval::Partial(Funcref {
+                name: OxStr::from("tr"),
+                args: vec![],
+                dict: Some(empty_dict),
+                registry: None,
+            }),
+        ]);
+        assert_eq!(super::echo_text(&t34_part_second), "[{}, function('tr', {})]");
+
+        // Recursive lists and dicts cycle markers:
+        let Typval::List(l_rec) = Typval::list(vec![]) else { unreachable!() };
+        l_rec.borrow_mut().items.push(Typval::List(l_rec.clone()));
+        assert_eq!(super::echo_text(&Typval::List(l_rec.clone())), "[[...@0]]");
+        assert_eq!(super::echo_text(&Typval::list(vec![Typval::List(l_rec)])), "[[[...@1]]]");
+
+        let Typval::Dict(d_rec) = Typval::dict(vec![]) else { unreachable!() };
+        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("d"), Typval::Dict(d_rec.clone())));
+        assert_eq!(super::echo_text(&Typval::Dict(d_rec.clone())), "{'d': {...@0}}");
+        assert_eq!(
+            super::echo_text(&Typval::dict(vec![(OxStr::from("out"), Typval::Dict(d_rec))])),
+            "{'out': {'d': {...@1}}}"
         );
     }
 }

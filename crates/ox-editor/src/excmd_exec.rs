@@ -26686,90 +26686,11 @@ pub(crate) fn typval_to_text(value: &Typval) -> String {
 }
 
 fn typval_to_display(value: &Typval, quoted_strings: bool) -> String {
-    typval_to_display_inner(value, quoted_strings, &mut Vec::new())
-}
-
-fn typval_to_display_inner(
-    value: &Typval,
-    quoted_strings: bool,
-    containers: &mut Vec<(u8, *const ())>,
-) -> String {
-    let identity = match value {
-        Typval::List(list) => Some((0, Rc::as_ptr(list).cast())),
-        Typval::Dict(dict) => Some((1, Rc::as_ptr(dict).cast())),
-        _ => None,
-    };
-    if let Some(identity) = identity {
-        if containers.contains(&identity) {
-            return if identity.0 == 0 {
-                "[...]".to_owned()
-            } else {
-                "{...}".to_owned()
-            };
-        }
-        containers.push(identity);
+    if quoted_strings {
+        ox_types::echo_text_quoted(value)
+    } else {
+        ox_types::echo_text(value)
     }
-    let display = match value {
-        Typval::Number(value) => value.to_string(),
-        Typval::Float(value) => ox_types::vim_float_text(*value),
-        Typval::String(value) => {
-            let text = value.to_string_lossy();
-            if quoted_strings {
-                format!("'{}'", text.replace('\'', "''"))
-            } else {
-                text.into_owned()
-            }
-        }
-        Typval::Blob(bytes) => format!(
-            "0z{}",
-            bytes.iter().fold(String::new(), |mut hex, byte| {
-                let _ = write!(hex, "{byte:02X}");
-                hex
-            })
-        ),
-        Typval::List(list) => list.try_borrow().map_or("[]".to_owned(), |data| {
-            format!(
-                "[{}]",
-                data.items
-                    .iter()
-                    .map(|item| typval_to_display_inner(item, true, containers))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }),
-        Typval::Dict(dict) => dict.try_borrow().map_or("{}".to_owned(), |data| {
-            format!(
-                "{{{}}}",
-                data.entries
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "'{}': {}",
-                            entry.key.to_string_lossy().replace('\'', "''"),
-                            typval_to_display_inner(&entry.value, true, containers)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }),
-        Typval::Funcref(function) | Typval::Partial(function) => {
-            format!("function('{}')", function.name.to_string_lossy())
-        }
-        Typval::Bool(value) => {
-            if *value {
-                "v:true".to_owned()
-            } else {
-                "v:false".to_owned()
-            }
-        }
-        Typval::Special(Special::Null) => "v:null".to_owned(),
-        Typval::Channel(id) | Typval::Job(id) => id.to_string(),
-    };
-    if identity.is_some() {
-        containers.pop();
-    }
-    display
 }
 
 #[expect(
