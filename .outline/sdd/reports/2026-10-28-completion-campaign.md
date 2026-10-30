@@ -1335,3 +1335,23 @@ One row per failing test in that run:
 
 A previous attempt on the same task failed on an infrastructure 403 after 45
 minutes and was reverted; its residue was not merged.
+
+
+### Alternate buffer, and a change reverted as a no-op
+
+`51b9a47` resolves `#` to the window's alternate buffer: `bufnr('#')`, `@#`, and
+`:buffer #` now read the window state instead of matching a buffer literally
+named `#`, a wiped handle is ignored, `%`/`#` refresh after a switch even when
+the register bank did not change, and `:buffer #` without a live alternate
+reports E94. Four tests cover it and `-p ox-editor` is green.
+
+It does not fix `dir_spec` T19 or T21: after a rebuild both still fail, so the
+missing piece is producing the alternate state on the directory switch
+(`:keepalt` is not honoured there), not reading it.
+
+A second change, `nvim_cmd`'s `magic.file`, was committed and then reverted. The
+lane's own follow-up showed the old builder already passed file arguments through
+unchanged, so the patch changed only argument validation and a bar refactor: no
+runtime behaviour moved, and the commit message claiming a reinterpretation fix
+was wrong. It is out of the tree; the honest finding is that `magic.file=false`
+already behaved correctly and T25/T30/T31 fail on the activation path instead.
