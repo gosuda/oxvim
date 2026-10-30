@@ -9347,6 +9347,28 @@ fn command_scriptnames<F: FileIO, E: ExEditorAccess>(
     command_edit(runtime, access, scope, lua, &edit)
 }
 
+/// Switches the current window's buffer for `:edit`, preserving its
+/// alternate buffer when the command carries `:keepalt`.
+fn set_current_buffer_for_edit(
+    editor: &mut Editor,
+    buffer: BufHandle,
+    release: BufferRelease,
+    keepalt: bool,
+) -> Result<(), EditorError> {
+    let window = editor.current_window();
+    let alternate = keepalt
+        .then(|| window.and_then(|window| editor.window(window).ok()))
+        .flatten()
+        .and_then(|window| window.alternate_buffer);
+    editor.set_current_buffer(buffer, release)?;
+    if keepalt
+        && let Some(window) = window
+    {
+        editor.window_mut(window)?.alternate_buffer = alternate;
+    }
+    Ok(())
+}
+
 fn command_edit<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -9360,6 +9382,10 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     // bytes upstream keeps, so `:edit Xa<CR>` really does name a buffer
     // ending in a CR.
     let reload_current = command.args.is_empty();
+    let keepalt = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::KeepAlt);
     let path = if reload_current {
         access.with_ex_editor(|editor| {
             editor
@@ -9458,9 +9484,16 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
     });
     let outcome = if unloaded {
         let old = access.with_ex_editor(|editor| editor.current_buffer());
-        let has_window = access
-            .with_ex_editor(|editor| editor.current_window())
-            .is_some();
+        let old_window = access.with_ex_editor(|editor| editor.current_window());
+        let old_alternate = old_window.and_then(|window| {
+            access.with_ex_editor(|editor| {
+                editor
+                    .window(window)
+                    .ok()
+                    .and_then(|state| state.alternate_buffer)
+            })
+        });
+        let has_window = old_window.is_some();
         let created_tab = Cell::new(None);
         match load_file_buffer_for_command(
             runtime,
@@ -9472,9 +9505,13 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             |_runtime| {
                 if has_window {
                     access.with_ex_editor(|editor| {
-                        editor
-                            .set_current_buffer(handle, BufferRelease::KeepLoaded)
-                            .map_err(LoadSwitchError::Editor)
+                        set_current_buffer_for_edit(
+                            editor,
+                            handle,
+                            BufferRelease::KeepLoaded,
+                            keepalt,
+                        )
+                        .map_err(LoadSwitchError::Editor)
                     })
                 } else {
                     access.with_ex_editor(|editor| {
@@ -9493,7 +9530,18 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
                 }
                 if let Some(old) = old {
                     let _ = access.with_ex_editor(|editor| {
-                        editor.set_current_buffer(old, BufferRelease::KeepLoaded)
+                        set_current_buffer_for_edit(
+                            editor,
+                            old,
+                            BufferRelease::KeepLoaded,
+                            keepalt,
+                        )?;
+                        if keepalt
+                            && let Some(window) = old_window
+                        {
+                            editor.window_mut(window)?.alternate_buffer = old_alternate;
+                        }
+                        Ok::<(), EditorError>(())
                     });
                 }
             },
@@ -9516,7 +9564,14 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
         }
     } else if matches!(outcome, LoadSwitchOutcome::Resident)
         && let Err(error) = access
-            .with_ex_editor(|editor| editor.set_current_buffer(handle, BufferRelease::KeepLoaded))
+            .with_ex_editor(|editor| {
+                set_current_buffer_for_edit(
+                    editor,
+                    handle,
+                    BufferRelease::KeepLoaded,
+                    keepalt,
+                )
+            })
     {
         return error_flow(runtime, "E948", error.to_string());
     }
@@ -13200,12 +13255,32 @@ fn command_file<F: FileIO, E: ExEditorAccess>(
         if !clear_name || !argument.is_empty() {
             return error_flow(runtime, "E474", "Invalid argument");
         }
-        return rename_current_buffer(runtime, access, scope, lua, OxStr::from(""));
+        return rename_current_buffer(
+            runtime,
+            access,
+            scope,
+            lua,
+            OxStr::from(""),
+            command
+                .modifiers
+                .iter()
+                .any(|modifier| modifier.kind == ModifierKind::KeepAlt),
+        );
     }
     if argument.is_empty() {
         return access.with_ex_editor(|editor| show_current_file(runtime, editor));
     }
-    rename_current_buffer(runtime, access, scope, lua, OxStr::from(argument))
+    rename_current_buffer(
+        runtime,
+        access,
+        scope,
+        lua,
+        OxStr::from(argument),
+        command
+            .modifiers
+            .iter()
+            .any(|modifier| modifier.kind == ModifierKind::KeepAlt),
+    )
 }
 
 fn rename_current_buffer<F: FileIO, E: ExEditorAccess>(
@@ -13214,6 +13289,7 @@ fn rename_current_buffer<F: FileIO, E: ExEditorAccess>(
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
     name: OxStr,
+    keepalt: bool,
 ) -> Flow {
     // `setfname` (`buffer.c:3624-3660`, `fname_expand`): a name that resolves
     // to a directory keeps a trailing separator, so a `:file` rename (the
@@ -13237,7 +13313,9 @@ fn rename_current_buffer<F: FileIO, E: ExEditorAccess>(
             .buffer(buffer)
             .is_ok_and(|state| state.name() == &name)
     }) {
-        if let Some(window) = access.with_ex_editor(|editor| editor.current_window()) {
+        if !keepalt
+            && let Some(window) = access.with_ex_editor(|editor| editor.current_window())
+        {
             access.with_ex_editor(|editor| {
                 if let Ok(state) = editor.window_mut(window) {
                     state.alternate_buffer = Some(buffer);

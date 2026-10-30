@@ -320,6 +320,65 @@ fn edit_loads_file_content_into_new_buffer() {
     );
 }
 
+/// `:keepalt edit` switches buffers without replacing the window's alternate.
+#[test]
+fn edit_keepalt_preserves_alternate_buffer() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+    let initial = editor.editor().current_buffer().unwrap();
+
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(initial)
+    );
+
+    executor
+        .execute_line(&editor, "keepalt edit second.txt")
+        .unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        editor.editor().buffer(second).unwrap().name().to_string_lossy(),
+        "second.txt"
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(initial)
+    );
+}
+
+/// A plain `:edit` replaces the window's alternate with the buffer it leaves.
+#[test]
+fn edit_updates_alternate_buffer_without_keepalt() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(first)
+    );
+}
+
 /// `:edit` with no file argument raises E32 ("No file name").
 /// Upstream: `ex_docmd.c` `ex_edit` — `*e_fname == NUL` → E32.
 #[test]
