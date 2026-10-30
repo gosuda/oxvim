@@ -191,6 +191,45 @@ fn fast_work_runs_before_deferred_safe_point() {
     assert_eq!(*order.lock().unwrap(), vec!["fast", "deferred"]);
 }
 
+#[test]
+fn transfer_requeues_deferred_tail_after_put_error() {
+    let reactor = Reactor::new().unwrap();
+    let queues = crate::WorkQueues::new(reactor.waker());
+    let owner = {
+        let mut owners = MultiQueue::new();
+        let root = owners.root();
+        owners.child(root).unwrap()
+    };
+    let scheduler = queues.scheduler();
+    scheduler
+        .schedule_deferred(owner, Event::Signal(1))
+        .unwrap();
+    scheduler
+        .schedule_deferred(owner, Event::Signal(2))
+        .unwrap();
+
+    let mut events = MultiQueue::new();
+    assert!(matches!(
+        queues.transfer(&mut events),
+        Err(crate::Error::UnknownOwner(found)) if found == owner
+    ));
+
+    let root = events.root();
+    assert_eq!(events.child(root).unwrap(), owner);
+    queues.transfer(&mut events).unwrap();
+
+    let signals: Vec<_> = events
+        .process_events(owner)
+        .unwrap()
+        .into_iter()
+        .map(|event| match event {
+            Event::Signal(signal) => signal,
+            Event::Callback(_) => unreachable!(),
+        })
+        .collect();
+    assert_eq!(signals, vec![1, 2]);
+}
+
 #[cfg(unix)]
 #[test]
 fn signal_is_delivered_as_loop_event() {
