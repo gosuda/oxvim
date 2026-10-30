@@ -1494,3 +1494,25 @@ The remaining case needs `shorten_fnames()`, which the port does not have.
 `echo_spec`'s remaining 12 are mostly the `String()` path: the shared formatter
 now matches the reference for `:echo`, but several cases assert
 `eval('String(...)')`, which still renders through the evaluator's own code.
+
+
+### Functional gate at `ae7d5d3`
+
+| Spec | Result |
+|---|---|
+| `dir_spec` | 38 of 38 |
+| `cd_spec` | 35 of 36 |
+| `echo_spec` | 34 of 41 |
+| `fs_spec` | 47 of 56 |
+
+`echo_spec` went 19 → 34 in this round: float `%g` formatting, funcref and
+partial display, message spelling, and one formatter shared by `:echo` and
+`string()`.
+
+Six of the seven remaining `echo_spec` cases are blocked by script numbering, not
+by display: the spec asserts `<SNR>1_Test2` and the port's user script is 2. The
+port sources a different set of startup scripts than the reference, so the index
+differs; matching it is startup-script parity work.
+
+The seventh is a value-model defect: `add(l, l)` stores a null rather than the
+list, so `String(l)` reads `[v:null]` where the reference reads `[[...@0]]`.
