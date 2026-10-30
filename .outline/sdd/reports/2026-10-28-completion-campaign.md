@@ -1516,3 +1516,26 @@ differs; matching it is startup-script parity work.
 
 The seventh is a value-model defect: `add(l, l)` stores a null rather than the
 list, so `String(l)` reads `[v:null]` where the reference reads `[[...@0]]`.
+
+### Gate at `e691945`
+
+| Spec | Result | Remaining |
+|---|---|---|
+| `dir_spec` | 38 of 38 | none |
+| `cd_spec` | 35 of 36 | buffer-local stickiness |
+| `echo_spec` | 39 of 41 | T23, T26 |
+| `fs_spec` | 47 of 56 | write/error paths |
+
+`echo_spec` moved 34 to 39 in three steps: one formatter for `string()`, a
+self-reference kept through the API mirror, and a dictionary bound as `self`
+when its member is callable. T18 also needed one anonymous string source per
+session, which the reference gets from the `SID_STR` pseudo id.
+
+T23 and T26 now differ from the reference in dictionary iteration order alone.
+The reference walks its hash table, so `{'z': 1, 'a': 2, 'm': 3}` prints as
+`{'a': 2, 'z': 1, 'm': 3}` regardless of insertion order; this port prints
+insertion order, and `keys()` agrees with it. Matching the reference means
+storing dictionaries in a table with the same order, which reaches every
+`echo`, `keys`, `items`, `values` and `for` loop over a dictionary.
+
+Measured defect class, not a formatter difference: dictionary iteration order.
