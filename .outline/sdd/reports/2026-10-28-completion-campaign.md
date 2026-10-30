@@ -1355,3 +1355,27 @@ unchanged, so the patch changed only argument validation and a bar refactor: no
 runtime behaviour moved, and the commit message claiming a reinterpretation fix
 was wrong. It is out of the tree; the honest finding is that `magic.file=false`
 already behaved correctly and T25/T30/T31 fail on the activation path instead.
+
+
+### `dir_spec`: 30 of 38
+
+| Commit | Change | Measure |
+|---|---|---|
+| `00f9a7d` | `:keepalt` honoured on the switch path (`buffer.c:1717-1727`) | 25 → 27 |
+| `ea7b9ce` | third executor tier for depth-three reentrant builtins; newline sentinel so `line\nbreak.txt` survives the command string | 27 → 30 |
+
+The activation failures were not a buffer-switch bug: opening a file fires
+`BufReadPost`, the bundled editorconfig plugin calls `vim.fs.parents` →
+`vim.fn.fnamemodify`, and with both pooled executors borrowed the builtin raised
+E5108, which rolled the edit back to the directory buffer.
+
+The newline sentinel is a stopgap: `build_nvim_cmd` writes the command as a
+string and the parser splits on newlines, so an argument with an embedded newline
+cannot survive in one piece. The real fix is to carry arguments without
+re-parsing a command string.
+
+Eight remain: message capture (2), `[count]-` overshoot, startup mapping
+precedence, `'hidden'` policy, netrw coexistence, and `:syntax` — the last is a
+subsystem, not a command: it needs a syntax loader, a `Syntax` autocmd, a group
+registry, and `:syntax list`, since the failing case asserts a group defined by
+`runtime/syntax/directory.vim`.
