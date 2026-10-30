@@ -7350,6 +7350,27 @@ fn normal_with_machine_still_applies_mappings_and_bang_skips_them() {
     assert_eq!(global_text(&executor, "hit").as_deref(), Some("no"));
 }
 
+/// A counted mapping consumes the accumulated count before execution and does
+/// not leak it into subsequent counted mappings.
+#[test]
+fn counted_mapping_clears_accumulated_count_between_invocations() {
+    let (editor, mut executor) = setup();
+    let machine = Rc::new(RefCell::new(ModeMachine::default()));
+    executor.set_mode_machine(machine);
+    executor
+        .execute_line(&editor, "nnoremap ,m :let g:c1 = v:count<CR>")
+        .unwrap();
+    executor
+        .execute_line(&editor, "nnoremap ,n :let g:c2 = v:count<CR>")
+        .unwrap();
+
+    executor.execute_line(&editor, "normal 1,m").unwrap();
+    assert_eq!(global_number(&executor, "c1"), 1);
+
+    executor.execute_line(&editor, "normal 2,n").unwrap();
+    assert_eq!(global_number(&executor, "c2"), 2);
+}
+
 /// Without an installed mode machine, `:normal!` falls back to a temporary
 /// machine — keys still execute (buffer changes happen) but mode changes
 /// don't persist. This is the existing unit-test behavior.

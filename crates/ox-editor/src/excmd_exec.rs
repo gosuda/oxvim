@@ -1241,7 +1241,13 @@ pub(crate) fn drain_typeahead<F: FileIO, E: ExEditorAccess>(
         }
         let mapping = machine.borrow_mut().take_mapping_action();
         if let Some((action, options)) = mapping {
+            if let crate::mode::Mode::Normal(state) = &mut machine.borrow_mut().mode {
+                state.count = 0;
+            }
             let flow = run_mapping_action(runtime, access, scope, lua, action, &options);
+            if let crate::mode::Mode::Normal(state) = &mut machine.borrow_mut().mode {
+                state.count = 0;
+            }
             if !matches!(flow, Flow::Normal) {
                 return flow;
             }
