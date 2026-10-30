@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::{
     AddressBase, COMMANDS, CmdlineContext, CmdlineSpecial, CommandFlags, ErrorCode, ExpansionPart,
-    ModifierKind, Parser, PreviewMagic, RangeKind, RangeSeparator, ResolvedCommand,
+    ModifierKind, NoUserCommands, Parser, PreviewMagic, RangeKind, RangeSeparator, ResolvedCommand,
     UserCommandInfo, UserCommandMatch, UserCommandProvider, command_spec, expand_with,
     parse_preview_pattern, resolve_command, scan_expansions, split_vimgrep_args,
 };
@@ -190,6 +190,20 @@ fn user_command_bar_flag_governs_bar_split() {
         "no -bar keeps the bar in the arguments"
     );
     assert_eq!(without_bar[0].args, "a | echo 'x'");
+}
+
+#[test]
+fn unlet_splits_a_following_bar_command() {
+    let commands = Parser::with_user_commands(&NoUserCommands)
+        .parse("if 1 | unlet x | endif")
+        .unwrap_or_default();
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command.command.name())
+            .collect::<Vec<_>>(),
+        ["if", "unlet", "endif"]
+    );
 }
 
 /// A range is rejected with E481 unless the command carries `-range`

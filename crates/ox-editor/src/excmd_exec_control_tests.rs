@@ -317,6 +317,7 @@ fn selected_function_branch_resolves_unknown_command_to_e492() {
 fn inactive_elseif_condition_not_evaluated() {
     // ex_docmd.c: once a truthy `:if`/`:elseif` branch is found, subsequent
     // `:elseif` conditions are NOT evaluated — referencing an undefined
+
     // variable in a skipped elseif must NOT raise E121.
     let mut executor = ExExecutor::new();
     let editor = TestEditorAccess::new(Editor::new());
@@ -329,6 +330,51 @@ fn inactive_elseif_condition_not_evaluated() {
         .unwrap();
     assert_eq!(gnum(&executor, "ran"), 1);
     gundefined(&executor, "bad");
+}
+#[test]
+fn inline_ifs_in_an_inactive_branch_keep_the_outer_block_closed() {
+    let mut executor = ExExecutor::new();
+    let editor = TestEditorAccess::new(Editor::new());
+    executor
+        .execute_script(
+            &editor,
+            "test.vim",
+            "function Test()\n\
+let b:netrw_curdir = '/tmp'\n\
+let w:netrw_explore_indx = 1\n\
+let w:netrw_explore_list = ['/tmp/a']\n\
+if exists(\"w:netrw_explore_indx\") && exists(\"b:netrw_curdir\")\n\
+if !exists(\"s:explore_prvdir\") || s:explore_prvdir != b:netrw_curdir\n\
+let s:explore_prvdir = b:netrw_curdir\n\
+let s:explore_match = ''\n\
+let dirlen = strlen(b:netrw_curdir)\n\
+if b:netrw_curdir !~ '/$'\n\
+let dirlen = dirlen + 1\n\
+endif\n\
+let prvfname = ''\n\
+for fname in w:netrw_explore_list\n\
+if fname =~ '^'.b:netrw_curdir\n\
+let s:explore_match = 'x'\n\
+elseif fname !~ '^/' && fname != prvfname\n\
+let s:explore_match = 'y'\n\
+endif\n\
+let prvfname = fname\n\
+endfor\n\
+if has(\"syntax\") && exists(\"g:syntax_on\") && g:syntax_on\n\
+let g:x = 1\n\
+endif\n\
+endif\n\
+else\n\
+if exists(\"s:explore_match\") | unlet s:explore_match | endif\n\
+if exists(\"s:explore_prvdir\") | unlet s:explore_prvdir | endif\n\
+endif\n\
+endfunction\n\
+call Test()\n\
+let g:ran = 1",
+        )
+        .unwrap();
+    assert_eq!(gnum(&executor, "ran"), 1);
+
 }
 
 // ===========================================================================

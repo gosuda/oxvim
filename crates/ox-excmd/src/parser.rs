@@ -1312,7 +1312,8 @@ fn command_end(
     // level — inside `()`/`[]`/`{}` it stays in the argument.
     if matches!(
         name,
-        "let"
+        "unlet"
+            | "let"
             | "const"
             | "call"
             | "for"
