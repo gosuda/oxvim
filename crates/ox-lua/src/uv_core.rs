@@ -605,14 +605,15 @@ fn install_fs(
                     Ok(values)
                 }
                 Err(error) => {
+                    let err_msg = format!("{error}: {path}");
                     if let Some(callback) = callback {
                         let args = MultiValue::from_vec(vec![Value::String(
-                            lua.create_string(error.to_string())?,
+                            lua.create_string(&err_msg)?,
                         )]);
                         schedule_callback(&scandir_scheduler, lua, callback, args, &scandir_fast)
                             .map_err(mlua::Error::runtime)?;
                     }
-                    fs_fail(lua, &error)
+                    fs_fail_msg(lua, &err_msg, error.name)
                 }
             }
         })?,
@@ -1279,10 +1280,14 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
 
 /// Synchronous failure shape: `nil, err, name` (luv `fail` returns).
 fn fs_fail(lua: &Lua, error: &FsError) -> mlua::Result<MultiValue> {
+    fs_fail_msg(lua, &error.to_string(), error.name)
+}
+
+fn fs_fail_msg(lua: &Lua, message: &str, name: &str) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_vec(vec![
         Value::Nil,
-        Value::String(lua.create_string(error.to_string())?),
-        Value::String(lua.create_string(error.name)?),
+        Value::String(lua.create_string(message)?),
+        Value::String(lua.create_string(name)?),
     ]))
 }
 
