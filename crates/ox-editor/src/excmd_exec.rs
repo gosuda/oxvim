@@ -25268,67 +25268,81 @@ fn unlet_name_garbage(target: &str) -> Option<&str> {
     }
 }
 
-fn strip_expression_comment(expression: &str) -> &str {
-    let bytes = expression.as_bytes();
-    let mut quote = None;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
+/// Advances `index` past one Vim single- or double-quoted string.
+pub(crate) fn skip_quoted(bytes: &[u8], index: &mut usize) {
+    let quote = bytes[*index];
+    *index += 1;
+    while *index < bytes.len() {
+        if quote == b'"' && bytes[*index] == b'\\' && *index + 1 < bytes.len() {
+            *index += 2;
+            continue;
+        }
+        if bytes[*index] == quote {
+            if quote == b'\'' && bytes.get(*index + 1) == Some(&b'\'') {
+                *index += 2;
+                continue;
             }
-            continue;
+            *index += 1;
+            return;
         }
+        *index += 1;
+    }
+}
+
+pub(crate) fn strip_expression_comment(expression: &str) -> &str {
+    let bytes = expression.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
         if byte == b'\'' {
-            quote = Some(byte);
+            skip_quoted(bytes, &mut index);
             continue;
         }
-        if byte != b'"' {
+        if byte == b'"' {
+            let previous = bytes[..index]
+                .iter()
+                .rposition(|byte| !byte.is_ascii_whitespace());
+            if index > 0
+                && bytes[index - 1].is_ascii_whitespace()
+                && previous.is_some_and(|previous| {
+                    bytes[previous].is_ascii_alphanumeric()
+                        || matches!(bytes[previous], b'\'' | b'"' | b']' | b')' | b'}')
+                })
+            {
+                return expression[..index].trim_end_matches([' ', '\t']);
+            }
+            skip_quoted(bytes, &mut index);
             continue;
         }
-        let previous = bytes[..index]
-            .iter()
-            .rposition(|byte| !byte.is_ascii_whitespace());
-        if index > 0
-            && bytes[index - 1].is_ascii_whitespace()
-            && previous.is_some_and(|previous| {
-                bytes[previous].is_ascii_alphanumeric()
-                    || matches!(bytes[previous], b'\'' | b'"' | b']' | b')' | b'}')
-            })
-        {
-            return expression[..index].trim_end_matches([' ', '\t']);
-        }
-        quote = Some(byte);
+        index += 1;
     }
     expression
 }
 
 pub(crate) fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {
     let bytes = args.as_bytes();
-    let mut quote = None;
     let mut depth = 0usize;
-    for index in 0..bytes.len() {
+    let mut index = 0usize;
+    while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
-            }
-            continue;
-        }
         if matches!(byte, b'\'' | b'"') && !matches!(bytes.get(index.wrapping_sub(1)), Some(b'@')) {
-            quote = Some(byte);
+            skip_quoted(bytes, &mut index);
             continue;
         }
         if matches!(byte, b'(' | b'[' | b'{') {
             depth += 1;
+            index += 1;
             continue;
         }
         if matches!(byte, b')' | b']' | b'}') {
             depth = depth.saturating_sub(1);
+            index += 1;
             continue;
         }
         if depth == 0 && byte == b'=' && index > 0 && bytes[index - 1] == b'@' {
             // `@=` is the expression register name, not an assignment
             // operator. Skip this `=` so the real `=` later is found.
+            index += 1;
             continue;
         }
         if depth == 0 && byte == b'=' {
@@ -25348,6 +25362,7 @@ pub(crate) fn split_assignment(args: &str) -> Option<(&str, &str, &str)> {
                 skipwhite_trim(&args[index + 1..]),
             ));
         }
+        index += 1;
     }
     None
 }
@@ -26059,61 +26074,47 @@ fn render_address(address: &Address) -> String {
     text
 }
 
-fn split_comma_args(source: &str) -> Vec<&str> {
+pub(crate) fn split_comma_args(source: &str) -> Vec<&str> {
     split_top_level(source, b',', true)
 }
 
 /// Offset of the `)` closing the call opened at `open`, skipping quoted
 /// strings with the same discipline as [`split_top_level`]. `None` when the
 /// parens never balance (`get_func_arguments` fails the whole `:defer`).
-fn find_closing_paren(text: &str, open: usize) -> Option<usize> {
+pub(crate) fn find_closing_paren(text: &str, open: usize) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut depth = 0usize;
-    let mut quote = None;
     let mut index = open;
     while index < bytes.len() {
-        let byte = bytes[index];
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
+        match bytes[index] {
+            b'\'' | b'"' => skip_quoted(bytes, &mut index),
+            b'(' => {
+                depth += 1;
+                index += 1;
             }
-            index += 1;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-        } else if byte == b'(' {
-            depth += 1;
-        } else if byte == b')' {
-            depth -= 1;
-            if depth == 0 {
-                return Some(index);
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+                index += 1;
             }
+            _ => index += 1,
         }
-        index += 1;
     }
     None
 }
 
-fn split_top_level(source: &str, delimiter: u8, exact: bool) -> Vec<&str> {
+pub(crate) fn split_top_level(source: &str, delimiter: u8, exact: bool) -> Vec<&str> {
     let bytes = source.as_bytes();
     let mut result = Vec::new();
     let mut start = 0usize;
-    let mut quote = None;
     let mut depth = 0usize;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
         if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-            index += 1;
+            skip_quoted(bytes, &mut index);
             continue;
         }
         if matches!(byte, b'(' | b'[' | b'{') {

@@ -30,7 +30,8 @@ use std::rc::Rc;
 use ox_text::Buffer;
 
 use crate::excmd_exec::{
-    LuaExec, run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor,
+    LuaExec, find_closing_paren, run_autocmd_plan, split_assignment, split_comma_args,
+    strip_expression_comment, sync_editor_into_scope, sync_scope_into_editor,
 };
 use crate::script::{FileEntry, FileIO, FileKind, FileMetadata};
 use crate::{
@@ -13750,5 +13751,108 @@ fn call_with_trailing_comment_containing_parentheses() {
     assert_eq!(
         global_value(&executor, "arg"),
         Some(ox_types::Typval::String(ox_types::OxStr::from("bar")))
+    );
+}
+
+#[test]
+fn find_closing_paren_handles_single_quote_trailing_backslash() {
+    assert_eq!(find_closing_paren(r#"foo('a\')"#, 3), Some(8));
+    assert_eq!(
+        find_closing_paren(r#"call s:NetrwInit("g:netrw_glob_escape",'*[]?`{~$\')"#, 16),
+        Some(50)
+    );
+}
+
+#[test]
+fn find_closing_paren_handles_double_quote_escapes() {
+    assert_eq!(find_closing_paren(r#"foo("a\")")"#, 3), Some(10));
+    assert_eq!(find_closing_paren(r#"foo("a\\")"#, 3), Some(9));
+}
+
+#[test]
+fn find_closing_paren_handles_single_quote_doubled() {
+    assert_eq!(find_closing_paren(r#"foo('it''s')"#, 3), Some(11));
+}
+
+#[test]
+fn split_comma_args_handles_single_quote_trailing_backslash() {
+    assert_eq!(split_comma_args(r"'a\', 'b'"), vec![r"'a\'", r"'b'"]);
+}
+
+#[test]
+fn split_comma_args_handles_double_quote_escapes() {
+    assert_eq!(split_comma_args(r#""a,\"b", "c""#), vec![r#""a,\"b""#, r#""c""#]);
+    assert_eq!(split_comma_args(r#""a\\", "b""#), vec![r#""a\\""#, r#""b""#]);
+}
+
+#[test]
+fn split_comma_args_handles_single_quote_doubled() {
+    assert_eq!(split_comma_args(r"'it''s', 'b'"), vec![r"'it''s'", r"'b'"]);
+}
+
+#[test]
+fn strip_expression_comment_handles_single_quote_trailing_backslash() {
+    assert_eq!(strip_expression_comment(r#"'a\' " comment"#), r"'a\'");
+}
+
+#[test]
+fn strip_expression_comment_handles_double_quote_escapes() {
+    assert_eq!(strip_expression_comment(r#""a\"" " comment"#), r#""a\"""#);
+    assert_eq!(strip_expression_comment(r#""a\\" " comment"#), r#""a\\""#);
+}
+
+#[test]
+fn strip_expression_comment_handles_single_quote_doubled() {
+    assert_eq!(strip_expression_comment(r#"'it''s' " comment"#), r"'it''s'");
+}
+
+#[test]
+fn split_assignment_handles_single_quote_trailing_backslash() {
+    assert_eq!(
+        split_assignment(r"d['a\'] = 1"),
+        Some(("d['a\\']", "=", "1"))
+    );
+}
+
+#[test]
+fn split_assignment_handles_double_quote_escapes() {
+    assert_eq!(
+        split_assignment(r#"d["a\"="] = 1"#),
+        Some((r#"d["a\"="]"#, "=", "1"))
+    );
+    assert_eq!(
+        split_assignment(r#"d["a\\"] = 1"#),
+        Some((r#"d["a\\"]"#, "=", "1"))
+    );
+}
+
+#[test]
+fn split_assignment_handles_single_quote_doubled() {
+    assert_eq!(
+        split_assignment(r"d['it''s'] = 1"),
+        Some(("d['it''s']", "=", "1"))
+    );
+}
+
+#[test]
+fn netrw_line_378_call_parses_without_e107() {
+    let (editor, mut executor) = setup();
+    let result = executor.execute_script(
+        &editor,
+        "netrw_test.vim",
+        "function! s:NetrwInit(var, val)\nendfunction\ncall s:NetrwInit(\"g:netrw_glob_escape\",'*[]?`{~$\\')\n",
+    );
+    assert!(result.is_ok(), "netrw init call must parse: {result:?}");
+}
+
+#[test]
+fn single_quoted_doubled_quote_unquotes_in_assignment() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "unquote.vim", "let g:res = 'it''s'\n")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "res"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("it's")))
     );
 }

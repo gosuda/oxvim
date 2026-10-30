@@ -12,7 +12,7 @@ use ox_types::{DictEntry, DictEntryFlags, DictRef, ListRef, OxStr, Typval};
 use crate::editor::Editor;
 use crate::excmd_exec::{
     DictWatchEvent, EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option,
-    eval_text, push_scope_watch_event, read_option, typval_to_text,
+    eval_text, push_scope_watch_event, read_option, skip_quoted, typval_to_text,
 };
 use crate::register::RegisterContent;
 use crate::script::FileIO;
@@ -1503,21 +1503,12 @@ fn split_top_level(source: &str, delimiter: u8, exact: bool) -> Vec<&str> {
     let bytes = source.as_bytes();
     let mut result = Vec::new();
     let mut start = 0usize;
-    let mut quote = None;
     let mut depth = 0usize;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
         if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-            index += 1;
+            skip_quoted(bytes, &mut index);
             continue;
         }
         if matches!(byte, b'(' | b'[' | b'{') {
@@ -1575,6 +1566,21 @@ mod unit {
     #[test]
     fn split_comma_args_respects_quotes() {
         assert_eq!(split_comma_args(r"'a,b', c"), vec!["'a,b'", "c"]);
+    }
+    #[test]
+    fn split_comma_args_handles_single_quote_trailing_backslash() {
+        assert_eq!(split_comma_args(r"'a\', c"), vec![r"'a\'", "c"]);
+    }
+
+    #[test]
+    fn split_comma_args_handles_double_quote_escapes() {
+        assert_eq!(split_comma_args(r#""a,\"b", c"#), vec![r#""a,\"b""#, "c"]);
+        assert_eq!(split_comma_args(r#""a\\", c"#), vec![r#""a\\""#, "c"]);
+    }
+
+    #[test]
+    fn split_comma_args_handles_single_quote_doubled() {
+        assert_eq!(split_comma_args(r"'it''s', c"), vec![r"'it''s'", "c"]);
     }
 
     #[test]
