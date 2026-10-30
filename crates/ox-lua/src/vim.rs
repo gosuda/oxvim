@@ -469,10 +469,15 @@ fn utf_sequence_len(bytes: &[u8]) -> usize {
     if first < 0x80 {
         return 1;
     }
+    // `utf8len_tab` (`mbyte.c:99-117`) maps every lead byte, including the
+    // illegal ones: 0xC0 and 0xC1 promise two bytes, 0xF5 to 0xFD promise four
+    // to six, and only 0xFE and 0xFF fall back to a single byte.
     let expected = match first {
-        0xc2..=0xdf => 2,
+        0xc0..=0xdf => 2,
         0xe0..=0xef => 3,
-        0xf0..=0xf4 => 4,
+        0xf0..=0xf7 => 4,
+        0xf8..=0xfb => 5,
+        0xfc..=0xfd => 6,
         _ => return 1,
     };
     // `utf_ptr2len_len` (`mbyte.c:852-872`): the *expected* length comes back
@@ -490,10 +495,25 @@ fn utf_sequence_len(bytes: &[u8]) -> usize {
 /// Base codepoint of a full sequence, or the raw byte for an invalid one --
 /// upstream's `utf_ptr2char` fallback.
 fn utf_character_value(bytes: &[u8]) -> u32 {
-    match std::str::from_utf8(bytes) {
-        Ok(text) => text.chars().next().map_or(u32::from(bytes[0]), |c| c as u32),
-        Err(_) => u32::from(bytes[0]),
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    let length = utf_sequence_len(bytes);
+    if length == 1 || bytes.len() < length {
+        return u32::from(first);
     }
+    if bytes[1..length].iter().any(|byte| byte & 0xc0 != 0x80) {
+        return u32::from(first);
+    }
+    // `utf_ptr2char` (`mbyte.c:642-700`) assembles the value from the bit
+    // layout and validates only the trail bytes, so a lead such as 0xF5 yields
+    // an out-of-range scalar rather than a fallback byte.
+    let lead_mask = 0xffu32 >> (length + 1);
+    let mut value = u32::from(first) & lead_mask;
+    for byte in &bytes[1..length] {
+        value = (value << 6) | (u32::from(*byte) & 0x3f);
+    }
+    value
 }
 
 /// `position` shifted by `delta`, when it stays inside the slice.
@@ -524,9 +544,11 @@ fn utf_bounds(bytes: &[u8], position: usize) -> (i64, i64) {
     // `utf_cp_bounds_len` needs the *complete* sequence: a truncation at the end
     // of the slice falls back to a single byte.
     let length = match bytes[start] {
-        0xc2..=0xdf => 2,
+        0xc0..=0xdf => 2,
         0xe0..=0xef => 3,
-        0xf0..=0xf4 => 4,
+        0xf0..=0xf7 => 4,
+        0xf8..=0xfb => 5,
+        0xfc..=0xfd => 6,
         _ => return (0, 1),
     };
     if start + length > bytes.len() || !bytes[start + 1..start + length]
