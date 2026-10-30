@@ -20,7 +20,8 @@ use crate::{Editor, LineReplaceRequest};
 use crate::autocmd::Event;
 use crate::excmd_exec::{
     CurrentBuffer, EvalHost, Flow, fire_buffer_lifecycle, flow_to_eval_error, object_to_typval,
-    option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number, typval_to_object,
+    find_buffer_argument, option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number,
+    typval_to_object,
     typval_to_option, typval_to_text,
 };
 
@@ -240,8 +241,7 @@ fn call_bufexists_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<T
         };
         return Err(EvalError::new(code, 0, message));
     }
-    let exists = !matches!(args.first(), Some(Typval::Number(0)))
-        && resolve_buffer_argument(editor, args.first()).is_some();
+    let exists = find_buffer_argument(editor, args.first()).is_some();
     Ok(Typval::Number(i64::from(exists)))
 }
 

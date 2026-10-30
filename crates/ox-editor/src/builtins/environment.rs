@@ -866,19 +866,7 @@ fn call_haslocaldir_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result
 /// non-number/string values answer 0 without an error.
 fn call_bufloaded_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     check_arity("bufloaded", args.len())?;
-    let buffer = match args.first() {
-        Some(Typval::Number(number)) if *number != 0 => ox_types::BufHandle::try_from(*number)
-            .ok()
-            .filter(|buffer| editor.buffer(*buffer).is_ok()),
-        Some(Typval::String(name)) if !name.as_bytes().is_empty() => {
-            editor.buffers().into_iter().find(|buffer| {
-                editor
-                    .buffer(*buffer)
-                    .is_ok_and(|state| state.name() == name)
-            })
-        }
-        _ => None,
-    };
+    let buffer = crate::excmd_exec::find_buffer_argument(editor, args.first());
     let loaded = buffer.is_some_and(|buffer| {
         editor
             .buffer(buffer)
@@ -892,19 +880,7 @@ fn call_bufloaded_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<T
 /// `""`, and non-name values miss.
 fn call_buflisted_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
     check_arity("buflisted", args.len())?;
-    let buffer = match args.first() {
-        Some(Typval::Number(number)) if *number != 0 => ox_types::BufHandle::try_from(*number)
-            .ok()
-            .filter(|buffer| editor.buffer(*buffer).is_ok()),
-        Some(Typval::String(name)) if !name.as_bytes().is_empty() => {
-            editor.buffers().into_iter().find(|buffer| {
-                editor
-                    .buffer(*buffer)
-                    .is_ok_and(|state| state.name() == name)
-            })
-        }
-        _ => None,
-    };
+    let buffer = crate::excmd_exec::find_buffer_argument(editor, args.first());
     let listed = buffer.is_some_and(|buffer| {
         editor.buffer(buffer).is_ok_and(|state| {
             state.flags.contains(crate::BufferFlags::LISTED)

@@ -3926,3 +3926,34 @@ fn stopinsert_requests_a_host_mode_transition() {
         Some(crate::PendingEditMode::StopInsert)
     );
 }
+
+/// `find_buffer` (`eval/buffer.c:49-71`) maps number `0` to the window's
+/// alternate buffer, and a string argument only ever matches a buffer name, so
+/// `""` and `"%"` miss. `buflisted`, `bufexists`, and `bufloaded` all share it.
+#[test]
+fn buffer_predicates_resolve_zero_to_the_alternate() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "predicates.vim",
+        "edit /tmp/oxvim-pred-a.txt\nedit /tmp/oxvim-pred-b.txt\n\
+         let g:listed0 = buflisted(0)\nlet g:exists0 = bufexists(0)\n\
+         let g:loaded0 = bufloaded(0)\nlet g:exists_percent = bufexists('%')\n\
+         let g:exists_empty = bufexists('')\n",
+    )
+    .unwrap();
+    let number = |name: &[u8]| match exec
+        .scope()
+        .get_scoped(ScopeKind::Global, name, 0)
+        .ok()
+    {
+        Some(Typval::Number(value)) => Some(*value),
+        _ => None,
+    };
+    assert_eq!(number(b"listed0"), Some(1));
+    assert_eq!(number(b"exists0"), Some(1));
+    assert_eq!(number(b"loaded0"), Some(1));
+    assert_eq!(number(b"exists_percent"), Some(0));
+    assert_eq!(number(b"exists_empty"), Some(0));
+}

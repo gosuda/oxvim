@@ -5537,6 +5537,40 @@ fn argument_path(editor: &Editor, argument: &str) -> PathBuf {
         )
 }
 
+/// `find_buffer` (`eval/buffer.c:49-71`): number `n` finds buffer `n`, and `0`
+/// finds the window's alternate (`buflist_findnr` maps `0` to `w_alt_fnum`).
+/// A string matches a buffer name; `""`, `"%"`, and anything else miss. Unlike
+/// [`resolve_buffer_argument`], no argument does not mean the current buffer.
+pub(crate) fn find_buffer_argument(
+    editor: &Editor,
+    argument: Option<&Typval>,
+) -> Option<BufHandle> {
+    match argument {
+        Some(Typval::Number(number)) => {
+            let alternate = || {
+                editor
+                    .current_window()
+                    .and_then(|window| editor.window(window).ok())
+                    .and_then(|window| window.alternate_buffer)
+            };
+            if *number == 0 {
+                return alternate().filter(|buffer| editor.buffer(*buffer).is_ok());
+            }
+            BufHandle::try_from(*number)
+                .ok()
+                .filter(|buffer| editor.buffer(*buffer).is_ok())
+        }
+        Some(Typval::String(name)) if !name.as_bytes().is_empty() => {
+            editor.buffers().into_iter().find(|buffer| {
+                editor
+                    .buffer(*buffer)
+                    .is_ok_and(|state| state.name() == name)
+            })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn resolve_buffer_argument(
     editor: &Editor,
     argument: Option<&Typval>,
