@@ -1281,7 +1281,7 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
 fn fs_fail(lua: &Lua, error: &FsError) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_vec(vec![
         Value::Nil,
-        Value::String(lua.create_string(error.message.as_str())?),
+        Value::String(lua.create_string(error.to_string())?),
         Value::String(lua.create_string(error.name)?),
     ]))
 }

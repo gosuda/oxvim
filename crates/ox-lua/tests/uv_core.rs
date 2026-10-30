@@ -1290,9 +1290,12 @@ fn fs_failures_report_luv_shapes_sync_and_async() {
         r"
         local uv = vim.uv
 
-        -- Sync fail shape: nil, err, name
+        -- Sync fail shape: nil, err, name; error string contains {name}: {message}
         local ok, err, name = uv.fs_stat(test_dir .. '/missing')
-        assert(ok == nil and name == 'ENOENT' and type(err) == 'string')
+        assert(ok == nil and name == 'ENOENT' and string.find(err, '^ENOENT: ') ~= nil)
+
+        ok, err, name = uv.fs_scandir(test_dir .. '/missing')
+        assert(ok == nil and name == 'ENOENT' and string.find(err, '^ENOENT: ') ~= nil)
 
         ok, err, name = uv.fs_open(test_dir .. '/missing', 'r', 0)
         assert(ok == nil and name == 'ENOENT')
