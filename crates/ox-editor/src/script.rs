@@ -1631,7 +1631,14 @@ fn next_quote_event(rest: &str, quoting: Quoting) -> Option<(usize, QuoteEvent)>
         };
         return Some((quote, event));
     }
-    let marker = rest.find(SNR_MARKER);
+    // A double-quoted run is a string literal, and upstream only rewrites a
+    // function name (`trans_function_name`, `eval/userfunc.c:1967`), so a
+    // `<SNR>` inside one stays as typed.
+    let marker = if quoting == Quoting::Double {
+        None
+    } else {
+        rest.find(SNR_MARKER)
+    };
     let quote = rest.find(['\'', '"']);
     let Some(at) = quote.filter(|at| marker.is_none_or(|marker| *at < marker)) else {
         return marker.map(|at| (at, QuoteEvent::Marker));
