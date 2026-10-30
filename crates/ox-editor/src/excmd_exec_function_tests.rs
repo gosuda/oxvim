@@ -267,17 +267,31 @@ fn function_bang_replaces_existing() {
 }
 
 #[test]
-fn function_redefinition_without_bang_is_e122() {
-    // eval/userfunc.c: defining an existing function without `!` raises
-    // E122 "Function already exists, add ! to replace it".
-    // test_user_func.vim: E122 on redefinition.
+fn function_redefinition_without_bang_is_e122_across_scripts() {
+    // eval/userfunc.c:2854-2860: a definition without `!` fails when the
+    // existing function came from another script, or from the same script in
+    // the same sourcing pass. Only re-sourcing one script allows it.
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
     script(&mut exec, &editor, "function! Dup()\nendfunction");
     let err = exec
-        .execute_script(&editor, "<test>", "function Dup()\nendfunction")
+        .execute_script(&editor, "<other>", "function Dup()\nendfunction")
         .unwrap_err();
     assert_eq!(error_code(&err), "E122");
+}
+
+#[test]
+fn function_redefinition_without_bang_is_allowed_when_one_script_loads_twice() {
+    // eval/userfunc.c:2858-2860: the same script id with a new sequence number
+    // replaces the function, so `:source` of one file twice is silent.
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(&editor, "<test>", "function Dup()\nendfunction")
+        .expect("first definition");
+    exec.execute_script(&editor, "<test>", "function Dup()\nreturn 2\nendfunction")
+        .expect("re-sourcing one script replaces its function");
+    script(&mut exec, &editor, "let g:r = Dup()");
+    assert_eq!(global_number(exec.scope(), "r"), Some(2));
 }
 
 // ---------------------------------------------------------------------------

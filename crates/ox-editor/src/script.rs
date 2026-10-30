@@ -1007,6 +1007,13 @@ impl<F: FileIO> ScriptCtx<F> {
     pub fn allocate_sid(&mut self, name: &str) -> Sid {
         let sid = self.next_sid;
         self.next_sid = self.next_sid.saturating_add(1);
+        if let Ok(path) = std::env::var("OXVIM_LOG_ALLOC_SID") {
+            use std::io::Write;
+            let bt = std::backtrace::Backtrace::force_capture();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "ALLOC SID {sid} for {name:?}\n{bt}");
+            }
+        }
         self.scripts.insert(
             sid,
             ScriptInfo {
@@ -1067,12 +1074,14 @@ impl<F: FileIO> ScriptCtx<F> {
         });
     }
 
-    /// The SID a previous sourcing of `name` already owns, when `name` is a
-    /// file rather than an anonymous context.
+    /// The SID a previous sourcing of `name` already owns.
+    ///
+    /// A string source has no file of its own, so the reference gives it one
+    /// pseudo id for the session: `do_source_ext` takes `SID_STR` when `str` is
+    /// given (`runtime.c:2226`), and the item materialises once
+    /// (`globals.h:298`). Two anonymous sources in one session therefore share
+    /// an id.
     fn reusable_sid(&self, name: &str) -> Option<Sid> {
-        if name.starts_with('<') {
-            return None;
-        }
         self.scripts
             .iter()
             .rev()
