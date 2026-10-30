@@ -389,6 +389,26 @@ fn edit_abandoned_buffer_follows_hidden_and_bufhidden() {
     executor.scripts().io().insert("second.txt", "second");
     executor.scripts().io().insert("third.txt", "third");
 
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufHidden *.txt call add(g:order, 'BufHidden:' . expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufUnload *.txt call add(g:order, 'BufUnload:' . expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter *.txt call add(g:order, 'BufEnter:' . expand('<afile>'))",
+        )
+        .unwrap();
+
     // Default 'hidden' is true: leaving first.txt retains it loaded in the background.
     executor.execute_line(&editor, "set hidden").unwrap();
     executor.execute_line(&editor, "edit first.txt").unwrap();
@@ -419,6 +439,18 @@ fn edit_abandoned_buffer_follows_hidden_and_bufhidden() {
         .unwrap();
     executor.execute_line(&editor, "edit first.txt").unwrap();
     assert!(editor.editor().buffer(third).unwrap().residency.is_loaded());
+    assert_eq!(
+        order_events(&executor),
+        [
+            "BufEnter:first.txt",
+            "BufHidden:first.txt",
+            "BufEnter:second.txt",
+            "BufUnload:second.txt",
+            "BufEnter:third.txt",
+            "BufHidden:third.txt",
+            "BufEnter:first.txt",
+        ]
+    );
 }
 
 #[test]

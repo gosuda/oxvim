@@ -7171,7 +7171,7 @@ fn command_help<F: FileIO, E: ExEditorAccess>(
             handle,
             origin,
             LoadSwitchFocus::Revalidate,
-            |runtime| {
+            |runtime, _scope, _lua| {
                 access.with_ex_editor(|editor| {
                     let result = open_tag_buffer(runtime, editor, handle, true, false, None, false);
                     if let Err(flow) = result {
@@ -9475,6 +9475,55 @@ fn buffer_release_for_edit(
     }
 }
 
+/// Switches the current window to `target` for `:edit`, honoring `'bufhidden'`
+/// and `'hidden'`, and firing `BufHidden` (buffer.c:661) or `BufUnload` (buffer.c:857)
+/// on the abandoned buffer if it is resident and leaving its only window.
+fn switch_and_release_for_edit<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    target: BufHandle,
+    command: &ExCommand,
+) -> Result<(), LoadSwitchError> {
+    let keepalt = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::KeepAlt);
+    let old_buf = access.with_ex_editor(|editor| editor.current_buffer());
+    let release = access.with_ex_editor(|editor| {
+        buffer_release_for_edit(editor, old_buf, command)
+    });
+    let will_detach = old_buf.is_some_and(|old| {
+        old != target
+            && access.with_ex_editor(|editor| {
+                let is_loaded = editor
+                    .buffer(old)
+                    .is_ok_and(|state| state.residency.is_loaded());
+                let window_count = editor
+                    .windows()
+                    .into_iter()
+                    .filter(|win| editor.window(*win).is_ok_and(|state| state.buffer == old))
+                    .count();
+                is_loaded && window_count <= 1
+            })
+    });
+    if will_detach && let Some(old) = old_buf {
+        let event = match release {
+            BufferRelease::KeepLoaded => Event::BufHidden,
+            BufferRelease::Unload => Event::BufUnload,
+        };
+        let flow = fire_buffer_lifecycle(runtime, access, scope, lua, &[event], old);
+        if !matches!(flow, Flow::Normal) {
+            return Err(LoadSwitchError::Flow(flow));
+        }
+    }
+    access.with_ex_editor(|editor| {
+        set_current_buffer_for_edit(editor, target, release, keepalt)
+            .map_err(LoadSwitchError::Editor)
+    })
+}
+
 fn command_edit<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -9608,18 +9657,16 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             lua,
             handle,
             origin,
-            |_runtime| {
+            |runtime, scope, lua| {
                 if has_window {
-                    access.with_ex_editor(|editor| {
-                        let release = buffer_release_for_edit(editor, editor.current_buffer(), command);
-                        set_current_buffer_for_edit(
-                            editor,
-                            handle,
-                            release,
-                            keepalt,
-                        )
-                        .map_err(LoadSwitchError::Editor)
-                    })
+                    switch_and_release_for_edit(
+                        runtime,
+                        access,
+                        scope,
+                        lua,
+                        handle,
+                        command,
+                    )
                 } else {
                     access.with_ex_editor(|editor| {
                         editor
@@ -9669,19 +9716,29 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
             Ok(_) => {}
             Err(error) => return error_flow(runtime, "E948", error.to_string()),
         }
-    } else if matches!(outcome, LoadSwitchOutcome::Resident)
-        && let Err(error) = access
-            .with_ex_editor(|editor| {
-                let release = buffer_release_for_edit(editor, editor.current_buffer(), command);
-                set_current_buffer_for_edit(
-                    editor,
-                    handle,
-                    release,
-                    keepalt,
-                )
-            })
-    {
-        return error_flow(runtime, "E948", error.to_string());
+    } else if matches!(outcome, LoadSwitchOutcome::Resident) {
+        if let Err(error) = switch_and_release_for_edit(
+            runtime,
+            access,
+            scope,
+            lua,
+            handle,
+            command,
+        ) {
+            match error {
+                LoadSwitchError::Flow(flow) => return flow,
+                LoadSwitchError::Editor(error) => {
+                    return error_flow(runtime, "E948", error.to_string());
+                }
+                LoadSwitchError::Read { path, error } => {
+                    return error_flow(
+                        runtime,
+                        "E484",
+                        format!("Can't open file {}: {error}", path.display()),
+                    );
+                }
+            }
+        }
     }
     // A `FileType` handler may have replaced or wiped the target while it
     // loaded (the `3P dir-browser` case): then the switch stays where the
@@ -14227,7 +14284,7 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
             new_buffer,
             origin,
             LoadSwitchFocus::Revalidate,
-            |_runtime| {
+            |_runtime, _scope, _lua| {
                 let created = if vertical && !below_right {
                     access.with_ex_editor(|editor| editor.split_left(tab, window, new_buffer, true))
                 } else if vertical {
@@ -14414,7 +14471,7 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
             buffer,
             origin,
             LoadSwitchFocus::Revalidate,
-            |_runtime| {
+            |_runtime, _scope, _lua| {
                 access.with_ex_editor(|editor| {
                     editor
                         .create_tabpage_at(buffer, DEFAULT_TABPAGE_GEOMETRY, after)
@@ -16680,7 +16737,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
     buffer: BufHandle,
     origin: BufferOrigin,
     focus: LoadSwitchFocus,
-    switch: impl FnOnce(&mut ExRuntime<F>) -> Result<(), LoadSwitchError>,
+    switch: impl FnOnce(&mut ExRuntime<F>, &mut Scope, Option<&Rc<dyn LuaExec>>) -> Result<(), LoadSwitchError>,
     restore: impl FnOnce(),
 ) -> Result<LoadSwitchOutcome, LoadSwitchError> {
     let abandoned = || {
@@ -16711,7 +16768,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
 
     let mut restore = Some(restore);
     if loaded {
-        if let Err(error) = switch(runtime) {
+        if let Err(error) = switch(runtime, scope, lua) {
             rollback_buffer_switch(access, buffer, &mut restore, false);
             return Err(error);
         }
@@ -16733,7 +16790,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
                 Ok(())
             })
             .map_err(LoadSwitchError::Editor)?;
-        if let Err(error) = switch(runtime) {
+        if let Err(error) = switch(runtime, scope, lua) {
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(error);
         }
@@ -16764,7 +16821,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         }) {
             return Err(LoadSwitchError::Editor(error));
         }
-        if let Err(error) = switch(runtime) {
+        if let Err(error) = switch(runtime, scope, lua) {
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(error);
         }
@@ -16838,7 +16895,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
             Ok(())
         })
         .map_err(LoadSwitchError::Editor)?;
-    if let Err(error) = switch(runtime) {
+    if let Err(error) = switch(runtime, scope, lua) {
         rollback_buffer_switch(access, buffer, &mut restore, true);
         return Err(error);
     }
@@ -16941,7 +16998,7 @@ fn prepare_buffer_for_display<F: FileIO, E: ExEditorAccess>(
         buffer,
         origin,
         LoadSwitchFocus::Preserve,
-        |_| Ok(()),
+        |_, _, _| Ok(()),
         || {},
     ) {
         Ok(_) => Flow::Normal,
@@ -16973,7 +17030,7 @@ fn prepare_created_tag_buffer<F: FileIO, E: ExEditorAccess>(
         buffer,
         BufferOrigin::Created,
         LoadSwitchFocus::Revalidate,
-        |runtime| {
+        |runtime, _scope, _lua| {
             access.with_ex_editor(|editor| {
                 open_tag_buffer(
                     runtime,
@@ -17042,7 +17099,7 @@ fn load_file_buffer_for_command<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     buffer: BufHandle,
     origin: BufferOrigin,
-    switch: impl FnOnce(&mut ExRuntime<F>) -> Result<(), LoadSwitchError>,
+    switch: impl FnOnce(&mut ExRuntime<F>, &mut Scope, Option<&Rc<dyn LuaExec>>) -> Result<(), LoadSwitchError>,
     restore: impl FnOnce(),
 ) -> Result<LoadSwitchOutcome, Flow> {
     match load_buffer_for_switch(
@@ -17114,7 +17171,7 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
         target,
         BufferOrigin::Existing,
         LoadSwitchFocus::Revalidate,
-        |_runtime| {
+        |_runtime, _scope, _lua| {
             access.with_ex_editor(|editor| {
                 editor
                     .set_current_buffer(target, BufferRelease::KeepLoaded)
