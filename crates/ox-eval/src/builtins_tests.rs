@@ -3184,6 +3184,36 @@ fn printf_formats_strings_numbers_and_radices() {
     assert!(call("printf", vec![text("%d %d"), number(1)]).is_err());
 }
 
+// Oracle: `strings.c:2205-2220` (`vim_vsnprintf_typval`). An unrecognized
+// conversion specifier (such as `netrw.vim:347`'s non-capturing group `\%(%s\)`)
+// emits the character literally and does not consume arguments, allowing the
+// subsequent `%s` to consume the string argument.
+#[test]
+fn printf_unknown_conversion_specifier_preserves_arguments_and_emits_literally() {
+    assert_eq!(
+        call("printf", vec![text(r"\%(%s\)"), text("txt")]).unwrap(),
+        text(r"\(txt\)")
+    );
+    assert_eq!(
+        call(
+            "printf",
+            vec![text(r"[\/]$,*,\%(%s\)[*@]\=$"), text("txt")]
+        )
+        .unwrap(),
+        text(r"[\/]$,*,\(txt\)[*@]\=$")
+    );
+}
+
+// Oracle: `strings.c:2205-2220`. An unrecognized conversion specifier consumes
+// no arguments (so `%(` alone does not raise E766), ignores width and flags,
+// and a trailing `%` emits nothing without raising E806.
+#[test]
+fn printf_unknown_conversion_specifier_without_arguments_and_trailing_percent() {
+    assert_eq!(call("printf", vec![text("%(")]).unwrap(), text("("));
+    assert_eq!(call("printf", vec![text("foo %")]).unwrap(), text("foo "));
+    assert_eq!(call("printf", vec![text("%05(")]).unwrap(), text("("));
+}
+
 #[test]
 fn exists_checks_evaluator_owned_namespaces_without_mutation() {
     let mut builtins = Builtins::without_regex();

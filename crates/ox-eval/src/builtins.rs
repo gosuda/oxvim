@@ -3954,8 +3954,18 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             source.next();
         }
         let Some(conversion) = source.next() else {
-            return Err(EvalError::new("E806", 0, "Invalid format specifier"));
+            // `strings.c:2213-2217`: trailing `%` emits nothing and consumes no argument.
+            break;
         };
+        // `strings.c:2205-2220`: unrecognized conversion specifiers emit the
+        // character literally, consume no argument, and ignore width/flags.
+        if !matches!(
+            conversion,
+            'd' | 'i' | 'u' | 'x' | 'X' | 'o' | 'b' | 'B' | 'c' | 'f' | 'F' | 'e' | 'E' | 'g' | 'G' | 's'
+        ) {
+            pieces.push(conversion);
+            continue;
+        }
         let Some(value) = arguments.next() else {
             return Err(EvalError::new(
                 "E766",
@@ -4059,13 +4069,7 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
                 }
                 text
             }
-            _ => {
-                return Err(EvalError::new(
-                    "E806",
-                    0,
-                    format!("Invalid format specifier: %{conversion}"),
-                ));
-            }
+            _ => conversion.to_string(),
         };
         let padding = width.saturating_sub(rendered.chars().count());
         if left {
