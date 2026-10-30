@@ -5514,6 +5514,11 @@ pub(crate) fn resolve_buffer_argument(
         Some(Typval::String(name)) if name.as_bytes().is_empty() || name.as_bytes() == b"%" => {
             editor.current_buffer()
         }
+        Some(Typval::String(name)) if name.as_bytes() == b"#" => editor
+            .current_window()
+            .and_then(|window| editor.window(window).ok())
+            .and_then(|window| window.alternate_buffer)
+            .filter(|buffer| editor.buffer(*buffer).is_ok()),
         Some(Typval::String(name)) => editor.buffers().into_iter().find(|buffer| {
             editor
                 .buffer(*buffer)
@@ -17125,17 +17130,24 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
     let handle = access.with_ex_editor(|editor| {
         if let Some(handle) = requested.and_then(|value| BufHandle::try_from(value).ok()) {
             Ok(handle)
-        } else if arg == "#"
-            && let Some(alternate) = editor
+        } else if arg == "#" {
+            match editor
                 .current_window()
                 .and_then(|window| editor.window(window).ok())
                 .and_then(|window| window.alternate_buffer)
                 .filter(|buffer| editor.buffer(*buffer).is_ok())
-        {
-            // `:b#` edits the alternate buffer (`do_buffer`'s `#`
-            // expansion, `buffer.c`): without a live alternate the name
-            // match below reports `E94`, as before.
-            Ok(alternate)
+            {
+                Some(alternate) => {
+                    // `:b#` edits the alternate buffer (`do_buffer`'s `#`
+                    // expansion, `buffer.c`).
+                    Ok(alternate)
+                }
+                None => Err(error_flow(
+                    runtime,
+                    "E94",
+                    "No matching buffer for #",
+                )),
+            }
         } else {
             let matches: Vec<BufHandle> = editor
                 .buffers()
@@ -24479,9 +24491,11 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
                 scope.set_register(&[name as u8], Typval::String(OxStr(content.to_bytes())));
             }
         }
-        refresh_special_registers(editor, scope);
         scope.synced.set_registers(register_version);
     }
+    // `%` and `#` are window projections, so they must refresh even when the
+    // register bank version is unchanged by a buffer switch.
+    refresh_special_registers(editor, scope);
     let option_version = editor.options().version();
     if scope.synced.options() != option_version {
         mirror_options(editor, scope);

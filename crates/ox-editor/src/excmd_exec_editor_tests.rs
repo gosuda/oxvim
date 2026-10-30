@@ -1767,6 +1767,109 @@ fn buffer_switches_to_specified_handle() {
 }
 
 #[test]
+fn bufnr_hash_tracks_each_window_buffer_switch() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(first)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("first"));
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(second)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("second"));
+
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(first));
+    assert_eq!(global_text(&executor, "alternate_name"), Some("first".to_owned()));
+
+    executor.execute_line(&editor, "buffer #").unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(second));
+    assert_eq!(global_text(&executor, "alternate_name"), Some("second".to_owned()));
+}
+
+#[test]
+fn hash_keeps_unloaded_alternate_until_wipe() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(first)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("first"));
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(first).unwrap();
+
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#')")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(first));
+
+    editor.editor_mut().wipe_buffer(first).unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), -1);
+    assert_eq!(global_text(&executor, "alternate_name"), Some(String::new()));
+}
+
+#[test]
+fn split_window_starts_without_an_alternate_buffer() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(first)
+    );
+
+    executor.execute_line(&editor, "split").unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#')")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), -1);
+}
+
+#[test]
+fn buffer_hash_does_not_match_literal_name_without_alternate() {
+    let (editor, mut executor) = setup();
+    let current = editor.editor().current_buffer().unwrap();
+    let literal = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(literal)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("#"));
+
+    assert_vim_error(executor.execute_line(&editor, "buffer #"), "E94");
+    assert_eq!(editor.editor().current_buffer(), Some(current));
+}
+
+#[test]
 fn buffer_list_aliases_share_default_and_bang_visibility() {
     for alias in ["ls", "buffers", "files"] {
         let (editor, mut executor) = setup();
