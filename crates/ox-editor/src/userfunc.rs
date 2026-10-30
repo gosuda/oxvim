@@ -593,6 +593,18 @@ impl UserFunctions {
         self.call_stack.iter().any(|frame| frame.name == canonical)
     }
 
+    /// Names of every function defined while script `sid` was current, which is
+    /// what `getscriptinfo()` reports as `functions` (`runtime.c:2654-2664`).
+    #[must_use]
+    pub fn names_in_script(&self, sid: Sid) -> Vec<String> {
+        self.functions
+            .borrow()
+            .values()
+            .filter(|function| function.context.sid == sid)
+            .map(|function| function.name.clone())
+            .collect()
+    }
+
     /// All functions in canonical name order.
     pub fn iter(&self) -> impl Iterator<Item = (String, UserFunc)> {
         self.functions

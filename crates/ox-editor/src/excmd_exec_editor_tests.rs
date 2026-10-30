@@ -3432,6 +3432,52 @@ fn scriptnames_lists_sourced_scripts_in_sid_order() {
     assert_eq!(echo_messages(&editor), vec!["  1: a.vim", "  2: b.vim"]);
 }
 
+/// `getscriptinfo()` reports every sourced script and, for a `sid` query, that
+/// script's variables and functions. Upstream: `f_getscriptinfo`
+/// (`runtime.c:2670-2740`).
+#[test]
+fn getscriptinfo_lists_scripts_and_answers_a_sid_query() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "gs_info.vim",
+            "function s:Fn()\nendfunction\nlet s:var = 7",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "let g:all = getscriptinfo({'name': 'gs_info'})",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:n = len(g:all)")
+        .unwrap();
+    assert_eq!(global_number(&executor, "n"), 1);
+    executor
+        .execute_line(
+            &editor,
+            "let g:one = getscriptinfo({'sid': g:all[0].sid})[0]",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:v = get(g:one.variables, 'var', -1)")
+        .unwrap();
+    assert_eq!(global_number(&executor, "v"), 7);
+    executor
+        .execute_line(&editor, "let g:f = get(g:one.functions, 0, '')")
+        .unwrap();
+    let name = match global_value(&executor, "f") {
+        Some(ox_types::Typval::String(text)) => text.to_string_lossy().into_owned(),
+        other => panic!("getscriptinfo returned no function name: {other:?}"),
+    };
+    assert!(
+        name.ends_with("_Fn"),
+        "getscriptinfo did not name the script-local function: {name}"
+    );
+}
+
 /// `:scriptnames` replaces a `$HOME` prefix with `~` (`home_replace` in
 /// `path.c`); without `$HOME` the path lists unchanged.
 #[test]

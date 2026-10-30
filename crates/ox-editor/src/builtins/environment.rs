@@ -14,11 +14,12 @@ use ox_eval::EvalError;
 use ox_eval::Scope;
 use ox_eval::ScopeKind;
 use ox_eval::eval::CallArg;
+use ox_eval::RegexEngine;
 use ox_types::{OxStr, Typval};
 
 use super::input_string_arg;
 use crate::builtins::position::cell_width;
-use crate::excmd_exec::{EvalHost, change_directory, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, VimRegex, change_directory, typval_number, typval_to_text};
 
 /// Routes one ambient-environment builtin.
 pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
@@ -83,8 +84,130 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .with_ex_editor(|editor| call_buflisted_builtin(editor, args)),
         "dictwatcheradd" => call_dictwatcher_add_builtin(host, args),
         "dictwatcherdel" => call_dictwatcher_del_builtin(host, args),
+        "getscriptinfo" => call_getscriptinfo_builtin(host, args),
         _ => unreachable!("environment builtin route and dispatcher disagree"),
     }
+}
+
+/// `f_getscriptinfo` (`runtime.c:2670-2740`): every sourced script as
+/// `{name, sid, version, autoload}`, filtered by `sid` or by a `name` pattern.
+///
+/// A `sid` query returns one entry and adds the script's `variables` and
+/// `functions`; a `name` query keeps every script whose name matches the
+/// pattern. Anything else lists every named script.
+///
+/// # Errors
+///
+/// Returns E118 for a second argument, E1249 for a non-positive `sid`, and the
+/// regex error for a bad `name` pattern.
+fn call_getscriptinfo_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    if args.len() > 1 {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: getscriptinfo",
+        ));
+    }
+    let query = match args.first() {
+        None => None,
+        Some(Typval::Dict(_)) => args.first(),
+        Some(value) => {
+            return Err(EvalError::new(
+                "E1206",
+                0,
+                format!(
+                    "Dictionary required for argument 1: {}",
+                    crate::excmd_exec::typval_to_text(value)
+                ),
+            ));
+        }
+    };
+    let requested_sid = match query {
+        Some(Typval::Dict(entries)) => {
+            let entries = entries.borrow().entries.clone();
+            entries
+                .iter()
+                .find(|entry| entry.key.as_bytes() == b"sid")
+                .map(|entry| {
+                    let text = crate::excmd_exec::typval_to_text(&entry.value);
+                    crate::excmd_exec::typval_number(&entry.value)
+                        .filter(|sid| *sid > 0)
+                        .and_then(|sid| crate::script::Sid::try_from(sid).ok())
+                        .ok_or_else(|| {
+                            EvalError::new(
+                                "E1249",
+                                0,
+                                format!("Invalid value for argument: sid: {text}"),
+                            )
+                        })
+                })
+        }
+        _ => None,
+    };
+    let requested_sid = match requested_sid {
+        Some(result) => Some(result?),
+        None => None,
+    };
+    let pattern = match (requested_sid, query) {
+        (None, Some(Typval::Dict(entries))) => {
+            let entries = entries.borrow().entries.clone();
+            entries
+                .iter()
+                .find(|entry| entry.key.as_bytes() == b"name")
+                .map(|entry| crate::excmd_exec::typval_to_text(&entry.value))
+        }
+        _ => None,
+    };
+
+    let mut items = Vec::new();
+    for (sid, name) in host.runtime.scripts.script_names() {
+        if requested_sid.is_some_and(|wanted| sid != wanted) {
+            continue;
+        }
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(pattern) = &pattern {
+            let matches = RegexEngine::is_match(
+                &VimRegex,
+                &OxStr::from(name),
+                &OxStr::from(pattern.as_str()),
+                false,
+            )?;
+            if !matches {
+                continue;
+            }
+        }
+        let mut fields = vec![
+            (OxStr::from("name"), Typval::String(OxStr::from(name))),
+            (OxStr::from("sid"), Typval::Number(sid as i64)),
+            (OxStr::from("version"), Typval::Number(1)),
+            (OxStr::from("autoload"), Typval::Bool(false)),
+        ];
+        if requested_sid.is_some() {
+            let variables = Typval::dict(
+                host.runtime
+                    .scripts
+                    .script_vars(sid)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            fields.push((OxStr::from("variables"), variables));
+            let functions = host
+                .runtime
+                .functions
+                .names_in_script(sid)
+                .into_iter()
+                .map(|name| Typval::String(OxStr::from(name.as_str())))
+                .collect();
+            fields.push((OxStr::from("functions"), Typval::list(functions)));
+        }
+        items.push(Typval::dict(fields));
+    }
+    Ok(Typval::list(items))
 }
 
 /// Routes one ambient-environment builtin with per-argument identities.
