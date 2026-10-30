@@ -78,6 +78,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "bufloaded" => host
             .access
             .with_ex_editor(|editor| call_bufloaded_builtin(editor, args)),
+        "buflisted" => host
+            .access
+            .with_ex_editor(|editor| call_buflisted_builtin(editor, args)),
         "dictwatcheradd" => call_dictwatcher_add_builtin(host, args),
         "dictwatcherdel" => call_dictwatcher_del_builtin(host, args),
         _ => unreachable!("environment builtin route and dispatcher disagree"),
@@ -882,6 +885,32 @@ fn call_bufloaded_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<T
             .is_ok_and(|state| state.residency.is_loaded())
     });
     Ok(Typval::Number(i64::from(loaded)))
+}
+
+/// `f_buflisted` (`eval/buffer.c:476-482`): whether `find_buffer()` resolves the
+/// argument and the buffer is listed. Resolution matches `bufloaded()`, so `0`,
+/// `""`, and non-name values miss.
+fn call_buflisted_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    check_arity("buflisted", args.len())?;
+    let buffer = match args.first() {
+        Some(Typval::Number(number)) if *number != 0 => ox_types::BufHandle::try_from(*number)
+            .ok()
+            .filter(|buffer| editor.buffer(*buffer).is_ok()),
+        Some(Typval::String(name)) if !name.as_bytes().is_empty() => {
+            editor.buffers().into_iter().find(|buffer| {
+                editor
+                    .buffer(*buffer)
+                    .is_ok_and(|state| state.name() == name)
+            })
+        }
+        _ => None,
+    };
+    let listed = buffer.is_some_and(|buffer| {
+        editor.buffer(buffer).is_ok_and(|state| {
+            state.flags.contains(crate::BufferFlags::LISTED)
+        })
+    });
+    Ok(Typval::Number(i64::from(listed)))
 }
 
 /// Whether a callback name needs the digit-lead rejection: upstream's

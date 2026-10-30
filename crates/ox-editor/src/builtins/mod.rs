@@ -91,7 +91,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "prompt_setprompt" | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
         "api_info" | "chdir" | "defer" | "eventhandler" | "getcwd" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
-        | "state" | "swapname" | "shiftwidth" | "haslocaldir" | "bufloaded" | "dictwatcheradd"
+        | "state" | "swapname" | "shiftwidth" | "haslocaldir" | "bufloaded" | "buflisted" | "dictwatcheradd"
         | "dictwatcherdel" => Family::Environment,
         "call" | "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand"
         | "funcref" | "function" | "luaeval" | "submatch" | "uniq" => Family::Eval,
