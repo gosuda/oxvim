@@ -288,9 +288,34 @@ fn call_buffer_identity_builtin(
     }
     let name = buffer
         .and_then(|handle| editor.buffer(handle).ok())
-        .map_or_else(|| OxStr::from(""), |state| state.name().clone());
+        .map_or_else(
+            || OxStr::from(""),
+            |state| shorten_against_cwd(editor, state.name()),
+        );
 
     Ok(Typval::String(name))
+}
+
+/// The name `bufname()` reports: a full path under the current directory is
+/// trimmed to its tail (`shorten_buf_fname`, `fileio.c:2434-2463`).
+///
+/// The reference stores that shortened form when the directory changes
+/// (`shorten_fnames`, `fileio.c:2468`); this port keeps the full name and trims
+/// on read, which answers the same string for every `bufname()` call.
+fn shorten_against_cwd(editor: &Editor, name: &OxStr) -> OxStr {
+    let Some(directory) = editor.effective_directory() else {
+        return name.clone();
+    };
+    let text = name.to_string_lossy();
+    if text.contains("://") {
+        return name.clone();
+    }
+    let directory = directory.to_string_lossy();
+    let prefix = format!("{}/", directory.trim_end_matches('/'));
+    match text.strip_prefix(prefix.as_str()) {
+        Some(tail) if !tail.is_empty() => OxStr::from(tail),
+        _ => name.clone(),
+    }
 }
 
 fn call_bufadd_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
