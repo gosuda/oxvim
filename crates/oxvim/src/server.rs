@@ -7,7 +7,6 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
 
 use mlua::{Function, Lua, MultiValue, Table, Value, Variadic};
 use ox_api::{
@@ -4378,25 +4377,6 @@ fn live_mode_builtin(
                 _ => false,
             };
             Typval::Number(if is_dir { 1 } else { 0 })
-        }
-        b"getcwd" => {
-            let is_global = matches!(args.first(), Some(Typval::Number(-1)));
-            let directory = session.with_editor(|editor| {
-                if is_global {
-                    editor
-                        .global_directory()
-                        .map(std::path::Path::to_path_buf)
-                        .or_else(|| std::env::current_dir().ok())
-                } else {
-                    editor
-                        .effective_directory()
-                        .or_else(|| std::env::current_dir().ok())
-                }
-            });
-            let text = directory
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            Typval::String(OxStr::from(text.as_str()))
         }
         _ => return Ok(None),
     };

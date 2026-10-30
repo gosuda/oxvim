@@ -532,6 +532,55 @@ fn reentrant_current_dir_shares_cd_minus_state() {
         Value::from(initial.as_str())
     );
 }
+#[expect(
+    clippy::expect_used,
+    reason = "filesystem and RPC state are assertions in the embedded smoke harness"
+)]
+#[test]
+fn scoped_getcwd_queries_window_and_tab_scopes_without_shortcut_corruption() {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock must follow the Unix epoch")
+        .as_nanos();
+    let root = ScratchDirectory(std::env::temp_dir().join(format!(
+        "oxvim-scoped-cwd-{}-{unique}",
+        std::process::id()
+    )));
+    let global_dir = root.0.join("global");
+    let window_dir = root.0.join("window");
+    fs::create_dir_all(&global_dir).expect("create global dir");
+    fs::create_dir_all(&window_dir).expect("create window dir");
+    let global_dir = global_dir.canonicalize().expect("canonical global dir");
+    let window_dir = window_dir.canonicalize().expect("canonical window dir");
+    let global_str = global_dir.to_str().expect("utf-8").to_owned();
+    let window_str = window_dir.to_str().expect("utf-8").to_owned();
+
+    let mut oxvim = Embedded::spawn();
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from(format!("cd {global_str}"))],
+    );
+    oxvim.request("nvim_command", vec![Value::from("bot split")]);
+    oxvim.request(
+        "nvim_command",
+        vec![Value::from(format!("lcd {window_str}"))],
+    );
+
+    // Window 1 has no local directory and should report globalDir.
+    let win1_cwd = oxvim.request(
+        "nvim_call_function",
+        vec![Value::from("getcwd"), Value::Array(vec![Value::from(1)])],
+    );
+    assert_eq!(win1_cwd, Value::from(global_str.as_str()));
+
+    // Window 2 has a local directory and should report windowDir.
+    let win2_cwd = oxvim.request(
+        "nvim_call_function",
+        vec![Value::from("getcwd"), Value::Array(vec![Value::from(2)])],
+    );
+    assert_eq!(win2_cwd, Value::from(window_str.as_str()));
+}
+
 
 #[test]
 fn lua_variable_and_option_tables_use_editor_state() {
