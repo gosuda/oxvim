@@ -1379,3 +1379,21 @@ precedence, `'hidden'` policy, netrw coexistence, and `:syntax` — the last is 
 subsystem, not a command: it needs a syntax loader, a `Syntax` autocmd, a group
 registry, and `:syntax list`, since the failing case asserts a group defined by
 `runtime/syntax/directory.vim`.
+
+
+### `dir_spec`: 32 of 38
+
+| Commit | Change | Cases |
+|---|---|---|
+| `51b596e` | message content read through `Message::text_lossy()`, so a notify message renders in `:messages` | T7, T28 pass |
+| `c48d09a` | `:call` closes at its own parenthesis via the existing `find_closing_paren`; a trailing comment with parentheses no longer truncates arguments | netrw coexistence unblocked |
+| `1f3b65b` | `uv` fs errors format as `{name}: {message}`, matching luv | ENOENT captured |
+
+Verified after the three commits: 32 OK, 6 FAIL, workspace 3879 green.
+
+The message change has **no unit test**: two attempts to write one at the API
+level missed the chunk shape and were removed rather than kept red. Its evidence
+is the functional T7 and T28 cases, which fail without it and pass with it.
+
+Six remain: `[count]-` overshoot, startup mapping precedence, `'hidden'`
+policy, two reload cases (T8, T27), and `:syntax`, which is a subsystem.
