@@ -1397,3 +1397,24 @@ is the functional T7 and T28 cases, which fail without it and pass with it.
 
 Six remain: `[count]-` overshoot, startup mapping precedence, `'hidden'`
 policy, two reload cases (T8, T27), and `:syntax`, which is a subsystem.
+
+
+### `dir_spec`: 35 of 38
+
+| Commit | Change | Cases |
+|---|---|---|
+| `249eae9` | `buffer_release_for_edit` decides release from `'bufhidden'`, `'hidden'`, `:hide` (`buffer.c:4120-4133`) | hidden abandonment |
+| `fa458ac` | editor filesystem builtins use the one number converter | `vim.fs.mkdir` |
+| `d2ba915` | unrecognized `printf` specifier kept literally (`strings.c:2205-2220`) | netrw suffix format |
+| `0b74ade`, `8792cba` | typed count cleared only for mappings that consume it | `[count]-` |
+| `b7e25ae` | normal-mode `CTRL-^` queues `:buffer #` | failed open keeps its listing |
+| `deed8f3` | five quote scanners share `skip_quoted` (`eval.c:3728-3735`) | netrw `:call` |
+| `690d3ba` | lexer coverage for single-quoted trailing backslash | — |
+
+Suite: 3904 passed, 1 skipped. Verified on the release binary at `690d3ba`.
+
+Three remain:
+
+- `does not shadow startup plugin mappings` expects zero and gets one.
+- `reloads directory buffers` needs `:syntax list` and a group a syntax file defines; the port has no syntax loader, so this is a subsystem.
+- `coexists with netrw` now gets past the autoload's init section and dies in `netrw#Explore` at `E171: Missing :endif`.
