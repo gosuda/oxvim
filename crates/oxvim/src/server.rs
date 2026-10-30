@@ -320,10 +320,20 @@ pub struct AppState {
     /// have completed and before that turn's RPC reply.
     channel_output: ChannelOutput,
     emitter: Emitter,
-    /// Long-lived render state: the layer stack and its grid buffers, rebuilt
-    /// in place on each redraw rather than reconstructed.
     compositor: Compositor,
     statusline_cache: Option<StatuslineCache>,
+    /// Per-session re-entry marker for `%!` statusline evaluation.
+    statusline_rendering: Rc<Cell<bool>>,
+}
+
+/// Clears the per-session statusline re-entry marker even if evaluation
+/// unwinds unexpectedly.
+struct StatuslineRenderGuard(Rc<Cell<bool>>);
+
+impl Drop for StatuslineRenderGuard {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
 }
 
 struct StatuslineCache {
@@ -783,6 +793,7 @@ impl AppState {
             emitter: Emitter::new(),
             compositor: Compositor::new(1, 1),
             statusline_cache: None,
+            statusline_rendering: Rc::new(Cell::new(false)),
         };
         state.run_startup(cli, timer)?;
         // main.c writes startup message output before the process waits on
@@ -1640,10 +1651,26 @@ impl AppState {
         self.render_statuslines_with_policy(StatuslineCachePolicy::Refresh)
     }
 
+    /// Guards the `%!` evaluator against `:redrawstatus` re-entry
+    /// (`statusline.c:81-92`). The flag belongs to this `AppState`, not a
+    /// process-global, so independent editor sessions cannot suppress one
+    /// another.
+    fn render_statuslines_with_policy(
+        &mut self,
+        policy: StatuslineCachePolicy,
+    ) -> HashMap<WinHandle, String> {
+        let flag = self.statusline_rendering.clone();
+        if flag.replace(true) {
+            return HashMap::new();
+        }
+        let _guard = StatuslineRenderGuard(flag);
+        self.render_statuslines_with_policy_inner(policy)
+    }
+
     /// Evaluates each active window's effective `'statusline'` before the
     /// compositor borrows the editor snapshot. This keeps `%` expressions and
     /// `%!` callbacks on the editor/executor path instead of the pure renderer.
-    fn render_statuslines_with_policy(
+    fn render_statuslines_with_policy_inner(
         &mut self,
         policy: StatuslineCachePolicy,
     ) -> HashMap<WinHandle, String> {
@@ -7474,6 +7501,33 @@ mod tests {
             .flatten()
             .ok_or("missing restored statusline")?;
         assert!(restored.0.starts_with("[No Name]"));
+        Ok(())
+    }
+
+    #[test]
+    fn statusline_render_reentry_is_ignored_and_outer_percent_bang_text_survives()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AppState::new(&Cli::default(), &mut StartupTimer::start())?;
+        let window = state.session.with_editor_mut(|editor| {
+            let window = editor.current_window().ok_or("missing window")?;
+            editor.options_mut().set_window(
+                window,
+                "statusline",
+                OptionValue::String("%!\"OUTER\"".to_owned()),
+            )?;
+            Ok::<_, Box<dyn std::error::Error>>(window)
+        })?;
+
+        state.statusline_rendering.set(true);
+        assert!(
+            state.render_statuslines().is_empty(),
+            "a nested statusline render must return no replacement text"
+        );
+        state.statusline_rendering.set(false);
+
+        let rendered = state.render_statuslines();
+        assert_eq!(rendered.get(&window).map(String::as_str), Some("OUTER"));
+        assert!(!state.statusline_rendering.get());
         Ok(())
     }
 

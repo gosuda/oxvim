@@ -356,6 +356,11 @@ impl Compositor {
         let windows = tab.windows();
         let tiled_count = tab.layout().window_count();
         let tiled_split = tiled_count > 1;
+        let laststatus = match editor.options().get_global("laststatus") {
+            Ok(OptionValue::Number(value)) => *value,
+            _ => 2,
+        };
+        let tiled_statusline = statusline_visible(laststatus, tiled_split);
         for window in windows {
             let state = editor.window(window)?;
             let geometry = tab.window_geometry(window)?;
@@ -371,7 +376,7 @@ impl Compositor {
                 let (row, grid_height) = tiled_window_grid_geometry(
                     geometry,
                     height.saturating_sub(tabline_top),
-                    tiled_split,
+                    tiled_statusline,
                 );
                 (
                     row.saturating_add(isize::try_from(tabline_top).unwrap_or(isize::MAX)),
@@ -700,7 +705,7 @@ impl Compositor {
             layer.grid = grid;
             layer.window = Some(window);
             layer.watched_extmarks = watched_extmarks;
-            if !is_float && tiled_split {
+            if !is_float && tiled_statusline {
                 let mut statusline = statuslines.get(&window).cloned().unwrap_or_else(|| {
                     let name = if buffer_state.name().as_bytes().is_empty() {
                         "[No Name]".to_owned()
@@ -991,15 +996,26 @@ fn resolve_tabline_row(
     Ok(resolved)
 }
 
-/// Content rectangle for a tiled window: one statusline under each split
-/// window, and the last screen row reserved for the message grid.
+/// Whether tiled windows reserve and draw their statusline row. `'laststatus'
+/// 0` hides it, `1` shows it only when the tabpage is split, and `2` shows it
+/// for a single window as well.
+fn statusline_visible(laststatus: i64, tiled_split: bool) -> bool {
+    match laststatus {
+        0 => false,
+        1 => tiled_split,
+        _ => true,
+    }
+}
+
+/// Content rectangle for a tiled window: one configured statusline under each
+/// window and the last screen row reserved for the message grid.
 fn tiled_window_grid_geometry(
     geometry: Geometry,
     screen_height: usize,
-    tiled_split: bool,
+    statusline_visible: bool,
 ) -> (isize, usize) {
     let work_bottom = screen_height.saturating_sub(1);
-    let statusline = usize::from(tiled_split);
+    let statusline = usize::from(statusline_visible);
     let frame_end = geometry.row.saturating_add(geometry.height);
     let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
     let grid_height = content_end.saturating_sub(geometry.row).max(1);

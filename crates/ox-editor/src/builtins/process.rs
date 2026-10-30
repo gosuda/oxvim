@@ -1609,8 +1609,10 @@ mod tests {
     }
 
     // `f_jobstart` sizes a `term` job's pty from the current window
-    // (eval/funcs.c:3505-3506): a 120x40 window has 39 text rows (the
-    // message row is reserved), so the child must see "39 120".
+    // (`eval/funcs.c:3505-3506`): with default `'laststatus'=2`, a 120x40
+    // window has 38 text rows after the message/statusline reservations
+    // (`drawscreen.c:2759-2762`, `window.c:1164-1171`), so the child must see
+    // "38 120".
     #[test]
     fn terminal_job_pty_matches_the_window_geometry() {
         let _guard = crate::lock_process_state();
@@ -1628,7 +1630,7 @@ mod tests {
         )
         .unwrap();
         let job = global_number(exec.scope(), "job").unwrap();
-        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((38, 120)));
     }
 
     // A bare `jobstart(..., {'pty': v:true})` takes the same window default:
@@ -1651,7 +1653,7 @@ mod tests {
         )
         .unwrap();
         let job = global_number(exec.scope(), "job").unwrap();
-        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((38, 120)));
     }
 
     // With no window to inherit from, each dimension keeps the

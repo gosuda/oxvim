@@ -1177,20 +1177,30 @@ impl TabpageState {
 
     /// Returns the renderable text rows for a tiled window.
     ///
-    /// This excludes the message row and split statusline that the compositor
-    /// reserves from the layout frame.
+    /// This excludes the message row and the configured statusline row that
+    /// the compositor reserves from the layout frame. `laststatus` is the
+    /// editor-wide option: zero hides all statuslines, one shows them only
+    /// for splits, and two shows them for every window.
     ///
     /// # Errors
     ///
     /// Returns [`LayoutError::UnknownWindow`] for a non-tiled window.
-    pub fn tiled_window_text_height(&self, window: WinHandle) -> Result<usize, LayoutError> {
+    pub fn tiled_window_text_height(
+        &self,
+        window: WinHandle,
+        laststatus: i64,
+    ) -> Result<usize, LayoutError> {
         let geometry = self.layout.window_geometry(self.resolve(window))?;
         let root = self.layout.root.geometry();
         // The work area ends at the root's absolute bottom row (exclusive),
         // less the message row. `height` alone is relative to the screen,
         // so a root below row zero would truncate every window under it.
         let work_bottom = root.row.saturating_add(root.height).saturating_sub(1);
-        let statusline = usize::from(self.layout.window_count() > 1);
+        let statusline = match laststatus {
+            0 => 0,
+            1 => usize::from(self.layout.window_count() > 1),
+            _ => 1,
+        };
         let frame_end = geometry.row.saturating_add(geometry.height);
         let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
         Ok(content_end.saturating_sub(geometry.row).max(1))
@@ -2470,7 +2480,23 @@ mod tests {
         let (first, _, _) = handles();
         let layout = Layout::new(first, state(), Geometry::new(10, 0, 80, 24).unwrap()).unwrap();
         let tabpage = TabpageState::new(layout);
-        assert_eq!(tabpage.tiled_window_text_height(first).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 23);
+    }
+
+    #[test]
+    fn text_height_honors_laststatus_for_single_and_split_windows() {
+        let (first, second, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 1).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 2).unwrap(), 22);
+        tabpage
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 12);
+        assert_eq!(tabpage.tiled_window_text_height(first, 1).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(first, 2).unwrap(), 11);
     }
 
     #[test]

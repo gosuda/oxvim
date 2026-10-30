@@ -2058,13 +2058,14 @@ impl Editor {
             .get(&window)
             .copied()
             .ok_or(EditorError::UnknownWindow(window))?;
+        let laststatus = self.laststatus();
         let (topline, skiprows) = {
             let state = self.window(window)?;
             let tabpage = self
                 .tabpages
                 .get(&tab)
                 .ok_or(EditorError::UnknownTabpage(tab))?;
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let mut topline = cursor_visible_topline(state.topline, position.lnum, height);
             let mut skiprows = 0;
             let geometry = self.window_geometry(window)?;
@@ -2508,6 +2509,17 @@ impl Editor {
     /// Returns mutable option state.
     pub const fn options_mut(&mut self) -> &mut OptionStore {
         &mut self.options
+    }
+
+    /// Returns the validated global `'laststatus'` value used by layout and
+    /// viewport calculations. The default keeps rendering resilient if option
+    /// metadata is unavailable during early startup.
+    #[must_use]
+    fn laststatus(&self) -> i64 {
+        match self.options.get_global("laststatus") {
+            Ok(OptionValue::Number(value)) => *value,
+            _ => 2,
+        }
     }
 
     /// Returns register state.
@@ -3189,22 +3201,26 @@ impl Editor {
         } else {
             tab
         };
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.resize(geometry)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
     /// Scrolls each tiled window's topline back into view after its frame
-    /// changed, the way `win_new_height`/`validate_cursor` do after a
-    /// resize (window.c) — a shrunken frame can otherwise leave the cursor
-    /// below the new text area and emit it past the window grid.
-    fn revalidate_window_toplines(tabpage: &mut TabpageState) -> Result<(), EditorError> {
+    /// changed, the way `win_new_height`/`validate_cursor` do after a resize
+    /// (window.c) — a shrunken frame can otherwise leave the cursor below the
+    /// new text area and emit it past the window grid.
+    fn revalidate_window_toplines(
+        tabpage: &mut TabpageState,
+        laststatus: i64,
+    ) -> Result<(), EditorError> {
         for window in tabpage.layout().windows() {
-            let height = tabpage.tiled_window_text_height(window)?;
+            let height = tabpage.tiled_window_text_height(window, laststatus)?;
             let state = tabpage.window_mut(window)?;
             state.topline = cursor_visible_topline(state.topline, state.cursor.lnum, height);
             state.skiprows = 0;
@@ -3226,12 +3242,13 @@ impl Editor {
         } else {
             tab
         };
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.equalize()?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
@@ -3516,12 +3533,13 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         tabpage.set_window_width(resolved, width)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
@@ -3545,12 +3563,13 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         tabpage.set_window_height(resolved, height)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
     /// Returns the renderable text-row count for a window.
@@ -3569,7 +3588,7 @@ impl Editor {
             .tabpages
             .get(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
-        Ok(viewport_height(tabpage, resolved))
+        Ok(viewport_height(tabpage, resolved, self.laststatus()))
     }
 
     /// Returns floating configuration, or `None` for a tiled window.
@@ -5131,6 +5150,7 @@ impl Editor {
             }
         };
         let previous = self.current_window();
+        let laststatus = self.laststatus();
         let (old_topline, old_cursor, old_height, old_buffer, local_directory, previous_directory) = {
             let tabpage = self
                 .tabpages
@@ -5140,7 +5160,7 @@ impl Editor {
             (
                 state.topline,
                 state.cursor,
-                tabpage.tiled_window_text_height(target)?,
+                tabpage.tiled_window_text_height(target, laststatus)?,
                 state.buffer,
                 state.local_directory.clone(),
                 state.previous_directory.clone(),
@@ -5180,7 +5200,7 @@ impl Editor {
             }
             return Err(error.into());
         }
-        let new_height = tabpage.tiled_window_text_height(target)?;
+        let new_height = tabpage.tiled_window_text_height(target, laststatus)?;
         let old_row = old_cursor
             .lnum
             .saturating_sub(old_topline)
@@ -5235,9 +5255,10 @@ impl Editor {
         };
         // The columns lose height, so the first window's view keeps its cursor
         // on screen with the same fraction arithmetic a ordinary split uses.
+        let laststatus = self.laststatus();
         let (old_topline, old_height) = {
             let state = tabpage.window(first)?;
-            (state.topline, tabpage.tiled_window_text_height(first)?)
+            (state.topline, tabpage.tiled_window_text_height(first, laststatus)?)
         };
         let previous = self.current_window();
         let window = allocate_window_handle(&mut self.next_window)?;
@@ -5258,7 +5279,7 @@ impl Editor {
             }
             return Err(error.into());
         }
-        let new_height = tabpage.tiled_window_text_height(first)?;
+        let new_height = tabpage.tiled_window_text_height(first, laststatus)?;
         let old_row = cursor
             .lnum
             .saturating_sub(old_topline)
@@ -5295,6 +5316,7 @@ impl Editor {
             .buffers
             .get(&buffer)
             .and_then(|state| state.text().ok());
+        let laststatus = self.laststatus();
         let line_count = buffer_text.map_or(1, Buffer::line_count).max(1);
         let old_end = start.saturating_add(old_count);
         let windows = &self.windows;
@@ -5303,7 +5325,7 @@ impl Editor {
             let Some(tabpage) = tabpages.get_mut(&tab) else {
                 continue;
             };
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let Ok(state) = tabpage.window_mut(window) else {
                 continue;
             };
@@ -5359,6 +5381,7 @@ impl Editor {
         let line_count = buffer_text.map_or(1, Buffer::line_count).max(1);
         // Byte length of the replacement's final row, which upstream reads
         // with `ml_get_buf_len` when collapsing rows the edit removed.
+        let laststatus = self.laststatus();
         let new_end_row_len = buffer_text
             .and_then(|text| text.line(splice.new_end().row.saturating_add(1)).ok())
             .map_or(0, |line| line.len());
@@ -5368,7 +5391,7 @@ impl Editor {
             let Some(tabpage) = tabpages.get_mut(&tab) else {
                 continue;
             };
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let Ok(state) = tabpage.window_mut(window) else {
                 continue;
             };
@@ -5476,14 +5499,13 @@ fn wrapped_line_rows(cells: usize, width: usize) -> usize {
 
 /// Renderable text rows for a window's viewport.
 ///
-/// Tiled windows reserve a statusline row and the message row from their
-/// layout frame (`tiled_window_text_height`), matching upstream
-/// `w_winrow_height` minus `--statusline`/`-2` reservations; floating frames
-/// already exclude their borders. Falls back to the frame height when the
-/// window has no geometry.
-fn viewport_height(tabpage: &TabpageState, window: WinHandle) -> usize {
+/// Tiled windows reserve the configured statusline row and the message row
+/// from their layout frame, matching upstream `w_winrow_height` minus
+/// `--statusline`/`-2` reservations; floating frames already exclude their
+/// borders. Falls back to the frame height when the window has no geometry.
+fn viewport_height(tabpage: &TabpageState, window: WinHandle, laststatus: i64) -> usize {
     tabpage
-        .tiled_window_text_height(window)
+        .tiled_window_text_height(window, laststatus)
         .or_else(|_| {
             tabpage
                 .window_geometry(window)
