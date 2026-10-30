@@ -5371,3 +5371,16 @@ fn search_cmdline_typing_sets_incsearch_preview_mark() {
         "incsearch preview mark not set for /NEEDL"
     );
 }
+
+/// Normal mode `CTRL-^` (`0x1E`) without count queues `:buffer #` to edit the
+/// alternate file; with count, queues `:buffer <count>`.
+#[test]
+fn normal_ctrl_hat_queues_buffer_switch_command() {
+    let (mut editor, _buffer, mut machine) = named_editor("hello", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\x1e", &mut eval).unwrap();
+    assert_eq!(machine.take_ex_command().as_deref(), Some("buffer #"));
+
+    machine.feed_keys(&mut editor, "3\x1e", &mut eval).unwrap();
+    assert_eq!(machine.take_ex_command().as_deref(), Some("buffer 3"));
+}

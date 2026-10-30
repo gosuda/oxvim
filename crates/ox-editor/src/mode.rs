@@ -2546,6 +2546,15 @@ impl ModeMachine {
                 Self::jump_ident_tag(editor, count)?;
                 Ok(Some(Mode::default()))
             }
+            '\u{1e}' => {
+                let target = if state.count != 0 {
+                    state.count.to_string()
+                } else {
+                    "#".to_owned()
+                };
+                self.completed_ex_command = Some(format!("buffer {target}"));
+                Ok(Some(Mode::default()))
+            }
             '\u{14}' => {
                 let window = cursor_context(editor)?.window;
                 let old_idx = editor
