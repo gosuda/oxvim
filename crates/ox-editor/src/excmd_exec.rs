@@ -6593,7 +6593,7 @@ fn command_let<F: FileIO, E: ExEditorAccess>(
         Err(flow) => return flow,
     };
     let target = curly_target.as_str();
-    let key = canonical_target(target);
+    let key = canonical_target(runtime, target);
     if runtime.const_vars.contains(&key) {
         return error_flow(
             runtime,
@@ -6684,7 +6684,7 @@ fn command_unlet<F: FileIO, E: ExEditorAccess>(
         } else if let Some(garbage) = unlet_name_garbage(target) {
             return error_flow(runtime, "E488", format!("Trailing characters: {garbage}"));
         }
-        let key = canonical_target(target);
+        let key = canonical_target(runtime, target);
         if runtime.const_vars.contains(&key) {
             return error_flow(
                 runtime,
@@ -25438,8 +25438,29 @@ fn parse_scope_name(target: &str) -> (Option<ScopeKind>, String) {
     (None, target.to_owned())
 }
 
-fn canonical_target(target: &str) -> String {
-    target.trim().to_owned()
+fn canonical_target<F: FileIO>(runtime: &ExRuntime<F>, target: &str) -> String {
+    let (kind, name) = parse_scope_name(target);
+    match kind {
+        Some(ScopeKind::Global) => format!("g:{name}"),
+        Some(ScopeKind::Script) => {
+            let sid = runtime.scripts.current_sid().unwrap_or(0);
+            format!("s:{sid}:{name}")
+        }
+        Some(ScopeKind::Buffer) => format!("b:{name}"),
+        Some(ScopeKind::Window) => format!("w:{name}"),
+        Some(ScopeKind::Tab) => format!("t:{name}"),
+        Some(ScopeKind::Vim) => format!("v:{name}"),
+        Some(ScopeKind::Local) | None => {
+            if let Some(frame) = runtime.functions.call_stack().last() {
+                format!("l:{}:{name}", frame.order)
+            } else if let Some(sid) = runtime.scripts.current_sid() {
+                format!("s:{sid}:{name}")
+            } else {
+                format!("g:{name}")
+            }
+        }
+        _ => target.trim().to_owned(),
+    }
 }
 
 fn apply_assignment_operator<F: FileIO>(
