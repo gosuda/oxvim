@@ -1315,13 +1315,23 @@ The 14 remaining, grouped by cause:
 `23754bb` fixed two cases and named the rest. Verified on the rebased tree with a
 fresh release build: 25 OK, 13 FAIL.
 
-| Case | Status | Cause |
-|---|---|---|
-| `<Plug>(nvim-dir-up)` | passes | the plugin used a pattern search; it now scans for the exact line |
-| modified unnamed buffer | still fails, but past the guard | the guard now precedes the modified check; the case fails later at `bufnr('#')`, which returns -1 |
-| alternate buffer | fails | no alternate-buffer tracking |
-| `[count]-` | fails | the global working directory resolves to `/` |
-| navigates / displays / encodes | fail | activating an entry still leaves the listing buffer in the window |
+One row per failing test in that run:
+
+| Case | Cause |
+|---|---|
+| `reports custom listing provider errors` | the plugin's `notify_error` never reaches `:messages` |
+| `failed directory open does not repeat the error on every BufEnter` | fails at setup for this case before the activation path |
+| `maps [count]- to open directories` | the global working directory resolves to `/` |
+| `preserves a modified unnamed buffer when opening the current directory` | past the guard now; fails at `bufnr('#')`, which is -1 |
+| `does not shadow startup plugin mappings in directory buffers` | startup mapping precedence in a directory buffer |
+| `preserves alternate buffer when opening a parent directory` | no alternate-buffer tracking |
+| `navigates entries and refreshes the listing` | activating an entry leaves the listing buffer in the window |
+| `follows global 'hidden' when abandoned` | the buffer stays loaded under `nohidden` |
+| `reloads directory buffers` | `:syntax` is unimplemented |
+| `reports an error and keeps the buffer when reloading a removed directory` | `ENOENT` message not captured |
+| `displays filenames as buffer text and opens them from the buffer` | same activation failure |
+| `encodes special filename characters in directory buffers` | same activation failure |
+| `coexists with netrw and can be disabled` | netrw's autoload hits E488 |
 
 A previous attempt on the same task failed on an infrastructure 403 after 45
 minutes and was reverted; its residue was not merged.
