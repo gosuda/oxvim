@@ -26,6 +26,7 @@ pub(crate) fn is_filesystem_builtin(name: &str) -> bool {
             | "glob"
             | "globpath"
             | "readfile"
+            | "readdir"
             | "writefile"
             | "filereadable"
             | "isdirectory"
@@ -53,6 +54,7 @@ pub(crate) fn call(io: &dyn FileIO, name: &str, args: &[Typval]) -> ox_eval::Res
         "glob" => glob(io, args),
         "globpath" => globpath(io, args),
         "readfile" => readfile(io, args),
+        "readdir" => readdir(io, args),
         "filereadable" => filereadable(io, &args[0]),
         "isdirectory" => isdirectory(io, &args[0]),
         "getftime" => getftime(io, &args[0]),
@@ -522,6 +524,32 @@ fn readfile(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
             .map(|line| Typval::String(OxStr(line)))
             .collect(),
     ))
+}
+
+/// `f_readdir` (`eval/fs.c:1218-1237`): returns a sorted list of entry names
+/// in `dirname`. When the path cannot be read, reports E484.
+fn readdir(io: &dyn FileIO, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let path = path_arg(&args[0])?;
+    let entries = match io.read_dir(&path) {
+        Ok(entries) => entries,
+        Err(_) => {
+            return Err(EvalError::new(
+                "E484",
+                0,
+                format!("Can't open file {}", path.display()),
+            ));
+        }
+    };
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .map(|entry| entry.name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let items = names
+        .into_iter()
+        .map(|name| Typval::String(OxStr::from(name.as_bytes())))
+        .collect();
+    Ok(Typval::list(items))
 }
 
 /// Text mode removes EF BB BF at any position (1426-1459), not only the one
@@ -1003,6 +1031,7 @@ mod tests {
             "glob",
             "globpath",
             "readfile",
+            "readdir",
             "filereadable",
             "isdirectory",
             "getftime",
@@ -1014,6 +1043,19 @@ mod tests {
         ] {
             assert!(is_filesystem_builtin(name), "{name} is not routed");
         }
+    }
+
+    #[test]
+    fn readdir_returns_sorted_entry_names() {
+        let root = TempRoot::new("readdir");
+        fs::write(root.0.join("b.txt"), b"b").unwrap();
+        fs::write(root.0.join("a.txt"), b"a").unwrap();
+        fs::create_dir(root.0.join("dir")).unwrap();
+        let res = call(&RealFileIO, "readdir", &[path(&root.0)]).unwrap();
+        assert_eq!(
+            res,
+            Typval::list(vec![text("a.txt"), text("b.txt"), text("dir")])
+        );
     }
 
     struct TempRoot(PathBuf);
