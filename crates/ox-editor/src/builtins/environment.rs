@@ -128,36 +128,37 @@ fn call_getscriptinfo_builtin<F: FileIO, E: ExEditorAccess>(
     let requested_sid = match query {
         Some(Typval::Dict(entries)) => {
             let entries = entries.borrow().entries.clone();
-            entries
-                .iter()
-                .find(|entry| entry.key.as_bytes() == b"sid")
-                .map(|entry| {
-                    let text = crate::excmd_exec::typval_to_text(&entry.value);
-                    crate::excmd_exec::typval_number(&entry.value)
-                        .filter(|sid| *sid > 0)
-                        .and_then(|sid| crate::script::Sid::try_from(sid).ok())
-                        .ok_or_else(|| {
-                            EvalError::new(
-                                "E1249",
-                                0,
-                                format!("Invalid value for argument: sid: {text}"),
-                            )
-                        })
-                })
+            match entries.iter().find(|entry| entry.key.as_bytes() == b"sid") {
+                Some(entry) => {
+                    // `tv_get_number_chk` (`typval.c:4178-4179`) names the type
+                    // before the range check reports E475.
+                    let sid = ox_eval::builtins::number_arg(&entry.value)?;
+                    if sid <= 0 {
+                        return Err(EvalError::new(
+                            "E475",
+                            0,
+                            format!(
+                                "Invalid argument: sid: {}",
+                                crate::excmd_exec::typval_to_text(&entry.value)
+                            ),
+                        ));
+                    }
+                    Some(crate::script::Sid::try_from(sid).map_err(|_| {
+                        EvalError::new("E475", 0, format!("Invalid argument: sid: {sid}"))
+                    })?)
+                }
+                None => None,
+            }
         }
         _ => None,
-    };
-    let requested_sid = match requested_sid {
-        Some(result) => Some(result?),
-        None => None,
     };
     let pattern = match (requested_sid, query) {
         (None, Some(Typval::Dict(entries))) => {
             let entries = entries.borrow().entries.clone();
-            entries
-                .iter()
-                .find(|entry| entry.key.as_bytes() == b"name")
-                .map(|entry| crate::excmd_exec::typval_to_text(&entry.value))
+            match entries.iter().find(|entry| entry.key.as_bytes() == b"name") {
+                Some(entry) => Some(ox_eval::builtins::string_arg(&entry.value)?),
+                None => None,
+            }
         }
         _ => None,
     };
@@ -171,12 +172,8 @@ fn call_getscriptinfo_builtin<F: FileIO, E: ExEditorAccess>(
             continue;
         }
         if let Some(pattern) = &pattern {
-            let matches = RegexEngine::is_match(
-                &VimRegex,
-                &OxStr::from(name),
-                &OxStr::from(pattern.as_str()),
-                false,
-            )?;
+            let matches =
+                RegexEngine::is_match(&VimRegex, &OxStr::from(name), pattern, false)?;
             if !matches {
                 continue;
             }
