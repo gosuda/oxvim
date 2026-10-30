@@ -836,6 +836,11 @@ pub(crate) struct ExRuntime<F: FileIO> {
     pub(crate) pending_edit_mode: Option<PendingEditMode>,
     /// Whether an uncaught error was displayed during this execution.
     pub(crate) did_emsg: bool,
+    /// Call frames the current text cannot see. `do_source_ext` calls
+    /// `save_funccal` (`runtime.c:2337`), so a sourced file's unscoped names are
+    /// global even when a function asked for the file: frames up to this depth
+    /// belong to the caller and are invisible to the script body.
+    pub(crate) source_bar: usize,
     /// A `BufWriteCmd`-owned write left the buffer modified while
     /// overwriting its own file: upstream's bare `FAIL`
     /// (`bufwrite.c:469-473`) shows no message and the `|` chain
@@ -905,6 +910,7 @@ impl<F: FileIO> ExRuntime<F> {
             active_autocmd: ActiveAutocmdContext::default(),
             autocmd_busy: 0,
             did_emsg: false,
+            source_bar: 0,
             write_silent_fail: false,
             filetype_autocmd_depth: 0,
             deferred_ops: Vec::new(),
@@ -2705,6 +2711,11 @@ impl<F: FileIO> ExExecutor<F> {
         let caller_script = self.scope.script.clone();
         let caller_augroup = self.runtime.current_augroup;
         let caller_sid = self.runtime.scripts.current_sid();
+        // `save_funccal` (`runtime.c:2337`): a sourced file does not run inside
+        // the caller's function, so its unscoped names are not that function's
+        // locals.
+        let caller_bar = self.runtime.source_bar;
+        self.runtime.source_bar = self.runtime.functions.call_stack().len();
         if let Some(from) = caller_sid {
             self.runtime.scripts.store_script_scope(from, &self.scope);
         }
@@ -2745,6 +2756,7 @@ impl<F: FileIO> ExExecutor<F> {
             None => self.scope.script = caller_script,
         }
         self.runtime.current_augroup = caller_augroup;
+        self.runtime.source_bar = caller_bar;
         result
     }
 
@@ -3317,6 +3329,10 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         let flow = run_deferred_line(runtime, access, scope, lua, instruction);
                         if !matches!(flow, Flow::Normal) {
                             display_error_message(runtime, access, &flow);
+                            if !instruction.cmdline && runtime.try_depth == 0 {
+                                pc += 1;
+                                continue;
+                            }
                             return flow;
                         }
                     }
@@ -3346,10 +3362,15 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                             continue;
                         }
                         display_error_message(runtime, access, &flow);
-                        // `did_emsg` aborts the whole do_cmdline
-                        // (ex_docmd.c:745-753): nothing after the failed
-                        // command runs unless `:silent!` or `:catch`
-                        // took the failure instead.
+                        // `do_cmdline` breaks its loop on an error only for a
+                        // line from the command line (`ex_docmd.c:745-753`):
+                        // `getexline` is the sole getter that stops it, so a
+                        // sourced file's `getsourceline` keeps going. Inside
+                        // `:try` the error must reach the handler instead.
+                        if !instruction.cmdline && runtime.try_depth == 0 {
+                            pc += 1;
+                            continue;
+                        }
                         return flow;
                     }
                 }
@@ -3364,6 +3385,10 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 let flow = run_deferred_line(runtime, access, scope, lua, instruction);
                 if !matches!(flow, Flow::Normal) {
                     display_error_message(runtime, access, &flow);
+                    if !instruction.cmdline && runtime.try_depth == 0 {
+                        pc += 1;
+                        continue;
+                    }
                     return flow;
                 }
             }
@@ -6175,6 +6200,11 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
     let caller_sid = runtime.scripts.current_sid();
+    // `save_funccal` (`runtime.c:2337`): the file body is not the caller's
+    // function body, so its unscoped names are global, not that function's
+    // locals.
+    let caller_bar = runtime.source_bar;
+    runtime.source_bar = runtime.functions.call_stack().len();
     if let Some(from) = caller_sid {
         runtime.scripts.store_script_scope(from, scope);
     }
@@ -6199,6 +6229,7 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
         None => scope.script = caller_script,
     }
     runtime.current_augroup = caller_augroup;
+    runtime.source_bar = caller_bar;
     Ok(flow)
 }
 /// `call_user_func` cleanup (userfunc.c:1272, 3487-3524): pops the frame's
@@ -25514,9 +25545,11 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
             .set_scoped(kind, name.as_bytes(), 0, value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
         push_scope_watch_event(runtime, kind, name.as_bytes(), old, Some(value));
-    } else if runtime.can_add_defer() {
+    } else if runtime.functions.call_stack().len() > runtime.source_bar {
         // `get_var_ht_dict` (eval/vars.c:2505-2512): inside a function a
-        // bare name is function-local; outside one it is global.
+        // bare name is function-local; outside one it is global. A file the
+        // function sources is outside it (`save_funccal`, `runtime.c:2337`),
+        // so `source_bar` hides the caller's frames here.
         let old = scope
             .get_scoped(ScopeKind::Local, name.as_bytes(), 0)
             .ok()
@@ -25935,11 +25968,16 @@ fn canonical_target<F: FileIO>(runtime: &ExRuntime<F>, target: &str) -> String {
         Some(ScopeKind::Tab) => format!("t:{name}"),
         Some(ScopeKind::Vim) => format!("v:{name}"),
         Some(ScopeKind::Local) | None => {
-            if let Some(frame) = runtime.functions.call_stack().last() {
+            let frames = runtime.functions.call_stack();
+            if let Some(frame) = frames
+                .last()
+                .filter(|_| frames.len() > runtime.source_bar)
+            {
                 format!("l:{}:{name}", frame.order)
-            } else if let Some(sid) = runtime.scripts.current_sid() {
-                format!("s:{sid}:{name}")
             } else {
+                // `:h internal-variables`: a name without a scope prefix is
+                // global outside a function, so a sourced script's `let x`
+                // creates `g:x` and never `s:x`.
                 format!("g:{name}")
             }
         }
