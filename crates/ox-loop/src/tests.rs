@@ -192,7 +192,7 @@ fn fast_work_runs_before_deferred_safe_point() {
 }
 
 #[test]
-fn transfer_requeues_deferred_tail_after_put_error() {
+fn transfer_requeues_deferred_tail_after_unknown_owner() {
     let reactor = Reactor::new().unwrap();
     let queues = crate::WorkQueues::new(reactor.waker());
     let owner = {
