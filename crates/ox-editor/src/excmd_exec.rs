@@ -6941,9 +6941,9 @@ fn command_echo<F: FileIO, E: ExEditorAccess>(
     // name (`encode.c:898-901`). Strings stay unquoted at the top level, and
     // nested values render as `:echo` renders them.
     let message = matches!(name, "echomsg" | "echoerr");
-    let render = |value: &Typval| match value {
-        Typval::Funcref(_) | Typval::Partial(_) if message => typval_to_display(value, true),
-        _ => typval_to_display(value, false),
+    let render = |value: &Typval| {
+        let quoted = message && matches!(value, Typval::Funcref(_) | Typval::Partial(_));
+        typval_to_display(value, quoted)
     };
     let mut pieces = Vec::new();
     if let Ok(value) = eval_text(runtime, access, scope, lua, args) {

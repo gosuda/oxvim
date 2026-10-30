@@ -596,9 +596,17 @@ impl<'a> Builtins<'a> {
             "strutf16len" => strutf16len(&args),
             "strwidth" => strwidth(&args[0], self.ambiguous_wide),
             "stridx" => string_index(&args, false),
-            "string" => Ok(Typval::String(OxStr::from(
-                ox_types::echo_text_quoted(&args[0]).as_str(),
-            ))),
+            "string" => {
+                let (text, has_cycle) = ox_types::echo_text_quoted_with_cycle(&args[0]);
+                if has_cycle {
+                    return Err(EvalError::new(
+                        "E724",
+                        0,
+                        "unable to correctly dump variable with self-referencing container",
+                    ));
+                }
+                Ok(Typval::String(OxStr::from(text.as_str())))
+            }
             "strpart" => strpart(&args),
             "strridx" => string_index(&args, true),
             "substitute" => self.regex_substitute(&args),

@@ -1147,8 +1147,84 @@ fn echon_joins_without_space_separator() {
     // echon separator is "" → "abcdef".
     assert_eq!(message_text(&msgs[0]), "abcdef");
 }
+#[test]
+fn echo_self_referencing_container_prints_dots_and_string_raises_e724() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    // 1. :echo of a self-referential list prints dots without error:
+    exec.execute_script(
+        &editor,
+        "<test_list>",
+        "function! TestList()\n\
+           let l = [1]\n\
+           call add(l, l)\n\
+           echo l\n\
+         endfunction\n\
+         call TestList()",
+    )
+    .unwrap();
+    let ed = editor.editor();
+    assert_eq!(message_text(ed.messages().last().unwrap()), "[1, [...@0]]");
+    drop(ed);
 
-// ── execute ────────────────────────────────────────────────────────────
+    // string(l) raises E724:
+    let res_str = exec.execute_script(
+        &editor,
+        "<test_string_l>",
+        "function! TestStringL()\n\
+           let l = [1]\n\
+           call add(l, l)\n\
+           let s = string(l)\n\
+         endfunction\n\
+         call TestStringL()",
+    );
+    let ExecError::Vim(err) = res_str.unwrap_err() else {
+        panic!("expected Vim exception for string(l) on list cycle");
+    };
+    assert_eq!(
+        err.emsg_text(),
+        "E724: unable to correctly dump variable with self-referencing container"
+    );
+
+    // 2. :echo of a self-referential dict prints dots without error:
+    exec.execute_script(
+        &editor,
+        "<test_dict>",
+        "function! TestDict()\n\
+           let d = {'a': 1}\n\
+           let d['self'] = d\n\
+           echo d\n\
+         endfunction\n\
+         call TestDict()",
+    )
+    .unwrap();
+    let ed_d = editor.editor();
+    assert_eq!(
+        message_text(ed_d.messages().last().unwrap()),
+        "{'a': 1, 'self': {...@0}}"
+    );
+    drop(ed_d);
+
+    // string(d) raises E724:
+    let res_str_d = exec.execute_script(
+        &editor,
+        "<test_string_d>",
+        "function! TestStringD()\n\
+           let d = {'a': 1}\n\
+           let d['self'] = d\n\
+           let s = string(d)\n\
+         endfunction\n\
+         call TestStringD()",
+    );
+    let ExecError::Vim(err_d) = res_str_d.unwrap_err() else {
+        panic!("expected Vim exception for string(d) on dict cycle");
+    };
+    assert_eq!(
+        err_d.emsg_text(),
+        "E724: unable to correctly dump variable with self-referencing container"
+    );
+}
+
 
 #[test]
 fn set_minus_equal_removes_complete_comma_list_item() {

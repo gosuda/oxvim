@@ -2370,15 +2370,15 @@ fn copy_is_outer_independent_but_keeps_nested_aliases() {
 fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
     let source = Typval::list(vec![]);
     call("add", vec![source.clone(), source.clone()]).unwrap();
-    assert_eq!(
-        call("string", vec![source.clone()]).unwrap(),
-        text("[[...@0]]")
-    );
+    assert!(matches!(
+        call("string", vec![source.clone()]),
+        Err(e) if e.code == "E724"
+    ));
     let copied = call("deepcopy", vec![source.clone()]).unwrap();
-    assert_eq!(
-        call("string", vec![copied.clone()]).unwrap(),
-        text("[[...@0]]")
-    );
+    assert!(matches!(
+        call("string", vec![copied.clone()]),
+        Err(e) if e.code == "E724"
+    ));
     let (Typval::List(source_ref), Typval::List(copy_ref)) = (&source, &copied) else {
         panic!("Lists expected")
     };
@@ -2388,6 +2388,31 @@ fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
     };
     assert!(std::rc::Rc::ptr_eq(copy_ref, cycle_ref));
 }
+#[test]
+fn string_builtin_raises_e724_on_self_referencing_container() {
+    let list = Typval::list(vec![Typval::Number(1)]);
+    let Typval::List(r) = &list else { unreachable!() };
+    r.borrow_mut().items.push(list.clone());
+    let err = call("string", vec![list]).unwrap_err();
+    assert_eq!(err.code, "E724");
+    assert_eq!(
+        err.message,
+        "unable to correctly dump variable with self-referencing container"
+    );
+
+    let dict = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]);
+    let Typval::Dict(d) = &dict else { unreachable!() };
+    d.borrow_mut()
+        .entries
+        .push(ox_types::DictEntry::new(OxStr::from("self"), dict.clone()));
+    let err_d = call("string", vec![dict]).unwrap_err();
+    assert_eq!(err_d.code, "E724");
+    assert_eq!(
+        err_d.message,
+        "unable to correctly dump variable with self-referencing container"
+    );
+}
+
 
 #[test]
 fn string_builtin_quotes_and_escapes_via_shared_formatter() {

@@ -3,7 +3,7 @@
 //! Mirrors upstream `typval_defs.h` `VarType` kinds. Vimscript strings are
 //! byte strings ([`OxStr`]); lists and dictionaries are shared reference types.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::{BitOr, BitOrAssign};
@@ -562,6 +562,7 @@ impl Typval {
         formatter: &mut fmt::Formatter<'_>,
         quoted_strings: bool,
         stack: &mut Vec<ConvStackFrame>,
+        saw_cycle: &mut bool,
     ) -> fmt::Result {
         match self {
             Self::Number(value) => write!(formatter, "{value}"),
@@ -588,6 +589,7 @@ impl Typval {
                 }
                 let ptr = Rc::as_ptr(list).cast::<()>();
                 if let Some(backref) = stack.iter().position(|f| *f == ConvStackFrame::List(ptr)) {
+                    *saw_cycle = true;
                     return write!(formatter, "[...@{backref}]");
                 }
                 stack.push(ConvStackFrame::List(ptr));
@@ -596,7 +598,7 @@ impl Typval {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    item.fmt_echo(formatter, true, stack)?;
+                    item.fmt_echo(formatter, true, stack, saw_cycle)?;
                 }
                 stack.pop();
                 formatter.write_str("]")
@@ -613,6 +615,7 @@ impl Typval {
                 }
                 let ptr = Rc::as_ptr(dict).cast::<()>();
                 if let Some(backref) = stack.iter().position(|f| *f == ConvStackFrame::Dict(ptr)) {
+                    *saw_cycle = true;
                     return write!(formatter, "{{...@{backref}}}");
                 }
                 stack.push(ConvStackFrame::Dict(ptr));
@@ -623,7 +626,7 @@ impl Typval {
                     }
                     fmt_escaped_string(formatter, entry.key.as_bytes(), true)?;
                     formatter.write_str(": ")?;
-                    entry.value.fmt_echo(formatter, true, stack)?;
+                    entry.value.fmt_echo(formatter, true, stack, saw_cycle)?;
                 }
                 stack.pop();
                 formatter.write_str("}")
@@ -658,7 +661,7 @@ impl Typval {
                         if index != 0 {
                             formatter.write_str(", ")?;
                         }
-                        arg.fmt_echo(formatter, true, stack)?;
+                        arg.fmt_echo(formatter, true, stack, saw_cycle)?;
                     }
                     formatter.write_str("]")?;
                     stack.pop();
@@ -666,7 +669,12 @@ impl Typval {
                 if let Some(dict_ref) = &function.dict {
                     // TYPVAL_ENCODE_CONV_FUNC_BEFORE_SELF (encode.c:400)
                     formatter.write_str(", ")?;
-                    Self::Dict(dict_ref.clone()).fmt_echo(formatter, true, stack)?;
+                    Self::Dict(dict_ref.clone()).fmt_echo(
+                        formatter,
+                        true,
+                        stack,
+                        saw_cycle,
+                    )?;
                 }
                 formatter.write_str(")")?;
                 stack.pop();
@@ -682,21 +690,38 @@ impl Typval {
 impl fmt::Display for Typval {
     /// `:echo` spelling; see [`Typval::fmt_echo`].
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.fmt_echo(formatter, false, &mut Vec::new())
+        self.fmt_echo(formatter, false, &mut Vec::new(), &mut false)
     }
 }
 
-/// One echo renderer shared by both string-quoting modes below.
 struct Echo<'a> {
     value: &'a Typval,
     quoted_strings: bool,
+    saw_cycle: Cell<bool>,
 }
 
 impl fmt::Display for Echo<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.value
-            .fmt_echo(formatter, self.quoted_strings, &mut Vec::new())
+        let mut saw = false;
+        let result = self.value.fmt_echo(
+            formatter,
+            self.quoted_strings,
+            &mut Vec::new(),
+            &mut saw,
+        );
+        self.saw_cycle.set(saw);
+        result
     }
+}
+
+fn echo_format_impl(value: &Typval, quoted_strings: bool) -> (String, bool) {
+    let echo = Echo {
+        value,
+        quoted_strings,
+        saw_cycle: Cell::new(false),
+    };
+    let text = echo.to_string();
+    (text, echo.saw_cycle.get())
 }
 
 /// `:echo` spelling of `value`: top-level strings render raw, exactly what
@@ -704,11 +729,7 @@ impl fmt::Display for Echo<'_> {
 /// Together these let the editor lane delete its own renderer.
 #[must_use]
 pub fn echo_text(value: &Typval) -> String {
-    Echo {
-        value,
-        quoted_strings: false,
-    }
-    .to_string()
+    echo_format_impl(value, false).0
 }
 
 /// `:echo` spelling of `value` with strings single-quoted: what `:echo`
@@ -716,11 +737,19 @@ pub fn echo_text(value: &Typval) -> String {
 /// `typval_to_display(value, true)` in `excmd_exec.rs`.
 #[must_use]
 pub fn echo_text_quoted(value: &Typval) -> String {
-    Echo {
-        value,
-        quoted_strings: true,
-    }
-    .to_string()
+    echo_format_impl(value, true).0
+}
+
+/// `:echo` spelling of `value` reporting whether any container cycle was encountered.
+#[must_use]
+pub fn echo_text_with_cycle(value: &Typval) -> (String, bool) {
+    echo_format_impl(value, false)
+}
+
+/// `:echo` quoted spelling of `value` reporting whether any container cycle was encountered.
+#[must_use]
+pub fn echo_text_quoted_with_cycle(value: &Typval) -> (String, bool) {
+    echo_format_impl(value, true)
 }
 impl PartialEq for Typval {
     fn eq(&self, other: &Self) -> bool {
@@ -1310,6 +1339,47 @@ mod tests {
             super::echo_text(&Typval::String(OxStr::from(&[0xed, 0xa0, 0xbc, 0xed, 0xb2, 0xa0][..]))),
             "<d83c><dca0>"
         );
+    }
 
+    #[test]
+    fn echo_command_cycle_markers_and_detection() {
+        // Self-referencing list
+        let Typval::List(l_rec) = Typval::list(vec![Typval::Number(1)]) else { unreachable!() };
+        l_rec.borrow_mut().items.push(Typval::List(l_rec.clone()));
+        let list_val = Typval::List(l_rec.clone());
+        let (echo_l, has_cycle_l) = super::echo_text_with_cycle(&list_val);
+        assert_eq!(echo_l, "[1, [...@0]]");
+        assert!(has_cycle_l);
+
+        // Nested self-referencing list
+        let nested_list = Typval::list(vec![list_val.clone()]);
+        let (echo_nested_l, has_cycle_nested_l) = super::echo_text_with_cycle(&nested_list);
+        assert_eq!(echo_nested_l, "[[1, [...@1]]]");
+        assert!(has_cycle_nested_l);
+
+        // Self-referencing dict
+        let Typval::Dict(d_rec) = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]) else { unreachable!() };
+        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("self"), Typval::Dict(d_rec.clone())));
+        let dict_val = Typval::Dict(d_rec.clone());
+        let (echo_d, has_cycle_d) = super::echo_text_with_cycle(&dict_val);
+        assert_eq!(echo_d, "{'a': 1, 'self': {...@0}}");
+        assert!(has_cycle_d);
+
+        // Nested self-referencing dict
+        let nested_dict = Typval::dict(vec![(OxStr::from("wrap"), dict_val.clone())]);
+        let (echo_nested_d, has_cycle_nested_d) = super::echo_text_with_cycle(&nested_dict);
+        assert_eq!(echo_nested_d, "{'wrap': {'a': 1, 'self': {...@1}}}");
+        assert!(has_cycle_nested_d);
+
+        // Quoted mode
+        let (echo_q, has_cycle_q) = super::echo_text_quoted_with_cycle(&dict_val);
+        assert_eq!(echo_q, "{'a': 1, 'self': {...@0}}");
+        assert!(has_cycle_q);
+
+        // Non-cyclic values report has_cycle == false
+        let plain = Typval::list(vec![Typval::Number(1), Typval::Number(2)]);
+        let (echo_plain, has_cycle_plain) = super::echo_text_with_cycle(&plain);
+        assert_eq!(echo_plain, "[1, 2]");
+        assert!(!has_cycle_plain);
     }
 }
