@@ -3202,6 +3202,8 @@ fn printf_unknown_conversion_specifier_preserves_arguments_and_emits_literally()
         .unwrap(),
         text(r"[\/]$,*,\(txt\)[*@]\=$")
     );
+    // `strings.c:2213-2217`: a trailing `%` emits nothing and consumes nothing.
+    assert_eq!(call("printf", vec![text("100%")]).unwrap(), text("100"));
 }
 
 // Oracle: `strings.c:2205-2220`. An unrecognized conversion specifier consumes
@@ -5327,4 +5329,33 @@ fn msgpack_rejects_bad_arguments_with_upstream_codes() {
         "{}",
         error.message
     );
+}
+
+#[test]
+fn single_quoted_string_with_trailing_backslash_parses_in_call() {
+    for source in [
+        &br#"NetrwInit("g:x",'*[]?`{~$\')"#[..],
+        &br#"s:NetrwInit("g:netrw_glob_escape",'*[]?`{~$\')"#[..],
+    ] {
+        let expr = Parser::new(source).parse().unwrap();
+        match expr.kind {
+            crate::parser::ExprKind::Call { args, .. } => {
+                assert_eq!(args.len(), 2);
+                match &args[1].kind {
+                    crate::parser::ExprKind::Literal(Typval::String(s)) => {
+                        assert_eq!(s.as_bytes(), br"*[]?`{~$\");
+                    }
+                    other => panic!("expected string literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected call expr, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unterminated_single_quoted_string_fails() {
+    let source = b"'unterminated";
+    let error = Parser::new(source).parse().unwrap_err();
+    assert_eq!(error.code, "E115");
 }
