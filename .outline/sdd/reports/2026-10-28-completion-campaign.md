@@ -1475,3 +1475,22 @@ where the reference leaves the option empty and the port now matched), but
 removing it cost three `dir_spec` cases because the bundled plugin needs the
 option set before its own `FileType` handling runs. The revert is `1f92945`'s
 inverse; the divergence and its cause are recorded here rather than dropped.
+
+
+### Functional gate after the syntax round
+
+| Spec | Result | Change |
+|---|---|---|
+| `dir_spec` | 38 of 38 | syntax core |
+| `cd_spec` | 35 of 36 | getcwd shortcut removed, `:edit!` reload, context-switch snapshot, 'autochdir' |
+| `echo_spec` | 29 of 41 | `%g` floats, funcref and partial display |
+| `fs_spec` | 47 of 56 | libuv error text |
+
+`cd_spec` was 13 of 36 at the start of this round. The cause was a live-mode
+`getcwd` shortcut that answered every form with either the global or the focused
+window's directory, ignoring the scope argument; removing it restored 18 cases.
+The remaining case needs `shorten_fnames()`, which the port does not have.
+
+`echo_spec`'s remaining 12 are mostly the `String()` path: the shared formatter
+now matches the reference for `:echo`, but several cases assert
+`eval('String(...)')`, which still renders through the evaluator's own code.
