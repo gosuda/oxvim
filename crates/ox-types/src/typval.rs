@@ -429,6 +429,129 @@ enum ConvStackFrame {
     PartialList,
 }
 
+/// Format a string with Neovim's `:echo` display escapes:
+/// - `encode.c:295-312`: `TYPVAL_ENCODE_CONV_STRING` wraps in single quotes and doubles `'`.
+/// - `message.c:280-295`: `msg_multiline` prints `\n`, `\r`, `\t` as-is.
+/// - `charset.c:525-529`: `transchar_nonprint` displays ASCII control chars `0x00..=0x1F`
+///   and `0x7F` using `^X` (`c ^ 0x40`) notation.
+/// - `charset.c:493-495`, `charset.c:539-557`: `transchar_hex` displays single invalid
+///   UTF-8 bytes `>= 0x80` as `<%02x>`.
+/// - `mbyte.c:642-699`, `charset.c:755-762`, `mbyte.c:1057-1089`: non-printable UTF-8
+///   codepoints (including surrogates 0xD800..=0xDFFF and controls) render as `<%02x>`/`<%04x>`.
+fn fmt_escaped_string(
+    formatter: &mut fmt::Formatter<'_>,
+    bytes: &[u8],
+    quoted: bool,
+) -> fmt::Result {
+    if quoted {
+        formatter.write_str("'")?;
+    }
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' && quoted {
+            formatter.write_str("''")?;
+            i += 1;
+        } else if b == b'\n' || b == b'\r' || b == b'\t' || b == 0x0b || b == 0x0c {
+            // Preserved whitespace controls: \n, \r, \t per message.c:280-295 (msg_multiline).
+            // Vertical tab (\x0b) and form feed (\x0c) are preserved as raw bytes so that
+            // error messages routed through typval_to_display retain their verbatim byte
+            // representation for Ex trailing character exceptions (E488).
+            formatter.write_str(match b {
+                b'\n' => "\n",
+                b'\r' => "\r",
+                b'\t' => "\t",
+                0x0b => "\x0b",
+                _ => "\x0c",
+            })?;
+            i += 1;
+        } else if b < 0x20 || b == 0x7f {
+            write!(formatter, "^{}", char::from(b ^ 0x40))?;
+            i += 1;
+        } else if b < 0x80 {
+            write!(formatter, "{}", char::from(b))?;
+            i += 1;
+        } else if let Some((cp, len)) = decode_utf8_codepoint(&bytes[i..]) {
+            if is_printable_codepoint(cp) {
+                if let Ok(s) = std::str::from_utf8(&bytes[i..i + len]) {
+                    formatter.write_str(s)?;
+                } else {
+                    write!(formatter, "<{cp:04x}>")?;
+                }
+            } else if cp <= 0xff {
+                write!(formatter, "<{cp:02x}>")?;
+            } else if cp <= 0xffff {
+                write!(formatter, "<{cp:04x}>")?;
+            } else {
+                write!(formatter, "<{cp:06x}>")?;
+            }
+            i += len;
+        } else {
+            write!(formatter, "<{b:02x}>")?;
+            i += 1;
+        }
+    }
+    if quoted {
+        formatter.write_str("'")?;
+    }
+    Ok(())
+}
+
+fn decode_utf8_codepoint(bytes: &[u8]) -> Option<(u32, usize)> {
+    let v0 = u32::from(*bytes.first()?);
+    if v0 < 0x80 {
+        return Some((v0, 1));
+    }
+    if (0xC2..=0xDF).contains(&v0) && bytes.len() >= 2 {
+        let v1 = u32::from(bytes[1]);
+        if (v1 & 0xC0) == 0x80 {
+            let cp = ((v0 & 0x1F) << 6) | (v1 & 0x3F);
+            return Some((cp, 2));
+        }
+    } else if (0xE0..=0xEF).contains(&v0) && bytes.len() >= 3 {
+        let v1 = u32::from(bytes[1]);
+        let v2 = u32::from(bytes[2]);
+        if (v1 & 0xC0) == 0x80 && (v2 & 0xC0) == 0x80 {
+            let cp = ((v0 & 0x0F) << 12) | ((v1 & 0x3F) << 6) | (v2 & 0x3F);
+            if cp >= 0x800 {
+                return Some((cp, 3));
+            }
+        }
+    } else if (0xF0..=0xF4).contains(&v0) && bytes.len() >= 4 {
+        let v1 = u32::from(bytes[1]);
+        let v2 = u32::from(bytes[2]);
+        let v3 = u32::from(bytes[3]);
+        if (v1 & 0xC0) == 0x80 && (v2 & 0xC0) == 0x80 && (v3 & 0xC0) == 0x80 {
+            let cp = ((v0 & 0x07) << 18) | ((v1 & 0x3F) << 12) | ((v2 & 0x3F) << 6) | (v3 & 0x3F);
+            if (0x10000..=0x10FFFF).contains(&cp) {
+                return Some((cp, 4));
+            }
+        }
+    }
+    None
+}
+
+fn is_printable_codepoint(cp: u32) -> bool {
+    if cp >= 0x100 {
+        if cp < 0x180B || cp > 0xFFFF {
+            return cp != 0x70F;
+        }
+        !matches!(
+            cp,
+            0x180B..=0x180E
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0xD800..=0xDFFF
+                | 0xFEFF
+                | 0xFFF9..=0xFFFB
+                | 0xFFFE..=0xFFFF
+        )
+    } else {
+        cp > 0 && ((cp & 0x60) != 0) && cp != 0x7F
+    }
+}
+
 impl Typval {
     /// `:echo` spelling of this value: top-level strings and funcrefs render raw,
     /// nested strings and funcrefs render quoted, matching `encode_tv2echo` / `encode_vim_to_echo`
@@ -444,13 +567,7 @@ impl Typval {
             Self::Number(value) => write!(formatter, "{value}"),
             Self::Float(value) => formatter.write_str(&vim_float_text(*value)),
             Self::String(value) => {
-                if quoted_strings {
-                    formatter.write_str("'")?;
-                    formatter.write_str(&value.to_string_lossy().replace('\'', "''"))?;
-                    formatter.write_str("'")
-                } else {
-                    formatter.write_str(&value.to_string_lossy())
-                }
+                fmt_escaped_string(formatter, value.as_bytes(), quoted_strings)
             }
             Self::Blob(bytes) => {
                 formatter.write_str("0z")?;
@@ -504,11 +621,8 @@ impl Typval {
                     if index != 0 {
                         formatter.write_str(", ")?;
                     }
-                    write!(
-                        formatter,
-                        "'{}': ",
-                        entry.key.to_string_lossy().replace('\'', "''")
-                    )?;
+                    fmt_escaped_string(formatter, entry.key.as_bytes(), true)?;
+                    formatter.write_str(": ")?;
                     entry.value.fmt_echo(formatter, true, stack)?;
                 }
                 stack.pop();
@@ -608,7 +722,6 @@ pub fn echo_text_quoted(value: &Typval) -> String {
     }
     .to_string()
 }
-
 impl PartialEq for Typval {
     fn eq(&self, other: &Self) -> bool {
         fn equal(left: &Typval, right: &Typval, seen: &mut HashSet<(usize, usize, u8)>) -> bool {
@@ -1149,14 +1262,54 @@ mod tests {
         let Typval::List(l_rec) = Typval::list(vec![]) else { unreachable!() };
         l_rec.borrow_mut().items.push(Typval::List(l_rec.clone()));
         assert_eq!(super::echo_text(&Typval::List(l_rec.clone())), "[[...@0]]");
-        assert_eq!(super::echo_text(&Typval::list(vec![Typval::List(l_rec)])), "[[[...@1]]]");
+        assert_eq!(super::echo_text(&Typval::list(vec![Typval::List(l_rec.clone())])), "[[[...@1]]]");
 
         let Typval::Dict(d_rec) = Typval::dict(vec![]) else { unreachable!() };
         d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("d"), Typval::Dict(d_rec.clone())));
         assert_eq!(super::echo_text(&Typval::Dict(d_rec.clone())), "{'d': {...@0}}");
         assert_eq!(
-            super::echo_text(&Typval::dict(vec![(OxStr::from("out"), Typval::Dict(d_rec))])),
+            super::echo_text(&Typval::dict(vec![(OxStr::from("out"), Typval::Dict(d_rec.clone()))])),
             "{'out': {'d': {...@1}}}"
         );
+
+    }
+
+    #[test]
+    fn echo_spec_five_shapes_escape_and_cycles() {
+        // T32: recursive lists
+        let Typval::List(l_rec) = Typval::list(vec![]) else { unreachable!() };
+        l_rec.borrow_mut().items.push(Typval::List(l_rec.clone()));
+        assert_eq!(super::echo_text(&Typval::List(l_rec.clone())), "[[...@0]]");
+        assert_eq!(super::echo_text_quoted(&Typval::List(l_rec)), "[[...@0]]");
+
+        // T37: recursive dictionaries
+        let Typval::Dict(d_rec) = Typval::dict(vec![]) else { unreachable!() };
+        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("d"), Typval::Dict(d_rec.clone())));
+        assert_eq!(super::echo_text(&Typval::Dict(d_rec.clone())), "{'d': {...@0}}");
+        assert_eq!(super::echo_text_quoted(&Typval::Dict(d_rec)), "{'d': {...@0}}");
+
+        // T38: displays hex as hex
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x80][..]))), "<80>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x81][..]))), "<81>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x8e][..]))), "<8e>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0xc2][..]))), "<c2>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from("«"))), "«");
+        assert_eq!(super::echo_text_quoted(&Typval::String(OxStr::from(&[0x80][..]))), "'<80>'");
+
+        // T39: displays ASCII control characters using ^X notation
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x03][..]))), "^C");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x01][..]))), "^A");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0x06][..]))), "^F");
+        assert_eq!(super::echo_text_quoted(&Typval::String(OxStr::from(&[0x03][..]))), "'^C'");
+
+        // T41: prints non-printable UTF-8 in <> notation
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0xc2, 0x8e][..]))), "<8e>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0xed, 0xa0, 0xbc][..]))), "<d83c>");
+        assert_eq!(super::echo_text(&Typval::String(OxStr::from(&[0xed, 0xb2, 0xa0][..]))), "<dca0>");
+        assert_eq!(
+            super::echo_text(&Typval::String(OxStr::from(&[0xed, 0xa0, 0xbc, 0xed, 0xb2, 0xa0][..]))),
+            "<d83c><dca0>"
+        );
+
     }
 }

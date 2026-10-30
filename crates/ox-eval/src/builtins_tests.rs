@@ -2372,12 +2372,12 @@ fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
     call("add", vec![source.clone(), source.clone()]).unwrap();
     assert_eq!(
         call("string", vec![source.clone()]).unwrap(),
-        text("[[...]]")
+        text("[[...@0]]")
     );
     let copied = call("deepcopy", vec![source.clone()]).unwrap();
     assert_eq!(
         call("string", vec![copied.clone()]).unwrap(),
-        text("[[...]]")
+        text("[[...@0]]")
     );
     let (Typval::List(source_ref), Typval::List(copy_ref)) = (&source, &copied) else {
         panic!("Lists expected")
@@ -2387,6 +2387,22 @@ fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
         panic!("cycle expected")
     };
     assert!(std::rc::Rc::ptr_eq(copy_ref, cycle_ref));
+}
+
+#[test]
+fn string_builtin_quotes_and_escapes_via_shared_formatter() {
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from(&[0x80][..]))]).unwrap(),
+        Typval::String(OxStr::from("'<80>'"))
+    );
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from(&[0x03][..]))]).unwrap(),
+        Typval::String(OxStr::from("'^C'"))
+    );
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from("it's"))]).unwrap(),
+        Typval::String(OxStr::from("'it''s'"))
+    );
 }
 
 #[test]

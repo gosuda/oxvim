@@ -596,7 +596,9 @@ impl<'a> Builtins<'a> {
             "strutf16len" => strutf16len(&args),
             "strwidth" => strwidth(&args[0], self.ambiguous_wide),
             "stridx" => string_index(&args, false),
-            "string" => Ok(Typval::String(vim_string(&args[0], 0)?)),
+            "string" => Ok(Typval::String(OxStr::from(
+                ox_types::echo_text_quoted(&args[0]).as_str(),
+            ))),
             "strpart" => strpart(&args),
             "strridx" => string_index(&args, true),
             "substitute" => self.regex_substitute(&args),
@@ -1654,18 +1656,18 @@ enum SortMode {
 /// (typval.c:1228-1257): a raw String is used as-is, any other value is
 /// stringified, and a String compared against a non-String sorts as a single
 /// quote (`'`) so it precedes other encoded values.
-fn sort_string_key(value: &Typval, peer_is_string: bool, depth: usize) -> Result<OxStr> {
+fn sort_string_key(value: &Typval, peer_is_string: bool) -> Result<OxStr> {
     match value {
         Typval::String(text) if peer_is_string => Ok((*text).clone()),
         Typval::String(_) => Ok(OxStr::from("'")),
-        _ => vim_string(value, depth),
+        _ => Ok(OxStr::from(ox_types::echo_text_quoted(value).as_str())),
     }
 }
 
 fn sort_string_pair(left: &Typval, right: &Typval, ignore_case: bool) -> Ordering {
     match (
-        sort_string_key(left, matches!(right, Typval::String(_)), 0),
-        sort_string_key(right, matches!(left, Typval::String(_)), 0),
+        sort_string_key(left, matches!(right, Typval::String(_))),
+        sort_string_key(right, matches!(left, Typval::String(_))),
     ) {
         (Ok(left), Ok(right)) => {
             match compare_bytes(left.as_bytes(), right.as_bytes(), ignore_case) {
@@ -1684,10 +1686,7 @@ fn sort_string_pair(left: &Typval, right: &Typval, ignore_case: bool) -> Orderin
 fn sort_numeric(value: &Typval) -> f64 {
     match value {
         Typval::String(_) => 0.0,
-        _ => match vim_string(value, 0) {
-            Ok(encoded) => leading_float(encoded.as_bytes()),
-            Err(_) => 0.0,
-        },
+        _ => leading_float(ox_types::echo_text_quoted(value).as_bytes()),
     }
 }
 
@@ -2155,7 +2154,7 @@ fn lnum_arg(buffer: &dyn BufferHost, value: &Typval) -> Result<i64> {
 fn line_text_arg(value: &Typval) -> Result<OxStr> {
     match value {
         Typval::String(text) => Ok(text.clone()),
-        other => vim_string(other, 0),
+        other => Ok(OxStr::from(ox_types::echo_text_quoted(other).as_str())),
     }
 }
 
@@ -3918,7 +3917,7 @@ fn is_regional_indicator(character: char) -> bool {
 fn printf_builtin(args: &[Typval]) -> Result<Typval> {
     let format = match &args[0] {
         Typval::String(text) => text.to_string_lossy().into_owned(),
-        other => vim_string(other, 0)?.to_string_lossy().into_owned(),
+        other => ox_types::echo_text_quoted(other),
     };
     let mut pieces = String::new();
     let mut arguments = args[1..].iter();
@@ -4062,7 +4061,7 @@ fn printf_builtin(args: &[Typval]) -> Result<Typval> {
             's' => {
                 let mut text = match value {
                     Typval::String(text) => text.to_string_lossy().into_owned(),
-                    other => vim_string(other, 0)?.to_string_lossy().into_owned(),
+                    other => ox_types::echo_text_quoted(other),
                 };
                 if let Some(count) = precision {
                     text = text.chars().take(count).collect();
@@ -4263,19 +4262,6 @@ pub fn float_as_string(number: f64) -> OxStr {
     OxStr(format_float('g', number, None, false, true).0.into_bytes())
 }
 
-/// `TYPVAL_ENCODE_CONV_FLOAT` (`eval/encode.c:351-372`): `%g` for a finite
-/// value, and a re-readable `str2float()` call for the two that `%g` cannot
-/// round-trip.
-fn vim_float_string(number: f64) -> String {
-    if number.is_nan() {
-        return "str2float('nan')".to_owned();
-    }
-    if number.is_infinite() {
-        let sign = if number < 0.0 { "-" } else { "" };
-        return format!("{sign}str2float('inf')");
-    }
-    format_float('g', number, None, false, true).0
-}
 
 /// Digits of `value` in `radix`, lowercase, without prefix.
 // u64→usize: radix is ≤16, so the modulo result always fits.
@@ -5640,91 +5626,6 @@ fn json_to_typval(value: JsonValue, depth: usize) -> Result<Typval> {
     }
 }
 
-fn vim_string(value: &Typval, _depth: usize) -> Result<OxStr> {
-    fn render(
-        value: &Typval,
-        active: &mut HashSet<(usize, u8)>,
-        output: &mut Vec<u8>,
-    ) -> Result<()> {
-        match value {
-            Typval::String(value) => {
-                output.push(b'\'');
-                for byte in value.as_bytes() {
-                    output.push(*byte);
-                    if *byte == b'\'' {
-                        output.push(b'\'');
-                    }
-                }
-                output.push(b'\'');
-            }
-            Typval::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-            Typval::Float(value) => output.extend_from_slice(vim_float_string(*value).as_bytes()),
-            Typval::Bool(value) => {
-                output.extend_from_slice(if *value { b"v:true" } else { b"v:false" });
-            }
-            Typval::Special(Special::Null) => output.extend_from_slice(b"v:null"),
-            Typval::Blob(value) => {
-                output.extend_from_slice(b"0z");
-                for byte in value {
-                    let _ = write!(StringWriter(output), "{byte:02X}");
-                }
-            }
-            Typval::List(reference) => {
-                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_LIST);
-                if !active.insert(key) {
-                    output.extend_from_slice(b"[...]");
-                    return Ok(());
-                }
-                output.push(b'[');
-                for (index, item) in list_items(reference)?.iter().enumerate() {
-                    if index > 0 {
-                        output.extend_from_slice(b", ");
-                    }
-                    render(item, active, output)?;
-                }
-                output.push(b']');
-                active.remove(&key);
-            }
-            Typval::Dict(reference) => {
-                let key = (Rc::as_ptr(reference) as usize, ox_types::VAR_DICT);
-                if !active.insert(key) {
-                    output.extend_from_slice(b"{...}");
-                    return Ok(());
-                }
-                output.push(b'{');
-                for (index, entry) in cloned_entries(reference)?.iter().enumerate() {
-                    if index > 0 {
-                        output.extend_from_slice(b", ");
-                    }
-                    render(&Typval::String(entry.key.clone()), active, output)?;
-                    output.extend_from_slice(b": ");
-                    render(&entry.value, active, output)?;
-                }
-                output.push(b'}');
-                active.remove(&key);
-            }
-            Typval::Funcref(Funcref { name, .. }) | Typval::Partial(Funcref { name, .. }) => {
-                output.extend_from_slice(b"function('");
-                output.extend_from_slice(name.as_bytes());
-                output.extend_from_slice(b"')");
-            }
-            Typval::Channel(value) | Typval::Job(value) => {
-                output.extend_from_slice(value.to_string().as_bytes());
-            }
-        }
-        Ok(())
-    }
-    let mut output = Vec::new();
-    render(value, &mut HashSet::new(), &mut output)?;
-    Ok(OxStr(output))
-}
-struct StringWriter<'a>(&'a mut Vec<u8>);
-impl std::fmt::Write for StringWriter<'_> {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
-        self.0.extend_from_slice(value.as_bytes());
-        Ok(())
-    }
-}
 
 fn values_equal(left: &Typval, right: &Typval, ignore_case: bool, depth: usize) -> Result<bool> {
     fn equal(
