@@ -314,6 +314,27 @@ pub fn install_vim_core(
     Ok(state)
 }
 
+/// A Lua index as a slice offset. `vim._maxint` reaches the host as a double
+/// past `i64`, so the range check compares in the float the caller used and
+/// every accepted value is then narrowed with a checked conversion.
+fn lua_index(index: f64, length: usize) -> Option<usize> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "length is compared with a Lua double the caller already passed as one"
+    )]
+    let bound = length as f64;
+    if index < 0.0 || index > bound {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the float is non-negative and not past `length`, checked just above"
+    )]
+    let value = index as usize;
+    Some(value)
+}
+
 /// Registers the UTF-8 helpers the Lua prelude builds `vim.str_utfindex` and
 /// `vim.str_byteindex` on, plus the three the prelude calls directly
 /// (`nlua_str_utfindex` and friends, `lua/stdlib.c:174-320`).
@@ -324,18 +345,16 @@ pub fn install_vim_core(
 fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     vim.set(
         "_str_utfindex",
-        lua.create_function(|_, (text, index): (mlua::String, Option<f64>)| {
+        lua.create_function(|_, (text, index): (mlua::LuaString, Option<f64>)| {
             let bytes = text.as_bytes();
             // `vim._maxint` arrives as a double that is already past `i64`,
             // so the bound is compared as a float: anything from the length up
             // is out of range and the wrapper falls back to the totals.
             let limit = match index {
-                Some(index) => {
-                    if index < 0.0 || index > bytes.len() as f64 {
-                        return Ok((None, None));
-                    }
-                    index as usize
-                }
+                Some(index) => match lua_index(index, bytes.len()) {
+                    Some(position) => position,
+                    None => return Ok((None, None)),
+                },
                 None => bytes.len(),
             };
             let (codepoints, codeunits) = utf_lengths(&bytes, limit);
@@ -347,7 +366,7 @@ fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     )?;
     vim.set(
         "_str_byteindex",
-        lua.create_function(|_, (text, index, utf16): (mlua::String, i64, Option<bool>)| {
+        lua.create_function(|_, (text, index, utf16): (mlua::LuaString, i64, Option<bool>)| {
             let bytes = text.as_bytes();
             if index < 0 {
                 return Ok(None);
@@ -358,7 +377,7 @@ fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     )?;
     vim.set(
         "str_utf_pos",
-        lua.create_function(|lua, text: mlua::String| {
+        lua.create_function(|lua, text: mlua::LuaString| {
             let bytes = text.as_bytes();
             let positions = lua.create_table()?;
             let mut offset = 0usize;
@@ -373,7 +392,7 @@ fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     )?;
     vim.set(
         "str_utf_start",
-        lua.create_function(|_, (text, index): (mlua::String, i64)| {
+        lua.create_function(|_, (text, index): (mlua::LuaString, i64)| {
             let bytes = text.as_bytes();
             let position = checked_position(&bytes, index)?;
             Ok(utf_bounds(&bytes, position).0)
@@ -381,7 +400,7 @@ fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
     )?;
     vim.set(
         "str_utf_end",
-        lua.create_function(|_, (text, index): (mlua::String, i64)| {
+        lua.create_function(|_, (text, index): (mlua::LuaString, i64)| {
             let bytes = text.as_bytes();
             let position = checked_position(&bytes, index)?;
             Ok(utf_bounds(&bytes, position).1 - 1)
@@ -406,8 +425,9 @@ fn utf_lengths(bytes: &[u8], limit: usize) -> (usize, usize) {
     let mut codeunits = 0usize;
     let mut offset = 0usize;
     while offset < limit {
-        let length = utf_sequence_len(&bytes[offset..]);
-        let end = (offset + length).min(bytes.len());
+        let length = utf_sequence_len(&bytes[offset..limit]);
+        let sequence_length = utf_sequence_len(&bytes[offset..]);
+        let end = (offset + sequence_length).min(bytes.len());
         let value = utf_character_value(&bytes[offset..end]);
         codepoints += 1;
         codeunits += if value > 0xffff { 2 } else { 1 };
@@ -476,6 +496,13 @@ fn utf_character_value(bytes: &[u8]) -> u32 {
     }
 }
 
+/// `position` shifted by `delta`, when it stays inside the slice.
+fn shifted(position: usize, delta: i64, length: usize) -> Option<usize> {
+    usize::try_from(i64::try_from(position).ok()?.checked_add(delta)?)
+        .ok()
+        .filter(|at| *at < length)
+}
+
 /// `utf_cp_bounds_len` (`mbyte.c`): offset from `position` back to the
 /// character's first byte, and forward to one past its last byte.
 fn utf_bounds(bytes: &[u8], position: usize) -> (i64, i64) {
@@ -483,21 +510,17 @@ fn utf_bounds(bytes: &[u8], position: usize) -> (i64, i64) {
         return (0, 1);
     }
     let mut first_off = 0i64;
-    loop {
-        let at = position as i64 + first_off;
-        if at < 0 || (at as usize) >= bytes.len() || bytes[at as usize] & 0xc0 != 0x80 {
-            break;
-        }
+    while shifted(position, first_off, bytes.len())
+        .is_some_and(|at| bytes[at] & 0xc0 == 0x80)
+    {
         first_off -= 1;
         if first_off < -3 {
             return (0, 1);
         }
     }
-    let start = position as i64 + first_off;
-    if start < 0 {
+    let Ok(start) = usize::try_from(i64::try_from(position).unwrap_or(i64::MAX) + first_off) else {
         return (0, 1);
-    }
-    let start = start as usize;
+    };
     // `utf_cp_bounds_len` needs the *complete* sequence: a truncation at the end
     // of the slice falls back to a single byte.
     let length = match bytes[start] {
