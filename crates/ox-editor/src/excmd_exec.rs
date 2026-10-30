@@ -16849,6 +16849,30 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         // dir-browser` case): then the caller stays where the handler left
         // it, like `set_curbuf` skipping entry for a wiped target
         // (`buffer.c:1790-1794`).
+        let filetype_unset = access.with_ex_editor(|editor| {
+            editor.current_buffer() == Some(buffer)
+                && editor.buffer(buffer).is_ok_and(|state| {
+                    !state.did_filetype()
+                        && matches!(
+                            editor.options().get_buffer(buffer, "filetype"),
+                            Ok(OptionValue::String(value)) if value.is_empty()
+                        )
+                })
+        });
+        if filetype_unset {
+            let flow = command_set(
+                runtime,
+                access,
+                scope,
+                lua,
+                "filetype=directory",
+                SetLayer::Local,
+            );
+            if !matches!(flow, Flow::Normal) {
+                rollback_buffer_switch(access, buffer, &mut restore, false);
+                return Err(LoadSwitchError::Flow(flow));
+            }
+        }
         if !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok()) {
             return Ok(LoadSwitchOutcome::Abandoned);
         }

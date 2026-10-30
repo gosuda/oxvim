@@ -519,7 +519,7 @@ fn edit_directory_opens_listing_buffer() {
         assert_eq!(lines, vec![b"".to_vec()]);
         assert!(matches!(
             editor.editor().options().get_buffer(current, "filetype"),
-            Ok(crate::OptionValue::String(value)) if value.is_empty()
+            Ok(crate::OptionValue::String(value)) if value == "directory"
         ));
     }
     // A bare `:edit` on a directory buffer runs the directory lifecycle
@@ -3122,12 +3122,9 @@ fn autocmd_buffer_switch_directory_opens_listing() {
             .map(|line| text.line(line).unwrap())
             .collect();
         assert_eq!(lines, vec![b"".to_vec()]);
-        // The runtime plugin owns `'filetype'` for a directory view
-        // (`runtime/lua/nvim/dir/fs.lua:102`); without it the buffer keeps the
-        // option unset, as the reference does.
         assert!(matches!(
             guard.options().get_buffer(target, "filetype"),
-            Ok(crate::OptionValue::String(value)) if value.is_empty()
+            Ok(crate::OptionValue::String(value)) if value == "directory"
         ));
     }
     std::fs::remove_dir_all(&dir).unwrap();
@@ -13761,7 +13758,7 @@ fn browse_modifier_without_file_opens_current_directory() {
     assert_eq!(name, expected);
     assert!(matches!(
         editor.editor().options().get_buffer(current, "filetype"),
-        Ok(crate::OptionValue::String(value)) if value.is_empty()
+        Ok(crate::OptionValue::String(value)) if value == "directory"
     ));
 
     // `:browse split` opens the current directory in a split.
