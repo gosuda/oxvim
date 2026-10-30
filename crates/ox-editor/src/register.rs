@@ -968,6 +968,7 @@ impl Registers {
                 let Some(slot) = self.named.get_mut(index) else {
                     return Err(RegisterError::InvalidName(name));
                 };
+                self.version = self.version.wrapping_add(1);
                 *slot = None;
                 Ok(())
             }
@@ -975,6 +976,7 @@ impl Registers {
                 let Some(slot) = self.numbered.get_mut(index) else {
                     return Err(RegisterError::InvalidName(name));
                 };
+                self.version = self.version.wrapping_add(1);
                 *slot = None;
                 Ok(())
             }
@@ -987,19 +989,23 @@ impl Registers {
                 Ok(())
             }
             RegisterName::SmallDelete => {
+                self.version = self.version.wrapping_add(1);
                 self.small_delete = None;
                 Ok(())
             }
             RegisterName::BlackHole => Ok(()),
             RegisterName::Expression => {
+                self.version = self.version.wrapping_add(1);
                 self.expression_source = Some(Vec::new());
                 Ok(())
             }
             RegisterName::SearchPattern => {
+                self.version = self.version.wrapping_add(1);
                 self.search_pattern = None;
                 Ok(())
             }
             RegisterName::AlternateFile => {
+                self.version = self.version.wrapping_add(1);
                 self.alternate_override = None;
                 Ok(())
             }
