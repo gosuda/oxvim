@@ -134,6 +134,7 @@ pub(crate) fn parse_and_bind_lvalue<F: FileIO, E: ExEditorAccess>(
                 format!("Trailing characters: {target}"),
             ));
         }
+        let register = if register == '@' { '"' } else { register };
         return Ok(Lvalue::Register(register as u8));
     }
     if let Some(rest) = target.strip_prefix('$') {
@@ -1411,7 +1412,10 @@ fn assign_register<F: FileIO, E: ExEditorAccess>(
     access
         .with_ex_editor(|editor| editor.registers_mut().set(register as char, content))
         .map_err(|error| lvalue_error(runtime, "E354", error.to_string()))?;
-    scope.set_register(&[register], value);
+    scope.set_register(&[register], value.clone());
+    if register == b'"' {
+        scope.set_register(b"@", value);
+    }
     Ok(())
 }
 
@@ -1463,6 +1467,9 @@ fn clear_register(editor: &mut Editor, scope: &mut Scope, register: u8) -> bool 
         return false;
     }
     scope.set_register(&[register], Typval::String(OxStr::from("")));
+    if register == b'"' {
+        scope.set_register(b"@", Typval::String(OxStr::from("")));
+    }
     true
 }
 

@@ -565,6 +565,35 @@ fn let_assigns_register_through_at() {
     assert_eq!(content.to_bytes(), b"text");
 }
 
+#[test]
+fn let_assigns_unnamed_register_through_at_at() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, r#"let @@ = "text""#).unwrap();
+    {
+        let ed = editor.editor();
+        let content = ed.registers().get('"').unwrap().unwrap();
+        assert_eq!(content.to_bytes(), b"text");
+    }
+    exec.execute_line(&editor, r#"let @@= "nospace""#).unwrap();
+    {
+        let ed = editor.editor();
+        let content = ed.registers().get('"').unwrap().unwrap();
+        assert_eq!(content.to_bytes(), b"nospace");
+    }
+    exec.execute_line(&editor, r#"let ykeep = @@"#).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"ykeep", 0),
+        Ok(&Typval::String(OxStr::from("nospace")))
+    );
+    exec.execute_line(&editor, r#"let @" = "other""#).unwrap();
+    exec.execute_line(&editor, r#"let roundtrip = @@"#).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"roundtrip", 0),
+        Ok(&Typval::String(OxStr::from("other")))
+    );
+}
+
 // ex_docmd.c:ex_let with `$VAR` target — `:let $VAR = "value"` stores
 // into the scope's env map (eval.c:env_setvar).
 #[test]

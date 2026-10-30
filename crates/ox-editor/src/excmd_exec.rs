@@ -24655,7 +24655,8 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     if scope.synced.registers() != register_version {
         scope.registers.clear();
         for name in "0123456789abcdefghijklmnopqrstuvwxyz\"-:.%#=*+_/@".chars() {
-            if let Ok(Some(content)) = editor.registers().get(name) {
+            let target_name = if name == '@' { '"' } else { name };
+            if let Ok(Some(content)) = editor.registers().get(target_name) {
                 scope.set_register(&[name as u8], Typval::String(OxStr(content.to_bytes())));
             }
         }
@@ -24962,12 +24963,16 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
         .strip_prefix('@')
         .and_then(|name| name.chars().next())
     {
+        let register = if register == '@' { '"' } else { register };
         let content = RegisterContent::from_text(typval_to_text(&value).as_bytes())
             .map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
         access
             .with_ex_editor(|editor| editor.registers_mut().set(register, content))
             .map_err(|error| error_flow(runtime, "E354", error.to_string()))?;
-        scope.set_register(&[register as u8], value);
+        scope.set_register(&[register as u8], value.clone());
+        if register == '"' {
+            scope.set_register(b"@", value);
+        }
         return Ok(());
     }
     if let Some(environment) = target.strip_prefix('$') {
@@ -25123,6 +25128,7 @@ fn read_target<F: FileIO, E: ExEditorAccess>(
         .strip_prefix('@')
         .and_then(|name| name.chars().next())
     {
+        let register = if register == '@' { '"' } else { register };
         return Ok(scope.get_register(&[register as u8]));
     }
     if let Some(environment) = target.strip_prefix('$') {
