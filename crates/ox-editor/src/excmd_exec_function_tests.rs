@@ -3041,6 +3041,44 @@ fn defer_rejects_dict_partial_trailing_text_and_top_level() {
     }
 }
 
+/// `defer()` on a lambda fires through the closure registry captured in its
+/// Funcref — a `<lambda>N` name owns no user-function entry, so a name
+/// redispatch at frame end would hit `E117` instead of running the body.
+/// Covers the `defer()` builtin form and the `:defer` command resolving a
+/// lambda variable.
+#[test]
+fn defer_lambda_fires_through_its_captured_closure() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func Main()\n\
+         let L = {-> add(g:seen, 'command')}\n\
+         call defer({-> add(g:seen, 'builtin')})\n\
+         defer L()\n\
+         call add(g:seen, 'body')\n\
+         endfunc\n\
+         let g:seen = []\n\
+         call Main()\n",
+    );
+    match exec.scope().get_scoped(ScopeKind::Global, b"seen", 0).cloned() {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["body", "command", "builtin"]);
+        }
+        other => panic!("expected g:seen list, got {other:?}"),
+    }
+}
+
 // eval/funcs.c f_system through os_system, os/shell.c shell_build_argv 60-97 —
 // a String command runs through 'shell' + 'shellcmdflag', the second argument
 // is the child's standard input and its pipe is closed, and a shell that

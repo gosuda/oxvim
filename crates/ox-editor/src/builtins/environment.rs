@@ -133,7 +133,7 @@ fn call_defer_builtin<F: FileIO, E: ExEditorAccess>(
     }
     // `userfunc.c:3398-3412`: a Partial's bound arguments come first, then
     // the arguments given to `defer()` itself.
-    let (name, mut call_args) = match &args[0] {
+    match &args[0] {
         Typval::Funcref(function) | Typval::Partial(function) => {
             if function.dict.is_some() {
                 return Err(EvalError::new(
@@ -142,10 +142,13 @@ fn call_defer_builtin<F: FileIO, E: ExEditorAccess>(
                     "Cannot use a partial with dictionary for :defer",
                 ));
             }
-            (
-                function.name.to_string_lossy().into_owned(),
-                function.args.clone(),
-            )
+            // The value is deferred whole: a lambda's `<lambda>N` resolves
+            // only through the closure registry captured in its Funcref, so
+            // re-dispatching the bare name at fire time would hit `E117`.
+            // Bound arguments stay inside the callee — `call_value` fires
+            // them before `defer()`'s own.
+            host.runtime
+                .push_deferred_call_value(args[0].clone(), args[1..].to_vec());
         }
         value => {
             let name = input_string_arg(value)?;
@@ -153,11 +156,10 @@ fn call_defer_builtin<F: FileIO, E: ExEditorAccess>(
             if text.is_empty() {
                 return Err(EvalError::new("E129", 0, "Function name required"));
             }
-            (text.into_owned(), Vec::new())
+            host.runtime
+                .push_deferred_call(text.into_owned(), args[1..].to_vec());
         }
-    };
-    call_args.extend(args[1..].iter().cloned());
-    host.runtime.push_deferred_call(name, call_args);
+    }
     Ok(Typval::Number(0))
 }
 

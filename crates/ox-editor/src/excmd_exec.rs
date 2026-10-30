@@ -731,6 +731,12 @@ impl Default for ActiveAutocmdContext {
 pub(crate) enum DeferredOp {
     /// Call the named function with the stored arguments.
     Call(String, Vec<Typval>),
+    /// Fire a stored `Funcref`/`Partial` with `defer()`'s own arguments.
+    /// The value is kept whole: a lambda's `<lambda>N` resolves only
+    /// through the closure registry it captured, so re-dispatching the
+    /// bare name at fire time would hit `E117`. Bound arguments ride
+    /// inside the callee, and `call_value` fires them first.
+    CallValue(Typval, Vec<Typval>),
     /// Remove one path the way deferred `delete()` would.
     Delete(PathBuf, crate::fs_builtins::DeleteMode),
 }
@@ -940,6 +946,14 @@ impl<F: FileIO> ExRuntime<F> {
     pub(crate) fn push_deferred_call(&mut self, name: String, args: Vec<Typval>) {
         if let Some(frame) = self.deferred_ops.last_mut() {
             frame.push(DeferredOp::Call(name, args));
+        }
+    }
+
+    /// `add_defer` for a registration that arrived as a `Funcref`/`Partial`
+    /// value rather than a bare name.
+    pub(crate) fn push_deferred_call_value(&mut self, callee: Typval, args: Vec<Typval>) {
+        if let Some(frame) = self.deferred_ops.last_mut() {
+            frame.push(DeferredOp::CallValue(callee, args));
         }
     }
 
@@ -6063,6 +6077,16 @@ fn drain_frame_defers<F: FileIO, E: ExEditorAccess>(
         }
         for operation in frame.into_iter().rev() {
             match operation {
+                DeferredOp::CallValue(callee, args) => {
+                    // `call_func` on a stored partial/lambda (userfunc.c:
+                    // 3512): firing the value through the evaluator keeps
+                    // the closure registry that a `<lambda>N` name lookup
+                    // cannot reach.
+                    let result = invoke_callable_value(runtime, access, scope, lua, callee, args);
+                    if let Err(flow) = result {
+                        deferred_flow.get_or_insert(flow);
+                    }
+                }
                 DeferredOp::Call(name, args) => {
                     // `call_func` (userfunc.c:3512) resolves the deferred name
                     // generically: a user function when one exists, a builtin
@@ -6243,7 +6267,7 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
                     )
                     .map(|_| ())
                 }
-                WatchCallback::Funcref(function) => invoke_dict_watcher_value(
+                WatchCallback::Funcref(function) => invoke_callable_value(
                     runtime,
                     access,
                     scope,
@@ -6251,7 +6275,7 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
                     Typval::Funcref(function.clone()),
                     args,
                 ),
-                WatchCallback::Partial(function) => invoke_dict_watcher_value(
+                WatchCallback::Partial(function) => invoke_callable_value(
                     runtime,
                     access,
                     scope,
@@ -6354,9 +6378,10 @@ fn record_changedtick_movement<F: FileIO, E: ExEditorAccess>(
     drain_dict_watchers(runtime, access, scope, lua);
 }
 
-/// Invokes one `Funcref`/`Partial` watcher callback through the evaluator, the
-/// same path the timer delivery uses for stored callables.
-fn invoke_dict_watcher_value<F: FileIO, E: ExEditorAccess>(
+/// Invokes one stored `Funcref`/`Partial` — a watcher callback or a deferred
+/// call — through the evaluator, the same path timer delivery uses for stored
+/// callables.
+fn invoke_callable_value<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
@@ -7817,23 +7842,28 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
     }
     // A callee naming a `Funcref`/`Partial` variable (`defer Part(..)`)
     // contributes its bound arguments before the call's own, exactly like
-    // `deref_func_name` supplying `ex_defer_inner` its `partial`.
-    let (effective, mut combined) = match resolve_defer_callee(runtime, access, scope, lua, name)
-    {
+    // `deref_func_name` supplying `ex_defer_inner` its `partial`. The value
+    // itself is kept as the callee so a lambda's captured closure registry
+    // survives to fire time; the bound half rides inside it and still
+    // counts toward arity here.
+    let (callee, effective) = match resolve_defer_callee(runtime, access, scope, lua, name) {
         Ok(resolved) => resolved,
         Err(flow) => return flow,
     };
-    combined.extend(values);
+    let total = match &callee {
+        Some(Typval::Partial(funcref) | Typval::Funcref(funcref)) => funcref.args.len(),
+        _ => 0,
+    } + values.len();
     let sid = runtime.scripts.current_sid().unwrap_or(0);
     if let Some(spec) = ox_eval::builtin_spec(&effective) {
-        if combined.len() < spec.min_args {
+        if total < spec.min_args {
             return error_flow(
                 runtime,
                 "E119",
                 format!("Not enough arguments for function: {effective}"),
             );
         }
-        if spec.max_args.is_some_and(|maximum| combined.len() > maximum) {
+        if spec.max_args.is_some_and(|maximum| total > maximum) {
             return error_flow(
                 runtime,
                 "E118",
@@ -7846,14 +7876,14 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
         .or_else(|| runtime.functions.get(&effective, 0))
     {
         let required = function.args.len().saturating_sub(function.default_args.len());
-        if combined.len() < required {
+        if total < required {
             return error_flow(
                 runtime,
                 "E119",
                 format!("Not enough arguments for function: {effective}"),
             );
         }
-        if !function.varargs && combined.len() > function.args.len() {
+        if !function.varargs && total > function.args.len() {
             return error_flow(
                 runtime,
                 "E118",
@@ -7869,29 +7899,35 @@ fn command_defer<F: FileIO, E: ExEditorAccess>(
     if !trailing.is_empty() && !trailing.starts_with('"') {
         return error_flow(runtime, "E488", format!("Trailing characters: {trailing}"));
     }
-    runtime.push_deferred_call(effective, combined);
+    match callee {
+        Some(callee) => runtime.push_deferred_call_value(callee, values),
+        None => runtime.push_deferred_call(effective, values),
+    }
     Flow::Normal
 }
 
-/// Resolves a `:defer` callee name to its effective function name plus any
-/// arguments bound by a `Funcref`/`Partial` variable of that name. A plain
-/// function or builtin name resolves to itself with no bound arguments.
+/// Resolves a `:defer` callee name to the stored `Funcref`/`Partial` value
+/// — bound arguments and closure identity intact — plus the effective
+/// function name for arity validation. A plain function or builtin name
+/// yields `None` and defers by name.
 fn resolve_defer_callee<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
     name: &str,
-) -> Result<(String, Vec<Typval>), Flow> {
+) -> Result<(Option<Typval>, String), Flow> {
     let bound = parse_and_bind_lvalue(runtime, access, scope, lua, name)
         .ok()
         .and_then(|lvalue| read_lvalue(runtime, access, scope, &lvalue).ok())
-        .and_then(|value| match value {
-            Typval::Partial(funcref) | Typval::Funcref(funcref) => Some(funcref),
-            _ => None,
+        .and_then(|value| {
+            matches!(value, Typval::Partial(_) | Typval::Funcref(_)).then_some(value)
         });
-    let Some(funcref) = bound else {
-        return Ok((name.to_owned(), Vec::new()));
+    let Some(value) = bound else {
+        return Ok((None, name.to_owned()));
+    };
+    let (Typval::Partial(funcref) | Typval::Funcref(funcref)) = &value else {
+        unreachable!("filtered to Funcref/Partial above")
     };
     if funcref.dict.is_some() {
         return Err(error_flow(
@@ -7908,7 +7944,7 @@ fn resolve_defer_callee<F: FileIO, E: ExEditorAccess>(
             format!("Unknown function: {name}"),
         ));
     }
-    Ok((effective, funcref.args.clone()))
+    Ok((Some(value), effective))
 }
 fn command_call<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
