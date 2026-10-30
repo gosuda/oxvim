@@ -1305,15 +1305,30 @@ fn command_end(
     // argument with a `skip_expr` loop, so the command ends at the first
     // `|` or `\n` the expression scan cannot consume.
     if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {
-        return expression_command_end(input, args_start, NewlineEnd::AnyDepth);
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::AnyDepth,
+            QuoteMode::String,
+        );
+    }
+    // `:unlet` has no EX_TRLBAR metadata, but `ex_unletlock` still calls
+    // `check_nextcmd` after parsing its names. Its bars and quote comments
+    // therefore terminate the command just like the handler-owned scanners.
+    if name == "unlet" {
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::Toplevel,
+            QuoteMode::TopLevelComment,
+        );
     }
     // Handlers that evaluate their own argument and then split the tail with
     // `check_nextcmd`: a newline separates only at the expression's top
     // level — inside `()`/`[]`/`{}` it stays in the argument.
     if matches!(
         name,
-        "unlet"
-            | "let"
+        "let"
             | "const"
             | "call"
             | "for"
@@ -1331,7 +1346,12 @@ fn command_end(
             | "caddexpr"
             | "laddexpr"
     ) {
-        return expression_command_end(input, args_start, NewlineEnd::Toplevel);
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::Toplevel,
+            QuoteMode::String,
+        );
     }
     // `ex_wincmd` (ex_docmd.c:6523-6549) consumes the window-command key
     // itself and then splits the tail with `check_nextcmd`
@@ -1404,6 +1424,7 @@ fn newline_command_end(input: &str, args_start: usize, continuation: bool) -> us
     }
     input.len()
 }
+
 
 /// The `separate_nextcmd` scan for a `TRLBAR` argument: the command ends at
 /// `|` (except :append/:change/:insert), a `"` comment (except `EX_NOTRLCOM`),
@@ -1502,8 +1523,18 @@ enum NewlineEnd {
     AnyDepth,
     Toplevel,
 }
+#[derive(Clone, Copy)]
+enum QuoteMode {
+    String,
+    TopLevelComment,
+}
 
-fn expression_command_end(input: &str, start: usize, newline: NewlineEnd) -> usize {
+fn expression_command_end(
+    input: &str,
+    start: usize,
+    newline: NewlineEnd,
+    quote_mode: QuoteMode,
+) -> usize {
     let bytes = input.as_bytes();
     let mut cursor = start;
     let mut quote = None;
@@ -1526,6 +1557,9 @@ fn expression_command_end(input: &str, start: usize, newline: NewlineEnd) -> usi
             continue;
         }
         match byte {
+            b'"' if nesting == 0 && matches!(quote_mode, QuoteMode::TopLevelComment) => {
+                return cursor;
+            }
             b'\'' | b'"' => quote = Some(byte),
             b'(' | b'[' | b'{' => nesting = nesting.saturating_add(1),
             b')' | b']' | b'}' => nesting = nesting.saturating_sub(1),
