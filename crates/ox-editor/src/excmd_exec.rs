@@ -2435,10 +2435,22 @@ impl<F: FileIO> ExExecutor<F> {
             AutocmdKind::ExString { script, .. } => *script,
             AutocmdKind::VimscriptFunction(_) | AutocmdKind::LuaCallback(_) => None,
         };
+        let caller_sid = self.runtime.scripts.current_sid();
+        let caller_script = self.scope.script.clone();
         let pushed = script.is_some_and(|script| self.runtime.scripts.push_autocmd_script(script));
+        if pushed && let Some(sid) = script {
+            self.runtime.scripts.switch_script_scope(caller_sid, sid, &mut self.scope);
+        }
         let result =
             self.with_autocmd_context(action, |executor| executor.execute_line(access, source));
         if pushed {
+            if let Some(sid) = script {
+                self.runtime.scripts.store_script_scope(sid, &self.scope);
+            }
+            match caller_sid {
+                Some(from) => self.runtime.scripts.load_script_scope(from, &mut self.scope),
+                None => self.scope.script = caller_script,
+            }
             self.runtime.scripts.pop_autocmd_script();
         }
         result
@@ -2692,6 +2704,10 @@ impl<F: FileIO> ExExecutor<F> {
         let lines = join_source_lines(&mut self.runtime, access, text, cfg!(windows))?;
         let caller_script = self.scope.script.clone();
         let caller_augroup = self.runtime.current_augroup;
+        let caller_sid = self.runtime.scripts.current_sid();
+        if let Some(from) = caller_sid {
+            self.runtime.scripts.store_script_scope(from, &self.scope);
+        }
         let sid = self
             .runtime
             .scripts
@@ -2724,7 +2740,10 @@ impl<F: FileIO> ExExecutor<F> {
             };
         self.runtime.scripts.store_script_scope(sid, &self.scope);
         self.runtime.scripts.pop_source();
-        self.scope.script = caller_script;
+        match caller_sid {
+            Some(from) => self.runtime.scripts.load_script_scope(from, &mut self.scope),
+            None => self.scope.script = caller_script,
+        }
         self.runtime.current_augroup = caller_augroup;
         result
     }
@@ -6046,6 +6065,10 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
         .to_string();
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
+    let caller_sid = runtime.scripts.current_sid();
+    if let Some(from) = caller_sid {
+        runtime.scripts.store_script_scope(from, scope);
+    }
     let sid = runtime
         .scripts
         .push_source(name, runtime.next_frame_order());
@@ -6062,7 +6085,10 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
     runtime.scripts.store_script_scope(sid, scope);
     runtime.scripts.pop_source();
-    scope.script = caller_script;
+    match caller_sid {
+        Some(from) => runtime.scripts.load_script_scope(from, scope),
+        None => scope.script = caller_script,
+    }
     runtime.current_augroup = caller_augroup;
     Ok(flow)
 }
@@ -21817,9 +21843,21 @@ pub(crate) fn run_autocmd_plan<F: FileIO, E: ExEditorAccess>(
                 );
                 // The body keeps the `s:` scope of the script that defined it
                 // (`autocmd.c` `sc_sid`), not the one running when it fires.
+                let caller_sid = runtime.scripts.current_sid();
+                let caller_script = scope.script.clone();
                 let pushed = script.is_some_and(|script| runtime.scripts.push_autocmd_script(script));
+                if pushed && let Some(sid) = script {
+                    runtime.scripts.switch_script_scope(caller_sid, *sid, scope);
+                }
                 let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
                 if pushed {
+                    if let Some(sid) = script {
+                        runtime.scripts.store_script_scope(*sid, scope);
+                    }
+                    match caller_sid {
+                        Some(from) => runtime.scripts.load_script_scope(from, scope),
+                        None => scope.script = caller_script,
+                    }
                     runtime.scripts.pop_autocmd_script();
                 }
                 (flow, false)
@@ -23372,7 +23410,8 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
         first_line,
     );
     let sid = definition.script_context.sid;
-    let switched = !definition.keepscript && sid != 0 && runtime.scripts.current_sid() != Some(sid);
+    let caller_sid = runtime.scripts.current_sid();
+    let switched = !definition.keepscript && sid != 0 && caller_sid != Some(sid);
     let caller_script = scope.script.clone();
     if !definition.keepscript && sid != 0 {
         let name = format!("command {name}");
@@ -23384,14 +23423,17 @@ fn command_invoke_user<F: FileIO, E: ExEditorAccess>(
             runtime.next_frame_order(),
         );
         if switched {
-            runtime.scripts.load_script_scope(sid, scope);
+            runtime.scripts.switch_script_scope(caller_sid, sid, scope);
         }
     }
     let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
     if !definition.keepscript && sid != 0 {
         if switched {
             runtime.scripts.store_script_scope(sid, scope);
-            scope.script = caller_script;
+            match caller_sid {
+                Some(from) => runtime.scripts.load_script_scope(from, scope),
+                None => scope.script = caller_script,
+            }
         }
         runtime.scripts.pop_source();
     }

@@ -1039,6 +1039,40 @@ fn computed_name_script_variable_assignment_visible_to_later_read() {
     assert_eq!(global_number(exec.scope(), "bar"), Some(99));
 }
 
+#[test]
+fn nested_source_calling_defining_script_function_updates_script_scope() {
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/inner.vim",
+        "call Init('s:foo', 42)\ncall Init('g:bar', 99)",
+    );
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &editor,
+        "/outer.vim",
+        "function! Init(n, v)\n  let {a:n} = a:v\nendfunction\nsource /inner.vim\nlet g:val = s:foo",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "val"), Some(42));
+    assert_eq!(global_number(exec.scope(), "bar"), Some(99));
+}
+
+#[test]
+fn autocmd_ex_string_preserves_defining_script_scope() {
+    let io = MemoryFileIO::new();
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &editor,
+        "/script.vim",
+        "let s:x = 100\nfunction! s:Get()\n  return s:x\nendfunction\nau User MyEvent let g:result = s:Get()",
+    )
+    .unwrap();
+    exec.execute_line(&editor, "doautocmd User MyEvent").unwrap();
+    assert_eq!(global_number(exec.scope(), "result"), Some(100));
+}
+
 // ---------------------------------------------------------------------------
 // Family: command resolution happens when a line runs, and re-sourcing a
 // script reuses its SID (ex_docmd.c find_ex_command / do_one_cmd;
