@@ -114,7 +114,7 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
         | "win_gettype" | "win_findbuf" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
         | "winrestview" | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout"
-        | "getwininfo" | "win_execute" | "win_screenpos" | "screenpos" => Family::Window,
+        | "getwininfo" | "win_execute" | "win_screenpos" | "screenpos" | "getjumplist" => Family::Window,
 
         "getreg" | "getregtype" | "setreg" | "getreginfo" => Family::Register,
         "complete" | "complete_check" | "complete_info" | "getcompletion" => Family::Completion,

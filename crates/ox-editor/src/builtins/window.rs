@@ -113,6 +113,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "getwinvar" => host
             .access
             .with_ex_editor(|editor| call_getwinvar(editor, args)),
+        "getjumplist" => host
+            .access
+            .with_ex_editor(|editor| call_getjumplist(editor, args)),
         "setwinvar" => host
             .access
             .with_ex_editor(|editor| call_setwinvar(editor, args)),
@@ -1072,6 +1075,105 @@ fn call_getwinvar(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
         }))
 }
 
+fn resolve_tabpage_arg(editor: &Editor, arg: Option<&Typval>) -> Option<ox_types::TabHandle> {
+    let Some(arg) = arg else {
+        return editor.current_tabpage();
+    };
+    let tabnr = typval_number(arg)?;
+    match tabnr.cmp(&0) {
+        std::cmp::Ordering::Less => None,
+        std::cmp::Ordering::Equal => editor.current_tabpage(),
+        std::cmp::Ordering::Greater => {
+            let index = one_based_index(tabnr)?;
+            editor.tabpages().get(index).copied()
+        }
+    }
+}
+
+/// Resolves a window specified by `winnr` (and optional `tabnr`) per `eval/window.c:find_tabwin`.
+fn resolve_tabwin(editor: &Editor, args: &[Typval]) -> Option<WinHandle> {
+    let Some(first) = args.first() else {
+        return editor.current_window();
+    };
+    let winnr = typval_number(first)?;
+    if winnr < 0 {
+        return None;
+    }
+    let tab = resolve_tabpage_arg(editor, args.get(1))?;
+    if winnr == 0 {
+        return editor
+            .tabpage(tab)
+            .ok()
+            .map(crate::layout::TabpageState::current_window)
+            .or_else(|| editor.current_window());
+    }
+
+    let windows = editor.tabpage_windows(tab).ok()?;
+    if winnr >= LOWEST_WINDOW_ID {
+        let target = editor.find_window_by_id(winnr)?;
+        return windows.contains(&target).then_some(target);
+    }
+
+    let index = one_based_index(winnr)?;
+    windows.get(index).copied()
+}
+
+fn buffer_by_file_path(editor: &Editor, path: &std::path::Path) -> Option<ox_types::BufHandle> {
+    editor.buffers().into_iter().find(|&handle| {
+        editor.buffer(handle).is_ok_and(|state| {
+            state.name().as_bytes() == path.as_os_str().as_encoded_bytes()
+        })
+    })
+}
+
+fn jump_entry_dict(editor: &Editor, location: &crate::marks::MarkLocation) -> Typval {
+    let bufnr = match &location.target {
+        crate::marks::MarkTarget::Buffer(buf) => i64::from(*buf),
+        crate::marks::MarkTarget::File(path) => {
+            buffer_by_file_path(editor, path).map_or(0, i64::from)
+        }
+    };
+    let mut dict_entries = vec![
+        (
+            OxStr::from("lnum"),
+            Typval::Number(i64::try_from(location.position.lnum).unwrap_or(i64::MAX)),
+        ),
+        (
+            OxStr::from("col"),
+            Typval::Number(i64::try_from(location.position.col).unwrap_or(i64::MAX)),
+        ),
+        (OxStr::from("coladd"), Typval::Number(0)),
+        (OxStr::from("bufnr"), Typval::Number(bufnr)),
+    ];
+    if let crate::marks::MarkTarget::File(path) = &location.target {
+        let file_str = OxStr::from(path.to_string_lossy().as_ref());
+        dict_entries.push((OxStr::from("filename"), Typval::String(file_str.clone())));
+        dict_entries.push((OxStr::from("file"), Typval::String(file_str)));
+    }
+    Typval::dict(dict_entries)
+}
+
+/// `getjumplist([{winnr} [, {tabnr}]])` (`eval/funcs.c:f_getjumplist`): returns
+/// the jumplist and 0-based current index for the window. An invalid window
+/// yields an empty list `[]`.
+fn call_getjumplist(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    let Some(_window) = resolve_tabwin(editor, args) else {
+        return Ok(Typval::list(Vec::new()));
+    };
+    let jumplist = editor.jumplist();
+    let entries = jumplist
+        .entries()
+        .iter()
+        .filter(|loc| loc.position.lnum != 0)
+        .map(|loc| jump_entry_dict(editor, loc))
+        .collect();
+    let current_index = i64::try_from(jumplist.index()).unwrap_or(i64::MAX);
+    Ok(Typval::list(vec![
+        Typval::list(entries),
+        Typval::Number(current_index),
+    ]))
+}
+
 /// `winlayout([{tabnr}])` (`eval/window.c:f_winlayout`): returns the tiled
 /// window layout of the current or named tabpage as a nested list.
 ///
@@ -1928,5 +2030,98 @@ let g:low = screenpos(win_getid(), 0, 1)
             other => panic!("expected Vim error, got {other:?}"),
         };
         assert_eq!(code, "E966");
+    }
+
+    #[test]
+    fn getjumplist_shapes_and_window_resolution() {
+        let mut editor = editor_with_window();
+        let buffer = editor.current_buffer().unwrap();
+        let winid = i64::from(editor.current_window().unwrap());
+
+        let fresh = call_getjumplist(&editor, &[]).unwrap();
+        let Typval::List(list) = fresh else {
+            panic!("getjumplist must return list");
+        };
+        let items = list.borrow().items.clone();
+        assert_eq!(items.len(), 2);
+        match &items[0] {
+            Typval::List(entries) => assert!(entries.borrow().items.is_empty()),
+            other => panic!("expected empty jumps list, got {other:?}"),
+        }
+        assert_eq!(items[1], Typval::Number(0));
+
+        let by_nr = call_getjumplist(&editor, &[Typval::Number(1)]).unwrap();
+        assert_eq!(by_nr, Typval::List(list.clone()));
+        let by_id = call_getjumplist(&editor, &[Typval::Number(winid)]).unwrap();
+        assert_eq!(by_id, Typval::List(list.clone()));
+        let by_tab = call_getjumplist(&editor, &[Typval::Number(1), Typval::Number(1)]).unwrap();
+        assert_eq!(by_tab, Typval::List(list));
+
+        let bad_win = call_getjumplist(&editor, &[Typval::Number(99)]).unwrap();
+        match bad_win {
+            Typval::List(l) => assert!(l.borrow().items.is_empty()),
+            other => panic!("expected empty list, got {other:?}"),
+        }
+        let bad_tab = call_getjumplist(&editor, &[Typval::Number(1), Typval::Number(99)]).unwrap();
+        match bad_tab {
+            Typval::List(l) => assert!(l.borrow().items.is_empty()),
+            other => panic!("expected empty list, got {other:?}"),
+        }
+
+        editor.jumplist_mut().push(crate::MarkLocation::in_buffer(
+            buffer,
+            ox_text::Position { lnum: 10, col: 2 },
+        ));
+        editor.jumplist_mut().push(crate::MarkLocation::in_file(
+            "/tmp/oxvim-test-jump.txt",
+            ox_text::Position { lnum: 20, col: 0 },
+        ));
+        let populated = call_getjumplist(&editor, &[]).unwrap();
+        let Typval::List(list) = populated else {
+            panic!("populated getjumplist must be list");
+        };
+        let items = list.borrow().items.clone();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1], Typval::Number(2));
+        let Typval::List(entries) = &items[0] else {
+            panic!("first element must be list of entries");
+        };
+        let jump_dicts = entries.borrow().items.clone();
+        assert_eq!(jump_dicts.len(), 2);
+
+        let Typval::Dict(first) = &jump_dicts[0] else {
+            panic!("first entry must be dict");
+        };
+        assert_eq!(first.borrow().get(b"lnum"), Some(&Typval::Number(10)));
+        assert_eq!(first.borrow().get(b"col"), Some(&Typval::Number(2)));
+        assert_eq!(first.borrow().get(b"coladd"), Some(&Typval::Number(0)));
+        assert_eq!(
+            first.borrow().get(b"bufnr"),
+            Some(&Typval::Number(i64::from(buffer)))
+        );
+        assert_eq!(first.borrow().get(b"filename"), None);
+
+        let Typval::Dict(second) = &jump_dicts[1] else {
+            panic!("second entry must be dict");
+        };
+        assert_eq!(second.borrow().get(b"lnum"), Some(&Typval::Number(20)));
+        assert_eq!(second.borrow().get(b"col"), Some(&Typval::Number(0)));
+        assert_eq!(second.borrow().get(b"coladd"), Some(&Typval::Number(0)));
+        assert_eq!(second.borrow().get(b"bufnr"), Some(&Typval::Number(0)));
+        assert_eq!(
+            second.borrow().get(b"filename"),
+            Some(&Typval::String(OxStr::from("/tmp/oxvim-test-jump.txt")))
+        );
+        assert_eq!(
+            second.borrow().get(b"file"),
+            Some(&Typval::String(OxStr::from("/tmp/oxvim-test-jump.txt")))
+        );
+        editor.jumplist_mut().backward();
+
+        let moved = call_getjumplist(&editor, &[]).unwrap();
+        let Typval::List(list) = moved else {
+            panic!("moved getjumplist must be list");
+        };
+        assert_eq!(list.borrow().items[1], Typval::Number(1));
     }
 }
