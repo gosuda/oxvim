@@ -153,6 +153,9 @@ impl Emitter {
                 let mut default_grid = self.take_scratch(channel_id)?;
                 default_grid.reshape(width, height)?;
                 for layer in compositor.layers() {
+                    if layer.kind == LayerKind::Message && layer.statusline.is_some() {
+                        continue;
+                    }
                     if let Some((statusline, hl_id)) = &layer.statusline {
                         let row = usize::try_from(layer.row)
                             .unwrap_or(0)
@@ -166,6 +169,24 @@ impl Emitter {
                             )?;
                         }
                     }
+                    if let Some((separator, hl_id)) = &layer.separator {
+                        let row = usize::try_from(layer.row)
+                            .unwrap_or(0)
+                            .saturating_add(layer.grid.height());
+                        if row < height {
+                            default_grid.write_text(
+                                row,
+                                usize::try_from(layer.col).unwrap_or(0),
+                                separator,
+                                *hl_id,
+                            )?;
+                        }
+                    }
+                }
+                if let Some((statusline, hl_id)) = compositor.global_statusline()
+                    && height >= 2
+                {
+                    default_grid.write_text(height - 2, 0, statusline, *hl_id)?;
                 }
                 compositor.paint_tabline_row(&mut default_grid)?;
                 let cmdline_cursor = if options.ext_cmdline {
@@ -176,7 +197,9 @@ impl Emitter {
                 self.emit_grid(channel_id, channel, &default_grid)?;
                 let float_compindex = float_compindexes(compositor);
                 for (index, layer) in compositor.layers().iter().enumerate() {
-                    if options.ext_messages && layer.kind == LayerKind::Message {
+                    if (options.ext_messages && layer.kind == LayerKind::Message)
+                        || (layer.kind == LayerKind::Message && layer.statusline.is_some())
+                    {
                         continue;
                     }
                     // The grid must exist before its position event: a new
@@ -243,6 +266,7 @@ impl Emitter {
             let current_grids = compositor
                 .layers()
                 .iter()
+                .filter(|layer| !(layer.kind == LayerKind::Message && layer.statusline.is_some()))
                 .map(|layer| layer.grid.id())
                 .collect::<BTreeSet<_>>();
             let previous_grids = self
@@ -257,8 +281,11 @@ impl Emitter {
             // lives on another tabpage and a later `win_pos` resurfaces it.
             if options.ext_multigrid {
                 for grid in previous_grids.difference(&current_grids) {
-                    let destroyed =
-                        *grid % 2 == 0 && !compositor.live_window_grids().contains(grid);
+                    if *grid % 2 != 0 {
+                        self.previous.remove(&(channel_id, *grid));
+                        continue;
+                    }
+                    let destroyed = !compositor.live_window_grids().contains(grid);
                     if destroyed {
                         // A destroyed window never resurfaces and grid ids are
                         // never reused, so its retained snapshot only leaks.
@@ -269,6 +296,9 @@ impl Emitter {
                 }
             }
             for layer in compositor.layers() {
+                if layer.kind == LayerKind::Message && layer.statusline.is_some() {
+                    continue;
+                }
                 let key = (channel_id, layer.grid.id());
                 let previous = self
                     .watched_extmarks

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use ox_editor::extmark::ExtmarkHighlightMode;
-use ox_editor::{Editor, ExtmarkPlacement, ExtmarkPosition, Geometry};
+use ox_editor::{Editor, ExtmarkPlacement, ExtmarkPosition, Geometry, OptionValue};
 use ox_rpc::decode;
 use ox_text::{Buffer, Position};
 use ox_types::{Dict, Object, OxStr};
@@ -927,24 +927,32 @@ fn grid_text(frame: &Object, target: i64) -> String {
         if *name != OxStr::from("grid_line") {
             continue;
         }
-        let Some(Object::Array(args)) = parts.get(1) else {
-            continue;
-        };
-        let Some(Object::Integer(grid)) = args.first() else {
-            continue;
-        };
-        if *grid != target {
-            continue;
-        }
-        let Some(Object::Array(cells)) = args.get(3) else {
-            continue;
-        };
-        for cell_repeat in cells {
-            let Object::Array(cell) = cell_repeat else {
+        for args in parts.iter().skip(1) {
+            let Object::Array(args) = args else {
                 continue;
             };
-            if let Some(Object::String(text)) = cell.first() {
-                out.push_str(&text.to_string_lossy());
+            let Some(Object::Integer(grid)) = args.first() else {
+                continue;
+            };
+            if *grid != target {
+                continue;
+            }
+            let Some(Object::Array(cells)) = args.get(3) else {
+                continue;
+            };
+            for cell_repeat in cells {
+                let Object::Array(cell) = cell_repeat else {
+                    continue;
+                };
+                if let Some(Object::String(text)) = cell.first() {
+                    let count = match cell.get(2) {
+                        Some(Object::Integer(n)) => usize::try_from(*n).unwrap_or(1),
+                        _ => 1,
+                    };
+                    for _ in 0..count {
+                        out.push_str(&text.to_string_lossy());
+                    }
+                }
             }
         }
     }
@@ -969,15 +977,17 @@ fn win_float_compindexes(frame: &Object) -> BTreeMap<i64, i64> {
         if *name != OxStr::from("win_float_pos") {
             continue;
         }
-        let Some(Object::Array(args)) = parts.get(1) else {
-            continue;
-        };
-        let (Some(Object::Integer(grid)), Some(Object::Integer(compindex))) =
-            (args.first(), args.get(8))
-        else {
-            continue;
-        };
-        map.insert(*grid, *compindex);
+        for args in parts.iter().skip(1) {
+            let Object::Array(args) = args else {
+                continue;
+            };
+            let (Some(Object::Integer(grid)), Some(Object::Integer(compindex))) =
+                (args.first(), args.get(8))
+            else {
+                continue;
+            };
+            map.insert(*grid, *compindex);
+        }
     }
     map
 }
@@ -991,8 +1001,12 @@ fn has_grid_resize(frame: &Object, grid: i64) -> bool {
     };
     events.iter().any(|event| {
         let Object::Array(parts) = event else { return false };
-        matches!(parts.first(), Some(Object::String(name)) if *name == OxStr::from("grid_resize"))
-            && matches!(parts.get(1), Some(Object::Array(args)) if args.first() == Some(&Object::Integer(grid)))
+        if parts.first() != Some(&Object::String(OxStr::from("grid_resize"))) {
+            return false;
+        }
+        parts.iter().skip(1).any(|args| {
+            matches!(args, Object::Array(args) if args.first() == Some(&Object::Integer(grid)))
+        })
     })
 }
 
@@ -1015,6 +1029,128 @@ fn event_names(frame: Object) -> Vec<String> {
             Some(name.to_string_lossy().into_owned())
         })
         .collect()
+}
+
+fn msg_set_pos_events(frame: &Object) -> Vec<(i64, i64)> {
+    let Object::Array(frame) = frame else {
+        return Vec::new();
+    };
+    let Some(Object::Array(events)) = frame.get(2) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for event in events {
+        let Object::Array(parts) = event else {
+            continue;
+        };
+        let Some(Object::String(name)) = parts.first() else {
+            continue;
+        };
+        if *name != OxStr::from("msg_set_pos") {
+            continue;
+        }
+        for args in parts.iter().skip(1) {
+            let Object::Array(args) = args else {
+                continue;
+            };
+            let (Some(Object::Integer(grid)), Some(Object::Integer(row))) =
+                (args.first(), args.get(1))
+            else {
+                continue;
+            };
+            out.push((*grid, *row));
+        }
+    }
+    out
+}
+
+fn win_hide_grids(frame: &Object) -> Vec<i64> {
+    let Object::Array(frame) = frame else {
+        return Vec::new();
+    };
+    let Some(Object::Array(events)) = frame.get(2) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for event in events {
+        let Object::Array(parts) = event else {
+            continue;
+        };
+        let Some(Object::String(name)) = parts.first() else {
+            continue;
+        };
+        if *name != OxStr::from("win_hide") {
+            continue;
+        }
+        for args in parts.iter().skip(1) {
+            let Object::Array(args) = args else {
+                continue;
+            };
+            if let Some(Object::Integer(grid)) = args.first() {
+                out.push(*grid);
+            }
+        }
+    }
+    out
+}
+
+fn grid_row_text(frame: &Object, target_grid: i64, target_row: i64) -> String {
+    let Object::Array(frame) = frame else {
+        return String::new();
+    };
+    let Some(Object::Array(events)) = frame.get(2) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for event in events {
+        let Object::Array(parts) = event else {
+            continue;
+        };
+        let Some(Object::String(name)) = parts.first() else {
+            continue;
+        };
+        if *name != OxStr::from("grid_line") {
+            continue;
+        }
+        for args in parts.iter().skip(1) {
+            let Object::Array(args) = args else {
+                continue;
+            };
+            let (Some(Object::Integer(grid)), Some(Object::Integer(row))) =
+                (args.first(), args.get(1))
+            else {
+                continue;
+            };
+            if *grid != target_grid || *row != target_row {
+                continue;
+            }
+            let startcol = match args.get(2) {
+                Some(Object::Integer(c)) => usize::try_from(*c).unwrap_or(0),
+                _ => 0,
+            };
+            while out.len() < startcol {
+                out.push(' ');
+            }
+            let Some(Object::Array(cells)) = args.get(3) else {
+                continue;
+            };
+            for cell_repeat in cells {
+                let Object::Array(cell) = cell_repeat else {
+                    continue;
+                };
+                if let Some(Object::String(text)) = cell.first() {
+                    let count = match cell.get(2) {
+                        Some(Object::Integer(n)) => usize::try_from(*n).unwrap_or(1),
+                        _ => 1,
+                    };
+                    for _ in 0..count {
+                        out.push_str(&text.to_string_lossy());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[test]
@@ -1313,4 +1449,128 @@ fn multigrid_steady_state_reuses_default_grid_without_stale_content() {
             );
         }
     }
+}
+
+#[test]
+fn multigrid_laststatus_three_paints_on_grid_one_without_synthetic_overlay_or_win_hide() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_lines(&[b"buffer content line".to_vec()], true).unwrap(),
+            true,
+        )
+        .unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 20, 8).unwrap())
+        .unwrap();
+    editor
+        .options_mut()
+        .set_global("laststatus", OptionValue::Number(3))
+        .unwrap();
+
+    let (width, height) = (20, 8);
+    let mut compositor = Compositor::new(width, height);
+    let mut highlights = HlState::new();
+    compositor
+        .refresh_from_editor(&editor, width, height, &mut highlights)
+        .unwrap();
+
+    let mut channels = UiChannels::new();
+    channels
+        .attach(
+            1,
+            width,
+            height,
+            UiOptions {
+                ext_linegrid: true,
+                ext_multigrid: true,
+                ..UiOptions::default()
+            },
+        )
+        .unwrap();
+    let mut emitter = Emitter::new();
+    let mut chrome = ChromeState::new();
+
+    let frames = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let decoded = decode(&frames[&1]).unwrap();
+
+    // 1. Resizing and positioning:
+    // Grid 1 is the default grid (20x8); grid 2 is the window grid (20x6, since row 6 is
+    // global statusline and row 7 is the message line).
+    assert!(has_grid_resize(&decoded, 1));
+    assert!(has_grid_resize(&decoded, 2));
+    // Synthetic grid 5 must NOT be resized or emitted.
+    assert!(!has_grid_resize(&decoded, 5));
+
+    // 2. No synthetic overlay:
+    // In ext_multigrid without ext_messages, no msg_set_pos for grid 5 or at row 6.
+    let msg_positions = msg_set_pos_events(&decoded);
+    assert!(!msg_positions.iter().any(|(grid, _)| *grid == 5));
+    assert!(!msg_positions.iter().any(|(_, row)| *row == 6));
+    // The only msg_set_pos emitted is for the real message line (grid 3 at row 7).
+    for (grid, row) in &msg_positions {
+        assert_eq!(*grid, 3);
+        assert_eq!(*row, 7);
+    }
+
+    // 3. Statusline text on grid 1:
+    // Global statusline lands on grid 1 at row height-2 (row 6), not row 0 or window grid 2.
+    assert!(grid_row_text(&decoded, 1, 6).contains("[No Name]"));
+    assert!(!grid_row_text(&decoded, 1, 0).contains("[No Name]"));
+    assert!(grid_row_text(&decoded, 2, 0).contains("buffer content line"));
+    assert!(!grid_text(&decoded, 2).contains("[No Name]"));
+
+    // 4. Transition to laststatus=2:
+    // Switching to per-window statusline must not emit win_hide for odd/synthetic grids.
+    editor
+        .options_mut()
+        .set_global("laststatus", OptionValue::Number(2))
+        .unwrap();
+    compositor
+        .refresh_from_editor(&editor, width, height, &mut highlights)
+        .unwrap();
+    let second_frames = emitter
+        .redraw(&mut channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let second_decoded = decode(&second_frames[&1]).unwrap();
+    let win_hides = win_hide_grids(&second_decoded);
+    assert!(!win_hides.contains(&5));
+    assert!(!win_hides.contains(&3));
+    assert!(!win_hides.contains(&1));
+
+    // 5. Client with ext_messages: true also renders global statusline on grid 1 at row 6,
+    // and emits no msg_set_pos events.
+    let mut ext_channels = UiChannels::new();
+    ext_channels
+        .attach(
+            2,
+            width,
+            height,
+            UiOptions {
+                ext_linegrid: true,
+                ext_multigrid: true,
+                ext_messages: true,
+                ..UiOptions::default()
+            },
+        )
+        .unwrap();
+    editor
+        .options_mut()
+        .set_global("laststatus", OptionValue::Number(3))
+        .unwrap();
+    compositor
+        .refresh_from_editor(&editor, width, height, &mut highlights)
+        .unwrap();
+    let ext_frames = Emitter::new()
+        .redraw(&mut ext_channels, &compositor, &mut highlights, &mut chrome)
+        .unwrap()
+        .0;
+    let ext_decoded = decode(&ext_frames[&2]).unwrap();
+    assert!(!event_names(ext_decoded.clone()).contains(&"msg_set_pos".to_owned()));
+    assert!(!has_grid_resize(&ext_decoded, 5));
+    assert!(grid_row_text(&ext_decoded, 1, 6).contains("[No Name]"));
 }

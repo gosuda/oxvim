@@ -60,6 +60,8 @@ pub struct Layer {
     pub watched_extmarks: Vec<WatchedExtmark>,
     /// Statusline text and highlight rendered on the default grid.
     pub statusline: Option<(String, u64)>,
+    /// Horizontal separator text and highlight rendered on the default grid.
+    pub separator: Option<(String, u64)>,
 }
 
 /// One `win_extmark` payload produced while drawing a window.
@@ -93,6 +95,7 @@ impl Layer {
             cursor: None,
             watched_extmarks: Vec::new(),
             statusline: None,
+            separator: None,
         }
     }
 
@@ -115,6 +118,7 @@ impl Layer {
         self.cursor = None;
         self.watched_extmarks.clear();
         self.statusline = None;
+        self.separator = None;
     }
 }
 
@@ -160,7 +164,8 @@ pub struct Compositor {
     width: usize,
     height: usize,
     layers: Vec<Layer>,
-    /// Resolved tabline runs for the top row: (column, text, hl id).
+    /// Global statusline text and highlight rendered on the default grid.
+    global_statusline: Option<(String, u64)>,
     /// Refreshed on every `refresh_from_editor`; empty means no tabline.
     tabline_row: Vec<(usize, String, u64)>,
     /// Whether the previous refresh painted a tabline row; drives the
@@ -181,6 +186,7 @@ impl Compositor {
             width,
             height,
             layers: Vec::new(),
+            global_statusline: None,
             tabline_row: Vec::new(),
             tabline_was_shown: false,
             live_window_grids: BTreeSet::new(),
@@ -210,6 +216,7 @@ impl Compositor {
     /// Removes all layers.
     pub fn clear(&mut self) {
         self.layers.clear();
+        self.global_statusline = None;
         self.tabline_row.clear();
         self.live_window_grids.clear();
     }
@@ -225,6 +232,12 @@ impl Compositor {
     pub fn live_window_grids(&self) -> &BTreeSet<i64> {
         &self.live_window_grids
     }
+    /// Returns the global statusline rendered on the default grid.
+    #[must_use]
+    pub fn global_statusline(&self) -> Option<&(String, u64)> {
+        self.global_statusline.as_ref()
+    }
+
 
     /// Rebuilds the layer stack from the active editor tabpage in place,
     /// reusing every retained layer whose grid id survives into this frame.
@@ -238,10 +251,6 @@ impl Compositor {
     /// Returns [`CompositorError::NoActiveTabpage`] when no tabpage is active, or
     /// editor, buffer, grid, and highlight errors from reading the snapshot,
     /// building window grids, or interning highlights.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "window rendering is an order-sensitive pass over editor state"
-    )]
     pub fn refresh_from_editor(
         &mut self,
         editor: &Editor,
@@ -338,6 +347,7 @@ impl Compositor {
             cterm_explicit: true,
             ..Highlight::default()
         })?;
+        let separator_id = highlight_or(highlights, "WinSeparator", 0)?;
         // The tabline reserves the top rows of the default grid
         // (`tabline_height`, window.c:7416-7429); windows shift down by it.
         let tabline = crate::tabline::tabline_layout(editor, width);
@@ -354,18 +364,28 @@ impl Compositor {
         self.width = width;
         self.height = height;
         let windows = tab.windows();
-        let tiled_count = tab.layout().window_count();
-        let tiled_split = tiled_count > 1;
         let laststatus = match editor.options().get_global("laststatus") {
             Ok(OptionValue::Number(value)) => *value,
             _ => 2,
         };
-        let tiled_statusline = statusline_visible(laststatus, tiled_split);
+        let global_statusline = laststatus == 3;
+        let mut global_statusline_text = None;
+        self.global_statusline = None;
         for window in windows {
             let state = editor.window(window)?;
             let geometry = tab.window_geometry(window)?;
             let config = tab.window_config(window)?;
             let is_float = config.is_some();
+            let window_statusline = if is_float {
+                false
+            } else {
+                tab.tiled_window_statusline_visible(window, laststatus)?
+            };
+            let window_separator = if is_float {
+                false
+            } else {
+                tab.tiled_window_separator_visible(window, laststatus)?
+            };
             let grid_id = window_grid_id(window);
             let (layer_row, grid_height) = if is_float {
                 (
@@ -373,14 +393,13 @@ impl Compositor {
                     geometry.height.max(1),
                 )
             } else {
-                let (row, grid_height) = tiled_window_grid_geometry(
+                tiled_window_grid_geometry(
                     geometry,
-                    height.saturating_sub(tabline_top),
-                    tiled_statusline,
-                );
-                (
-                    row.saturating_add(isize::try_from(tabline_top).unwrap_or(isize::MAX)),
-                    grid_height,
+                    height,
+                    tabline_top,
+                    window_statusline,
+                    window_separator,
+                    global_statusline,
                 )
             };
             let kind = if is_float {
@@ -705,8 +724,13 @@ impl Compositor {
             layer.grid = grid;
             layer.window = Some(window);
             layer.watched_extmarks = watched_extmarks;
-            if !is_float && tiled_statusline {
-                let mut statusline = statuslines.get(&window).cloned().unwrap_or_else(|| {
+            if !is_float && window_separator {
+                layer.separator = Some(("─".repeat(geometry.width), separator_id));
+            }
+            let needs_statusline =
+                window_statusline || (global_statusline && current_window == Some(window));
+            if needs_statusline {
+                let statusline_text = statuslines.get(&window).cloned().unwrap_or_else(|| {
                     let name = if buffer_state.name().as_bytes().is_empty() {
                         "[No Name]".to_owned()
                     } else {
@@ -722,16 +746,27 @@ impl Compositor {
                     };
                     format!("{name}{modified}")
                 });
-                statusline.extend(std::iter::repeat_n(
-                    ' ',
-                    geometry.width.saturating_sub(statusline.len()),
-                ));
                 let hl_id = if current_window == Some(window) {
                     statusline_id
                 } else {
                     statusline_nc_id
                 };
-                layer.statusline = Some((statusline, hl_id));
+                if window_statusline {
+                    let mut statusline = statusline_text.clone();
+                    statusline.extend(std::iter::repeat_n(
+                        ' ',
+                        geometry.width.saturating_sub(statusline.len()),
+                    ));
+                    layer.statusline = Some((statusline, hl_id));
+                }
+                if global_statusline && current_window == Some(window) {
+                    let mut statusline = statusline_text;
+                    statusline.extend(std::iter::repeat_n(
+                        ' ',
+                        width.saturating_sub(statusline.len()),
+                    ));
+                    global_statusline_text = Some((statusline, hl_id));
+                }
             }
             layer.cursor = (current_window == Some(window)).then(|| {
                 let before_cursor = (state.topline..state.cursor.lnum)
@@ -767,6 +802,9 @@ impl Compositor {
             });
             self.layers.push(layer);
         }
+        self.global_statusline = global_statusline
+            .then_some(global_statusline_text)
+            .flatten();
         let mut message = match take_layer(&mut retired, 3) {
             Some(layer) => layer,
             None => Layer::new(
@@ -825,7 +863,10 @@ impl Compositor {
         let mut order: Vec<usize> = (0..self.layers.len())
             .filter(|&index| {
                 matches!(messages, MessageLayers::Include)
+                    // Message layers are optional in ext_messages mode; the
+                    // global statusline is compositor-owned chrome on grid 1.
                     || self.layers[index].kind != LayerKind::Message
+                    || self.layers[index].statusline.is_some()
             })
             .collect();
         order.sort_by_key(|&index| {
@@ -842,6 +883,11 @@ impl Compositor {
         // Painted before the layers: a 1-to-0 transition blanks row 0 so
         // the window layers repaint it in the same frame.
         self.paint_tabline_row(output)?;
+        if let Some((statusline, hl_id)) = &self.global_statusline
+            && self.height >= 2
+        {
+            output.write_text(self.height - 2, 0, statusline, *hl_id)?;
+        }
         for index in order {
             let layer = &self.layers[index];
             for source_row in 0..layer.grid.height() {
@@ -893,6 +939,16 @@ impl Compositor {
                 && col < self.width
             {
                 output.write_text(row, col, statusline, *hl_id)?;
+            }
+            if let Some((separator, hl_id)) = &layer.separator
+                && let (Some(row), Some(col)) = (
+                    layer.grid.height().checked_add_signed(layer.row),
+                    0usize.checked_add_signed(layer.col),
+                )
+                && row < self.height
+                && col < self.width
+            {
+                output.write_text(row, col, separator, *hl_id)?;
             }
             if let Some((row, col)) = layer.cursor
                 && let (Some(row), Some(col)) = (
@@ -957,6 +1013,37 @@ fn window_grid_id(window: WinHandle) -> i64 {
     ordinal.saturating_mul(2)
 }
 
+/// Content rectangle for a tiled window: one configured statusline or
+/// horizontal separator under each window, the top rows reserved for the
+/// tabline, and the bottom rows reserved for the message grid (and global
+/// statusline when `laststatus=3`).
+fn tiled_window_grid_geometry(
+    geometry: Geometry,
+    screen_height: usize,
+    tabline_top: usize,
+    statusline_visible: bool,
+    separator_visible: bool,
+    global_statusline: bool,
+) -> (isize, usize) {
+    let layer_row =
+        isize::try_from(geometry.row.saturating_add(tabline_top)).unwrap_or(isize::MAX);
+    let global_stl = usize::from(global_statusline);
+    let work_bottom = screen_height.saturating_sub(1 + global_stl);
+    let statusline = usize::from(statusline_visible);
+    let separator = usize::from(separator_visible);
+    let frame_end = geometry
+        .row
+        .saturating_add(tabline_top)
+        .saturating_add(geometry.height);
+    let content_end = frame_end
+        .min(work_bottom)
+        .saturating_sub(statusline.saturating_add(separator));
+    let grid_height = content_end
+        .saturating_sub(geometry.row.saturating_add(tabline_top))
+        .max(1);
+    (layer_row, grid_height)
+}
+
 /// Removes the retained layer for `id`, if one survived the previous frame.
 fn take_layer(retired: &mut Vec<Layer>, id: i64) -> Option<Layer> {
     retired
@@ -996,34 +1083,6 @@ fn resolve_tabline_row(
     Ok(resolved)
 }
 
-/// Whether tiled windows reserve and draw their statusline row. `'laststatus'
-/// 0` hides it, `1` shows it only when the tabpage is split, and `2` shows it
-/// for a single window as well.
-fn statusline_visible(laststatus: i64, tiled_split: bool) -> bool {
-    match laststatus {
-        0 => false,
-        1 => tiled_split,
-        _ => true,
-    }
-}
-
-/// Content rectangle for a tiled window: one configured statusline under each
-/// window and the last screen row reserved for the message grid.
-fn tiled_window_grid_geometry(
-    geometry: Geometry,
-    screen_height: usize,
-    statusline_visible: bool,
-) -> (isize, usize) {
-    let work_bottom = screen_height.saturating_sub(1);
-    let statusline = usize::from(statusline_visible);
-    let frame_end = geometry.row.saturating_add(geometry.height);
-    let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
-    let grid_height = content_end.saturating_sub(geometry.row).max(1);
-    (
-        isize::try_from(geometry.row).unwrap_or(isize::MAX),
-        grid_height,
-    )
-}
 
 #[expect(
     clippy::too_many_arguments,
@@ -1296,3 +1355,302 @@ fn highlight_or(
         )
         .map_err(CompositorError::from)
 }
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test setup requires valid editor state")]
+mod tests {
+    use super::*;
+    use ox_text::Buffer;
+
+    fn window_layers(compositor: &Compositor) -> Vec<&Layer> {
+        compositor
+            .layers()
+            .iter()
+            .filter(|layer| layer.kind == LayerKind::Window && layer.window.is_some())
+            .collect()
+    }
+
+    #[test]
+    fn laststatus_zero_draws_only_non_bottom_split_statusline() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_lines(&[b"line".to_vec()], true).unwrap(), true)
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        let original = editor.current_window().unwrap();
+        editor.split_above(tab, original, buffer, true).unwrap();
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(0))
+            .unwrap();
+
+        let mut highlights = HlState::new();
+        let mut compositor = Compositor::new(20, 8);
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 2);
+        let upper = windows.iter().find(|layer| layer.row == 0).unwrap();
+        let lower = windows.iter().find(|layer| layer.row == 4).unwrap();
+        assert_eq!(upper.grid.height(), 3);
+        assert_eq!(lower.grid.height(), 3);
+        assert!(upper.statusline.is_some());
+        assert!(lower.statusline.is_none());
+
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(2))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        let lower = windows.iter().find(|layer| layer.row == 4).unwrap();
+        assert_eq!(lower.grid.height(), 2);
+        assert!(lower.statusline.is_some());
+    }
+
+    #[test]
+    fn laststatus_three_uses_one_global_row_for_single_horizontal_and_vertical() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_lines(&[b"line".to_vec()], true).unwrap(), true)
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(3))
+            .unwrap();
+
+        let mut highlights = HlState::new();
+        let mut compositor = Compositor::new(20, 8);
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].grid.height(), 6);
+        assert!(windows[0].statusline.is_none());
+        let mut screen = Grid::new(1, 20, 8).unwrap();
+        compositor
+            .compose_into(&mut screen, &mut highlights)
+            .unwrap();
+        assert_eq!(screen.cell(6, 0).unwrap().text, OxStr::from("["));
+        assert!(compositor.global_statusline().is_some());
+
+        let original = editor.current_window().unwrap();
+        editor.split_above(tab, original, buffer, true).unwrap();
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|layer| layer.statusline.is_none()));
+        let upper = windows.iter().find(|layer| layer.row == 0).unwrap();
+        assert_eq!(upper.grid.height(), 3);
+        assert_eq!(
+            upper.separator.as_ref().map(|(text, _)| text.as_str()),
+            Some("────────────────────")
+        );
+        let lower = windows.iter().find(|layer| layer.row == 4).unwrap();
+        assert_eq!(lower.grid.height(), 2);
+        assert!(lower.separator.is_none());
+        assert!(compositor.global_statusline().is_some());
+        let mut screen = Grid::new(1, 20, 8).unwrap();
+        compositor
+            .compose_into(&mut screen, &mut highlights)
+            .unwrap();
+        assert_eq!(screen.cell(3, 0).unwrap().text, OxStr::from("─"));
+        assert_eq!(screen.cell(6, 0).unwrap().text, OxStr::from("["));
+
+        let mut vertical_editor = Editor::new();
+        let vertical_buffer = vertical_editor
+            .create_buffer_with(Buffer::from_lines(&[b"line".to_vec()], true).unwrap(), true)
+            .unwrap();
+        let vertical_tab = vertical_editor
+            .create_tabpage(vertical_buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        let vertical_original = vertical_editor.current_window().unwrap();
+        vertical_editor
+            .split_vertical(vertical_tab, vertical_original, vertical_buffer, true)
+            .unwrap();
+        vertical_editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(3))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&vertical_editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|layer| layer.statusline.is_none()));
+        assert!(windows.iter().all(|layer| layer.separator.is_none()));
+        assert!(windows.iter().all(|layer| layer.grid.height() == 6));
+        assert!(compositor.global_statusline().is_some());
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sequential assertions verify tabline height and statusline layout across laststatus 0, 2, and 3 for both split directions"
+    )]
+    fn visible_tabline_with_split_and_laststatus_zero_two_three() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(Buffer::from_lines(&[b"line".to_vec()], true).unwrap(), true)
+            .unwrap();
+        let tab = editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        let original = editor.current_window().unwrap();
+        editor.split_above(tab, original, buffer, true).unwrap();
+        editor
+            .options_mut()
+            .set_global("showtabline", OptionValue::Number(2))
+            .unwrap();
+
+        let mut highlights = HlState::new();
+        let mut compositor = Compositor::new(20, 8);
+
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(0))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 2);
+        let upper = windows.iter().find(|layer| layer.row == 1).unwrap();
+        let lower = windows.iter().find(|layer| layer.row == 5).unwrap();
+        assert_eq!(upper.grid.height(), 3);
+        assert_eq!(lower.grid.height(), 2);
+        assert!(upper.statusline.is_some());
+        assert!(lower.statusline.is_none());
+        assert!(upper.separator.is_none());
+        assert!(lower.separator.is_none());
+        assert!(compositor.global_statusline().is_none());
+
+        let mut screen = Grid::new(1, 20, 8).unwrap();
+        compositor
+            .compose_into(&mut screen, &mut highlights)
+            .unwrap();
+        assert_eq!(screen.cell(4, 0).unwrap().text, OxStr::from("["));
+
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(2))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        let upper = windows.iter().find(|layer| layer.row == 1).unwrap();
+        let lower = windows.iter().find(|layer| layer.row == 5).unwrap();
+        assert_eq!(upper.grid.height(), 3);
+        assert_eq!(lower.grid.height(), 1);
+        assert!(upper.statusline.is_some());
+        assert!(lower.statusline.is_some());
+        assert!(upper.separator.is_none());
+        assert!(lower.separator.is_none());
+        assert!(compositor.global_statusline().is_none());
+
+        let mut screen = Grid::new(1, 20, 8).unwrap();
+        compositor
+            .compose_into(&mut screen, &mut highlights)
+            .unwrap();
+        assert_eq!(screen.cell(4, 0).unwrap().text, OxStr::from("["));
+        assert_eq!(screen.cell(6, 0).unwrap().text, OxStr::from("["));
+
+        editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(3))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        let upper = windows.iter().find(|layer| layer.row == 1).unwrap();
+        let lower = windows.iter().find(|layer| layer.row == 5).unwrap();
+        assert_eq!(upper.grid.height(), 3);
+        assert_eq!(lower.grid.height(), 1);
+        assert!(upper.statusline.is_none());
+        assert!(lower.statusline.is_none());
+        assert_eq!(
+            upper.separator.as_ref().map(|(text, _)| text.as_str()),
+            Some("────────────────────")
+        );
+        assert!(lower.separator.is_none());
+        assert!(compositor.global_statusline().is_some());
+
+        let mut screen = Grid::new(1, 20, 8).unwrap();
+        compositor
+            .compose_into(&mut screen, &mut highlights)
+            .unwrap();
+        assert_eq!(screen.cell(4, 0).unwrap().text, OxStr::from("─"));
+        assert_eq!(screen.cell(6, 0).unwrap().text, OxStr::from("["));
+
+        let mut vertical_editor = Editor::new();
+        let vertical_buffer = vertical_editor
+            .create_buffer_with(Buffer::from_lines(&[b"line".to_vec()], true).unwrap(), true)
+            .unwrap();
+        let vertical_tab = vertical_editor
+            .create_tabpage(vertical_buffer, Geometry::new(0, 0, 20, 8).unwrap())
+            .unwrap();
+        let vertical_original = vertical_editor.current_window().unwrap();
+        vertical_editor
+            .split_vertical(vertical_tab, vertical_original, vertical_buffer, true)
+            .unwrap();
+        vertical_editor
+            .options_mut()
+            .set_global("showtabline", OptionValue::Number(2))
+            .unwrap();
+
+        vertical_editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(0))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&vertical_editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|layer| layer.row == 1));
+        assert!(windows.iter().all(|layer| layer.grid.height() == 6));
+        assert!(windows.iter().all(|layer| layer.statusline.is_none()));
+        assert!(windows.iter().all(|layer| layer.separator.is_none()));
+
+        vertical_editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(2))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&vertical_editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert!(windows.iter().all(|layer| layer.row == 1));
+        assert!(windows.iter().all(|layer| layer.grid.height() == 5));
+        assert!(windows.iter().all(|layer| layer.statusline.is_some()));
+        assert!(windows.iter().all(|layer| layer.separator.is_none()));
+
+        vertical_editor
+            .options_mut()
+            .set_global("laststatus", OptionValue::Number(3))
+            .unwrap();
+        compositor
+            .refresh_from_editor(&vertical_editor, 20, 8, &mut highlights)
+            .unwrap();
+        let windows = window_layers(&compositor);
+        assert!(windows.iter().all(|layer| layer.row == 1));
+        assert!(windows.iter().all(|layer| layer.grid.height() == 5));
+        assert!(windows.iter().all(|layer| layer.statusline.is_none()));
+        assert!(windows.iter().all(|layer| layer.separator.is_none()));
+        assert!(compositor.global_statusline().is_some());
+    }
+}
+

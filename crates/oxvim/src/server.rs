@@ -338,6 +338,8 @@ impl Drop for StatuslineRenderGuard {
 
 struct StatuslineCache {
     cwd: Option<PathBuf>,
+    width: usize,
+    global_statusline: bool,
     formats: Vec<(
         WinHandle,
         String,
@@ -1540,6 +1542,21 @@ impl AppState {
         self.session.with_editor(|editor| editor.ui_sends_pending())
     }
 
+    /// Returns the shared screen dimensions used by the compositor. Multiple
+    /// attached UIs render at the smallest common size, matching the redraw
+    /// geometry and the global statusline's `Columns` width.
+    fn screen_size(&self) -> (usize, usize) {
+        self.session.with_render_state(|ui_channels, _, _| {
+            ui_channels
+                .iter()
+                .map(|(_, channel)| channel.size())
+                .reduce(|(width, height), (other_width, other_height)| {
+                    (width.min(other_width), height.min(other_height))
+                })
+                .unwrap_or((1, 1))
+        })
+    }
+
     /// Whether any `nvim__redraw` request awaits the next redraw pass.
     fn has_pending_redraws(&self) -> bool {
         self.session.with_editor(|editor| editor.redraws_pending())
@@ -1643,12 +1660,10 @@ impl AppState {
         }
         Ok(())
     }
+    #[cfg(test)]
     fn render_statuslines(&mut self) -> HashMap<WinHandle, String> {
-        self.render_statuslines_with_policy(StatuslineCachePolicy::Reuse)
-    }
-
-    fn refresh_statuslines(&mut self) -> HashMap<WinHandle, String> {
-        self.render_statuslines_with_policy(StatuslineCachePolicy::Refresh)
+        let width = self.screen_size().0;
+        self.render_statuslines_with_policy(StatuslineCachePolicy::Reuse, width)
     }
 
     /// Guards the `%!` evaluator against `:redrawstatus` re-entry
@@ -1658,13 +1673,14 @@ impl AppState {
     fn render_statuslines_with_policy(
         &mut self,
         policy: StatuslineCachePolicy,
+        width: usize,
     ) -> HashMap<WinHandle, String> {
         let flag = self.statusline_rendering.clone();
         if flag.replace(true) {
             return HashMap::new();
         }
         let _guard = StatuslineRenderGuard(flag);
-        self.render_statuslines_with_policy_inner(policy)
+        self.render_statuslines_with_policy_inner(policy, width)
     }
 
     /// Evaluates each active window's effective `'statusline'` before the
@@ -1673,8 +1689,15 @@ impl AppState {
     fn render_statuslines_with_policy_inner(
         &mut self,
         policy: StatuslineCachePolicy,
+        width: usize,
     ) -> HashMap<WinHandle, String> {
         let cwd = std::env::current_dir().ok();
+        let global_statusline = self.session.with_editor(|editor| {
+            matches!(
+                editor.options().get_global("laststatus"),
+                Ok(OptionValue::Number(value)) if *value == 3
+            )
+        });
         let formats = self.session.with_editor(|editor| {
             let Some(tab) = editor.current_tabpage() else {
                 return Vec::new();
@@ -1712,6 +1735,8 @@ impl AppState {
         if matches!(policy, StatuslineCachePolicy::Reuse)
             && let Some(cache) = &self.statusline_cache
             && cache.cwd == cwd
+            && cache.width == width
+            && cache.global_statusline == global_statusline
             && cache.formats == formats
         {
             return cache.rendered.clone();
@@ -1719,23 +1744,35 @@ impl AppState {
         let Some((_, evaluate)) = self.registry.get("nvim_eval_statusline") else {
             self.statusline_cache = Some(StatuslineCache {
                 cwd,
+                width,
+                global_statusline,
                 formats,
                 rendered: HashMap::new(),
             });
             return HashMap::new();
         };
+        let maxwidth = i64::try_from(width).unwrap_or(i64::MAX);
         let mut rendered = HashMap::with_capacity(formats.len());
         for entry in &formats {
             let window = entry.0;
             let format = &entry.1;
+            let mut options = vec![(
+                OxStr::from("winid"),
+                Object::Integer(i64::from(window)),
+            )];
+            // statusline.c:344-349 evaluates a global statusline against
+            // `Columns`, rather than the target window's width.
+            if global_statusline {
+                options.push((
+                    OxStr::from("maxwidth"),
+                    Object::Integer(maxwidth),
+                ));
+            }
             let Ok(output) = evaluate(
                 &self.session,
                 &[
                     Object::String(OxStr::from(format.as_bytes())),
-                    Object::Dict(Dict(vec![(
-                        OxStr::from("winid"),
-                        Object::Integer(i64::from(window)),
-                    )])),
+                    Object::Dict(Dict(options)),
                 ],
             ) else {
                 continue;
@@ -1750,6 +1787,8 @@ impl AppState {
         }
         self.statusline_cache = Some(StatuslineCache {
             cwd,
+            width,
+            global_statusline,
             formats,
             rendered: rendered.clone(),
         });
@@ -1762,20 +1801,12 @@ impl AppState {
         self.publish_messages()
             .map_err(|error| ApiError::exception(error.to_string()))?;
         if plan.update_screen {
+            let (width, height) = self.screen_size();
             let statuslines = if plan.refresh_statuslines {
-                self.refresh_statuslines()
+                self.render_statuslines_with_policy(StatuslineCachePolicy::Refresh, width)
             } else {
-                self.render_statuslines()
+                self.render_statuslines_with_policy(StatuslineCachePolicy::Reuse, width)
             };
-            let (width, height) = self.session.with_render_state(|ui_channels, _, _| {
-                ui_channels
-                    .iter()
-                    .map(|(_, channel)| channel.size())
-                    .reduce(|(width, height), (other_width, other_height)| {
-                        (width.min(other_width), height.min(other_height))
-                    })
-                    .unwrap_or((1, 1))
-            });
             self.session
                 .with_editor(|editor| {
                     self.session.with_render_state(|_, highlights, _| {
@@ -7501,6 +7532,40 @@ mod tests {
             .flatten()
             .ok_or("missing restored statusline")?;
         assert!(restored.0.starts_with("[No Name]"));
+        Ok(())
+    }
+
+    #[test]
+    fn global_statusline_uses_screen_width_and_invalidates_width_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = AppState::new(&Cli::default(), &mut StartupTimer::start())?;
+        let window = state.session.with_editor_mut(|editor| {
+            editor
+                .options_mut()
+                .set_global("laststatus", OptionValue::Number(3))?;
+            let window = editor.current_window().ok_or("missing window")?;
+            editor.options_mut().set_window(
+                window,
+                "statusline",
+                OptionValue::String("abcd%=".to_owned()),
+            )?;
+            Ok::<_, Box<dyn std::error::Error>>(window)
+        })?;
+
+        let narrow = state.render_statuslines_with_policy_inner(
+            StatuslineCachePolicy::Refresh,
+            20,
+        );
+        assert_eq!(narrow.get(&window).map(String::len), Some(20));
+        let wide = state.render_statuslines_with_policy_inner(
+            StatuslineCachePolicy::Reuse,
+            40,
+        );
+        assert_eq!(wide.get(&window).map(String::len), Some(40));
+        assert_eq!(
+            state.statusline_cache.as_ref().map(|cache| cache.width),
+            Some(40)
+        );
         Ok(())
     }
 
