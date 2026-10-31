@@ -103,8 +103,8 @@ pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
 pub use ops::{EditRange, Operator, OperatorError, OperatorRequest, OperatorResult};
 pub use options::{
     OPTION_COUNT, OPTION_METADATA, OptionDefault, OptionDefaultValue, OptionError, OptionListKind,
-    OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue, option_metadata,
-    option_value_object,
+    OptionLastSet, OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue,
+    option_metadata, option_value_object,
 };
 pub use register::{
     ClipboardProvider, RegisterContent, RegisterError, RegisterKind, Registers, Selection,
