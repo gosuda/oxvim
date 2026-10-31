@@ -617,6 +617,70 @@ fn rpc_u32(value: &MpackValue) -> mlua::Result<u32> {
         .ok_or_else(|| mlua::Error::runtime("invalid msgpack-rpc string"))
 }
 
+/// Encodes a Lua double following upstream `.references/neovim/src/mpack/conv.c:108-145`:
+/// - Infinities encode as 32-bit float because `(float)v == v` holds.
+/// - -0.0 and 0.0 encode as integer 0.
+/// - Finite numbers within `[-2^63, 0)` that equal their `i64` truncation encode as signed integer tokens.
+/// - Finite numbers within `[0, 2^64)` that equal their `u64` truncation encode as unsigned integer tokens.
+/// - Other finite doubles use F32 when `(float)v == v` else F64. NaN fails the single-precision check and stays F64.
+fn pack_number(value: f64) -> MpackValue {
+    if value.is_infinite() {
+        return MpackValue::F32(if value.is_sign_negative() {
+            f32::NEG_INFINITY
+        } else {
+            f32::INFINITY
+        });
+    }
+
+    const INT64_MIN_DOUBLE: f64 = -9_223_372_036_854_775_808.0;
+    const UINT64_MAX_DOUBLE: f64 = 18_446_744_073_709_551_616.0;
+
+    if value == 0.0 {
+        return MpackValue::Integer(0_u64.into());
+    }
+
+    if value < 0.0 && value >= INT64_MIN_DOUBLE {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_precision_loss,
+            reason = "range guard guarantees value truncates to an in-range i64"
+        )]
+        let int_val = value as i64;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "compares whether the double is an exact integer"
+        )]
+        if (int_val as f64) == value {
+            return MpackValue::Integer(int_val.into());
+        }
+    } else if value > 0.0 && value < UINT64_MAX_DOUBLE {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "range guard guarantees value truncates to an in-range u64"
+        )]
+        let uint_val = value as u64;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "compares whether the double is an exact integer"
+        )]
+        if (uint_val as f64) == value {
+            return MpackValue::Integer(uint_val.into());
+        }
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "checking whether double fits in single-precision float"
+    )]
+    let single = value as f32;
+    if f64::from(single) == value {
+        MpackValue::F32(single)
+    } else {
+        MpackValue::F64(value)
+    }
+}
+
 fn lua_to_mpack(
     lua: &Lua,
     value: &Value,
@@ -642,17 +706,7 @@ fn lua_to_mpack(
         Value::Nil => MpackValue::Nil,
         Value::Boolean(value) => MpackValue::Boolean(*value),
         Value::Integer(value) => MpackValue::Integer((*value).into()),
-        Value::Number(value) if value.is_infinite() => {
-            // conv.c's mpack_fits_single() compares (float)v == v, which is
-            // true for infinities, so both signs use a 32-bit float.
-            MpackValue::F32(if value.is_sign_negative() {
-                f32::NEG_INFINITY
-            } else {
-                f32::INFINITY
-            })
-        }
-        // NaN fails mpack_fits_single() and stays a 64-bit float.
-        Value::Number(value) => MpackValue::F64(*value),
+        Value::Number(value) => pack_number(*value),
         Value::String(value) => {
             let bytes = value.as_bytes();
             let is_bin = match packer.and_then(|packer| packer.is_bin.as_ref()) {

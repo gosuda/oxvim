@@ -204,6 +204,62 @@ fn mpack_encodes_nonfinite_numbers_with_upstream_float_widths() {
 }
 
 #[test]
+fn mpack_encodes_numbers_matching_upstream_tokens_and_roundtrips() {
+    let host = host();
+    let encoded: (
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+        mlua::LuaString,
+    ) = eval(
+        &host,
+        "return vim.mpack.encode(1.5), \
+                vim.mpack.encode(1.0), \
+                vim.mpack.encode(-0.0), \
+                vim.mpack.encode(2^63), \
+                vim.mpack.encode(-1.0), \
+                vim.mpack.encode(-2^63), \
+                vim.mpack.encode(2^64 - 2048), \
+                vim.mpack.encode(2^64)",
+    );
+
+    assert_eq!(encoded.0.as_bytes().as_ref(), [0xca, 0x3f, 0xc0, 0x00, 0x00]);
+    assert_eq!(encoded.1.as_bytes().as_ref(), [0x01]);
+    assert_eq!(encoded.2.as_bytes().as_ref(), [0x00]);
+    assert_eq!(
+        encoded.3.as_bytes().as_ref(),
+        [0xcf, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(encoded.4.as_bytes().as_ref(), [0xff]);
+    assert_eq!(
+        encoded.5.as_bytes().as_ref(),
+        [0xd3, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    );
+    assert_eq!(
+        encoded.6.as_bytes().as_ref(),
+        [0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x00]
+    );
+    assert_eq!(encoded.7.as_bytes().as_ref(), [0xca, 0x5f, 0x80, 0x00, 0x00]);
+
+    let roundtrips: (bool, bool, bool, bool, bool, bool, bool, bool) = eval(
+        &host,
+        "return vim.mpack.decode(vim.mpack.encode(1.5)) == 1.5, \
+                vim.mpack.decode(vim.mpack.encode(1.0)) == 1.0, \
+                vim.mpack.decode(vim.mpack.encode(-0.0)) == 0.0, \
+                vim.mpack.decode(vim.mpack.encode(2^63)) == 2^63, \
+                vim.mpack.decode(vim.mpack.encode(-1.0)) == -1.0, \
+                vim.mpack.decode(vim.mpack.encode(-2^63)) == -2^63, \
+                vim.mpack.decode(vim.mpack.encode(2^64 - 2048)) == 2^64 - 2048, \
+                vim.mpack.decode(vim.mpack.encode(2^64)) == 2^64",
+    );
+    assert_eq!(roundtrips, (true, true, true, true, true, true, true, true));
+}
+
+#[test]
 fn mpack_sessions_accept_optional_options_and_expose_header_only_receive() {
     let host = host();
     let result: (bool, bool, bool, bool, bool, bool, bool) = eval(
