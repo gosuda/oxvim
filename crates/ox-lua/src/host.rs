@@ -211,13 +211,13 @@ impl LuaHost {
             self.lua.create_string(path.to_string_lossy().as_bytes())?,
         )]);
         let mut results = call_with_traceback(&self.lua, &loadfile, path_arg)
-            .map_err(|e| ExecError::Load(e.to_string()))?;
+            .map_err(|e| ExecError::Load(crate::vim::mlua_error_text(&e)))?;
         let chunk_value = results.pop_front();
         let error_value = results.pop_front();
         match chunk_value {
             Some(Value::Function(chunk)) => {
                 call_with_traceback(&self.lua, &chunk, MultiValue::new())
-                    .map_err(|e| ExecError::Load(e.to_string()))?;
+                    .map_err(|e| ExecError::Load(crate::vim::mlua_error_text(&e)))?;
                 Ok(())
             }
             Some(Value::Nil) => {
