@@ -23,7 +23,7 @@ use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ox_text::shada::{Entry as StreamEntry, EntryType, ShaDa as Stream};
+pub use ox_text::shada::{Entry as StreamEntry, EntryType, ShaDa as Stream};
 use ox_text::{Buffer, Position};
 use ox_types::{Object, OxStr};
 use rmpv::Value;
@@ -356,7 +356,7 @@ pub(crate) fn write_shada(
     }
     if params.dump_registers() {
         // shada.c:2491-2494, 2601
-        entries.extend(register_entries(editor, &params, timestamp));
+        entries.extend(register_entries(editor, params.max_reg_lines(), timestamp));
     }
     if params.num_marked_files() > 0 {
         // shada.c:2408-2411, 2602-2608
@@ -434,8 +434,9 @@ fn header_entry(timestamp: u64, max_kbyte: i64) -> StreamEntry {
     )
 }
 
-fn buffer_list_entry(editor: &Editor, timestamp: u64) -> StreamEntry {
-    // shada.c:1513-1536
+/// Builds the single `BufferList` entry (`shada.c:1513-1536`): one `f` map
+/// per listed named buffer, in buffer order.
+pub fn buffer_list_entry(editor: &Editor, timestamp: u64) -> StreamEntry {
     let buffers = editor
         .buffers()
         .into_iter()
@@ -498,9 +499,9 @@ fn global_mark_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
         .collect()
 }
 
-fn register_entries(editor: &Editor, params: &ShadaParams, timestamp: u64) -> Vec<StreamEntry> {
-    // shada_initialize_registers: `-`, `0-9`, and `a-z`.
-    let cap = params.max_reg_lines();
+/// Builds `Register` entries for `-`, `0-9`, and `a-z`, skipping registers
+/// longer than `cap` lines (negative: no cap).
+pub fn register_entries(editor: &Editor, cap: i64, timestamp: u64) -> Vec<StreamEntry> {
     let unnamed = editor.registers().unnamed_target_name();
     let names = std::iter::once('-').chain('0'..='9').chain('a'..='z');
     let mut entries = Vec::new();
@@ -518,6 +519,21 @@ fn register_entries(editor: &Editor, params: &ShadaParams, timestamp: u64) -> Ve
         ));
     }
     entries
+}
+
+/// Builds one `Register` entry payload (`shada.c:1483-1511`): `rc` and `n`
+/// always; `rt`/`rw`/`ru` only when they differ from the defaults
+/// (characterwise, rendered width at most one, not unnamed).
+pub fn register_entry(
+    name: char,
+    content: &RegisterContent,
+    timestamp: u64,
+) -> StreamEntry {
+    StreamEntry::new(
+        EntryType::Register,
+        timestamp,
+        register_value(name, content, false),
+    )
 }
 
 fn register_value(name: char, content: &RegisterContent, is_unnamed: bool) -> Value {
@@ -541,11 +557,11 @@ fn register_value(name: char, content: &RegisterContent, is_unnamed: bool) -> Va
         map.push((Value::from("rt"), Value::from(type_id)));
     }
     if let RegisterKind::BlockWise { width } = content.kind()
-        && width != 0
+        && width > 1
     {
         map.push((
             Value::from("rw"),
-            Value::from(u64::try_from(width).unwrap_or(u64::MAX)),
+            Value::from(u64::try_from(width - 1).unwrap_or(u64::MAX)),
         ));
     }
     if is_unnamed {
@@ -554,8 +570,9 @@ fn register_value(name: char, content: &RegisterContent, is_unnamed: bool) -> Va
     Value::Map(map)
 }
 
-fn jump_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
-    // shada_init_jumps: file-backed jump entries only.
+/// Builds `Jump` entries for the file-backed part of the jump list, oldest
+/// first (`shada_init_jumps`).
+pub fn jump_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
     editor
         .jumplist()
         .entries()
@@ -614,7 +631,6 @@ fn local_mark_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
 }
 
 fn change_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
-    // shada.c:2538-2556
     let mut entries = Vec::new();
     for handle in editor.buffers() {
         let Ok(state) = editor.buffer(handle) else {
@@ -637,6 +653,185 @@ fn change_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
         }
     }
     entries
+}
+
+/// Builds `Variable` entries for every `g:` variable, each payload
+/// `[name, value]` (`shada_encode_gvars`, `shada.c:3674-3710`).
+pub fn gvar_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
+    let mut entries = Vec::new();
+    for (name, object) in editor.gvars().iter() {
+        let mut bytes = Vec::new();
+        if ox_rpc::encode(&mut bytes, object).is_err() {
+            continue;
+        }
+        let mut cursor = Cursor::new(bytes);
+        let Ok(value) = rmpv::decode::read_value(&mut cursor) else {
+            continue;
+        };
+        entries.push(StreamEntry::new(
+            EntryType::Variable,
+            timestamp,
+            Value::Array(vec![Value::Binary(name.as_bytes().to_vec()), value]),
+        ));
+    }
+    entries
+}
+
+fn variable_name(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::String(text) => Some(text.as_bytes().to_vec()),
+        Value::Binary(bytes) => Some(bytes.clone()),
+        _ => None,
+    }
+}
+
+/// Applies a `Variable` entry payload: sets `g:<name>` to the decoded value
+/// (`shada.c:1076-1081`).
+pub fn apply_gvar_entry(editor: &mut Editor, data: &Value) {
+    let Some(items) = data.as_array().filter(|items| items.len() >= 2) else {
+        return;
+    };
+    let Some(name) = variable_name(&items[0]) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    if rmpv::encode::write_value(&mut bytes, &items[1]).is_err() {
+        return;
+    }
+    let Ok(object) = ox_rpc::decode(&bytes) else {
+        return;
+    };
+    editor.gvars_mut().insert(OxStr(name), object);
+}
+
+fn mark_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    map.iter()
+        .find(|(candidate, _)| match candidate {
+            Value::String(text) => text.as_str() == Some(key),
+            Value::Binary(bytes) => bytes.as_slice() == key.as_bytes(),
+            _ => false,
+        })
+        .map(|(_, value)| value)
+}
+
+fn field_u64(map: &[(Value, Value)], key: &str) -> Option<u64> {
+    match mark_field(map, key) {
+        Some(Value::Integer(number)) => number.as_u64(),
+        _ => None,
+    }
+}
+
+fn field_bytes(value: &Value) -> Option<&[u8]> {
+    match value {
+        Value::String(text) => Some(text.as_bytes()),
+        Value::Binary(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }
+}
+
+/// Applies a `Register` entry payload to the register bank (`shada.c:1046-1074`):
+/// rows split at embedded line feeds, `rt`/`rw` (width is stored as one less
+/// than rendered) choose the shape, and `ru` points the unnamed register at
+/// this one.
+pub fn apply_register_entry(editor: &mut Editor, data: &Value) {
+    let Some(map) = data.as_map() else {
+        return;
+    };
+    let Some(Value::Array(contents)) = mark_field(map, "rc") else {
+        return;
+    };
+    if contents.is_empty() {
+        return;
+    }
+    let mut rows = Vec::new();
+    for row in contents {
+        let Some(bytes) = field_bytes(row) else {
+            return;
+        };
+        rows.push(bytes.to_vec());
+    }
+    let Some(name) = field_u64(map, "n").and_then(|code| u8::try_from(code).ok())
+        .map(char::from)
+    else {
+        return;
+    };
+    let kind = match field_u64(map, "rt").unwrap_or(0) {
+        0 => RegisterKind::CharacterWise,
+        1 => RegisterKind::LineWise,
+        2 => {
+            let width = usize::try_from(field_u64(map, "rw").unwrap_or(0))
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            RegisterKind::BlockWise { width }
+        }
+        _ => return,
+    };
+    let content = RegisterContent::from_binary_lines(kind, rows);
+    let _ = editor.registers_mut().set(name, content);
+    if matches!(mark_field(map, "ru"), Some(Value::Boolean(true))) {
+        editor.registers_mut().set_unnamed_target(name);
+    }
+}
+
+/// Applies a `Jump` entry payload by appending to the jump list
+/// (`shada.c:1103-1134`).
+pub fn apply_jump_entry(editor: &mut Editor, data: &Value) {
+    let Some(map) = data.as_map() else {
+        return;
+    };
+    let Some(file) = mark_field(map, "f").and_then(field_bytes) else {
+        return;
+    };
+    if file.is_empty() {
+        return;
+    }
+    let lnum = field_u64(map, "l").unwrap_or(1);
+    if lnum == 0 {
+        return;
+    }
+    let location = MarkLocation::in_file(
+        String::from_utf8_lossy(file).into_owned(),
+        Position {
+            lnum: usize::try_from(lnum).unwrap_or(1),
+            col: usize::try_from(field_u64(map, "c").unwrap_or(0)).unwrap_or(0),
+        },
+    );
+    editor.jumplist_mut().push(location);
+}
+
+/// Applies a `BufferList` entry payload by creating missing named buffers
+/// (`shada.c:1139-1157`).
+pub fn apply_buffer_list_entry(editor: &mut Editor, data: &Value) {
+    let Some(items) = data.as_array() else {
+        return;
+    };
+    for item in items {
+        let Some(map) = item.as_map() else {
+            continue;
+        };
+        let Some(name) = mark_field(map, "f").and_then(field_bytes) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        create_missing_named_buffer(editor, name);
+    }
+}
+
+fn create_missing_named_buffer(editor: &mut Editor, name: &[u8]) {
+    let exists = editor.buffers().into_iter().any(|handle| {
+        editor
+            .buffer(handle)
+            .is_ok_and(|state| state.name().as_bytes() == name)
+    });
+    if exists {
+        return;
+    }
+    let text = String::from_utf8_lossy(name).into_owned();
+    if let Ok(handle) = editor.create_buffer_with(Buffer::new(), true) {
+        let _ = editor.rename_buffer(handle, OxStr::from(text.as_str()));
+    }
 }
 
 fn history_entries(
@@ -1122,14 +1317,12 @@ impl ApplyState<'_, '_> {
     }
 
     fn apply_register(&mut self, position: u64, data: &Value) {
-        // shada.c:1046-1074; payload shada.c:3308-3330.
         let Some(map) = data.as_map() else {
             self.record(read_error("register", position, "is not a dictionary"));
             return;
         };
         let missing_contents = "has rc key with missing or empty array";
         let Some(contents) = map_entry(map, "rc").and_then(Value::as_array) else {
-            // shada.c:3315-3319
             self.record(read_error("register", position, missing_contents));
             return;
         };
@@ -1137,13 +1330,8 @@ impl ApplyState<'_, '_> {
             self.record(read_error("register", position, missing_contents));
             return;
         }
-        let mut rows = Vec::with_capacity(contents.len());
         for row in contents {
-            if let Some(bytes) = value_bytes(row) {
-                // Upstream rows never carry separators; a hostile file may
-                // embed them and register rows reject newlines, so split.
-                rows.extend(bytes.split(|byte| *byte == b'\n').map(<[u8]>::to_vec));
-            } else {
+            if value_bytes(row).is_none() {
                 self.record(read_error(
                     "register",
                     position,
@@ -1152,33 +1340,13 @@ impl ApplyState<'_, '_> {
                 return;
             }
         }
-        let Some(name) = map_entry(map, "n").and_then(value_name) else {
-            return; // unnamed/malformed names are dropped, as upstream defaults
-        };
-        let type_id = map_entry(map, "rt").and_then(Value::as_u64).unwrap_or(0);
-        let kind = match type_id {
-            0 => RegisterKind::CharacterWise,
-            1 => RegisterKind::LineWise,
-            2 => {
-                let width =
-                    usize::try_from(map_entry(map, "rw").and_then(Value::as_u64).unwrap_or(0))
-                        .unwrap_or(0);
-                if width == 0 {
-                    // Upstream drops invalid registers (shada.c:1047-1052);
-                    // a zero-width block would break downstream geometry.
-                    return;
-                }
-                RegisterKind::BlockWise { width }
-            }
-            // shada.c:1047-1052
-            _ => return,
-        };
-        if !self.forceit && matches!(self.editor.registers().get(name), Ok(Some(_))) {
-            // Timestamp proxy (shada.c:1056-1062).
+        if let Some(name) = map_entry(map, "n").and_then(value_name)
+            && !self.forceit
+            && matches!(self.editor.registers().get(name), Ok(Some(_)))
+        {
             return;
         }
-        let content = RegisterContent::from_binary_lines(kind, rows);
-        let _ = self.editor.registers_mut().set(name, content);
+        apply_register_entry(self.editor, data);
     }
 
     fn apply_global_mark(&mut self, position: u64, data: &Value) {
@@ -1254,12 +1422,11 @@ impl ApplyState<'_, '_> {
     }
 
     fn apply_buffer_list(&mut self, position: u64, data: &Value) {
-        // shada.c:924-927 (gate) + 1139-1157 (apply).
-        if !self.params.dump_buffer_list() || !self.editor.arglist().is_empty() {
+        let gated = !self.params.dump_buffer_list() || !self.editor.arglist().is_empty();
+        if gated {
             return;
         }
         let Some(items) = data.as_array() else {
-            // shada.c:3446-3448
             self.record(read_error("buffer list", position, "is not an array"));
             return;
         };
@@ -1273,20 +1440,7 @@ impl ApplyState<'_, '_> {
             if name.is_empty() {
                 continue;
             }
-            let text = String::from_utf8_lossy(&name).into_owned();
-            let existing = self.editor.buffers().into_iter().find(|handle| {
-                self.editor
-                    .buffer(*handle)
-                    .is_ok_and(|state| state.name().as_bytes() == name.as_slice())
-            });
-            if existing.is_some() {
-                continue;
-            }
-            if let Ok(handle) = self.editor.create_buffer_with(Buffer::new(), true) {
-                let _ = self
-                    .editor
-                    .rename_buffer(handle, OxStr::from(text.as_str()));
-            }
+            create_missing_named_buffer(self.editor, name.as_slice());
         }
     }
 

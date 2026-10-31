@@ -21,6 +21,14 @@ fn session_with(editor: Editor) -> crate::ApiSession {
     crate::ApiSession::new(Rc::new(RefCell::new(editor)))
 }
 
+fn hex_readfile_lines(hex: &str) -> Vec<Object> {
+    let data: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("fixture is hex"))
+        .collect();
+    crate::context::bytes_to_readfile_lines(&data)
+}
+
 fn dict(entries: &[(&str, Object)]) -> Dict {
     Dict(
         entries
@@ -4291,6 +4299,37 @@ fn extmark_boolean_option_diagnostic_matches_api_contract() {
 }
 
 #[test]
+fn context_validation_rejects_unknown_keys_and_type_names() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+
+    let error = crate::context::nvim_get_context(
+        &session,
+        dict(&[("blah", Object::Array(Vec::new()))]),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid key: 'blah'");
+
+    let error = crate::context::nvim_get_context(&session, dict(&[("types", Object::Integer(42))]))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid 'types': expected Array, got Integer");
+
+    let error = crate::context::nvim_get_context(
+        &session,
+        dict(&[(
+            "types",
+            Object::Array(vec![
+                Object::String(OxStr::from("jumps")),
+                Object::String(OxStr::from("zub")),
+                Object::String(OxStr::from("zam")),
+            ]),
+        )]),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid 'type': 'zub'");
+}
+
+#[test]
 fn context_round_trip_restores_gvars() {
     let (mut editor, _, _, _) = editor_with_lines(&["one"]);
     editor
@@ -4300,13 +4339,7 @@ fn context_round_trip_restores_gvars() {
     let session = session_with(editor);
     let context = crate::context::nvim_get_context(
         &session,
-        dict(&[(
-            "types",
-            Object::Array(vec![
-                Object::String(OxStr::from("gvars")),
-                Object::String(OxStr::from("bufs")),
-            ]),
-        )]),
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("gvars"))]))]),
     )
     .unwrap();
     session.with_editor_mut(|editor| editor.gvars_mut().0.clear());
@@ -4334,20 +4367,16 @@ fn context_round_trip_restores_binary_blockwise_register_lines_and_width() {
     let session = session_with(editor);
     let context = crate::context::nvim_get_context(
         &session,
-        dict(&[(
-            "types",
-            Object::Array(vec![Object::String(OxStr::from("regs"))]),
-        )]),
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("regs"))]))]),
     )
     .unwrap();
 
-    session
-        .with_editor_mut(|editor| {
-            editor
-                .registers_mut()
-                .set('a', RegisterContent::characterwise(b"changed").unwrap())
-                .unwrap();
-        });
+    session.with_editor_mut(|editor| {
+        editor
+            .registers_mut()
+            .set('a', RegisterContent::characterwise(b"changed").unwrap())
+            .unwrap();
+    });
     crate::context::nvim_load_context(&session, context).unwrap();
 
     assert_eq!(
@@ -4360,524 +4389,256 @@ fn context_round_trip_restores_binary_blockwise_register_lines_and_width() {
 }
 
 #[test]
-fn context_load_preserves_explicit_blockwise_widths_for_consumers() {
+fn context_round_trip_restores_one_jump() {
     let (editor, _, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);
-    let context = dict(&[(
-        "regs",
-        Object::Array(vec![
-            Object::Dict(Dict(vec![
-                (
-                    OxStr::from("name"),
-                    Object::String(OxStr::from("a")),
-                ),
-                (
-                    OxStr::from("type"),
-                    Object::String(OxStr(vec![0x16, b'1'])),
-                ),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("é"))]),
-                ),
-            ])),
-            Object::Dict(Dict(vec![
-                (
-                    OxStr::from("name"),
-                    Object::String(OxStr::from("b")),
-                ),
-                (
-                    OxStr::from("type"),
-                    Object::String(OxStr(vec![0x16, b'7'])),
-                ),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("x"))]),
-                ),
-            ])),
-        ]),
-    )]);
-    crate::context::nvim_load_context(&session, context).unwrap();
-
-    let loaded = crate::context::nvim_get_context(
+    session
+        .with_editor_mut(|editor| {
+            editor.jumplist_mut().push(ox_editor::MarkLocation::in_file(
+                "/tmp/oxvim-context-jump",
+                ox_text::Position { lnum: 3, col: 0 },
+            ));
+        });
+    let context = crate::context::nvim_get_context(
         &session,
-        dict(&[(
-            "types",
-            Object::Array(vec![Object::String(OxStr::from("regs"))]),
-        )]),
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("jumps"))]))]),
     )
     .unwrap();
-    let Object::Array(registers) = loaded.get(&OxStr::from("regs")).unwrap() else {
-        panic!("context registers must be an Array");
-    };
-    let types = registers
-        .iter()
-        .map(|register| {
-            let Object::Dict(register) = register else {
-                panic!("context register must be a Dictionary");
-            };
-            let Some(Object::String(name)) = register.get(&OxStr::from("name")) else {
-                panic!("context register requires a name");
-            };
-            let Some(Object::String(kind)) = register.get(&OxStr::from("type")) else {
-                panic!("context register requires a type");
-            };
-            (name.to_string_lossy().into_owned(), kind.as_bytes().to_vec())
-        })
-        .collect::<Vec<_>>();
+    session.with_editor_mut(|editor| {
+        *editor.jumplist_mut() = ox_editor::Jumplist::new();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file(), Some(std::path::Path::new("/tmp/oxvim-context-jump")));
+    assert_eq!(entries[0].position, ox_text::Position { lnum: 3, col: 0 });
+}
+
+#[test]
+fn context_round_trip_restores_buffer_list() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    editor
+        .rename_buffer(buffer, OxStr::from("/tmp/oxvim-context-buf"))
+        .unwrap();
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("bufs"))]))]),
+    )
+    .unwrap();
+    let listed = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .filter(|handle| {
+                editor
+                    .buffer(*handle)
+                    .is_ok_and(|state| state.flags.contains(ox_editor::BufferFlags::LISTED))
+            })
+            .collect::<Vec<_>>()
+    });
+    for handle in listed {
+        crate::buffer::nvim_buf_delete(&session, handle, dict(&[("force", Object::Boolean(true))]))
+            .unwrap();
+    }
+    let wiped = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .all(|handle| editor.buffer(handle).is_ok_and(|state| state.name().as_bytes().is_empty()))
+    });
+    assert!(wiped, "the named buffer must be gone before load");
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let restored = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .filter_map(|handle| {
+                editor
+                    .buffer(handle)
+                    .ok()
+                    .map(|state| state.name().to_string_lossy().into_owned())
+                    .filter(|name| !name.is_empty())
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(restored, vec!["/tmp/oxvim-context-buf".to_owned()]);
+}
+
+#[test]
+fn context_load_frees_saved_registers_before_applying() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"kept").unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("regs"))]))]),
+    )
+    .unwrap();
+    session.with_editor_mut(|editor| {
+        editor
+            .registers_mut()
+            .set('b', RegisterContent::characterwise(b"dropped").unwrap())
+            .unwrap();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
     assert_eq!(
-        types,
-        vec![
-            ("a".to_owned(), vec![0x16, b'1']),
-            ("b".to_owned(), vec![0x16, b'7']),
-        ]
+        session.with_editor(|editor| editor.registers().get('a').unwrap().cloned()),
+        Some(RegisterContent::characterwise(b"kept").unwrap())
+    );
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('b').unwrap().cloned()),
+        None
     );
 }
 
 #[test]
-fn context_load_rejects_malicious_blockwise_widths() {
-    let (editor, _, _, _) = editor_with_lines(&["one"]);
+fn context_load_frees_saved_registers_even_without_regs() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"gone").unwrap())
+        .unwrap();
     let session = session_with(editor);
-
-    // Width exceeding upstream MAXCOL (0x7fff_ffff = 2147483647)
-    let context_exceeds_maxcol = dict(&[(
-        "regs",
-        Object::Array(vec![Object::Dict(Dict(vec![
-            (OxStr::from("name"), Object::String(OxStr::from("a"))),
-            (
-                OxStr::from("type"),
-                Object::String(OxStr(
-                    vec![0x16]
-                        .into_iter()
-                        .chain(b"2147483648".iter().copied())
-                        .collect(),
-                )),
-            ),
-            (
-                OxStr::from("lines"),
-                Object::Array(vec![Object::String(OxStr::from("x"))]),
-            ),
-        ]))]),
-    )]);
-    assert!(matches!(
-        crate::context::nvim_load_context(&session, context_exceeds_maxcol),
-        Err(ApiError::Validation(_))
-    ));
-
-    // Astronomical/overflowing numeric width
-    let context_overflow = dict(&[(
-        "regs",
-        Object::Array(vec![Object::Dict(Dict(vec![
-            (OxStr::from("name"), Object::String(OxStr::from("b"))),
-            (
-                OxStr::from("type"),
-                Object::String(OxStr(
-                    vec![0x16]
-                        .into_iter()
-                        .chain(b"99999999999999999999999999999999".iter().copied())
-                        .collect(),
-                )),
-            ),
-            (
-                OxStr::from("lines"),
-                Object::Array(vec![Object::String(OxStr::from("x"))]),
-            ),
-        ]))]),
-    )]);
-    assert!(matches!(
-        crate::context::nvim_load_context(&session, context_overflow),
-        Err(ApiError::Validation(_))
-    ));
-
-    // Zero width is rejected
-    let context_zero = dict(&[(
-        "regs",
-        Object::Array(vec![Object::Dict(Dict(vec![
-            (OxStr::from("name"), Object::String(OxStr::from("c"))),
-            (
-                OxStr::from("type"),
-                Object::String(OxStr(vec![0x16, b'0'])),
-            ),
-            (
-                OxStr::from("lines"),
-                Object::Array(vec![Object::String(OxStr::from("x"))]),
-            ),
-        ]))]),
-    )]);
-    assert!(matches!(
-        crate::context::nvim_load_context(&session, context_zero),
-        Err(ApiError::Validation(_))
-    ));
+    crate::context::nvim_load_context(&session, dict(&[])).unwrap();
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('a').unwrap().cloned()),
+        None
+    );
 }
 
 #[test]
-fn context_load_rejects_malformed_register_types() {
-    let (editor, _, _, _) = editor_with_lines(&["one"]);
-    let session = session_with(editor);
-
-    let malformed_types: Vec<Object> = vec![
-        // Non-digit suffix
-        Object::String(OxStr(vec![0x16, b'a', b'b', b'c'])),
-        // Trailing non-digit
-        Object::String(OxStr(vec![0x16, b'1', b'2', b'x'])),
-        // Negative sign
-        Object::String(OxStr(vec![0x16, b'-', b'1'])),
-        // Unknown type character
-        Object::String(OxStr::from("x")),
-        // Empty type string
-        Object::String(OxStr::from("")),
-        // Extra characters on non-blockwise types
-        Object::String(OxStr::from("V1")),
-        Object::String(OxStr::from("v9")),
-        // Non-string type
-        Object::Integer(16),
-    ];
-
-    for malformed in malformed_types {
-        let context = dict(&[(
-            "regs",
-            Object::Array(vec![Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("a"))),
-                (OxStr::from("type"), malformed),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("x"))]),
-                ),
-            ]))]),
-        )]);
-        assert!(matches!(
-            crate::context::nvim_load_context(&session, context),
-            Err(ApiError::Validation(_))
-        ));
-    }
-}
-
-#[test]
-fn context_load_infers_and_widens_by_display_cells() {
-    let (editor, _, _, _) = editor_with_lines(&["one"]);
-    let session = session_with(editor);
-
-    let context = dict(&[(
-        "regs",
-        Object::Array(vec![
-            // 'a': bare \x16 with multibyte "é" (2 bytes UTF-8, 1 display cell) -> inferred width 1
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("a"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("é"))]),
-                ),
-            ])),
-            // 'b': bare 'b' with wide CJK "界" (3 bytes UTF-8, 2 display cells) -> inferred width 2
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("b"))),
-                (OxStr::from("type"), Object::String(OxStr::from("b"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("界"))]),
-                ),
-            ])),
-            // 'c': explicit width 1 with wide CJK "界" (2 display cells) -> widened to 2
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("c"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16, b'1']))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("界"))]),
-                ),
-            ])),
-            // 'd': explicit width 5 with wide CJK "界" (2 display cells) -> remains 5
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("d"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16, b'5']))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("界"))]),
-                ),
-            ])),
-            // 'e': bare \x16 with multiline mixed content: "界a" (3 cells, 4 bytes), "é" (1 cell, 2 bytes) -> inferred width 3
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("e"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![
-                        Object::String(OxStr::from("界a")),
-                        Object::String(OxStr::from("é")),
-                    ]),
-                ),
-            ])),
-        ]),
-    )]);
-
-    crate::context::nvim_load_context(&session, context).unwrap();
-
-    let reg_a = session
-        .with_editor(|ed| ed.registers().get('a').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_a.kind(), RegisterKind::BlockWise { width: 1 });
-    assert_eq!(reg_a.lines(), &[b"\xc3\xa9".to_vec()]);
-
-    let reg_b = session
-        .with_editor(|ed| ed.registers().get('b').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_b.kind(), RegisterKind::BlockWise { width: 2 });
-    assert_eq!(reg_b.lines(), &[b"\xe7\x95\x8c".to_vec()]);
-
-    let reg_c = session
-        .with_editor(|ed| ed.registers().get('c').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_c.kind(), RegisterKind::BlockWise { width: 2 });
-
-    let reg_d = session
-        .with_editor(|ed| ed.registers().get('d').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_d.kind(), RegisterKind::BlockWise { width: 5 });
-
-    let reg_e = session
-        .with_editor(|ed| ed.registers().get('e').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_e.kind(), RegisterKind::BlockWise { width: 3 });
-}
-
-#[test]
-fn context_display_cells_handles_invalid_multibyte_sequences() {
-    // Direct display_cells behavior checks for invalid multibyte sequences mirroring upstream:
-    // Single invalid / illegal bytes occupy 4 display cells (<xx>):
-    assert_eq!(crate::context::display_cells(b"\xff"), 4);
-    assert_eq!(crate::context::display_cells(b"\x80"), 4);
-    // Overlong 2-byte sequence (\xc0\xaf): both bytes invalid -> 4 + 4 = 8
-    assert_eq!(crate::context::display_cells(b"\xc0\xaf"), 8);
-    // Multibyte lead byte with non-continuation ASCII (\xc3\x28 / \xc3(): 4 for \xc3 + 1 for '(' -> 5
-    assert_eq!(crate::context::display_cells(b"\xc3("), 5);
-    // Truncated 2-byte lead at EOF (\xc3): 4
-    assert_eq!(crate::context::display_cells(b"\xc3"), 4);
-    // Overlong 3-byte sequence (\xe0\x80\x80): 4 + 4 + 4 = 12
-    assert_eq!(crate::context::display_cells(b"\xe0\x80\x80"), 12);
-    // Surrogate 3-byte sequence (\xed\xa0\x80 / U+D800): 4 + 4 + 4 = 12
-    assert_eq!(crate::context::display_cells(b"\xed\xa0\x80"), 12);
-    // Truncated 3-byte sequence (\xe7\x95): 4 + 4 = 8
-    assert_eq!(crate::context::display_cells(b"\xe7\x95"), 8);
-    // 3-byte sequence with invalid second continuation (\xe7\x95 ): 4 + 4 + 1 = 9
-    assert_eq!(crate::context::display_cells(b"\xe7\x95 "), 9);
-    // Overlong 4-byte sequence (\xf0\x80\x80\x80): 4 * 4 = 16
-    assert_eq!(crate::context::display_cells(b"\xf0\x80\x80\x80"), 16);
-    // Out-of-range 4-byte sequence (> U+10FFFF, \xf4\x90\x80\x80): 4 * 4 = 16
-    assert_eq!(crate::context::display_cells(b"\xf4\x90\x80\x80"), 16);
-    // Mixed valid CJK and invalid byte ("界\xff"): 2 + 4 = 6
-    assert_eq!(crate::context::display_cells(b"\xe7\x95\x8c\xff"), 6);
-    // Invalid lead followed by valid UTF-8 ("\xe0é" / \xe0\xc3\xa9): 4 + 1 = 5
-    assert_eq!(crate::context::display_cells(b"\xe0\xc3\xa9"), 5);
-}
-
-#[test]
-fn context_load_handles_invalid_multibyte_sequences_and_preserves_bytes() {
-    let (editor, _, _, _) = editor_with_lines(&["one"]);
-    let session = session_with(editor);
-
-    let invalid_overlong = vec![0xe0, 0x80, 0x80];
-    let invalid_continuation = vec![0xc3, b'('];
-    let truncated_cjk = vec![0xe7, 0x95];
-    let mixed_cjk_invalid = vec![0xe7, 0x95, 0x8c, 0xff];
-
-    let context = dict(&[(
-        "regs",
-        Object::Array(vec![
-            // 'a': bare \x16 with overlong 3-byte invalid sequence -> inferred width 12
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("a"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr(invalid_overlong.clone()))]),
-                ),
-            ])),
-            // 'b': bare \x16 with invalid continuation byte \xc3( -> inferred width 5
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("b"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr(invalid_continuation.clone()))]),
-                ),
-            ])),
-            // 'c': explicit width 8 widened to 12 by overlong invalid sequence
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("c"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16, b'8']))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr(invalid_overlong.clone()))]),
-                ),
-            ])),
-            // 'd': explicit width 20 preserved when larger than 12
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("d"))),
-                (
-                    OxStr::from("type"),
-                    Object::String(OxStr(vec![0x16, b'2', b'0'])),
-                ),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr(invalid_overlong.clone()))]),
-                ),
-            ])),
-            // 'e': bare 'b' with truncated multibyte -> inferred width 8
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("e"))),
-                (OxStr::from("type"), Object::String(OxStr::from("b"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr(truncated_cjk.clone()))]),
-                ),
-            ])),
-            // 'f': bare \x16 with multiline mixed content (6 cells and 1 cell) -> inferred width 6
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("f"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![
-                        Object::String(OxStr(mixed_cjk_invalid.clone())),
-                        Object::String(OxStr::from("a")),
-                    ]),
-                ),
-            ])),
-        ]),
-    )]);
-
-    crate::context::nvim_load_context(&session, context).unwrap();
-
-    let assert_reg = |name: char, expected_width: usize, expected_lines: &[Vec<u8>]| {
-        let reg = session
-            .with_editor(|ed| ed.registers().get(name).unwrap().cloned())
-            .unwrap();
-        assert_eq!(
-            reg.kind(),
-            RegisterKind::BlockWise {
-                width: expected_width
-            }
-        );
-        assert_eq!(reg.lines(), expected_lines);
+fn context_load_restores_blockwise_width_from_stream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let rows = vec![b"hello".to_vec(), b"world".to_vec()];
+    let entry = ox_editor::shada::register_entry(
+        'a',
+        &RegisterContent::from_binary_lines(RegisterKind::BlockWise { width: 10 }, rows.clone()),
+        0,
+    );
+    let stream = ox_editor::shada::Stream {
+        entries: vec![entry],
     };
+    let mut bytes = Vec::new();
+    stream.write(&mut bytes, 0).unwrap();
+    let context = dict(&[(
+        "regs",
+        Object::Array(crate::context::bytes_to_readfile_lines(&bytes)),
+    )]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"reset").unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let loaded = session
+        .with_editor(|editor| editor.registers().get('a').unwrap().cloned())
+        .unwrap();
+    assert_eq!(loaded.kind(), RegisterKind::BlockWise { width: 10 });
+    assert_eq!(loaded.lines(), &rows);
+}
 
-    assert_reg('a', 12, std::slice::from_ref(&invalid_overlong));
-    assert_reg('b', 5, std::slice::from_ref(&invalid_continuation));
-    assert_reg('c', 12, std::slice::from_ref(&invalid_overlong));
-    assert_reg('d', 20, std::slice::from_ref(&invalid_overlong));
-    assert_reg('e', 8, std::slice::from_ref(&truncated_cjk));
-    assert_reg('f', 6, &[mixed_cjk_invalid.clone(), b"a".to_vec()]);
+const UPSTREAM_REGS_FIXTURE: &str = "05cf18e37d8f341069011e84a2726392c40568656c6c6fc405776f726c64a16e61a2727402a2727709";
+const UPSTREAM_JUMPS_FIXTURE: &str = "08cf0a0a0a0a6ae557da3782a166c42f2f686f6d652f616c7068612f726577726974652f4f7876696d2f6f7876696d2d70726f62652d6a756d702d66696c65a16c0308cf0a0a0a0a6ae557da3481a166c42f2f686f6d652f616c7068612f726577726974652f4f7876696d2f6f7876696d2d70726f62652d6a756d702d66696c65";
+const UPSTREAM_GVARS_FIXTURE: &str = "06cf0a0a0a0a6ae557da0d92c40970726f62655f7661722a";
+
+#[test]
+fn context_load_applies_upstream_register_bytes_and_width() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let context = dict(&[(
+        "regs",
+        Object::Array(hex_readfile_lines(UPSTREAM_REGS_FIXTURE)),
+    )]);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let loaded = session
+        .with_editor(|editor| editor.registers().get('a').unwrap().cloned())
+        .unwrap();
+    assert_eq!(loaded.kind(), RegisterKind::BlockWise { width: 10 });
+    assert_eq!(loaded.lines(), &[b"hello".to_vec(), b"world".to_vec()]);
 }
 
 #[test]
-fn context_load_handles_bare_existing_types_and_defaults() {
+fn context_load_applies_upstream_jump_bytes() {
     let (editor, _, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);
-
     let context = dict(&[(
-        "regs",
-        Object::Array(vec![
-            // 'v' characterwise
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("a"))),
-                (OxStr::from("type"), Object::String(OxStr::from("v"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("hello"))]),
-                ),
-            ])),
-            // 'c' characterwise alias
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("b"))),
-                (OxStr::from("type"), Object::String(OxStr::from("c"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("world"))]),
-                ),
-            ])),
-            // 'V' linewise
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("c"))),
-                (OxStr::from("type"), Object::String(OxStr::from("V"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("line"))]),
-                ),
-            ])),
-            // 'l' linewise alias
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("d"))),
-                (OxStr::from("type"), Object::String(OxStr::from("l"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("row"))]),
-                ),
-            ])),
-            // bare '\x16' blockwise
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("e"))),
-                (OxStr::from("type"), Object::String(OxStr(vec![0x16]))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("block"))]),
-                ),
-            ])),
-            // bare 'b' blockwise
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("f"))),
-                (OxStr::from("type"), Object::String(OxStr::from("b"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("wide"))]),
-                ),
-            ])),
-            // omitted type defaults to characterwise
-            Object::Dict(Dict(vec![
-                (OxStr::from("name"), Object::String(OxStr::from("g"))),
-                (
-                    OxStr::from("lines"),
-                    Object::Array(vec![Object::String(OxStr::from("default"))]),
-                ),
-            ])),
-        ]),
+        "jumps",
+        Object::Array(hex_readfile_lines(UPSTREAM_JUMPS_FIXTURE)),
     )]);
-
     crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    assert_eq!(entries.len(), 2);
+    let file = entries[0]
+        .file()
+        .map(std::path::Path::to_string_lossy)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(
+        file.as_deref(),
+        Some("/home/alpha/rewrite/Oxvim/oxvim-probe-jump-file")
+    );
+    assert_eq!(entries[0].position, ox_text::Position { lnum: 3, col: 0 });
+    assert_eq!(entries[1].position, ox_text::Position { lnum: 1, col: 0 });
+}
 
-    let reg_a = session
-        .with_editor(|ed| ed.registers().get('a').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_a.kind(), RegisterKind::CharacterWise);
+#[test]
+fn context_load_applies_upstream_gvar_bytes() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let context = dict(&[(
+        "gvars",
+        Object::Array(hex_readfile_lines(UPSTREAM_GVARS_FIXTURE)),
+    )]);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    assert_eq!(
+        session.with_editor(|editor| editor.gvars().get(&OxStr::from("probe_var")).cloned()),
+        Some(Object::Integer(42))
+    );
+}
 
-    let reg_b = session
-        .with_editor(|ed| ed.registers().get('b').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_b.kind(), RegisterKind::CharacterWise);
+#[test]
+fn context_load_ignores_unknown_keys_and_non_array_values() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    crate::context::nvim_load_context(
+        &session,
+        dict(&[
+            ("unknown", Object::Integer(123)),
+            ("regs", Object::Integer(456)),
+        ]),
+    )
+    .unwrap();
+}
 
-    let reg_c = session
-        .with_editor(|ed| ed.registers().get('c').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_c.kind(), RegisterKind::LineWise);
+#[test]
+fn context_load_rejects_non_string_register_lines() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let error = crate::context::nvim_load_context(
+        &session,
+        dict(&[(
+            "regs",
+            Object::Array(vec![Object::Dict(Dict(vec![]))]),
+        )]),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "E474: Failed to convert list to msgpack string buffer"
+    );
+}
 
-    let reg_d = session
-        .with_editor(|ed| ed.registers().get('d').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_d.kind(), RegisterKind::LineWise);
-
-    let reg_e = session
-        .with_editor(|ed| ed.registers().get('e').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_e.kind(), RegisterKind::BlockWise { width: 5 });
-
-    let reg_f = session
-        .with_editor(|ed| ed.registers().get('f').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_f.kind(), RegisterKind::BlockWise { width: 4 });
-
-    let reg_g = session
-        .with_editor(|ed| ed.registers().get('g').unwrap().cloned())
-        .unwrap();
-    assert_eq!(reg_g.kind(), RegisterKind::CharacterWise);
+#[test]
+fn context_display_cells_matches_mb_string2cells_len() {
+    assert_eq!(crate::context::display_cells(b"\xff"), 4);
+    assert_eq!(crate::context::display_cells(b"\xc0\xaf"), 8);
+    assert_eq!(crate::context::display_cells(b"\xc3("), 5);
+    assert_eq!(crate::context::display_cells(b"\xe7\x95\x8c"), 2);
+    assert_eq!(crate::context::display_cells(b"\xe7\x95\x8c\xff"), 6);
+    assert_eq!(crate::context::display_cells(b"\xe0\xc3\xa9"), 5);
 }
 
 #[test]
