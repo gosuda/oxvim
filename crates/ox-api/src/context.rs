@@ -1,6 +1,7 @@
 //! Editor context save/load API.
 
 use ox_editor::{MarkTarget, RegisterContent, RegisterKind};
+use unicode_width::UnicodeWidthChar;
 
 use crate::session::ApiSession;
 use crate::{ApiError, Dict, Object, OxStr, Registry, RegistryError, api};
@@ -36,8 +37,101 @@ fn register_type(kind: RegisterKind) -> OxStr {
     match kind {
         RegisterKind::CharacterWise => OxStr::from("v"),
         RegisterKind::LineWise => OxStr::from("V"),
-        RegisterKind::BlockWise { .. } => OxStr::from("\u{16}"),
+        RegisterKind::BlockWise { width } => {
+            let mut value = vec![0x16];
+            value.extend(width.to_string().as_bytes());
+            OxStr(value)
+        }
     }
+}
+
+/// Upstream `MAXCOL` (`pos_defs.h:19`), the column and block-width upper bound.
+const MAXCOL: usize = 0x7fff_ffff;
+
+enum RegisterShape {
+    Character,
+    Line,
+    Block { width: Option<usize> },
+}
+
+fn parse_register_type(value: &[u8]) -> Result<RegisterShape, ApiError> {
+    let Some(&first) = value.first() else {
+        return Err(ApiError::validation("invalid context register type"));
+    };
+    match first {
+        b'v' | b'c' => {
+            if value.len() != 1 {
+                return Err(ApiError::validation("invalid context register type"));
+            }
+            Ok(RegisterShape::Character)
+        }
+        b'V' | b'l' => {
+            if value.len() != 1 {
+                return Err(ApiError::validation("invalid context register type"));
+            }
+            Ok(RegisterShape::Line)
+        }
+        b'b' | 0x16 => {
+            if value.len() == 1 {
+                return Ok(RegisterShape::Block { width: None });
+            }
+            if !value[1..].iter().all(u8::is_ascii_digit) {
+                return Err(ApiError::validation("invalid context register type"));
+            }
+            let width = value[1..].iter().try_fold(0_usize, |width, digit| {
+                width
+                    .checked_mul(10)?
+                    .checked_add(usize::from(*digit - b'0'))
+            });
+            let Some(width) = width else {
+                return Err(ApiError::validation("invalid context register type"));
+            };
+            if width == 0 || width > MAXCOL {
+                return Err(ApiError::validation("invalid context register type"));
+            }
+            Ok(RegisterShape::Block { width: Some(width) })
+        }
+        _ => Err(ApiError::validation("invalid context register type")),
+    }
+}
+
+/// Measures display cells in a row mirroring upstream `mb_string2cells_len`
+/// (`register.c:update_yankreg_width`). Printable ASCII and tabs are one cell,
+/// control bytes two, invalid bytes four, and Unicode characters their display width.
+pub(crate) fn display_cells(line: &[u8]) -> usize {
+    let mut cells = 0_usize;
+    let mut index = 0;
+    while index < line.len() {
+        let first = line[index];
+        if first < 0x80 {
+            cells = cells.saturating_add(match first {
+                0x00..=0x08 | 0x0a..=0x1f | 0x7f => 2,
+                _ => 1,
+            });
+            index += 1;
+            continue;
+        }
+        let width = match first {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => 1,
+        };
+        if width > 1
+            && index + width <= line.len()
+            && let Ok(text) = std::str::from_utf8(&line[index..index + width])
+        {
+            let char_cells = text.chars().next().map_or(1, |character| {
+                UnicodeWidthChar::width(character).unwrap_or(1).max(1)
+            });
+            cells = cells.saturating_add(char_cells);
+            index += width;
+            continue;
+        }
+        cells = cells.saturating_add(4);
+        index += 1;
+    }
+    cells
 }
 
 fn save_registers(session: &ApiSession) -> Vec<Object> {
@@ -146,12 +240,10 @@ fn load_registers(session: &ApiSession, values: &[Object]) -> Result<(), ApiErro
             .ok()
             .and_then(|name| name.chars().next())
             .ok_or_else(|| ApiError::validation("invalid context register name"))?;
-        let kind = match entry.get(&OxStr::from("type")) {
-            Some(Object::String(value)) if value.as_bytes() == b"V" => RegisterKind::LineWise,
-            Some(Object::String(value)) if value.as_bytes() == [0x16] => {
-                RegisterKind::BlockWise { width: 1 }
-            }
-            _ => RegisterKind::CharacterWise,
+        let shape = match entry.get(&OxStr::from("type")) {
+            Some(Object::String(value)) => parse_register_type(value.as_bytes())?,
+            Some(_) => return Err(ApiError::validation("invalid context register type")),
+            None => RegisterShape::Character,
         };
         let Some(Object::Array(lines)) = entry.get(&OxStr::from("lines")) else {
             return Err(ApiError::validation("context register requires lines"));
@@ -163,14 +255,26 @@ fn load_registers(session: &ApiSession, values: &[Object]) -> Result<(), ApiErro
                 _ => Err(ApiError::validation("register line must be a String")),
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let kind = match kind {
-            RegisterKind::BlockWise { .. } => RegisterKind::BlockWise {
-                width: lines.iter().map(Vec::len).max().unwrap_or(1).max(1),
-            },
-            other => other,
+        let kind = match shape {
+            RegisterShape::Block { width } => {
+                let max_cells = lines
+                    .iter()
+                    .map(|line| display_cells(line))
+                    .max()
+                    .unwrap_or(0);
+                let width = match width {
+                    Some(explicit) => explicit.max(max_cells),
+                    None => max_cells.max(1),
+                };
+                if width > MAXCOL {
+                    return Err(ApiError::validation("invalid context register type"));
+                }
+                RegisterKind::BlockWise { width }
+            }
+            RegisterShape::Line => RegisterKind::LineWise,
+            RegisterShape::Character => RegisterKind::CharacterWise,
         };
-        let content = RegisterContent::new(kind, lines)
-            .map_err(|error| ApiError::validation(error.to_string()))?;
+        let content = RegisterContent::from_binary_lines(kind, lines);
         session.with_editor_mut(|editor| {
             editor
                 .registers_mut()
