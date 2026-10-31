@@ -467,7 +467,11 @@ pub fn execute_nvim_cmd(
 ) -> Result<OxStr, ApiError> {
     let (command, output) = build_nvim_cmd(cmd, opts)?;
     let message_start = session.with_editor(|editor| editor.messages().len());
+    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
+    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
     let result = execute_command(session, &OxStr(command.into_bytes()), executor);
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev));
     if !output {
         result?;
         return Ok(OxStr::from(""));
@@ -1381,20 +1385,32 @@ pub fn nvim_set_option(session: &ApiSession, name: OxStr, value: Object) -> Resu
     let name = option_name(&name)?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
     let value = object_to_legacy_option_value(metadata, name, value)?;
-    // Upstream's `nvim_set_option` reaches the same `set_option_value` path as
-    // the modern setter, so it publishes `OptionSet` too (option.c:4373).
-    let previous = session
-        .with_editor(|editor| editor.options().get_global(name).cloned())
-        .map_err(exception)?;
+    let target = if metadata.scopes.contains(&OptionScope::Global) {
+        OptionTarget::Global
+    } else if metadata.scopes.contains(&OptionScope::Window) {
+        OptionTarget::Window(current_window(session)?)
+    } else if metadata.scopes.contains(&OptionScope::Buffer) {
+        OptionTarget::Buffer(current_buffer(session)?)
+    } else {
+        OptionTarget::Global
+    };
+    let previous = current_option_value(session, name, target)?;
     let previous_object = structured_option_value(metadata, &previous);
-    session
-        .with_editor_mut(|editor| editor.options_mut().set_global(name, value.clone()))
-        .map_err(exception)?;
+    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
+    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
+    let prev_sctx = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
+    let set_result = set_option_at(session, name, value.clone(), target);
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev_sctx));
+    set_result?;
     let assigned = structured_option_value(metadata, &value);
+    let opt_scope = match target {
+        OptionTarget::Global => OptionSetScope::Global,
+        _ => OptionSetScope::Local,
+    };
     crate::autocmd::fire_option_set(
         session,
         metadata.name,
-        OptionSetScope::Global,
+        opt_scope,
         &previous_object,
         None,
         Some(&previous_object),
@@ -2196,7 +2212,10 @@ fn set_option_at(
     let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
     let buffer_only = metadata.scopes.contains(&OptionScope::Buffer)
         && !metadata.scopes.contains(&OptionScope::Global);
-    session.with_editor_mut(|editor| match target {
+    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
+    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
+    let result = session.with_editor_mut(|editor| match target {
         OptionTarget::Global => {
             if buffer_only {
                 editor
@@ -2245,7 +2264,9 @@ fn set_option_at(
                 .set_window(window, name, value)
                 .map_err(option_value_error)
         }
-    })
+    });
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev));
+    result
 }
 
 fn resolve_buffer(session: &ApiSession, buffer: BufHandle) -> Result<BufHandle, ApiError> {
@@ -3169,7 +3190,7 @@ pub fn nvim_call_dict_function(
 }
 
 // option.c:7180-7233 is the return schema; metadata comes from options.lua.
-fn option_info(metadata: &OptionMetadata) -> Dict {
+fn option_info(metadata: &OptionMetadata, last_set: Option<&ox_editor::OptionLastSet>) -> Dict {
     let scope = if metadata.scopes.contains(&OptionScope::Buffer) {
         "buf"
     } else if metadata.scopes.contains(&OptionScope::Window) {
@@ -3181,6 +3202,15 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
         .default
         .value
         .map_or(Object::Nil, |value| option_value_to_object(&value.into()));
+    let (was_set, sid, lnum, chan) = match last_set {
+        Some(ls) => (
+            true,
+            ls.sid,
+            i64::try_from(ls.line).unwrap_or(0),
+            i64::try_from(ls.channel_id).unwrap_or(0),
+        ),
+        None => (false, 0, 0, 0),
+    };
     Dict(vec![
         (
             OxStr::from("name"),
@@ -3219,10 +3249,10 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
             OxStr::from("allows_duplicates"),
             Object::Boolean(!metadata.deny_duplicates),
         ),
-        (OxStr::from("was_set"), Object::Boolean(false)),
-        (OxStr::from("last_set_sid"), Object::Integer(0)),
-        (OxStr::from("last_set_linenr"), Object::Integer(0)),
-        (OxStr::from("last_set_chan"), Object::Integer(0)),
+        (OxStr::from("was_set"), Object::Boolean(was_set)),
+        (OxStr::from("last_set_sid"), Object::Integer(sid)),
+        (OxStr::from("last_set_linenr"), Object::Integer(lnum)),
+        (OxStr::from("last_set_chan"), Object::Integer(chan)),
     ])
 }
 
@@ -3231,14 +3261,17 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
     clippy::unnecessary_wraps,
     reason = "`#[api]` requires owned arguments and a `Result` return"
 )]
-pub fn nvim_get_all_options_info(_session: &ApiSession) -> Result<Dict, ApiError> {
+pub fn nvim_get_all_options_info(session: &ApiSession) -> Result<Dict, ApiError> {
     Ok(Dict(
         ox_editor::OPTION_METADATA
             .iter()
             .map(|metadata| {
+                let last_set = session.with_editor(|editor| {
+                    editor.options().get_last_set_global(metadata.name).cloned()
+                });
                 (
                     OxStr::from(metadata.name),
-                    Object::Dict(option_info(metadata)),
+                    Object::Dict(option_info(metadata, last_set.as_ref())),
                 )
             })
             .collect::<Vec<_>>(),
@@ -3259,7 +3292,17 @@ pub fn nvim_get_option_info2(
     let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
     let target = option_target(session, name, &opts)?;
     get_option_at(session, name, target)?;
-    Ok(option_info(metadata))
+    let last_set = session.with_editor(|editor| {
+        let (buf, win, local_only) = match target {
+            OptionTarget::Global => (None, None, false),
+            OptionTarget::Buffer(b) => (Some(b), None, true),
+            OptionTarget::Window(w) => (None, Some(w), true),
+            OptionTarget::GlobalAndBuffer(b) => (Some(b), None, false),
+            OptionTarget::GlobalAndWindow(w) => (None, Some(w), false),
+        };
+        editor.options().get_last_set(metadata.name, buf, win, local_only).cloned()
+    });
+    Ok(option_info(metadata, last_set.as_ref()))
 }
 
 // api/vimscript.c:360-499. This parses syntax; no evaluator is invoked.
@@ -4455,6 +4498,15 @@ mod api_scope_watch_tests {
         }
     }
 
+    fn dict(entries: &[(&str, Object)]) -> Dict {
+        Dict(
+            entries
+                .iter()
+                .map(|(key, value)| (OxStr::from(*key), value.clone()))
+                .collect(),
+        )
+    }
+
     impl CommandExecutor for LiveHost {
         fn execute(
             &mut self,
@@ -4651,7 +4703,22 @@ mod api_scope_watch_tests {
     }
 
     fn session_with_live_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>) {
-        let (session, executor, _) = session_with_live_buffer_host();
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, ox_editor::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        let executor = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        crate::set_command_executor(
+            &session,
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+        );
         (session, executor)
     }
 
@@ -4810,5 +4877,114 @@ mod api_scope_watch_tests {
             "read-only key keeps its error: {error:?}"
         );
         assert_eq!(seen(&session), Object::Array(vec![]));
+    }
+    #[test]
+    fn nvim_cmd_set_records_channel_provenance_and_verbose_set_reports_it() {
+        let (session, _executor) = session_with_live_host();
+        let _caller = session.enter_rpc_call(ox_rpc::ChannelId::new(3));
+        let cmd = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline"))]),
+            ),
+        ]);
+        crate::global::nvim_cmd(&session, cmd, Dict(Vec::new())).unwrap();
+
+        let info = crate::global::nvim_get_option_info2(
+            &session,
+            OxStr::from("cursorline"),
+            Dict(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            info.get(&OxStr::from("was_set")),
+            Some(&Object::Boolean(true))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_sid")),
+            Some(&Object::Integer(-9))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_chan")),
+            Some(&Object::Integer(3))
+        );
+
+        let query = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline?"))]),
+            ),
+            (
+                "mods",
+                Object::Dict(dict(&[("verbose", Object::Integer(1))])),
+            ),
+        ]);
+        let output = crate::global::nvim_cmd(
+            &session,
+            query,
+            dict(&[("output", Object::Boolean(true))]),
+        )
+        .unwrap();
+        let out_str = output.to_string_lossy();
+        assert!(
+            out_str.contains("cursorline\n\tLast set from API client (channel id 3)"),
+            "expected API client Last set text in output, got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn nvim_set_option_records_channel_provenance_and_verbose_reports_it() {
+        let (session, _executor) = session_with_live_host();
+        let _caller = session.enter_rpc_call(ox_rpc::ChannelId::new(7));
+        crate::global::nvim_set_option(
+            &session,
+            OxStr::from("cursorline"),
+            Object::Boolean(true),
+        )
+        .unwrap();
+
+        let info = crate::global::nvim_get_option_info2(
+            &session,
+            OxStr::from("cursorline"),
+            Dict(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            info.get(&OxStr::from("was_set")),
+            Some(&Object::Boolean(true))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_sid")),
+            Some(&Object::Integer(-9))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_chan")),
+            Some(&Object::Integer(7))
+        );
+
+        let query = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline?"))]),
+            ),
+            (
+                "mods",
+                Object::Dict(dict(&[("verbose", Object::Integer(1))])),
+            ),
+        ]);
+        let output = crate::global::nvim_cmd(
+            &session,
+            query,
+            dict(&[("output", Object::Boolean(true))]),
+        )
+        .unwrap();
+        let out_str = output.to_string_lossy();
+        assert!(
+            out_str.contains("cursorline\n\tLast set from API client (channel id 7)"),
+            "expected channel 7 in output, got: {out_str}"
+        );
     }
 }

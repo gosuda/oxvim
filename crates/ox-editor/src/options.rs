@@ -213,6 +213,146 @@ pub enum OptionError {
     },
 }
 
+/// Upstream `sctx_T` information recorded when an option was last set.
+///
+/// Remembered so `:verbose set {opt}?` and `nvim_get_option_info2` can report
+/// where an option was last modified.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptionLastSet {
+    /// Defining script ID (`sc_sid`): > 0 for a script file,
+    /// negative constants for special contexts (e.g. `SID_API_CLIENT = -9`),
+    /// or 0 when set manually/interactively.
+    pub sid: i64,
+    /// Physical line number within the script (`sc_lnum`). Zero for API/client sets.
+    pub line: usize,
+    /// Channel ID when set by an API client (`sc_chan`). Zero otherwise.
+    pub channel_id: u64,
+    /// Path or name of the script when `sid > 0`.
+    pub script_name: Option<String>,
+}
+
+impl Default for OptionLastSet {
+    fn default() -> Self {
+        Self {
+            sid: Self::SID_NONE,
+            line: 0,
+            channel_id: 0,
+            script_name: None,
+        }
+    }
+}
+
+impl OptionLastSet {
+    /// Option was set by hand or unset default (no last set message).
+    pub const SID_NONE: i64 = 0;
+    /// Option was set in a modeline.
+    pub const SID_MODELINE: i64 = -1;
+    /// Option was set with `--cmd`.
+    pub const SID_CMDARG: i64 = -2;
+    /// Option was set with `-c`.
+    pub const SID_CARG: i64 = -3;
+    /// Option was set from an environment variable.
+    pub const SID_ENV: i64 = -4;
+    /// Option was cleared in an error handler.
+    pub const SID_ERROR: i64 = -5;
+    /// Option was set on window layout change.
+    pub const SID_WINLAYOUT: i64 = -6;
+    /// Option was set in a user command block.
+    pub const SID_UBLOCK: i64 = -7;
+    /// Option was set from Lua.
+    pub const SID_LUA: i64 = -8;
+    /// Option was set by an API client.
+    pub const SID_API_CLIENT: i64 = -9;
+    /// Option was set from an anonymous source string.
+    pub const SID_STR: i64 = -10;
+
+    /// Creates an empty provenance record (set by hand or default).
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            sid: Self::SID_NONE,
+            line: 0,
+            channel_id: 0,
+            script_name: None,
+        }
+    }
+
+    /// Creates an API-client provenance record with the given channel id.
+    #[must_use]
+    pub const fn api_client(channel_id: u64) -> Self {
+        Self {
+            sid: Self::SID_API_CLIENT,
+            line: 0,
+            channel_id,
+            script_name: None,
+        }
+    }
+
+    /// Creates a Lua provenance record.
+    #[must_use]
+    pub const fn lua() -> Self {
+        Self {
+            sid: Self::SID_LUA,
+            line: 0,
+            channel_id: 0,
+            script_name: None,
+        }
+    }
+
+    /// Creates a script provenance record.
+    #[must_use]
+    pub fn script(sid: u64, line: usize, name: impl Into<String>) -> Self {
+        Self {
+            sid: i64::try_from(sid).unwrap_or(Self::SID_NONE),
+            line,
+            channel_id: 0,
+            script_name: Some(name.into()),
+        }
+    }
+
+    /// Formats the "Last set from ..." message to append to option display.
+    /// Returns `None` if `sid == 0` (option was set by hand or unset).
+    #[must_use]
+    pub fn format_last_set(&self) -> Option<String> {
+        if self.sid == Self::SID_NONE {
+            return None;
+        }
+        let mut msg = String::from("\n\tLast set from ");
+        match self.sid {
+            Self::SID_MODELINE => {
+                msg.push_str("modeline");
+                if self.line > 0 {
+                    msg.push_str(" line ");
+                    msg.push_str(&self.line.to_string());
+                }
+            }
+            Self::SID_CMDARG => msg.push_str("--cmd argument"),
+            Self::SID_CARG => msg.push_str("-c argument"),
+            Self::SID_ENV => msg.push_str("environment variable"),
+            Self::SID_ERROR => msg.push_str("error handler"),
+            Self::SID_WINLAYOUT => msg.push_str("changed window size"),
+            Self::SID_LUA => msg.push_str("Lua (run Nvim with -V1 for more details)"),
+            Self::SID_API_CLIENT => {
+                msg.push_str(&format!("API client (channel id {})", self.channel_id));
+            }
+            Self::SID_STR => msg.push_str("anonymous :source"),
+            sid if sid > 0 => {
+                if let Some(name) = &self.script_name {
+                    msg.push_str(name);
+                    if self.line > 0 {
+                        msg.push_str(" line ");
+                        msg.push_str(&self.line.to_string());
+                    }
+                } else {
+                    msg.push_str(&format!("anonymous :source (script id {sid})"));
+                }
+            }
+            _ => return None,
+        }
+        Some(msg)
+    }
+}
+
 /// Global option baselines plus buffer-local and window-local overlays.
 ///
 /// All names are canonicalized before storage, so aliases never create a
@@ -224,6 +364,10 @@ pub struct OptionStore {
     windows: HashMap<WinHandle, HashMap<&'static str, OptionValue>>,
     /// Bumped by every mutation so readers can cache a resolved view.
     version: u64,
+    global_last_set: HashMap<&'static str, OptionLastSet>,
+    buffer_last_set: HashMap<BufHandle, HashMap<&'static str, OptionLastSet>>,
+    window_last_set: HashMap<WinHandle, HashMap<&'static str, OptionLastSet>>,
+    current_sctx: Option<OptionLastSet>,
 }
 
 impl Default for OptionStore {
@@ -239,6 +383,10 @@ impl Default for OptionStore {
             buffers: HashMap::new(),
             windows: HashMap::new(),
             version: 0,
+            global_last_set: HashMap::new(),
+            buffer_last_set: HashMap::new(),
+            window_last_set: HashMap::new(),
+            current_sctx: None,
         }
     }
 }
@@ -335,6 +483,213 @@ impl OptionStore {
         }
         self.baseline(metadata)
     }
+    /// Returns the current dynamic script context in force for option writes, if any.
+    #[must_use]
+    pub fn current_sctx(&self) -> Option<&OptionLastSet> {
+        self.current_sctx.as_ref()
+    }
+
+    /// Sets the dynamic script context for option writes, returning the previous one.
+    pub fn set_current_sctx(&mut self, sctx: Option<OptionLastSet>) -> Option<OptionLastSet> {
+        std::mem::replace(&mut self.current_sctx, sctx)
+    }
+
+    /// Reads the last-set record for an editor-wide option.
+    #[must_use]
+    pub fn get_last_set_global(&self, name: &str) -> Option<&OptionLastSet> {
+        let metadata = Self::metadata(name).ok()?;
+        self.global_last_set.get(metadata.name)
+    }
+
+    /// Reads the last-set record for a buffer-local option, falling back to its global baseline.
+    #[must_use]
+    pub fn get_last_set_buffer(&self, buffer: BufHandle, name: &str) -> Option<&OptionLastSet> {
+        let metadata = Self::metadata(name).ok()?;
+        if let Some(last_set) = self
+            .buffer_last_set
+            .get(&buffer)
+            .and_then(|values| values.get(metadata.name))
+        {
+            return Some(last_set);
+        }
+        self.global_last_set.get(metadata.name)
+    }
+
+    /// Reads the last-set record for a window-local option, falling back to its global baseline.
+    #[must_use]
+    pub fn get_last_set_window(&self, window: WinHandle, name: &str) -> Option<&OptionLastSet> {
+        let metadata = Self::metadata(name).ok()?;
+        if let Some(last_set) = self
+            .window_last_set
+            .get(&window)
+            .and_then(|values| values.get(metadata.name))
+        {
+            return Some(last_set);
+        }
+        self.global_last_set.get(metadata.name)
+    }
+
+    /// Resolves the last-set record for an option given current buffer and window handles.
+    #[must_use]
+    pub fn get_last_set(
+        &self,
+        name: &str,
+        buffer: Option<BufHandle>,
+        window: Option<WinHandle>,
+        local_only: bool,
+    ) -> Option<&OptionLastSet> {
+        let metadata = Self::metadata(name).ok()?;
+        if local_only {
+            return self.get_last_set_local_only(metadata, buffer, window);
+        }
+        self.get_last_set_effective(metadata, buffer, window)
+    }
+
+    fn get_last_set_local_only(
+        &self,
+        metadata: &OptionMetadata,
+        buffer: Option<BufHandle>,
+        window: Option<WinHandle>,
+    ) -> Option<&OptionLastSet> {
+        if metadata.scopes.contains(&OptionScope::Window) {
+            let win = window?;
+            return self.window_last_set.get(&win)?.get(metadata.name);
+        }
+        if metadata.scopes.contains(&OptionScope::Buffer) {
+            let buf = buffer?;
+            return self.buffer_last_set.get(&buf)?.get(metadata.name);
+        }
+        self.global_last_set.get(metadata.name)
+    }
+
+    fn get_last_set_effective(
+        &self,
+        metadata: &OptionMetadata,
+        buffer: Option<BufHandle>,
+        window: Option<WinHandle>,
+    ) -> Option<&OptionLastSet> {
+        if metadata.scopes.contains(&OptionScope::Window)
+            && let Some(win) = window
+            && let Some(last_set) = self.window_last_set.get(&win).and_then(|m| m.get(metadata.name))
+            && last_set.sid != OptionLastSet::SID_NONE
+        {
+            return Some(last_set);
+        }
+        if metadata.scopes.contains(&OptionScope::Buffer)
+            && let Some(buf) = buffer
+            && let Some(last_set) = self.buffer_last_set.get(&buf).and_then(|m| m.get(metadata.name))
+            && last_set.sid != OptionLastSet::SID_NONE
+        {
+            return Some(last_set);
+        }
+        self.global_last_set.get(metadata.name)
+    }
+
+    /// Sets an editor-wide option with an explicit last-set record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at global scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
+    pub fn set_global_with_last_set(
+        &mut self,
+        name: &str,
+        value: OptionValue,
+        last_set: OptionLastSet,
+    ) -> Result<(), OptionError> {
+        let metadata = Self::metadata(name)?;
+        require_scope(metadata, OptionScope::Global)?;
+        validate_value(metadata, &value)?;
+        self.global.insert(metadata.name, value);
+        self.global_last_set.insert(metadata.name, last_set);
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Updates the global baseline for a buffer-local or window-local option with an explicit last-set record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
+    pub fn set_global_default_with_last_set(
+        &mut self,
+        name: &str,
+        value: OptionValue,
+        last_set: OptionLastSet,
+    ) -> Result<(), OptionError> {
+        let metadata = Self::metadata(name)?;
+        validate_value(metadata, &value)?;
+        if !metadata.no_global() {
+            self.global.insert(metadata.name, value);
+            self.global_last_set.insert(metadata.name, last_set);
+        }
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Sets a buffer-local overlay with an explicit last-set record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at buffer scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
+    pub fn set_buffer_with_last_set(
+        &mut self,
+        buffer: BufHandle,
+        name: &str,
+        value: OptionValue,
+        last_set: OptionLastSet,
+    ) -> Result<(), OptionError> {
+        let metadata = Self::metadata(name)?;
+        require_scope(metadata, OptionScope::Buffer)?;
+        validate_value(metadata, &value)?;
+        self.buffers
+            .entry(buffer)
+            .or_default()
+            .insert(metadata.name, value);
+        self.buffer_last_set
+            .entry(buffer)
+            .or_default()
+            .insert(metadata.name, last_set);
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Sets a window-local overlay with an explicit last-set record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptionError::UnknownOption`] if `name` is not recognized,
+    /// [`OptionError::WrongScope`] if the option is not declared at window scope,
+    /// [`OptionError::TypeMismatch`] if the value type differs, or
+    /// [`OptionError::InvalidList`] if a string-list value is malformed.
+    pub fn set_window_with_last_set(
+        &mut self,
+        window: WinHandle,
+        name: &str,
+        value: OptionValue,
+        last_set: OptionLastSet,
+    ) -> Result<(), OptionError> {
+        let metadata = Self::metadata(name)?;
+        require_scope(metadata, OptionScope::Window)?;
+        validate_value(metadata, &value)?;
+        self.windows
+            .entry(window)
+            .or_default()
+            .insert(metadata.name, value);
+        self.window_last_set
+            .entry(window)
+            .or_default()
+            .insert(metadata.name, last_set);
+        self.version = self.version.wrapping_add(1);
+        Ok(())
+    }
 
     /// Sets an editor-wide option after type and list validation.
     ///
@@ -345,12 +700,8 @@ impl OptionStore {
     /// [`OptionError::TypeMismatch`] if the value type differs, or
     /// [`OptionError::InvalidList`] if a string-list value is malformed.
     pub fn set_global(&mut self, name: &str, value: OptionValue) -> Result<(), OptionError> {
-        let metadata = Self::metadata(name)?;
-        require_scope(metadata, OptionScope::Global)?;
-        validate_value(metadata, &value)?;
-        self.global.insert(metadata.name, value);
-        self.version = self.version.wrapping_add(1);
-        Ok(())
+        let last_set = self.current_sctx.clone().unwrap_or_default();
+        self.set_global_with_last_set(name, value, last_set)
     }
 
     /// Updates the global baseline for a buffer-local or window-local option
@@ -369,13 +720,8 @@ impl OptionStore {
         name: &str,
         value: OptionValue,
     ) -> Result<(), OptionError> {
-        let metadata = Self::metadata(name)?;
-        validate_value(metadata, &value)?;
-        if !metadata.no_global() {
-            self.global.insert(metadata.name, value);
-        }
-        self.version = self.version.wrapping_add(1);
-        Ok(())
+        let last_set = self.current_sctx.clone().unwrap_or_default();
+        self.set_global_default_with_last_set(name, value, last_set)
     }
 
     /// Sets a buffer-local overlay after type and list validation.
@@ -392,15 +738,8 @@ impl OptionStore {
         name: &str,
         value: OptionValue,
     ) -> Result<(), OptionError> {
-        let metadata = Self::metadata(name)?;
-        require_scope(metadata, OptionScope::Buffer)?;
-        validate_value(metadata, &value)?;
-        self.buffers
-            .entry(buffer)
-            .or_default()
-            .insert(metadata.name, value);
-        self.version = self.version.wrapping_add(1);
-        Ok(())
+        let last_set = self.current_sctx.clone().unwrap_or_default();
+        self.set_buffer_with_last_set(buffer, name, value, last_set)
     }
 
     /// Sets a window-local overlay after type and list validation.
@@ -417,15 +756,8 @@ impl OptionStore {
         name: &str,
         value: OptionValue,
     ) -> Result<(), OptionError> {
-        let metadata = Self::metadata(name)?;
-        require_scope(metadata, OptionScope::Window)?;
-        validate_value(metadata, &value)?;
-        self.windows
-            .entry(window)
-            .or_default()
-            .insert(metadata.name, value);
-        self.version = self.version.wrapping_add(1);
-        Ok(())
+        let last_set = self.current_sctx.clone().unwrap_or_default();
+        self.set_window_with_last_set(window, name, value, last_set)
     }
 
     /// Removes a buffer-local overlay and restores fallback behavior.
@@ -441,8 +773,12 @@ impl OptionStore {
             .buffers
             .get_mut(&buffer)
             .is_some_and(|values| values.remove(metadata.name).is_some());
+        if let Some(map) = self.buffer_last_set.get_mut(&buffer) {
+            map.remove(metadata.name);
+        }
         if self.buffers.get(&buffer).is_some_and(HashMap::is_empty) {
             self.buffers.remove(&buffer);
+            self.buffer_last_set.remove(&buffer);
         }
         self.version = self.version.wrapping_add(1);
         Ok(removed)
@@ -461,8 +797,12 @@ impl OptionStore {
             .windows
             .get_mut(&window)
             .is_some_and(|values| values.remove(metadata.name).is_some());
+        if let Some(map) = self.window_last_set.get_mut(&window) {
+            map.remove(metadata.name);
+        }
         if self.windows.get(&window).is_some_and(HashMap::is_empty) {
             self.windows.remove(&window);
+            self.window_last_set.remove(&window);
         }
         self.version = self.version.wrapping_add(1);
         Ok(removed)
@@ -471,6 +811,7 @@ impl OptionStore {
     /// Drops every local value owned by a wiped buffer.
     pub fn remove_buffer(&mut self, buffer: BufHandle) {
         self.buffers.remove(&buffer);
+        self.buffer_last_set.remove(&buffer);
         self.version = self.version.wrapping_add(1);
     }
 
@@ -533,6 +874,16 @@ impl OptionStore {
                 self.version = self.version.wrapping_add(1);
             }
         }
+        if let Some(overlay) = self.window_last_set.get(&source) {
+            let overlay: HashMap<&'static str, OptionLastSet> = overlay
+                .iter()
+                .filter(|(name, _)| !NOT_COPIED.contains(name))
+                .map(|(name, value)| (*name, value.clone()))
+                .collect();
+            if !overlay.is_empty() {
+                self.window_last_set.insert(window, overlay);
+            }
+        }
     }
 
     /// Drops every local value owned by a closed window.
@@ -545,11 +896,14 @@ impl OptionStore {
     /// current before the command.
     pub fn reset_window(&mut self, window: WinHandle) {
         self.windows.remove(&window);
+        self.window_last_set.remove(&window);
         self.version = self.version.wrapping_add(1);
     }
 
+    /// Drops every local value owned by a closed window.
     pub fn remove_window(&mut self, window: WinHandle) {
         self.windows.remove(&window);
+        self.window_last_set.remove(&window);
         self.version = self.version.wrapping_add(1);
     }
 

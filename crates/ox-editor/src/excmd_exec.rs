@@ -4296,11 +4296,34 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             access,
             scope,
             lua,
-            &command.args,
-            SetLayer::Effective,
+            SetInvocation {
+                args: &command.args,
+                layer: SetLayer::Effective,
+                verbose: is_verbose_command(command, access),
+            },
         ),
-        "setlocal" => command_set(runtime, access, scope, lua, &command.args, SetLayer::Local),
-        "setglobal" => command_set(runtime, access, scope, lua, &command.args, SetLayer::Global),
+        "setlocal" => command_set(
+            runtime,
+            access,
+            scope,
+            lua,
+            SetInvocation {
+                args: &command.args,
+                layer: SetLayer::Local,
+                verbose: is_verbose_command(command, access),
+            },
+        ),
+        "setglobal" => command_set(
+            runtime,
+            access,
+            scope,
+            lua,
+            SetInvocation {
+                args: &command.args,
+                layer: SetLayer::Global,
+                verbose: is_verbose_command(command, access),
+            },
+        ),
         "syntax" => command_syntax(runtime, access, scope, lua, command),
         "filetype" => command_filetype(runtime, access, scope, lua, command),
         "setfiletype" => command_setfiletype(runtime, access, scope, lua, command),
@@ -6942,39 +6965,73 @@ struct OptionAssignment {
     old_global: Option<OptionValue>,
 }
 
+struct SetInvocation<'a> {
+    args: &'a str,
+    layer: SetLayer,
+    verbose: bool,
+}
+
+fn is_verbose_command<E: ExEditorAccess>(command: &ExCommand, access: &E) -> bool {
+    if let Some(m) = command.modifiers.iter().find(|m| m.kind == ModifierKind::Verbose) {
+        m.count.unwrap_or(1) > 0
+    } else {
+        access.with_ex_editor(|editor| {
+            editor
+                .options()
+                .get_global("verbose")
+                .is_ok_and(|v| matches!(v, OptionValue::Number(n) if *n > 0))
+        })
+    }
+}
+
 fn command_set<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
     scope: &mut Scope,
     lua: Option<&Rc<dyn LuaExec>>,
-    args: &str,
-    layer: SetLayer,
+    invocation: SetInvocation<'_>,
 ) -> Flow {
-    if args.trim().is_empty() || args.trim() == "all" {
-        let all = args.trim() == "all";
+    if invocation.args.trim().is_empty() || invocation.args.trim() == "all" {
+        let all = invocation.args.trim() == "all";
         for metadata in OPTION_METADATA {
             if !all && access.with_ex_editor(|editor| option_is_default(editor, metadata.name)) {
                 continue;
             }
             if let Some(text) =
-                access.with_ex_editor(|editor| display_option(editor, metadata.name, layer))
+                access.with_ex_editor(|editor| display_option(editor, metadata.name, invocation.layer, false))
             {
                 access.with_ex_editor(|editor| push_info_text_message(editor, text));
             }
         }
         return Flow::Normal;
     }
+    let script_sctx = if runtime.scripts.current_context().sid > 0 {
+        Some(crate::OptionLastSet::script(
+            runtime.scripts.current_context().sid,
+            runtime.scripts.current_context().lnum,
+            runtime.scripts.current_name().unwrap_or(""),
+        ))
+    } else {
+        None
+    };
+    let prev_sctx = if script_sctx.is_some() {
+        access.with_ex_editor(|editor| editor.options_mut().set_current_sctx(script_sctx))
+    } else {
+        None
+    };
+    let finish = |access: &E, flow: Flow| -> Flow {
+        if prev_sctx.is_some() {
+            access.with_ex_editor(|editor| editor.options_mut().set_current_sctx(prev_sctx));
+        }
+        flow
+    };
     let mut touched_runtimepath = false;
-    for raw in split_set_args(args) {
-        let assignment = match set_one(access, scope, &raw, layer) {
+    for raw in split_set_args(invocation.args) {
+        let assignment = match set_one(access, scope, &raw, invocation.layer, invocation.verbose) {
             Ok(assignment) => assignment,
-            Err((code, message)) => return error_flow(runtime, code, message),
+            Err((code, message)) => return finish(access, error_flow(runtime, code, message)),
         };
         touched_runtimepath |= set_arg_targets(&raw);
-        // Upstream fires FileType after each committed 'filetype' write
-        // (`option.c:4150-4156`), before the next argument is processed.
-        // The assignment stays committed when a handler fails, and later
-        // arguments of this `:set` are abandoned with its flow.
         if let Some(assignment) = &assignment {
             if assignment.name == "autochdir" {
                 access.with_ex_editor(|editor| editor.do_autochdir());
@@ -6992,20 +7049,18 @@ fn command_set<F: FileIO, E: ExEditorAccess>(
                 Flow::Normal
             };
             if !matches!(flow, Flow::Normal) {
-                return flow;
+                return finish(access, flow);
             }
-            // `apply_optionset_autocmd` runs after every committed write
-            // (`option.c:2154`), before the next argument of this `:set`.
             let flow = fire_optionset_autocmd(runtime, access, scope, lua, assignment);
             if !matches!(flow, Flow::Normal) {
-                return flow;
+                return finish(access, flow);
             }
         }
     }
     if touched_runtimepath {
         access.with_ex_editor(|editor| sync_runtime_roots(runtime, editor));
     }
-    Flow::Normal
+    finish(access, Flow::Normal)
 }
 
 /// Whether one `:set` argument names the 'runtimepath' option, so runtime
@@ -17024,8 +17079,11 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
                 access,
                 scope,
                 lua,
-                "filetype=directory",
-                SetLayer::Local,
+                SetInvocation {
+                    args: "filetype=directory",
+                    layer: SetLayer::Local,
+                    verbose: false,
+                },
             );
             if !matches!(flow, Flow::Normal) {
                 rollback_buffer_switch(access, buffer, &mut restore, false);
@@ -20430,8 +20488,11 @@ fn open_health_buffer<F: FileIO, E: ExEditorAccess>(
         access,
         scope,
         lua,
-        "filetype=checkhealth",
-        SetLayer::Local,
+        SetInvocation {
+            args: "filetype=checkhealth",
+            layer: SetLayer::Local,
+            verbose: false,
+        },
     );
     if !matches!(flow, Flow::Normal) {
         return flow;
@@ -22093,8 +22154,11 @@ fn command_setfiletype<F: FileIO, E: ExEditorAccess>(
         access,
         scope,
         lua,
-        &format!("filetype={arg}"),
-        SetLayer::Local,
+        SetInvocation {
+            args: &format!("filetype={arg}"),
+            layer: SetLayer::Local,
+            verbose: false,
+        },
     );
     if fallback
         && matches!(flow, Flow::Normal)
@@ -25762,9 +25826,26 @@ pub(crate) fn assign_option<F: FileIO, E: ExEditorAccess>(
         .ok_or_else(|| error_flow(runtime, "E355", format!("Unknown option: {name}")))?;
     let converted = typval_to_option(value, metadata.value_type)
         .map_err(|message| error_flow(runtime, "E474", message))?;
-    access
-        .with_ex_editor(|editor| set_option_value(editor, metadata.name, converted, prefix))
-        .map_err(|(code, message)| error_flow(runtime, code, message))?;
+    let script_sctx = if runtime.scripts.current_context().sid > 0 {
+        Some(crate::OptionLastSet::script(
+            runtime.scripts.current_context().sid,
+            runtime.scripts.current_context().lnum,
+            runtime.scripts.current_name().unwrap_or(""),
+        ))
+    } else {
+        None
+    };
+    let prev_sctx = if script_sctx.is_some() {
+        access.with_ex_editor(|editor| editor.options_mut().set_current_sctx(script_sctx))
+    } else {
+        None
+    };
+    let set_result = access
+        .with_ex_editor(|editor| set_option_value(editor, metadata.name, converted, prefix));
+    if prev_sctx.is_some() {
+        access.with_ex_editor(|editor| editor.options_mut().set_current_sctx(prev_sctx));
+    }
+    set_result.map_err(|(code, message)| error_flow(runtime, code, message))?;
     // `&opt` reads keep the spelling as written; without the alias mirror a
     // `let &ts=8` inside one executed unit still reads `&ts` stale until the
     // next editor→scope sync.
@@ -27136,10 +27217,11 @@ fn set_one<E: ExEditorAccess>(
     scope: &mut Scope,
     raw: &str,
     layer: SetLayer,
+    verbose: bool,
 ) -> Result<Option<OptionAssignment>, (&'static str, String)> {
     let raw = raw.trim();
     if let Some(name) = raw.strip_suffix('?') {
-        if let Some(text) = access.with_ex_editor(|editor| display_option(editor, name, layer)) {
+        if let Some(text) = access.with_ex_editor(|editor| display_option(editor, name, layer, verbose)) {
             access.with_ex_editor(|editor| push_info_text_message(editor, text));
             return Ok(None);
         }
@@ -27207,7 +27289,7 @@ fn set_one<E: ExEditorAccess>(
     let metadata =
         crate::option_metadata(name).ok_or_else(|| ("E518", format!("Unknown option: {name}")))?;
     if metadata.value_type != OptionType::Boolean
-        && let Some(text) = access.with_ex_editor(|editor| display_option(editor, name, layer))
+        && let Some(text) = access.with_ex_editor(|editor| display_option(editor, name, layer, verbose))
     {
         access.with_ex_editor(|editor| push_info_text_message(editor, text));
         return Ok(None);
@@ -27428,15 +27510,31 @@ fn split_set_args(args: &str) -> Vec<String> {
     output
 }
 
-fn display_option(editor: &Editor, name: &str, layer: SetLayer) -> Option<String> {
+fn display_option(
+    editor: &Editor,
+    name: &str,
+    layer: SetLayer,
+    verbose: bool,
+) -> Option<String> {
     let metadata = crate::option_metadata(name)?;
     let value = option_value(editor, metadata.name, layer)?;
-    Some(match value {
+    let mut text = match value {
         OptionValue::Boolean(true) => metadata.name.to_owned(),
         OptionValue::Boolean(false) => format!("no{}", metadata.name),
         OptionValue::Number(value) => format!("{}={value}", metadata.name),
         OptionValue::String(value) => format!("{}={value}", metadata.name),
-    })
+    };
+    if verbose {
+        let buffer = editor.current_buffer();
+        let window = editor.current_window();
+        let local_only = matches!(layer, SetLayer::Local);
+        if let Some(last_set) = editor.options().get_last_set(metadata.name, buffer, window, local_only) {
+            if let Some(msg) = last_set.format_last_set() {
+                text.push_str(&msg);
+            }
+        }
+    }
+    Some(text)
 }
 
 fn option_is_default(editor: &Editor, name: &str) -> bool {

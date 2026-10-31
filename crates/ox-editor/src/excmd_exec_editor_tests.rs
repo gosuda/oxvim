@@ -14112,3 +14112,54 @@ fn api_set_container_retains_self_reference_after_eval_append() {
         "entry 'd' must reference the dict itself"
     );
 }
+
+#[test]
+fn verbose_set_cursorline_from_script_reports_last_set_script_path() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("custom_opt.vim", "set cursorline\n");
+    executor
+        .execute_line(&editor, "source custom_opt.vim")
+        .unwrap();
+    executor
+        .execute_line(&editor, "verbose set cursorline?")
+        .unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("verbose message");
+    assert!(
+        text.contains("cursorline\n\tLast set from custom_opt.vim line 1"),
+        "expected script last set text, got: {text}"
+    );
+}
+
+#[test]
+fn set_cursorline_without_verbose_has_no_last_set_line() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("custom_opt.vim", "set cursorline\n");
+    executor
+        .execute_line(&editor, "source custom_opt.vim")
+        .unwrap();
+    editor.editor_mut().truncate_messages(0);
+    executor.execute_line(&editor, "set cursorline?").unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("option query message");
+    assert_eq!(text, "cursorline");
+}
+
+#[test]
+fn verbose_set_cursorline_interactively_has_no_last_set_line() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set cursorline").unwrap();
+    editor.editor_mut().truncate_messages(0);
+    executor
+        .execute_line(&editor, "verbose set cursorline?")
+        .unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("option query message");
+    assert_eq!(text, "cursorline");
+}
