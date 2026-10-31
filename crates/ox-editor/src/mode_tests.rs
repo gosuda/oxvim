@@ -12,7 +12,7 @@ use crate::ops::OperatorError;
 use crate::{
     BufferRelease, Editor, ExExecutor, Geometry, InsertState, Keys, MapMode, MappingAction,
     MappingOptions, Mode, ModeError, ModeMachine, NullExprEval, OptionValue, TestEditorAccess,
-    TypeaheadFlags, VisualKind,
+    TypeaheadFlags, VisualKind, VisualState,
 };
 use ox_types::{OxStr, Typval};
 
@@ -4308,6 +4308,60 @@ fn reset_visual_mode_is_noop_outside_visual() {
         matches!(machine.mode(), Mode::Visual(state) if state.kind == VisualKind::Block),
         "gv should restore block Visual after a no-op reset",
     );
+}
+
+#[test]
+fn visual_swap_ends_tracks_cursor_move_and_sets_marks() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_bytes(b"some short lines\nof test text\n").unwrap(),
+            true,
+        )
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "v", &mut eval).unwrap();
+    assert_eq!(
+        machine.mode(),
+        &Mode::Visual(VisualState {
+            anchor: position(1, 0),
+            cursor: position(1, 0),
+            kind: VisualKind::Character,
+            count: 0,
+            register: None,
+            prefix: String::new(),
+            wanted: None,
+        })
+    );
+
+    editor.set_window_cursor(window, position(1, 2)).unwrap();
+    machine.feed_keys(&mut editor, "o", &mut eval).unwrap();
+    assert_eq!(
+        machine.mode(),
+        &Mode::Visual(VisualState {
+            anchor: position(1, 2),
+            cursor: position(1, 0),
+            kind: VisualKind::Character,
+            count: 0,
+            register: None,
+            prefix: String::new(),
+            wanted: None,
+        })
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 0));
+
+    editor.set_window_cursor(window, position(2, 3)).unwrap();
+    machine.feed_keys(&mut editor, "\u{1b}", &mut eval).unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(editor.local_mark(buffer, '<').unwrap().unwrap(), position(1, 2));
+    assert_eq!(editor.local_mark(buffer, '>').unwrap().unwrap(), position(2, 3));
 }
 
 // ---------------------------------------------------------------------------

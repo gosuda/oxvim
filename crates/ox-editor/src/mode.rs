@@ -763,6 +763,17 @@ impl ModeMachine {
         self.pending_mapping_action.take()
     }
 
+    /// Synchronizes visual selection cursor with current window cursor.
+    pub fn sync_visual_cursor(&mut self, editor: &Editor) {
+        if let Mode::Visual(state) = &mut self.mode {
+            if let Some(window) = editor.current_window()
+                && let Ok(win) = editor.window(window)
+            {
+                sync_visual_state(state, win);
+            }
+        }
+    }
+
     /// `state.c:34-106`: checking consumes mappings and input but performs no buffer mutation.
     ///
     /// # Errors
@@ -770,6 +781,7 @@ impl ModeMachine {
     /// Returns an error when input decoding or mapping expansion fails, or when
     /// recursive mapping reaches `'maxmapdepth'`.
     pub fn check(&mut self, editor: &mut Editor) -> Result<Step, ModeError> {
+        self.sync_visual_cursor(editor);
         loop {
             let Some(flags) = editor.typeahead().front_flags() else {
                 self.map_pending = false;
@@ -2988,6 +3000,10 @@ impl ModeMachine {
         key: char,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
+        let ctx = cursor_context(editor)?;
+        if let Ok(win) = editor.window(ctx.window) {
+            sync_visual_state(state, win);
+        }
         if key == '\u{1c}' {
             self.pending_ctrl_bslash = true;
             return Ok(None);
@@ -2995,7 +3011,7 @@ impl ModeMachine {
         if self.pending_ctrl_bslash {
             self.pending_ctrl_bslash = false;
             if key == '\u{0e}' {
-                // `v_CTRL-\_CTRL-N`: stop Visual mode without executing.
+                Self::save_visual_marks(editor, ctx.buffer, state);
                 self.last_visual = Some(state.clone());
                 return Ok(Some(Mode::default()));
             }
@@ -3108,8 +3124,27 @@ impl ModeMachine {
         }
         match key {
             '\u{1b}' => {
+                Self::save_visual_marks(editor, ctx.buffer, state);
                 self.last_visual = Some(state.clone());
                 Ok(Some(Mode::default()))
+            }
+            'v' | 'V' | '\u{16}' | '\u{11}' => {
+                let target = match key {
+                    'v' => VisualKind::Character,
+                    'V' => VisualKind::Line,
+                    _ => VisualKind::Block,
+                };
+                if state.kind == target {
+                    Self::save_visual_marks(editor, ctx.buffer, state);
+                    self.last_visual = Some(state.clone());
+                    Ok(Some(Mode::default()))
+                } else {
+                    state.kind = target;
+                    if target == VisualKind::Block {
+                        state.wanted = Some(state.cursor.col);
+                    }
+                    Ok(None)
+                }
             }
             'o' | 'O' => {
                 if key == 'O' && state.kind == VisualKind::Block {
@@ -3117,8 +3152,25 @@ impl ModeMachine {
                 } else {
                     state.swap_ends();
                 }
-                let window = cursor_context(editor)?.window;
-                editor.set_window_cursor(window, state.cursor)?;
+                let target = if state.kind == VisualKind::Block {
+                    let max_col = ctx
+                        .line(editor, state.cursor.lnum)
+                        .ok()
+                        .map_or(0, |l| crate::motion::prev_char_boundary(&l, l.len()));
+                    Position {
+                        lnum: state.cursor.lnum,
+                        col: state.cursor.col.min(max_col),
+                    }
+                } else {
+                    state.cursor
+                };
+                editor.set_window_cursor(ctx.window, target)?;
+                if state.kind == VisualKind::Block
+                    && let Ok(win) = editor.window_mut(ctx.window)
+                {
+                    win.curswant = i64::try_from(state.cursor.col).unwrap_or(i64::MAX);
+                    win.set_curswant = false;
+                }
                 Ok(None)
             }
             'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => {
@@ -3223,13 +3275,43 @@ impl ModeMachine {
             )
             .map(|motion| (motion, None))
         };
-        if let Some((motion, want)) = display {
+        if let Some((mut motion, want)) = display {
+            let keep_curswant = if motion.keep_curswant {
+                if state.kind == VisualKind::Block && state.wanted.is_some() {
+                    state.wanted.map(|w| i64::try_from(w).unwrap_or(i64::MAX))
+                } else {
+                    editor.window(ctx.window).ok().map(|win| {
+                        if win.set_curswant {
+                            i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX)
+                        } else {
+                            win.curswant
+                        }
+                    })
+                }
+            } else {
+                None
+            };
+            if let Some(curswant) = keep_curswant {
+                let lnum = motion.target.lnum;
+                let line = ctx.lines.get(lnum.saturating_sub(1));
+                let col = line.map_or(0, |line| {
+                    let want = usize::try_from(curswant).unwrap_or(0);
+                    want.min(crate::motion::prev_char_boundary(line, line.len()))
+                });
+                motion.target.col = col;
+            }
             editor.set_window_cursor(ctx.window, motion.target)?;
-            if let Some(want) = want
-                && let Ok(state) = editor.window_mut(ctx.window)
+            if let Some(curswant) = keep_curswant.or(want)
+                && let Ok(win) = editor.window_mut(ctx.window)
             {
-                state.curswant = want;
-                state.set_curswant = false;
+                win.curswant = curswant;
+                win.set_curswant = false;
+            }
+            if matches!(command, "$" | "g_")
+                && let Ok(win) = editor.window_mut(ctx.window)
+            {
+                win.curswant = i64::MAX;
+                win.set_curswant = false;
             }
             extend_visual(state, motion.target, ctx.cursor);
         }
@@ -3581,19 +3663,22 @@ impl ModeMachine {
         // Visual operators record the selection in `'<'`/`'>`
         // (`b_visual`); a linewise end reads as `MAXCOL`
         // (`getpos("'>")`, `test_put.vim`).
-        let range = state.range();
-        let mut end = range.end;
-        if matches!(state.kind, VisualKind::Line) {
-            end.col = 0x7FFF_FFFF;
-        }
-        let _ = editor.set_local_mark(ctx.buffer, '<', range.start);
-        let _ = editor.set_local_mark(ctx.buffer, '>', end);
+        Self::save_visual_marks(editor, ctx.buffer, state);
         Ok(Some(if result.enter_insert {
             Mode::Insert(InsertState)
         } else {
             Mode::default()
         }))
     }
+    fn save_visual_marks(editor: &mut Editor, buffer: BufHandle, state: &VisualState) {
+    let range = state.range();
+    let mut end = range.end;
+    if matches!(state.kind, VisualKind::Line) {
+        end.col = 0x7FFF_FFFF;
+    }
+    let _ = editor.set_local_mark(buffer, '<', range.start);
+    let _ = editor.set_local_mark(buffer, '>', end);
+}
     /// Shared `CTRL-\` second-key arm for Insert and Replace (`insert.c:640`).
     /// Pure state machine: no buffer writes. `Exit` ends the sequence with a
     /// mode change; `Consumed` ends it with nothing further; `Literal` means
@@ -5572,6 +5657,23 @@ fn extend_visual(state: &mut VisualState, target: Position, from: Position) {
         state.extend_block(target, from);
     } else {
         state.extend(target);
+    }
+}
+
+/// Synchronizes a visual selection's active endpoint with the window cursor.
+/// For block visual mode, virtual edge columns (`wanted`) are preserved across
+/// vertical motions over ragged / shorter rows (`ops.c:2223-2231`, `normal.c:4670-4706`).
+fn sync_visual_state(state: &mut VisualState, win: &crate::WindowState) {
+    if state.kind == VisualKind::Block {
+        if win.set_curswant {
+            state.cursor = win.cursor;
+            state.wanted = Some(win.cursor.col);
+        } else {
+            state.cursor.lnum = win.cursor.lnum;
+            state.cursor.col = state.wanted.unwrap_or(win.cursor.col);
+        }
+    } else {
+        state.cursor = win.cursor;
     }
 }
 
