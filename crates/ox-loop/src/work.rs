@@ -119,9 +119,52 @@ impl WorkQueues {
             };
             match work {
                 Work::Fast(_, event) => event.dispatch(),
-                Work::Deferred(_, event) => events.put(owner, event)?,
+                Work::Deferred(_, event) => {
+                    if let Err(error) = events.is_empty(owner) {
+                        restore_pending(
+                            &self.pending,
+                            &mut channels,
+                            &mut order,
+                            owner,
+                            Work::Deferred(owner, event),
+                        );
+                        return Err(error);
+                    }
+                    events.put(owner, event)?;
+                }
             }
         }
         Ok(())
     }
 }
+
+fn restore_pending(
+    pending: &Arc<Mutex<Pending>>,
+    channels: &mut BTreeMap<Owner, VecDeque<Work>>,
+    order: &mut VecDeque<Owner>,
+    owner: Owner,
+    work: Work,
+) {
+    channels.entry(owner).or_default().push_front(work);
+    order.push_front(owner);
+
+    let mut pending = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut pending_channels = std::mem::take(&mut pending.channels);
+    let local_channels = std::mem::take(channels);
+    let mut merged_channels = BTreeMap::new();
+    for (owner, mut local_queue) in local_channels {
+        if let Some(mut pending_queue) = pending_channels.remove(&owner) {
+            local_queue.append(&mut pending_queue);
+        }
+        merged_channels.insert(owner, local_queue);
+    }
+    merged_channels.append(&mut pending_channels);
+    pending.channels = merged_channels;
+
+    let mut merged_order = std::mem::take(order);
+    merged_order.append(&mut pending.order);
+    pending.order = merged_order;
+}
+

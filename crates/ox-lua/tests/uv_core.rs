@@ -151,6 +151,76 @@ fn immediate_timer_callback_can_close_its_handle() {
         .unwrap();
 }
 
+/// `vim._core.keyparse` (`nlua_keyparse`, lua/stdlib.c:692) answers one table
+/// per chord with the modifier list in `mod_mask_table` order, the bare key,
+/// the `keytrans` spelling, and the alternate name. `vim.keycode(keys, true)`
+/// builds on this, so the Lua shape is the contract.
+#[test]
+fn keyparse_reports_modifiers_and_both_spellings() {
+    let (host, _scheduler) = host();
+    host.lua()
+        .load(
+            r"
+            local chrome = vim._core.keyparse('\1')
+            assert(#chrome == 1, 'one chord')
+            assert(vim.deep_equal(chrome[1].mod, { 'C' }), vim.inspect(chrome[1].mod))
+            assert(chrome[1].key == 'a', chrome[1].key)
+            assert(chrome[1].keys == '<C-A>', chrome[1].keys)
+            assert(chrome[1].key_alt == 'A', tostring(chrome[1].key_alt))
+
+            -- A plain lowercase key carries no modifiers; an uppercase
+            -- letter is the shifted form, which the oracle reports as 'S'.
+            local plain = vim._core.keyparse('a')
+            assert(#plain[1].mod == 0, 'no modifiers on a lowercase key')
+            assert(plain[1].key == 'a', plain[1].key)
+            assert(plain[1].keys == 'a', plain[1].keys)
+
+            local shifted = vim._core.keyparse('A')
+            assert(vim.deep_equal(shifted[1].mod, { 'S' }), 'uppercase is shifted')
+            assert(shifted[1].key == 'a', shifted[1].key)
+            ",
+        )
+        .exec()
+        .expect("vim._core.keyparse answers the Lua shape");
+}
+
+/// A read callback may stop reading on the same pipe. The callback used to run
+/// with the pipe's callback state still borrowed, so `read_stop` panicked and
+/// `difftool` lost its output.
+#[cfg(unix)]
+#[test]
+fn pipe_read_callback_can_stop_its_own_pipe() {
+    let (host, _scheduler) = host();
+    host.lua()
+        .load(
+            r"
+            local pair = assert(vim.uv.pipe({ nonblock = true }, {}))
+            local reader = assert(vim.uv.new_pipe(false))
+            local writer = assert(vim.uv.new_pipe(false))
+            reader:open(pair.read)
+            writer:open(pair.write)
+
+            seen = ''
+            stopped = false
+            reader:read_start(function(err, data)
+              assert(err == nil)
+              if not data then return end
+              seen = seen .. data
+              stopped = reader:read_stop()
+              reader:close()
+              writer:close()
+              vim.uv.stop()
+            end)
+            writer:write('chunk\n')
+            vim.uv.run('default')
+            assert(stopped, 'read_stop answered from the callback')
+            assert(seen == 'chunk\n', 'read delivered ' .. vim.inspect(seen))
+            ",
+        )
+        .exec()
+        .expect("read_stop from the read callback");
+}
+
 #[cfg(unix)]
 #[test]
 fn immediate_pipe_callback_can_close_process_handles() {
@@ -1220,9 +1290,12 @@ fn fs_failures_report_luv_shapes_sync_and_async() {
         r"
         local uv = vim.uv
 
-        -- Sync fail shape: nil, err, name
+        -- Sync fail shape: nil, err, name; error string contains {name}: {message}
         local ok, err, name = uv.fs_stat(test_dir .. '/missing')
-        assert(ok == nil and name == 'ENOENT' and type(err) == 'string')
+        assert(ok == nil and name == 'ENOENT' and string.find(err, '^ENOENT: ') ~= nil)
+
+        ok, err, name = uv.fs_scandir(test_dir .. '/missing')
+        assert(ok == nil and name == 'ENOENT' and string.find(err, '^ENOENT: ') ~= nil)
 
         ok, err, name = uv.fs_open(test_dir .. '/missing', 'r', 0)
         assert(ok == nil and name == 'ENOENT')
@@ -1330,6 +1403,7 @@ fn misc_surface_reports_process_and_system_state() {
         assert(type(uname.sysname) == 'string' and type(uname.release) == 'string'
           and type(uname.version) == 'string' and type(uname.machine) == 'string')
         assert(uv.getpid() > 0 and uv.os_getpid() == uv.getpid())
+        assert(type(uv.getuid()) == 'number' and uv.getuid() >= 0)
         local before = uv.hrtime()
         assert(uv.hrtime() >= before)
         local sec, usec = uv.gettimeofday()
@@ -1409,4 +1483,114 @@ fn chdir_round_trips_through_the_process_working_directory() {
     );
     assert!(host.lua().globals().get::<bool>("chdir_ok").unwrap());
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn getuid_reports_current_process_user_id() {
+    let (host, scheduler) = host();
+    #[cfg(unix)]
+    // SAFETY: getuid takes no arguments, dereferences no pointers, and cannot fail.
+    let expected_uid = unsafe { libc::getuid() };
+    #[cfg(unix)]
+    host.lua()
+        .globals()
+        .set("expected_uid", expected_uid)
+        .unwrap();
+    drive(
+        &host,
+        &scheduler,
+        r"
+        local uv = vim.uv
+        local uid = uv.getuid()
+        assert(type(uid) == 'number')
+        assert(uid >= 0)
+        if expected_uid ~= nil then
+          assert(uid == expected_uid, 'expected ' .. tostring(expected_uid) .. ' but got ' .. tostring(uid))
+        end
+        getuid_ok = true
+        ",
+    );
+    assert!(host.lua().globals().get::<bool>("getuid_ok").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_delivers_signals_and_reports_luv_failures() {
+    let (host, scheduler) = host();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local my_pid = uv.getpid()
+
+        -- Probing self with signal 0 returns 0 on success
+        assert(uv.kill(my_pid, 0) == 0)
+
+        -- Killing a definitely non-existent PID fails with ESRCH
+        local ok, err, name = uv.kill(99999999, 'sigterm')
+        assert(ok == nil, 'expected nil on failure')
+        assert(name == 'ESRCH', 'expected ESRCH but got ' .. tostring(name))
+        assert(err == 'ESRCH: no such process', 'expected matching error message but got ' .. tostring(err))
+
+        -- Signal 0 on non-existent PID also fails with ESRCH
+        local ok0, err0, name0 = uv.kill(99999999, 0)
+        assert(ok0 == nil and name0 == 'ESRCH' and err0 == 'ESRCH: no such process')
+
+        -- Invalid signal names fail with EINVAL
+        local bad_ok, bad_err, bad_name = uv.kill(my_pid, 'invalid_signal_name')
+        assert(bad_ok == nil and bad_name == 'EINVAL')
+        assert(bad_err == 'EINVAL: invalid argument')
+
+        -- Invalid PID (<= 0 or out of range) fails with EINVAL
+        local neg_ok, neg_err, neg_name = uv.kill(-1, 'sigterm')
+        assert(neg_ok == nil and neg_name == 'EINVAL')
+        assert(neg_err == 'EINVAL: invalid argument')
+
+        kill_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("kill_ok").unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn kill_terminates_spawned_child_process() {
+    let (host, scheduler) = host();
+    drive(
+        &host,
+        &scheduler,
+        r#"
+        local uv = vim.uv
+        local exited = false
+        local exit_code, exit_sig
+        local child
+        child = assert(uv.spawn('/bin/sleep', { args = { '10' } }, function(code, signal)
+            exited = true
+            exit_code = code
+            exit_sig = signal
+            child:close()
+        end))
+
+        local pid = child:get_pid()
+        assert(type(pid) == 'number' and pid > 0)
+
+        -- Signal 0 confirms process exists
+        assert(uv.kill(pid, 0) == 0)
+
+        -- Kill with default signal (sigterm) or sigkill
+        assert(uv.kill(pid, 'sigkill') == 0)
+
+        vim.uv.run('default')
+        assert(exited, 'child process should have exited')
+        assert(exit_sig == 9 or exit_code ~= 0)
+
+        -- Once dead, killing it fails with ESRCH
+        local ok, err, name = uv.kill(pid, 0)
+        assert(ok == nil and name == 'ESRCH' and err == 'ESRCH: no such process')
+
+        child_kill_ok = true
+        "#,
+    );
+    assert!(host.lua().globals().get::<bool>("child_kill_ok").unwrap());
 }

@@ -30,9 +30,10 @@ use std::rc::Rc;
 use ox_text::Buffer;
 
 use crate::excmd_exec::{
-    LuaExec, run_autocmd_plan, sync_editor_into_scope, sync_scope_into_editor,
+    LuaExec, find_closing_paren, run_autocmd_plan, split_assignment, split_comma_args,
+    strip_expression_comment, sync_editor_into_scope, sync_scope_into_editor,
 };
-use crate::script::{FileIO, FileKind, FileMetadata};
+use crate::script::{FileEntry, FileIO, FileKind, FileMetadata};
 use crate::{
     AutocmdContext, AutocmdFilter, AutocmdKind, AutocmdOptions, Editor, Event, ExExecutor,
     ExecError, ExecOutcome, Geometry, Lookup, MapMode, Mode, ModeMachine, TestEditorAccess,
@@ -49,6 +50,8 @@ use crate::{
 struct MemoryFileIO {
     files: Rc<RefCell<HashMap<PathBuf, String>>>,
     directories: Rc<RefCell<HashSet<PathBuf>>>,
+    /// Raw byte content (swapfiles) that is not valid UTF-8 text.
+    blobs: Rc<RefCell<HashMap<PathBuf, Vec<u8>>>>,
 }
 
 impl MemoryFileIO {
@@ -71,6 +74,11 @@ impl MemoryFileIO {
 
     fn insert_directory(&self, path: &str) {
         self.directories.borrow_mut().insert(PathBuf::from(path));
+    }
+    fn insert_blob(&self, path: &str, data: Vec<u8>) {
+        self.blobs
+            .borrow_mut()
+            .insert(PathBuf::from(path), data);
     }
 
     fn content(&self, path: &str) -> Option<String> {
@@ -102,6 +110,48 @@ impl FileIO for MemoryFileIO {
 
     fn exists(&self, path: &Path) -> bool {
         self.files.borrow().contains_key(path)
+            || self.blobs.borrow().contains_key(path)
+            || self.directories.borrow().contains(path)
+    }
+    fn read_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        if let Some(blob) = self.blobs.borrow().get(path) {
+            return Ok(blob.clone());
+        }
+        self.read_to_string(path).map(String::into_bytes)
+    }
+
+    fn read_dir(&self, path: &Path) -> std::io::Result<Vec<FileEntry>> {
+        use std::collections::BTreeMap;
+
+        let mut children: BTreeMap<std::ffi::OsString, PathBuf> = BTreeMap::new();
+        let all = self
+            .files
+            .borrow()
+            .keys()
+            .cloned()
+            .chain(self.directories.borrow().iter().cloned())
+            .chain(self.blobs.borrow().keys().cloned())
+            .collect::<Vec<_>>();
+        for candidate in &all {
+            if let Ok(rest) = candidate.strip_prefix(path) {
+                let mut components = rest.components();
+                if let Some(first) = components.next() {
+                    children
+                        .entry(first.as_os_str().to_owned())
+                        .or_insert_with(|| path.join(first));
+                }
+            }
+        }
+        if children.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "directory not found",
+            ));
+        }
+        Ok(children
+            .into_iter()
+            .map(|(name, full)| FileEntry { path: full, name })
+            .collect())
     }
 
     fn metadata(&self, path: &Path, _follow_links: bool) -> std::io::Result<FileMetadata> {
@@ -271,6 +321,191 @@ fn edit_loads_file_content_into_new_buffer() {
     );
 }
 
+/// `:keepalt edit` switches buffers without replacing the window's alternate.
+#[test]
+fn edit_keepalt_preserves_alternate_buffer() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+    executor.execute_line(&editor, "file initial.txt").unwrap();
+    let initial = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(initial)
+    );
+
+    executor
+        .execute_line(&editor, "keepalt edit second.txt")
+        .unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert_ne!(second, first);
+    assert_eq!(
+        editor.editor().buffer(second).unwrap().name().to_string_lossy(),
+        "second.txt"
+    );
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(initial)
+    );
+}
+
+/// A plain `:edit` replaces the window's alternate with the buffer it leaves.
+#[test]
+fn edit_updates_alternate_buffer_without_keepalt() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(first)
+    );
+}
+
+#[test]
+fn edit_switches_buffer_pushes_jumplist() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "line1\nline2\nline3\n");
+    executor.scripts().io().insert("second.txt", "hello\n");
+    executor.scripts().io().insert("third.txt", "world\n");
+    executor.execute_line(&editor, "file start.txt").unwrap();
+    let start = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    let win = editor.editor().current_window().unwrap();
+    editor.editor_mut().set_window_cursor(win, ox_text::Position { lnum: 3, col: 0 }).unwrap();
+
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 2);
+    assert_eq!(
+        editor.editor().jumplist().entries()[0],
+        crate::marks::MarkLocation::in_buffer(start, ox_text::Position { lnum: 1, col: 0 })
+    );
+    assert_eq!(
+        editor.editor().jumplist().entries()[1],
+        crate::marks::MarkLocation::in_buffer(first, ox_text::Position { lnum: 3, col: 0 })
+    );
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 3);
+    assert_eq!(
+        editor.editor().jumplist().entries()[2],
+        crate::marks::MarkLocation::in_buffer(second, ox_text::Position { lnum: 1, col: 0 })
+    );
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 3);
+}
+
+/// Abandoning a buffer during `:edit` respects `'hidden'` and `'bufhidden'`
+/// (`do_ecmd` -> `close_buffer`, `buffer.c:4120-4133`).
+#[test]
+fn edit_abandoned_buffer_follows_hidden_and_bufhidden() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "first");
+    executor.scripts().io().insert("second.txt", "second");
+    executor.scripts().io().insert("third.txt", "third");
+
+    executor.execute_line(&editor, "let g:order = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufHidden *.txt call add(g:order, 'BufHidden:' . expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufUnload *.txt call add(g:order, 'BufUnload:' . expand('<afile>'))",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd BufEnter *.txt call add(g:order, 'BufEnter:' . expand('<afile>'))",
+        )
+        .unwrap();
+
+    // Default 'hidden' is true: leaving first.txt retains it loaded in the background.
+    executor.execute_line(&editor, "set hidden").unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(first).unwrap().residency.is_loaded());
+
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+    assert!(editor.editor().buffer(first).unwrap().residency.is_loaded());
+
+    // With 'nohidden': leaving second.txt unloads it when abandoned.
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(second).unwrap().residency.is_loaded());
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert!(!editor.editor().buffer(second).unwrap().residency.is_loaded());
+
+    // 'bufhidden=hide' keeps the buffer loaded even with 'nohidden'.
+    let third = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(
+            third,
+            "bufhidden",
+            crate::OptionValue::String("hide".into()),
+        )
+        .unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    assert!(editor.editor().buffer(third).unwrap().residency.is_loaded());
+    assert_eq!(
+        order_events(&executor),
+        [
+            "BufEnter:first.txt",
+            "BufHidden:first.txt",
+            "BufEnter:second.txt",
+            "BufUnload:second.txt",
+            "BufEnter:third.txt",
+            "BufHidden:third.txt",
+            "BufEnter:first.txt",
+        ]
+    );
+}
+
+#[test]
+fn edit_decodes_sentinel_newline_in_filename() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("line\nbreak.txt", "newline content");
+    executor
+        .execute_line(&editor, "edit line\0break.txt")
+        .unwrap();
+    let e = editor.editor();
+    let current = e.current_buffer().unwrap();
+    let state = e.buffer(current).unwrap();
+    assert_eq!(state.name().to_string_lossy(), "line\nbreak.txt");
+    assert_eq!(
+        state.text().unwrap().line(1).unwrap(),
+        b"newline content".to_vec()
+    );
+}
+
 /// `:edit` with no file argument raises E32 ("No file name").
 /// Upstream: `ex_docmd.c` `ex_edit` — `*e_fname == NUL` → E32.
 #[test]
@@ -278,6 +513,214 @@ fn edit_empty_path_raises_e32() {
     let (editor, mut executor) = setup();
     let result = executor.execute_line(&editor, "edit");
     assert_vim_error(result, "E32");
+}
+
+/// `:edit {dir}` stages an empty directory buffer instead of failing with E484
+/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`): the buffer name carries
+/// a trailing `/` and the filetype is `directory`, while the listing itself is
+/// rendered by `runtime/plugin/dir.lua` on `BufEnter` (no Lua host here, so the
+/// buffer stays empty). Oracle (`dir_spec.lua` startup listing).
+#[test]
+fn edit_directory_opens_listing_buffer() {
+    let root = std::env::temp_dir().join(format!("oxvim-edit-dir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("subdir")).unwrap();
+    std::fs::write(root.join("alpha.txt"), "alpha").unwrap();
+    std::fs::write(root.join(".hidden"), "hidden").unwrap();
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+
+    let mut raw = Editor::new();
+    let scratch = raw.create_buffer(true).unwrap();
+    raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(raw);
+    let mut executor = ExExecutor::new();
+
+    for dir in [&empty, &root] {
+        executor
+            .execute_line(&editor, &format!("edit {}", dir.display()))
+            .unwrap();
+        let current = editor.editor().current_buffer().unwrap();
+        let guard = editor.editor();
+        let state = guard.buffer(current).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", dir.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
+        assert!(matches!(
+            editor.editor().options().get_buffer(current, "filetype"),
+            Ok(crate::OptionValue::String(value)) if value == "directory"
+        ));
+    }
+    // A bare `:edit` on a directory buffer runs the directory lifecycle
+    // (`BufReadPre`, `BufReadCmd`, `BufEnter`) without failing: with no
+    // handlers the buffer keeps its (empty) lines in place.
+    // (`dir_spec.lua` "reloads directory buffers"; the plugin reloads there.)
+    let current = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit").unwrap();
+    {
+        let reloaded = editor.editor().current_buffer().unwrap();
+        assert_eq!(reloaded, current);
+        let guard = editor.editor();
+        let state = guard.buffer(reloaded).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", root.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `:checkhealth {missing}` reports the missing provider in a `health://`
+/// buffer instead of raising (`runtime/lua/vim/health.lua` `func == ''`
+/// branch; `ex_docmd.c` `ex_checkhealth`).
+/// Oracle (`health_spec.lua` "gracefully handles invalid healthcheck"):
+/// the buffer shows the `===...` rule and
+/// `- ❌ ERROR No healthcheck found for "..." plugin.`
+#[test]
+fn checkhealth_missing_provider_reports_in_health_buffer() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "checkhealth nonexistent")
+        .unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let guard = editor.editor();
+    let state = guard.buffer(current).unwrap();
+    assert_eq!(state.name().to_string_lossy(), "health://");
+    let text = state.text().unwrap();
+    let lines: Vec<String> = (1..=text.line_count())
+        .map(|line| String::from_utf8_lossy(&text.line(line).unwrap()).into_owned())
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line == "=============================================================================="),
+        "missing rule, got {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|line| line.contains(
+            "No healthcheck found for \"nonexistent\" plugin."
+        )),
+        "missing provider report, got {lines:?}"
+    );
+}
+
+/// Lua host that forces the `:checkhealth` native fallback while still
+/// serving autocmd callbacks: `execute_chunk` fails the way a re-entered
+/// host that cannot run the module does, and `invoke_callback` records.
+struct CheckhealthFallbackLua {
+    calls: RefCell<Vec<usize>>,
+}
+
+impl crate::LuaExec for CheckhealthFallbackLua {
+    fn execute_chunk(
+        &self,
+        _code: &str,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        Err(LuaExecError::Runtime("no free Ex executor".to_owned()))
+    }
+
+    fn execute_file(&self, _path: &Path) -> Result<(), LuaExecError> {
+        Err(LuaExecError::Runtime("no files".to_owned()))
+    }
+
+    fn invoke_callback(
+        &self,
+        reference: usize,
+        _args: Vec<Object>,
+    ) -> Result<Object, LuaExecError> {
+        self.calls.borrow_mut().push(reference);
+        Ok(Object::Nil)
+    }
+}
+
+/// `:checkhealth` whose host cannot run the Lua module falls back to the
+/// native report with the host still attached, so a `FileType` Lua callback
+/// executes instead of raising `E5108`.
+#[test]
+fn checkhealth_native_fallback_runs_lua_filetype_callback_with_host() {
+    let (editor, mut executor) = setup();
+    let host = Rc::new(CheckhealthFallbackLua {
+        calls: RefCell::new(Vec::new()),
+    });
+    executor.set_lua_exec(host.clone());
+    executor
+        .scripts()
+        .io()
+        .insert("/rt/lua/vim/health.lua", "return {}");
+    executor
+        .execute_line(&editor, "set runtimepath=/rt")
+        .unwrap();
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::FileType],
+            "checkhealth",
+            &AutocmdKind::LuaCallback(7),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "checkhealth nonexistent")
+        .unwrap();
+    assert_eq!(
+        host.calls.borrow().as_slice(),
+        &[7],
+        "the native fallback must run the FileType Lua callback with the host",
+    );
+}
+
+/// Without any Lua host, a `FileType` Lua callback reached through the
+/// native `:checkhealth` path names the callback and the event instead of
+/// the generic `E5108` text.
+#[test]
+fn checkhealth_native_path_without_host_names_callback_and_event() {
+    let (editor, mut executor) = setup();
+    editor
+        .editor_mut()
+        .autocmds_mut()
+        .register_api(
+            &[Event::FileType],
+            "checkhealth",
+            &AutocmdKind::LuaCallback(9),
+            &AutocmdOptions::default(),
+        )
+        .unwrap();
+    match executor.execute_line(&editor, "checkhealth nonexistent") {
+        Err(ExecError::Vim(exception)) => {
+            match &exception.kind {
+                VimExceptionKind::Error(code) => assert_eq!(
+                    code, "E5108",
+                    "hostless Lua callback must stay E5108, got E{code}: {}",
+                    exception.message(),
+                ),
+                other => panic!("expected Error(E5108), got {other:?}"),
+            }
+            let message = exception.message();
+            assert!(
+                message.contains("Lua callback 9"),
+                "error must name the callback, got {message:?}",
+            );
+            assert!(
+                message.contains("FileType"),
+                "error must name the event, got {message:?}",
+            );
+        }
+        other => panic!("expected E5108, got {other:?}"),
+    }
 }
 
 /// `:write {file}` persists the current buffer's text through the `FileIO`
@@ -1209,12 +1652,14 @@ fn tabpagewinnr_rejects_bad_arity_and_selector() {
 // Citations: ex_docmd.c ex_close (E37, E444), ex_edit (E37)
 // ---------------------------------------------------------------------------
 
-/// `:close` on a modified buffer without `!` raises E37.
-/// Upstream: `ex_docmd.c` `ex_close` — `buf_modified` check before
-/// `win_close`.
+/// `:close` on a modified buffer without `!` raises E37 when the buffer
+/// cannot hide (`'hidden'` off, no `:hide`, `'bufhidden'` not `hide`).
+/// Upstream: `ex_docmd.c` `ex_close` → `ex_win_close` (`need_hide` +
+/// `buf_hide`, `buffer.c:4120`) — `buf_modified` check before `win_close`.
 #[test]
 fn close_modified_buffer_without_bang_raises_e37() {
     let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
     // Need two windows so :close can target one.
     executor.execute_line(&editor, "split").unwrap();
     assert_eq!(editor.editor().windows().len(), 2);
@@ -1235,6 +1680,32 @@ fn close_modified_buffer_without_bang_raises_e37() {
     assert_vim_error(result, "E37");
     // Window count unchanged because close was refused.
     assert_eq!(editor.editor().windows().len(), 2);
+}
+
+/// `:close` on a modified buffer hides it under Neovim's default `'hidden'`.
+/// Upstream: `ex_docmd.c:5204-5217` — `need_hide && !buf_hide(buf)` is false
+/// when `'hidden'` is on, so `win_close` runs instead of raising E37.
+#[test]
+fn close_modified_buffer_with_hidden_on_succeeds() {
+    let (editor, mut executor) = setup();
+    assert!(matches!(
+        editor.editor().options().get_global("hidden"),
+        Ok(crate::OptionValue::Boolean(true))
+    ));
+    executor.execute_line(&editor, "split").unwrap();
+    assert_eq!(editor.editor().windows().len(), 2);
+
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .flags
+        .set(crate::BufferFlags::MODIFIED, true);
+
+    executor.execute_line(&editor, "close").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+    assert!(editor.editor().buffer(buffer).is_ok());
 }
 
 /// `:close!` on a modified buffer succeeds, discarding the modified check.
@@ -1406,7 +1877,11 @@ fn resize_wincmd_and_echohl_mutate_existing_editor_state() {
     assert_ne!(split, original);
 
     executor.execute_line(&editor, "resize 2").unwrap();
-    assert_eq!(editor.editor().window_geometry(split).unwrap().height, 2);
+    assert_eq!(
+        editor.editor().window_text_height(split).unwrap(),
+        2,
+        ":resize uses text rows; the frame includes the statusline row"
+    );
     executor.execute_line(&editor, "wincmd w").unwrap();
     assert_eq!(editor.editor().current_window(), Some(original));
     executor.execute_line(&editor, "echohl Search").unwrap();
@@ -1479,6 +1954,109 @@ fn buffer_switches_to_specified_handle() {
 
     executor.execute_line(&editor, "buffer 2").unwrap();
     assert_eq!(editor.editor().current_buffer(), Some(buf2));
+}
+
+#[test]
+fn bufnr_hash_tracks_each_window_buffer_switch() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(first)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("first"));
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(second)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("second"));
+
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(first));
+    assert_eq!(global_text(&executor, "alternate_name"), Some("first".to_owned()));
+
+    executor.execute_line(&editor, "buffer #").unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(second));
+    assert_eq!(global_text(&executor, "alternate_name"), Some("second".to_owned()));
+}
+
+#[test]
+fn hash_keeps_unloaded_alternate_until_wipe() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(first)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("first"));
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    editor.editor_mut().unload_buffer(first).unwrap();
+
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#')")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), i64::from(first));
+
+    editor.editor_mut().wipe_buffer(first).unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#') | let g:alternate_name = @#")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), -1);
+    assert_eq!(global_text(&executor, "alternate_name"), Some(String::new()));
+}
+
+#[test]
+fn split_window_starts_without_an_alternate_buffer() {
+    let (editor, mut executor) = setup();
+    let first = editor.editor().current_buffer().unwrap();
+    let second = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .set_current_buffer(second, crate::BufferRelease::KeepLoaded)
+        .unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .window(editor.editor().current_window().unwrap())
+            .unwrap()
+            .alternate_buffer,
+        Some(first)
+    );
+
+    executor.execute_line(&editor, "split").unwrap();
+    executor
+        .execute_line(&editor, "let g:alternate = bufnr('#')")
+        .unwrap();
+    assert_eq!(global_number(&executor, "alternate"), -1);
+}
+
+#[test]
+fn buffer_hash_does_not_match_literal_name_without_alternate() {
+    let (editor, mut executor) = setup();
+    let current = editor.editor().current_buffer().unwrap();
+    let literal = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(literal)
+        .unwrap()
+        .set_name(ox_types::OxStr::from("#"));
+
+    assert_vim_error(executor.execute_line(&editor, "buffer #"), "E94");
+    assert_eq!(editor.editor().current_buffer(), Some(current));
 }
 
 #[test]
@@ -1832,7 +2410,7 @@ fn autocmd_bang_clears_builtin_popupmenu_group() {
         .register_legacy(
             &[Event::BufEnter],
             "*",
-            &AutocmdKind::ExString("echo stale".to_owned()),
+            &AutocmdKind::ExString { source: "echo stale".to_owned(), script: None },
             &AutocmdOptions {
                 group,
                 ..AutocmdOptions::default()
@@ -1949,7 +2527,7 @@ fn autocmd_bang_with_body_replaces_the_definitions() {
     assert_eq!(definitions.len(), 1, "bang must replace, not only delete");
     assert_eq!(
         definitions[0].kind,
-        AutocmdKind::ExString("let g:new = 1".to_owned())
+        AutocmdKind::ExString { source: "let g:new = 1".to_owned(), script: None }
     );
 
     executor.scripts().io().insert("replaced.py", "x");
@@ -2371,6 +2949,7 @@ fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
     executor
         .execute_line(&editor, "setlocal shiftwidth=8")
         .unwrap();
+    executor.execute_line(&editor, "file source.txt").unwrap();
     let source = editor.editor().current_buffer().unwrap();
     executor
         .execute_line(&editor, "edit read-hook.txt")
@@ -2544,10 +3123,13 @@ fn autocmd_buffer_switch_missing_file_uses_new_file_semantics() {
     assert!(!state.flags.contains(crate::BufferFlags::MODIFIED));
 }
 
-/// A non-`NotFound` reload failure preserves the cycle-one contract: the
-/// switch reports E86, leaves the target unloaded, and keeps the old buffer.
+/// A directory entered through the switch path stages an empty directory buffer
+/// (`fileio.c:420-424` `NOTDONE`, `buffer.c:412-415`) instead of failing the
+/// read: the `:buffer` switch succeeds, the buffer keeps the directory name
+/// with a trailing `/`, and the listing is left to `runtime/plugin/dir.lua`
+/// (no Lua host here, so the lines stay empty).
 #[test]
-fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+fn autocmd_buffer_switch_directory_opens_listing() {
     let dir = std::env::temp_dir().join(format!("oxvim-excmd-unloaded-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -2564,6 +3146,53 @@ fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
         (TestEditorAccess::new(raw), ExExecutor::new())
     };
     let target = editor.editor().buffers()[1];
+
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(target)))
+        .unwrap();
+    {
+        assert_eq!(editor.editor().current_buffer(), Some(target));
+        let guard = editor.editor();
+        let state = guard.buffer(target).unwrap();
+        assert_eq!(
+            state.name().to_string_lossy(),
+            format!("{}/", dir.display())
+        );
+        let text = state.text().unwrap();
+        let lines: Vec<Vec<u8>> = (1..=text.line_count())
+            .map(|line| text.line(line).unwrap())
+            .collect();
+        assert_eq!(lines, vec![b"".to_vec()]);
+        assert!(matches!(
+            guard.options().get_buffer(target, "filetype"),
+            Ok(crate::OptionValue::String(value)) if value == "directory"
+        ));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A genuinely failed read preserves the cycle-one contract through the
+/// switch path: the switch reports E86, leaves the target unloaded, and keeps
+/// the old buffer. Directories are views now (`NOTDONE`, above), not
+/// failures, so this uses an unreadable file as the failure case.
+#[test]
+fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
+    let (editor, mut executor) = {
+        let mut raw = Editor::new();
+        let scratch = raw.create_buffer(true).unwrap();
+        raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let target = raw.create_buffer(true).unwrap();
+        raw.buffer_mut(target)
+            .unwrap()
+            .set_name(ox_types::OxStr::from("unreadable.txt"));
+        raw.unload_buffer(target).unwrap();
+        (
+            TestEditorAccess::new(raw),
+            ExExecutor::with_io(UnreadableFileIO),
+        )
+    };
+    let target = editor.editor().buffers()[1];
     let scratch = editor.editor().buffers()[0];
 
     assert_vim_error(
@@ -2572,7 +3201,6 @@ fn autocmd_buffer_switch_failed_read_keeps_target_unloaded() {
     );
     assert_eq!(editor.editor().current_buffer(), Some(scratch));
     assert!(editor.editor().buffer(target).unwrap().text().is_err());
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// `:bnext` runs the same sequence; a wrapping `:bnext` on the only listed
@@ -2821,6 +3449,209 @@ fn a_quit_inside_a_sourced_script_runs_the_exit_sequence() {
         ExecOutcome::Quit(0)
     );
     assert!(global_flag(&executor, "early"));
+}
+
+// ---------------------------------------------------------------------------
+// :scriptnames
+// Citations: runtime.c ex_scriptnames (listing loop, SID edit, E474);
+// ex_docmd.c set_cmd_count (post-command count folds into the address),
+// correct_range (address 0 counts as 1 without ZEROR).
+// ---------------------------------------------------------------------------
+
+/// `:scriptnames` lists every sourced script as `%3d: name` in SID order.
+/// Upstream: `runtime.c` `ex_scriptnames` listing loop.
+#[test]
+fn scriptnames_lists_sourced_scripts_in_sid_order() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_script(&editor, "b.vim", "let g:xb = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["  1: a.vim", "  2: b.vim"]);
+}
+
+/// `getscriptinfo()` reports every sourced script and, for a `sid` query, that
+/// script's variables and functions. Upstream: `f_getscriptinfo`
+/// (`runtime.c:2670-2740`).
+#[test]
+fn getscriptinfo_lists_scripts_and_answers_a_sid_query() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "gs_info.vim",
+            "function s:Fn()\nendfunction\nlet s:var = 7",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "let g:all = getscriptinfo({'name': 'gs_info'})",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:n = len(g:all)")
+        .unwrap();
+    assert_eq!(global_number(&executor, "n"), 1);
+    executor
+        .execute_line(
+            &editor,
+            "let g:one = getscriptinfo({'sid': g:all[0].sid})[0]",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:v = get(g:one.variables, 'var', -1)")
+        .unwrap();
+    assert_eq!(global_number(&executor, "v"), 7);
+    executor
+        .execute_line(&editor, "let g:f = get(g:one.functions, 0, '')")
+        .unwrap();
+    let name = match global_value(&executor, "f") {
+        Some(ox_types::Typval::String(text)) => text.to_string_lossy().into_owned(),
+        other => panic!("getscriptinfo returned no function name: {other:?}"),
+    };
+    assert!(
+        name.ends_with("_Fn"),
+        "getscriptinfo did not name the script-local function: {name}"
+    );
+}
+
+/// `:scriptnames` replaces a `$HOME` prefix with `~` (`home_replace` in
+/// `path.c`); without `$HOME` the path lists unchanged.
+#[test]
+fn scriptnames_replaces_home_prefix_with_tilde() {
+    let (editor, mut executor) = setup();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let (name, expected) = if home.is_empty() {
+        ("sn_home.vim".to_owned(), "sn_home.vim".to_owned())
+    } else {
+        (format!("{home}/sn_home.vim"), "~/sn_home.vim".to_owned())
+    };
+    executor
+        .execute_script(&editor, &name, "let g:xh = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames").unwrap();
+    assert_eq!(echo_messages(&editor), vec![format!("  1: {expected}")]);
+}
+
+/// `:scriptnames {id}` and `:{id}scriptnames` edit that script through the
+/// `:edit` path (`do_exedit`).
+#[test]
+fn scriptnames_count_and_range_edit_indexed_script() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("a.vim", "echo 'a'");
+    executor.scripts().io().insert("b.vim", "echo 'b'");
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_script(&editor, "b.vim", "let g:xb = 1")
+        .unwrap();
+    executor.execute_line(&editor, "scriptnames 2").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "b.vim"
+    );
+    executor.execute_line(&editor, "1scriptnames").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "a.vim"
+    );
+}
+
+/// `:scriptnames {file}` edits that file, exactly what `:edit` would open.
+#[test]
+fn scriptnames_bare_filename_edits_file() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("other.vim", "echo 'other'");
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "scriptnames other.vim")
+        .unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(current)
+            .unwrap()
+            .name()
+            .to_string_lossy(),
+        "other.vim"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Script-local scope across nested calls
+// Upstream keeps one `s:` dict per script (`svars`), mutated in place, so a
+// function always sees its defining script's live variables — even when that
+// script is still executing further down the stack. Oxvim mirrors the visible
+// map into `scope.script`, so the switch has to flush the outgoing frame into
+// its own SID before loading the incoming one; loading the registry copy
+// without flushing hides mid-execution assignments (`s:has_ffi` going
+// missing inside `Ntest_override`).
+// ---------------------------------------------------------------------------
+
+/// A function defined in a script observes that script's live `s:` map when
+/// called from another script's function while the defining script is still
+/// executing on the stack.
+#[test]
+fn nested_function_call_sees_defining_scripts_live_script_locals() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("inner.vim", "func Inner()\nreturn Outer()\nendfunc\n");
+    executor
+        .execute_script(
+            &editor,
+            "outer.vim",
+            "let s:token = 7\nfunc Outer()\nreturn s:token\nendfunc\nsource inner.vim\nlet g:seen = Inner()\n",
+        )
+        .unwrap();
+    assert_eq!(
+        executor
+            .scope()
+            .get_scoped(ox_eval::scope::ScopeKind::Global, b"seen", 0)
+            .unwrap(),
+        &ox_types::Typval::Number(7)
+    );
+}
+
+/// `:scriptnames {id}` past the registry is E474 (`e_invarg`); the oracle
+/// prints `E474: Invalid argument` for both the count and the range form.
+#[test]
+fn scriptnames_out_of_range_id_reports_invalid_argument() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "a.vim", "let g:xa = 1")
+        .unwrap();
+    for line in ["scriptnames 99", "99scriptnames"] {
+        let err = executor.execute_line(&editor, line).unwrap_err();
+        match err {
+            ExecError::Vim(exception) => {
+                assert_eq!(exception.kind, VimExceptionKind::Error("E474".to_owned()));
+                assert_eq!(exception.emsg_text(), "E474: Invalid argument");
+            }
+            other => panic!("expected E474, got {other:?}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4285,6 +5116,95 @@ fn filetype_detect_refires_the_filetypedetect_group() {
 fn filetype_rejects_unknown_argument_with_e475() {
     let (editor, mut executor) = setup_filetype();
     assert_vim_error(executor.execute_line(&editor, "filetype nope"), "E475");
+}
+
+#[test]
+fn syntax_rejects_unknown_subcommand_with_e410() {
+    let (editor, mut executor) = setup();
+    assert_vim_error(
+        executor.execute_line(&editor, "syntax invalidSubcmd"),
+        "E410",
+    );
+}
+
+#[test]
+fn syntax_on_and_off_toggles_global_var() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "syntax on").unwrap();
+    assert!(global_flag(&executor, "syntax_on"));
+    executor.execute_line(&editor, "syntax off").unwrap();
+    assert!(!global_flag(&executor, "syntax_on"));
+    executor.execute_line(&editor, "syntax enable").unwrap();
+    assert!(global_flag(&executor, "syntax_on"));
+}
+
+#[test]
+fn syntax_match_and_list_via_syn_abbreviation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, r#"syn match directoryDirectory ".*/$""#)
+        .unwrap();
+    let buf = editor.editor().current_buffer().unwrap();
+    let has_group = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .has_group("directoryDirectory");
+    assert!(has_group);
+
+    let list_out = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .format_list(Some("directoryDirectory"))
+        .unwrap();
+    assert!(list_out.contains("directoryDirectory xxx match +.*/$+  "));
+}
+
+#[test]
+fn syntax_keyword_and_region_dispatch() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "syntax keyword cType int char float")
+        .unwrap();
+    executor
+        .execute_line(&editor, r#"syntax region cComment start="/*" end="*/""#)
+        .unwrap();
+    let buf = editor.editor().current_buffer().unwrap();
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cType"));
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cComment"));
+
+    executor.execute_line(&editor, "syntax clear cType").unwrap();
+    assert!(!editor.editor().buffer(buf).unwrap().syntax.has_group("cType"));
+    assert!(editor.editor().buffer(buf).unwrap().syntax.has_group("cComment"));
+
+    executor.execute_line(&editor, "syntax clear").unwrap();
+    assert!(editor.editor().buffer(buf).unwrap().syntax.is_empty());
+}
+
+#[test]
+fn filetype_setter_loads_directory_syntax() {
+    let (editor, mut executor) = setup();
+    let io = executor.scripts().io().clone();
+    io.insert(
+        "rt/syntax/directory.vim",
+        r#"syn match directoryDirectory ".*/$""#,
+    );
+    executor.execute_line(&editor, "set rtp+=rt").unwrap();
+    executor
+        .execute_line(&editor, "setlocal filetype=directory")
+        .unwrap();
+
+    let buf = editor.editor().current_buffer().unwrap();
+    let has_group = editor
+        .editor()
+        .buffer(buf)
+        .unwrap()
+        .syntax
+        .has_group("directoryDirectory");
+    assert!(has_group);
 }
 
 // ---------------------------------------------------------------------------
@@ -5906,6 +6826,27 @@ fn sleep_rejects_a_zero_count_with_e939() {
     executor.execute_line(&editor, "0read in.txt").unwrap();
 }
 
+/// `:sleep` pumps the event loop while waiting (`os_delay` with events):
+/// a job whose exit lands mid-sleep has its callback delivered before the
+/// script continues, instead of waiting for a later drain.
+#[test]
+fn sleep_delivers_job_callbacks_before_continuing() {
+    let _guard = crate::lock_process_state();
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "sleep",
+            "func! OnSleepExit(id, data, event)\nlet g:sleep_fired = 1\nendfunc\nlet g:sleep_fired = 0\nlet g:sleep_job = jobstart(['sh', '-c', 'exit 0'], {'on_exit': 'OnSleepExit'})\nsleep 200m\n",
+        )
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "sleep_fired"),
+        Some(ox_types::Typval::Number(1)),
+        "a job exit during :sleep must be delivered before the sleep ends"
+    );
+}
+
 /// `:scriptencoding` outside a sourced file is E167.
 #[test]
 fn scriptencoding_outside_a_script_raises_e167() {
@@ -6047,6 +6988,29 @@ fn argdelete_rejects_an_address_with_an_argument() {
     executor.execute_line(&editor, "args a.txt b.txt").unwrap();
     assert_vim_error(executor.execute_line(&editor, "1argdelete a.txt"), "E475");
     assert_eq!(arglist_names(&editor), vec!["a.txt", "b.txt"]);
+}
+#[test]
+fn argglobal_bare_succeeds_and_with_files_redefines_list() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("x.txt", "x\n");
+    executor.scripts().io().insert("y.txt", "y\n");
+    executor.execute_line(&editor, "argglobal").unwrap();
+    executor.execute_line(&editor, "argglobal x.txt y.txt").unwrap();
+    assert_eq!(arglist_names(&editor), vec!["x.txt", "y.txt"]);
+    assert_eq!(editor.editor().arglist().index(), 0);
+}
+
+#[test]
+fn argument_with_range_count_selects_argument() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("first.txt", "1\n");
+    executor.scripts().io().insert("second.txt", "2\n");
+    executor.execute_line(&editor, "args first.txt second.txt").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 0);
+    executor.execute_line(&editor, "2argu").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 1);
+    executor.execute_line(&editor, "1argu").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 0);
 }
 
 fn arglist_names(editor: &TestEditorAccess) -> Vec<String> {
@@ -6618,6 +7582,27 @@ fn normal_with_machine_still_applies_mappings_and_bang_skips_them() {
     assert_eq!(global_text(&executor, "hit").as_deref(), Some("no"));
 }
 
+/// A counted mapping consumes the accumulated count before execution and does
+/// not leak it into subsequent counted mappings.
+#[test]
+fn counted_mapping_clears_accumulated_count_between_invocations() {
+    let (editor, mut executor) = setup();
+    let machine = Rc::new(RefCell::new(ModeMachine::default()));
+    executor.set_mode_machine(machine);
+    executor
+        .execute_line(&editor, "nnoremap ,m :let g:c1 = v:count<CR>")
+        .unwrap();
+    executor
+        .execute_line(&editor, "nnoremap ,n :let g:c2 = v:count<CR>")
+        .unwrap();
+
+    executor.execute_line(&editor, "normal 1,m").unwrap();
+    assert_eq!(global_number(&executor, "c1"), 1);
+
+    executor.execute_line(&editor, "normal 2,n").unwrap();
+    assert_eq!(global_number(&executor, "c2"), 2);
+}
+
 /// Without an installed mode machine, `:normal!` falls back to a temporary
 /// machine — keys still execute (buffer changes happen) but mode changes
 /// don't persist. This is the existing unit-test behavior.
@@ -6955,6 +7940,349 @@ fn a_trailing_cr_survives_into_normal_and_a_mapping_rhs() {
     assert_eq!(global_text(&executor, "qargs").as_deref(), Some("hi\r"));
 }
 
+/// The API fires `OptionSet` by publishing `v:option_*` and handing each
+/// planned command to `execute_autocmd_command`. That path must see the
+/// published values, not the previous ones: `nvim.dir` records
+/// `call add(g:events, v:option_new)` exactly this way.
+#[test]
+fn an_api_optionset_command_reads_the_published_values() {
+    let (editor, mut executor) = setup();
+    editor.editor_mut().set_v_vim_did_enter();
+    executor.execute_line(&editor, "let g:events = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd OptionSet buftype call add(g:events, v:option_new)",
+        )
+        .unwrap();
+    let plan = editor.editor_mut().autocmds_mut().plan(
+        crate::Event::OptionSet,
+        crate::AutocmdContext {
+            match_name: Some(b"buftype"),
+            nested: true,
+            ..crate::AutocmdContext::default()
+        },
+    );
+    let saved = editor.editor_mut().publish_option_set(
+        crate::OptionSetScope::Local,
+        &crate::option_value_object(&crate::OptionValue::String("nowrite".to_owned())),
+        None,
+        None,
+        &crate::option_value_object(&crate::OptionValue::String("nowrite".to_owned())),
+    );
+    assert_eq!(plan.ready.len(), 1, "one handler");
+    for action in &plan.ready {
+        let crate::AutocmdKind::ExString {
+            source: source,
+            script: None,
+        } = &action.kind
+        else {
+            panic!("a `:autocmd ... call` handler is Ex source");
+        };
+        executor
+            .execute_autocmd_command(&editor, action, source)
+            .unwrap();
+    }
+    editor.editor_mut().restore_option_set(saved);
+    let events = global_value(&executor, "events");
+    let Some(ox_types::Typval::List(events)) = events else {
+        panic!("g:events is a list");
+    };
+    let items: Vec<String> = events
+        .borrow()
+        .items
+        .iter()
+        .map(|item| match item {
+            ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(items, vec!["nowrite".to_owned()]);
+}
+
+/// `:set` fires `OptionSet` after the write, with `v:option_new` published for
+/// the handler (`apply_optionset_autocmd`, option.c:2154). The event waits for
+/// startup in upstream, so the fixture marks startup finished.
+#[test]
+fn set_fires_optionset_with_the_new_value() {
+    let (editor, mut executor) = setup();
+    editor.editor_mut().set_v_vim_did_enter();
+    executor
+        .execute_line(
+            &editor,
+            "autocmd OptionSet buftype let g:seen = v:option_new .. '|' .. v:option_command",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "set buftype=nowrite")
+        .unwrap();
+    assert_eq!(
+        global_text(&executor, "seen").as_deref(),
+        Some("nowrite|set")
+    );
+    // A different option never matches the pattern.
+    executor.execute_line(&editor, "set tabstop=3").unwrap();
+    assert_eq!(
+        global_text(&executor, "seen").as_deref(),
+        Some("nowrite|set")
+    );
+}
+
+/// `g:['key'] = v` writes the scope dictionary itself (`get_lval` on a bare
+/// scope prefix with subscripts). The reference reports `42` here;
+/// `dict_notifications_spec.lua:38` writes its watchers exactly this way.
+#[test]
+fn a_scope_dict_subscript_assignment_reaches_the_scope() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"probe\"] = 42")
+        .unwrap_or_else(|error| panic!("scope-dict assignment: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "probe"),
+        Some(ox_types::Typval::Number(42))
+    );
+    // The value must also reach the editor's own `g:` map, which is what an
+    // RPC client reads (`nvim_get_var`), not only the executor's scope mirror.
+    assert_eq!(
+        editor
+            .editor()
+            .gvars()
+            .get(&ox_types::OxStr::from("probe"))
+            .cloned(),
+        Some(ox_types::Object::Integer(42))
+    );
+}
+
+/// `unlet g:['k']` removes the scope variable itself, like the assignment form
+/// writes it. Oracle: after `let g:["probe"] = 42` and
+/// `unlet g:["probe"]`, `exists("g:probe")` is 0.
+#[test]
+fn a_scope_dict_subscript_unlet_removes_the_variable() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"probe\"] = 42")
+        .unwrap();
+    executor.execute_line(&editor, "unlet g:[\"probe\"]").unwrap();
+    assert_eq!(
+        global_value(&executor, "probe"),
+        None,
+        "the variable is gone from the scope"
+    );
+}
+
+/// A1: `unlet g:['missing']` raises E716 naming the key. The scope-dict form
+/// reaches the same removal as `unlet g:missing`. Oracle:
+/// `E716: Key not present in Dictionary: "nope"`.
+#[test]
+fn a_scope_dict_unlet_of_a_missing_key_raises_e716() {
+    let (editor, mut executor) = setup();
+    let error = executor
+        .execute_line(&editor, "unlet g:[\"nope\"]")
+        .expect_err("a missing key is an error");
+    let text = format!("{error:?}");
+    assert!(text.contains("E716"), "E716 for a missing key: {text}");
+    assert!(text.contains("nope"), "the error names the key: {text}");
+}
+
+/// A1b: a missing key on a plain dictionary subscript quotes the key too.
+/// Oracle: `unlet g:d.nope` answers
+/// `E716: Key not present in Dictionary: "nope"`.
+#[test]
+fn a_dict_subscript_unlet_quotes_the_missing_key() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "let g:d = {}").unwrap();
+    let error = executor
+        .execute_line(&editor, "unlet g:d.nope")
+        .expect_err("a missing key is an error");
+    let text = format!("{error:?}");
+    assert!(text.contains("E716"), "E716 for a missing key: {text}");
+    assert!(
+        text.contains("\\\"nope\\\""),
+        "the key is quoted: {text}"
+    );
+}
+
+/// A2: the bang form is silent. Oracle: `unlet! g:['nope']` reports nothing.
+#[test]
+fn a_scope_dict_unlet_bang_ignores_a_missing_key() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "unlet! g:[\"nope\"]")
+        .unwrap_or_else(|error| panic!("bang form is silent: {error:?}"));
+}
+
+/// A4: a bare `:doautocmd` is a silent no-op, not an error. Oracle: the
+/// command returns without a message or exception.
+#[test]
+fn doautocmd_without_an_event_is_a_silent_noop() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "doautocmd")
+        .unwrap_or_else(|error| panic!("bare doautocmd is silent: {error:?}"));
+}
+
+/// A5: `<nomodeline>` with no event after it is also a silent no-op, because
+/// the stripping happens before the event scan (`check_nomodeline`).
+#[test]
+fn doautocmd_with_only_nomodeline_is_a_silent_noop() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "doautocmd <nomodeline>")
+        .unwrap_or_else(|error| panic!("no event after the tag: {error:?}"));
+}
+
+/// A9: the empty key is a legal dictionary key. `let g:[''] = 1` stores it and
+/// `g:['']` reads it back; a boundary on the key, not on the scope.
+#[test]
+fn a_scope_dict_empty_key_round_trips() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:[\"\"] = 7")
+        .unwrap_or_else(|error| panic!("empty key assignment: {error:?}"));
+    executor
+        .execute_line(&editor, "let g:readback = g:[\"\"]")
+        .unwrap_or_else(|error| panic!("empty key read: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "readback"),
+        Some(ox_types::Typval::Number(7))
+    );
+}
+
+/// `:doautocmd` applies one event's registrations to the current buffer
+/// (`do_doautocmd`, autocmd.c:1141). The covered grammar is a named group, a
+/// plain event, an explicit file name, and the two argument errors; a run that
+/// matches nothing is silent, because `ex_doautocmd` passes `do_msg = false`
+/// (`ex_docmd.c:4527`). Modeline execution is out of scope: this port does not
+/// run modelines at all, so `<nomodeline>` is only accepted and dropped.
+#[test]
+fn doautocmd_applies_one_event_and_rejects_bad_arguments() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "let g:hits = 0 | let g:named = 0")
+        .unwrap();
+    executor.execute_line(&editor, "augroup Probe").unwrap();
+    executor.execute_line(&editor, "autocmd!").unwrap();
+    executor.execute_line(&editor, "augroup END").unwrap();
+    executor
+        .execute_line(&editor, "autocmd Probe BufEnter *.txt let g:hits += 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd Probe User Hit let g:named += 1")
+        .unwrap();
+
+    // An explicit file name decides whether the pattern matches.
+    executor
+        .execute_line(&editor, "doautocmd Probe BufEnter notes.txt")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "the explicit name matched the pattern"
+    );
+    executor
+        .execute_line(&editor, "doautocmd Probe BufEnter other.md")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "a name the pattern rejects fires nothing"
+    );
+
+    // `<nomodeline>` is stripped only at the start of the whole argument
+    // (`check_nomodeline`, autocmd.c:1244), so it cannot follow a group name.
+    executor
+        .execute_line(&editor, "doautocmd <nomodeline> User Hit")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "named"),
+        Some(ox_types::Typval::Number(1)),
+        "a prefixed <nomodeline> still fires the event"
+    );
+
+    // A named group restricts the match: the same event fires nothing in an
+    // empty group, silently.
+    executor.execute_line(&editor, "augroup Other").unwrap();
+    executor.execute_line(&editor, "autocmd!").unwrap();
+    executor.execute_line(&editor, "augroup END").unwrap();
+    executor
+        .execute_line(&editor, "doautocmd Other User Hit")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "named"),
+        Some(ox_types::Typval::Number(1)),
+        "another group has no definition for the event"
+    );
+
+    // `*` is E217.
+    let error = executor
+        .execute_line(&editor, "doautocmd *")
+        .expect_err("`*` is rejected");
+    assert!(
+        format!("{error:?}").contains("E217"),
+        "E217 for the wildcard: {error:?}"
+    );
+    // An unknown event name names the group only when one was given
+    // (`arg_event_skip`, autocmd.c:2467).
+    let error = executor
+        .execute_line(&editor, "doautocmd BadEvent")
+        .expect_err("an unknown name fails before firing");
+    assert!(
+        format!("{error:?}").contains("No such group or event"),
+        "combined form without a group: {error:?}"
+    );
+    let error = executor
+        .execute_line(&editor, "doautocmd Probe BadEvent")
+        .expect_err("an unknown name after a group fails too");
+    assert!(
+        format!("{error:?}").contains("No such event"),
+        "group form names only the event: {error:?}"
+    );
+}
+
+/// A legacy `:autocmd` body keeps the `s:` scope of the script that defined
+/// it (`autocmd.c` stores `sc_sid` on the entry). Without that, a body defined
+/// in `runtime/ftplugin.vim` calls `s:LoadFTPlugin()` under whichever script is
+/// running when the event fires and raises E117.
+#[test]
+fn an_autocmd_body_keeps_its_defining_script_scope() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert(
+        "sid-def.vim",
+        "let g:hits = 0\nfunc! s:Bump()\n  let g:hits += 1\nendfunc\nau FileType * call s:Bump()\n",
+    );
+    executor
+        .scripts()
+        .io()
+        .insert("sid-fire.vim", "set filetype=x\n");
+    executor
+        .execute_line(&editor, "source sid-def.vim")
+        .unwrap_or_else(|error| panic!("source the definition: {error:?}"));
+    executor
+        .execute_line(&editor, "source sid-fire.vim")
+        .unwrap_or_else(|error| panic!("source the trigger: {error:?}"));
+    assert_eq!(
+        global_value(&executor, "hits"),
+        Some(ox_types::Typval::Number(1)),
+        "the body ran under its defining script"
+    );
+}
+
+/// `<q-bang>` is the quoted bang: `"!"` when the command carried one, `""`
+/// otherwise (`uc_check_code` `ct_BANG` with `quote`, `usercmd.c:1563`).
+/// `pack/dist/opt/cfilter/plugin/cfilter.vim:61` builds a `:call` expression
+/// from it, so a literal tag there is E15, not a value.
+#[test]
+fn q_bang_expands_to_the_quoted_bang() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "command! -bang T69Qbang let g:qbang = <q-bang>")
+        .unwrap();
+    executor.execute_line(&editor, "T69Qbang!").unwrap();
+    assert_eq!(global_text(&executor, "qbang").as_deref(), Some("!"));
+    executor.execute_line(&editor, "T69Qbang").unwrap();
+    assert_eq!(global_text(&executor, "qbang").as_deref(), Some(""));
+}
+
 /// The trailing-space half of the same rule. `:map` is `EX_TRLBAR` *with*
 /// `EX_NOTRLCOM`, so `del_trailing_spaces` never reaches it and the spaces stay
 /// in the right-hand side — the rhs below still executes with three spaces
@@ -7028,11 +8356,7 @@ fn maparg_key(
         other => panic!("maparg did not answer a dictionary: {other:?}"),
     };
     let entries = dict.borrow();
-    entries
-        .entries
-        .iter()
-        .find(|entry| entry.key.as_bytes() == key.as_bytes())
-        .map(|entry| entry.value.clone())
+    entries.get(key.as_bytes()).cloned()
 }
 
 /// `maparg()`'s compatible `rhs` is `m_orig_str`, the right-hand side *as
@@ -8626,6 +9950,75 @@ impl crate::LuaExec for CallbackRecorder {
         Ok(Object::Nil)
     }
 }
+/// `:runtime` sources a `.lua` file through the Lua host and a `.vim` file
+/// through the Vimscript sourcer (`source_callback`, runtime.c:975-990).
+/// Sourcing a Lua plugin as Vimscript parses its first statement as an Ex
+/// command, which is how `plugin/difftool.lua` produced
+/// `E488: Trailing characters: ~= nil then`.
+#[test]
+fn runtime_sources_a_lua_file_through_the_lua_host() {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    struct RecordingLua(Rc<RefCell<Vec<PathBuf>>>);
+    impl crate::LuaExec for RecordingLua {
+        fn execute_chunk(
+            &self,
+            _code: &str,
+            _args: Vec<Object>,
+        ) -> Result<Object, crate::LuaExecError> {
+            Ok(Object::Nil)
+        }
+        fn execute_file(&self, path: &Path) -> Result<(), crate::LuaExecError> {
+            self.0.borrow_mut().push(path.to_path_buf());
+            Ok(())
+        }
+        fn invoke_callback(&self, _: usize, _: Vec<Object>) -> Result<Object, crate::LuaExecError> {
+            Ok(Object::Nil)
+        }
+    }
+
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let io = MemoryFileIO::new();
+    io.insert("/rt/plugin/probe.lua", "if vim.g.x ~= nil then return end\n");
+    io.insert("/rt/plugin/probe.vim", "let g:vim_plugin = 'ran'\n");
+    let mut executor = ExExecutor::with_io(io);
+    executor.set_lua_exec(Rc::new(RecordingLua(Rc::clone(&seen))));
+    let (editor, _) = {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (TestEditorAccess::new(editor), ())
+    };
+    executor
+        .execute_line(&editor, "set runtimepath=/rt")
+        .expect("runtimepath");
+    executor
+        .execute_line(&editor, "runtime plugin/probe.lua")
+        .expect("a Lua plugin must source through the Lua host");
+    assert_eq!(
+        seen.borrow().as_slice(),
+        [PathBuf::from("/rt/plugin/probe.lua")],
+        "the .lua file goes through the Lua host"
+    );
+    executor
+        .execute_line(&editor, "runtime plugin/probe.vim")
+        .expect("a Vimscript plugin still sources");
+    assert_eq!(
+        global_text(&executor, "vim_plugin").as_deref(),
+        Some("ran"),
+        "the .vim file still runs as Vimscript"
+    );
+    assert_eq!(
+        seen.borrow().len(),
+        1,
+        "the Vimscript file must not reach the Lua host"
+    );
+}
+
 /// Re-enters an Ex executor while a Lua callback is active. The host itself
 /// is an owned `Rc`, so callback dispatch does not borrow a runtime cell across
 /// the user-code call.
@@ -9366,10 +10759,7 @@ fn depth_zero_script_error_displays_and_aborts() {
             "call NoSuchFunc123()\nlet g:after = 1\n",
         )
         .unwrap_err();
-    assert!(
-        error.to_string().contains("NoSuchFunc123"),
-        "got {error}"
-    );
+    assert!(error.to_string().contains("NoSuchFunc123"), "got {error}");
     assert!(!global_flag(&executor, "after"));
     assert!(executor.did_emsg());
 }
@@ -10168,4 +11558,2633 @@ fn plan_abort_rules_follow_try_depth_inheritance() {
             .is_err(),
         "explicit :throw must still abort later plan actions",
     );
+}
+
+// ---------------------------------------------------------------------------
+// :join / :change / :move / :uniq / :badd / :checktime / :tabfirst /
+// :tablast / :helpclose
+//
+// Citations:
+// - `src/nvim/ex_docmd.c` `ex_join` (6709-6725), `ex_copymove` (6668-6707),
+//   `ex_tabnext` (5755-5795), `ex_edit`/`do_ecmd` (6023-6076), `get_address`
+//   (3402-3713), `set_cmd_count` (1373-1393)
+// - `src/nvim/ops.c` `do_join` (1900-2010), `skip_comment`/`get_leader_len`
+// - `src/nvim/ex_cmds.c` `ex_change` (3148-3181), `ex_append` (3017-3146),
+//   `do_move` (896-994), `ex_uniq` (697-880)
+// - `src/nvim/ex_cmds2.c` `ex_checktime` (787-800)
+// - `src/nvim/fileio.c` `buf_check_timestamp` (2997+), `check_timestamps`
+// - `src/nvim/help.c` `ex_helpclose` (238-244)
+// - `src/nvim/buffer.c` `buflist_new` (existing name returns the entry)
+// - `src/nvim/message.c` `msgmore` (1652+: "N fewer lines")
+// - `src/nvim/ex_cmds.lua` command flags (BANG/RANGE/COUNT/EXTRA/TRLBAR)
+// - `runtime/doc/change.txt` `:uniq` semantics (`[!]` keeps the first line
+//   of each duplicate run and drops lines that never repeat)
+// - `test/old/testdir/test_join.vim`, `test_uniq.vim`, `test_buffer.vim`
+//   (`Test_badd_options`), `test_tabpage.vim`
+// ---------------------------------------------------------------------------
+
+fn cursor_line(editor: &TestEditorAccess) -> usize {
+    let window = editor.editor().current_window().unwrap();
+    editor.editor().window(window).unwrap().cursor.lnum
+}
+
+/// `:join` joins the addressed lines with one space by default.
+/// Upstream: `ex_join` → `do_join(..., insert_space=true, ...)`; the cursor
+/// lands on the joined line (`beginline(BL_WHITE | BL_FIX)`).
+#[test]
+fn join_joins_range_with_single_space() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1,2join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a b", "c"]);
+    assert_eq!(cursor_line(&editor), 1);
+}
+
+/// `:join!` concatenates without inserting spaces.
+/// Upstream: `do_join(..., insert_space=false, ...)` (`!eap->forceit`).
+#[test]
+fn join_bang_concatenates_without_space() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1,2join!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["ab", "c"]);
+}
+
+/// `:join` with no range joins the cursor line with the next one.
+/// Upstream: `ex_join` sets `line2 = line1 + 1` when both name the cursor
+/// line and only one address was given.
+#[test]
+fn join_without_range_joins_cursor_line_with_next() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "2").unwrap();
+    assert_eq!(cursor_line(&editor), 2);
+    executor.execute_line(&editor, "join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b c"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// A post-command count extends the joined range (`set_cmd_count`).
+#[test]
+fn join_count_extends_range() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "1join 2").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a b", "c"]);
+}
+
+/// `'joinspaces'` inserts two spaces after `.`, `?` and `!`.
+/// Upstream: `do_join`'s `p_js` branch.
+#[test]
+fn join_spaces_adds_second_space_after_period() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"end.".to_vec(), b"next".to_vec()]);
+    executor.execute_line(&editor, "set joinspaces").unwrap();
+    executor.execute_line(&editor, "join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["end.  next"]);
+}
+
+/// `:2,2join` changes nothing (`addr_count >= 2` returns early), but the
+/// cursor still moves onto `line1` first (`ex_join` sets it before the
+/// early return).
+#[test]
+fn join_repeated_single_line_address_is_noop() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "2,2join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// Joining the last line alone only beeps upstream; here it changes nothing.
+#[test]
+fn join_last_line_alone_is_noop() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "3join").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b", "c"]);
+}
+
+/// `:change` deletes the range and inserts the following lines in its place;
+/// the cursor lands on the last inserted line.
+/// Upstream: `ex_change` (delete) then `ex_append` with `line2 = line1`.
+#[test]
+fn change_replaces_range_with_inserted_text() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor
+        .execute_line(&editor, "2,3change\nX\nY\n.\n")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "Y", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 3);
+}
+
+/// `:change` with an immediate `.` deletes the range and inserts nothing;
+/// the cursor lands on the line the deletion left behind.
+/// Upstream: the `get_append_line` loop breaks at once, leaving
+/// `w_cursor.lnum = line1 - 1`.
+#[test]
+fn change_bare_dot_deletes_only() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3change\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 1);
+}
+
+/// A count extends the changed range from its end (`set_cmd_count`).
+#[test]
+fn change_count_extends_deleted_range() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor
+        .execute_line(&editor, "2change 2\nX\n.\n")
+        .unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "d", "e"]);
+}
+
+/// `:change!` accepts input the same way (`!` only toggles autoindent, which
+/// this port does not model for any append-family command).
+#[test]
+fn change_bang_accepts_input() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2change!\nX\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "X", "c", "d", "e"]);
+}
+
+/// `:%change` replaces the whole buffer.
+#[test]
+fn change_whole_buffer_replaces_all() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    executor.execute_line(&editor, "%change\nX\n.\n").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["X"]);
+}
+
+/// `:move` relocates lines below the destination, which is evaluated before
+/// the move (`ex_copymove`); `:0` names the gap before the first line.
+#[test]
+fn move_lines_below_destination() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move 0").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["b", "c", "a", "d", "e"]);
+    assert_eq!(cursor_line(&editor), 2);
+}
+
+/// A destination past the range shifts down by the moved count (`do_move`
+/// copies before deleting, netting an insert after `dest - count`).
+#[test]
+fn move_after_later_line() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move 4").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+    assert_eq!(cursor_line(&editor), 4);
+}
+
+/// Destination address arithmetic: `$` with offsets (`get_address`).
+#[test]
+fn move_destination_address_arithmetic() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move $-1").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+}
+
+/// A `/pattern/` destination searches from the cursor line; trailing
+/// `p`/`l`/`#` flags are skipped (`get_flags`) and the rest ignored.
+#[test]
+fn move_search_destination() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    executor.execute_line(&editor, "2,3move /d/").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "d", "b", "c", "e"]);
+}
+
+/// Moving a range into itself is `E134` (`do_move`).
+#[test]
+fn move_into_itself_is_e134() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a".to_vec(),
+        b"b".to_vec(),
+        b"c".to_vec(),
+        b"d".to_vec(),
+        b"e".to_vec(),
+    ]);
+    let result = executor.execute_line(&editor, "2,3move 2");
+    assert_vim_error(result, "E134");
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["a", "b", "c", "d", "e"],
+        "a failed move changes nothing",
+    );
+}
+
+/// A missing destination parses to `MAXLNUM`, which `ex_copymove` reports as
+/// `E16` (`e_invrange`).
+#[test]
+fn move_missing_destination_is_e16() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    let result = executor.execute_line(&editor, "1,2move");
+    assert_vim_error(result, "E16");
+}
+
+/// `:move` takes no bang: the parser rejects it with `E477` before the
+/// command runs. Oracle: `1,2move!` → `E477: No ! allowed`.
+#[test]
+fn move_bang_is_e477() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec(), b"b".to_vec()]);
+    let result = executor.execute_line(&editor, "1,2move!");
+    assert_vim_error(result, "E477");
+}
+
+/// `%uniq` drops adjacent duplicates, keeping the first of each run.
+/// Upstream: `ex_uniq` with neither `u` nor `!` (`test_uniq.vim`
+/// "Alphabetical uniq #1").
+#[test]
+fn uniq_removes_adjacent_duplicates() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["aa", "cc", "bb", "aa", "yyy", "zz"]
+    );
+}
+
+/// `%uniq!` keeps the first line of each duplicate run and deletes lines
+/// that never repeat (`keep_only_not_unique`; `!` wins over `u`).
+/// Upstream: `test_uniq.vim` "uniq not uniqued #1" → `["cc", "yyy"]`.
+#[test]
+fn uniq_bang_keeps_first_of_run_and_drops_singletons() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["cc", "yyy"]);
+}
+
+/// `%uniq u` keeps only lines that do not repeat.
+/// Upstream: `test_uniq.vim` "uniq only unique #1" → `["aa", "bb", "aa",
+/// "zz"]`.
+#[test]
+fn uniq_u_keeps_only_non_repeating_lines() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"aa".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"cc".to_vec(),
+        b"bb".to_vec(),
+        b"aa".to_vec(),
+        b"yyy".to_vec(),
+        b"yyy".to_vec(),
+        b"zz".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq u").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["aa", "bb", "aa", "zz"]);
+}
+
+/// `:uniq` honors an explicit range, and a single-line range returns before
+/// argument parsing ("Uniq one line is really quick!").
+#[test]
+fn uniq_range_and_single_line_noop() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"1".to_vec(),
+        b"2".to_vec(),
+        b"3".to_vec(),
+        b"4".to_vec(),
+        b"5".to_vec(),
+        b"6".to_vec(),
+        b"7".to_vec(),
+        b"8".to_vec(),
+        b"9".to_vec(),
+    ]);
+    executor.execute_line(&editor, "3,5uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    );
+    executor.execute_line(&editor, "4uniq").unwrap();
+    assert_eq!(
+        buffer_text(&editor),
+        vec!["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+    );
+}
+
+/// Deletions longer than `'report'` announce `N fewer lines` (`msgmore`).
+/// Upstream: `test_uniq.vim` `Test_uniq_cmd_report` ("6 fewer lines").
+#[test]
+fn uniq_reports_fewer_lines_message() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"1".to_vec(),
+        b"1".to_vec(),
+        b"1".to_vec(),
+        b"2".to_vec(),
+        b"2".to_vec(),
+        b"2".to_vec(),
+        b"3".to_vec(),
+        b"3".to_vec(),
+        b"3".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["1", "2", "3"]);
+    let reports: Vec<String> = editor
+        .editor()
+        .messages()
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        reports.iter().any(|text| text == "6 fewer lines"),
+        "expected a '6 fewer lines' report, got: {reports:?}",
+    );
+}
+
+/// A deletion marks the buffer modified (`test_uniq.vim` modified check,
+/// `Test_uniq_undo`).
+#[test]
+fn uniq_with_deletions_sets_modified() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .buffer_mut(buffer)
+        .unwrap()
+        .mark_saved();
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["a", "b"]);
+    assert!(editor
+        .editor()
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED));
+}
+
+/// An unchanged buffer stays unmodified (`test_uniq.vim` modified check).
+#[test]
+fn uniq_without_deletions_keeps_unmodified() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "%uniq").unwrap();
+    assert!(!editor
+        .editor()
+        .buffer(buffer)
+        .unwrap()
+        .flags
+        .contains(crate::BufferFlags::MODIFIED));
+}
+
+/// Unknown uniq flags are `E475` (`semsg(e_invarg2, p)`).
+/// Upstream: `test_uniq.vim` `uniq no` → `E475:`.
+#[test]
+fn uniq_invalid_flag_is_e475() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "uniq no");
+    assert_vim_error(result, "E475");
+}
+
+/// An unterminated uniq pattern is `E654` (`skip_regexp_err`).
+/// Upstream: `test_uniq.vim` `uniq #pat%` → `E654:`.
+#[test]
+fn uniq_unterminated_pattern_is_e654() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "uniq #pat%");
+    assert_vim_error(result, "E654");
+}
+
+/// A range past the end of the buffer is `E16` (`invalid_range`).
+/// Upstream: `test_uniq.vim` `1,999uniq` → `E16:`.
+#[test]
+fn uniq_out_of_range_is_e16() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"line1".to_vec(), b"line2".to_vec()]);
+    let result = executor.execute_line(&editor, "1,999uniq");
+    assert_vim_error(result, "E16");
+}
+
+/// `:badd` adds an unloaded but listed buffer (`buflist_new` with
+/// `BLN_LISTED` never reads the file).
+#[test]
+fn badd_adds_unloaded_listed_buffer() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    let found = editor
+        .editor()
+        .buffers()
+        .into_iter()
+        .find(|handle| {
+            editor
+                .editor()
+                .buffer(*handle)
+                .is_ok_and(|state| state.name().as_bytes() == b"newfile.txt")
+        })
+        .expect("badd must add the named buffer");
+    let guard = editor.editor();
+    let state = guard.buffer(found).unwrap();
+    assert!(state.flags.contains(crate::BufferFlags::LISTED));
+    assert!(!state.residency.is_loaded());
+}
+
+/// `:badd` with no argument is `E471` (`NEEDARG`).
+#[test]
+fn badd_empty_argument_is_e471() {
+    let (editor, mut executor) = setup();
+    let result = executor.execute_line(&editor, "badd");
+    assert_vim_error(result, "E471");
+}
+
+/// A name that is already listed is a silent no-op (`buflist_new` returns
+/// the existing entry).
+#[test]
+fn badd_listed_name_is_noop() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    let before = editor.editor().buffers().len();
+    executor.execute_line(&editor, "badd newfile.txt").unwrap();
+    assert_eq!(editor.editor().buffers().len(), before);
+}
+
+/// `:checktime` is silent when no loaded buffer changed on disk.
+/// Upstream: `ex_checktime` → `check_timestamps(false)` with nothing to do.
+#[test]
+fn checktime_quiet_when_nothing_changed() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "checktime").unwrap();
+    assert_eq!(editor.editor().messages().len(), seen);
+}
+
+/// `:checktime` warns when the file changed under an unmodified buffer.
+/// Upstream: `buf_check_timestamp` → `W11` (no `FileChangedShell` handlers
+/// here to consume the warning first). `noautoread` forces the warning path:
+/// this port defaults `'autoread'` on (upstream defaults it off), and under
+/// `'autoread'` an unmodified buffer reloads silently instead.
+#[test]
+fn checktime_warns_when_disk_changed() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    executor.execute_line(&editor, "set noautoread").unwrap();
+    executor.scripts().io().insert("current.txt", "changed\n");
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "checktime").unwrap();
+    let fresh: Vec<String> = editor.editor().messages()[seen..]
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        fresh.iter().any(|text| text.contains("W11")),
+        "expected a W11 warning, got: {fresh:?}",
+    );
+}
+
+/// `:checktime` reloads a changed, unmodified buffer under `'autoread'`.
+/// Upstream: `buf_check_timestamp` with `RELOAD_NORMAL`.
+#[test]
+fn checktime_reloads_changed_buffer_under_autoread() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    executor.execute_line(&editor, "set autoread").unwrap();
+    executor.scripts().io().insert("current.txt", "changed\n");
+    executor.execute_line(&editor, "checktime").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["changed"]);
+}
+
+/// `:tabfirst` (and `:tabrewind`) enters the first tabpage.
+/// Upstream: `ex_tabnext` `CMD_tabfirst`/`CMD_tabrewind` → `goto_tabpage(1)`.
+#[test]
+fn tabfirst_goes_to_first_tabpage() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    assert_eq!(current_tab_index(&editor), 3);
+    executor.execute_line(&editor, "tabfirst").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabrewind").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+}
+
+/// `:tablast` enters the last tabpage.
+/// Upstream: `ex_tabnext` `CMD_tablast` → `goto_tabpage(9999)`.
+#[test]
+fn tablast_goes_to_last_tabpage() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabfirst").unwrap();
+    assert_eq!(current_tab_index(&editor), 1);
+    executor.execute_line(&editor, "tablast").unwrap();
+    assert_eq!(current_tab_index(&editor), 3);
+}
+
+/// `:helpclose` closes one help window in the current tabpage.
+/// Upstream: `ex_helpclose` closes the first `bt_help` window.
+#[test]
+fn helpclose_closes_open_help_window() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let help = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(
+            help,
+            "buftype",
+            crate::options::OptionValue::String("help".to_owned()),
+        )
+        .unwrap();
+    executor.execute_line(&editor, "split").unwrap();
+    assert_eq!(editor.editor().windows().len(), 2);
+    executor
+        .execute_line(&editor, &format!("buffer {}", i64::from(help)))
+        .unwrap();
+    executor.execute_line(&editor, "helpclose").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+}
+
+/// `:helpclose` with no help window open is a silent no-op.
+#[test]
+fn helpclose_without_help_window_is_noop() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "helpclose").unwrap();
+    assert_eq!(editor.editor().windows().len(), 1);
+    assert_eq!(editor.editor().messages().len(), seen);
+}
+
+/// Reads a script-global string list for `:cdo` visit assertions.
+fn global_strings(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<String> {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::List(items)) => items
+            .borrow()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ox_types::Typval::String(text) => {
+                    Some(text.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect(),
+        other => panic!("expected string list global {name}, got {other:?}"),
+    }
+}
+
+/// `:cdo` visits each valid entry in ordinal order (`ex_listdo`,
+/// ex_cmds2.c:556-690): unparseable lines are skipped, not counted, and an
+/// explicit range selects valid-entry ordinals (test_cdo.vim `XdoTests`).
+#[test]
+fn cdo_visits_each_valid_entry_in_range() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor.scripts().io().insert("qf3.txt", "three\n");
+    executor
+        .execute_line(
+            &editor,
+            "cgetexpr ['non-error 1', 'qf1.txt:1:1:one', 'non-error 2', 'qf2.txt:1:1:two', 'qf3.txt:1:1:three']",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(
+        global_strings(&executor, "seen"),
+        ["qf1.txt", "qf2.txt", "qf3.txt"]
+    );
+
+    executor.execute_line(&editor, "unlet g:seen").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "2,2cdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "seen"), ["qf2.txt"]);
+}
+
+/// `:cfdo` visits the first valid entry of each file once (`FORWARD_FILE`),
+/// and `:cdo` on an empty list is a silent no-op while an explicit
+/// out-of-range address is `E16` (ex_docmd.c `invalid_range`,
+/// `ADDR_QUICKFIX_VALID`).
+#[test]
+fn cfdo_visits_each_file_once_and_empty_cdo_stays_silent() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(
+            &editor,
+            "cgetexpr ['qf1.txt:1:1:one', 'qf1.txt:1:1:again', 'qf2.txt:1:1:two']",
+        )
+        .unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cfdo let g:seen = get(g:, 'seen', []) + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "seen"), ["qf1.txt", "qf2.txt"]);
+
+    executor.execute_line(&editor, "call setqflist([])").unwrap();
+    executor.execute_line(&editor, "let g:empty = []").unwrap();
+    executor
+        .execute_line(
+            &editor,
+            "cdo let g:empty = g:empty + [expand('%')]",
+        )
+        .unwrap();
+    assert_eq!(global_strings(&executor, "empty"), Vec::<String>::new());
+    assert_vim_error(
+        executor.execute_line(&editor, "2cdo let g:empty = [expand('%')]"),
+        "E16",
+    );
+}
+
+/// `:cdo` leaving a modified buffer without `!` fails with `E37`
+/// (`can_abandon` via `buflist_getfile`; test_cdo.vim's unsaved-buffer
+/// check), while `!` overrides the guard and runs the nested command.
+#[test]
+fn cdo_abandoning_modified_buffer_without_bang_is_e37() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(&editor, "cgetexpr ['qf1.txt:1:1:one', 'qf2.txt:1:1:two']")
+        .unwrap();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "setlocal modified").unwrap();
+    assert_vim_error(
+        executor.execute_line(&editor, "2,2cdo call add([], 1)"),
+        "E37",
+    );
+    executor
+        .execute_line(&editor, "2,2cdo! let g:forced = expand('%')")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "forced"),
+        Some(ox_types::Typval::String("qf2.txt".into()))
+    );
+}
+
+/// `:silent!` records the suppressed code in `v:errmsg` without displaying
+/// it (message.c:826-828: "also when using `:silent! cmd`").
+#[test]
+fn silent_bang_records_errmsg_while_swallowing_the_error() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set nohidden").unwrap();
+    executor.scripts().io().insert("qf1.txt", "one\n");
+    executor.scripts().io().insert("qf2.txt", "two\n");
+    executor
+        .execute_line(&editor, "cgetexpr ['qf1.txt:1:1:one', 'qf2.txt:1:1:two']")
+        .unwrap();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "setlocal modified").unwrap();
+    let messages = editor.editor().messages().len();
+    executor
+        .execute_line(&editor, "silent! 2,2cdo call add([], 1)")
+        .unwrap();
+    assert_eq!(
+        editor.editor().messages().len(),
+        messages,
+        ":silent! must not display the swallowed error"
+    );
+    match executor.evaluate_expression(&editor, "v:errmsg") {
+        Ok(ox_types::Typval::String(text)) => assert!(
+            text.to_string_lossy().starts_with("E37"),
+            "v:errmsg must name the swallowed error, got {text:?}"
+        ),
+        other => panic!("expected v:errmsg string, got {other:?}"),
+    }
+}
+
+/// `++once` / `++nested` are definition flags, not pattern text
+/// (`arg_autocmd_flag_get`, autocmd.c:778-830): the pattern stores cleanly,
+/// the flags store on the options, and `++once` consumes itself on first
+/// fire while a repeated flag is `E983`.
+#[test]
+fn autocmd_once_flag_fires_once_and_stores_clean_pattern() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py ++once let g:hit = 1")
+        .unwrap();
+    let definitions = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].pattern, "*.py");
+    assert!(definitions[0].once);
+    assert!(!definitions[0].nested);
+    assert_eq!(
+        definitions[0].kind,
+        AutocmdKind::ExString { source: "let g:hit = 1".to_owned(), script: None }
+    );
+
+    executor.scripts().io().insert("once.py", "x");
+    executor.execute_line(&editor, "edit once.py").unwrap();
+    assert_eq!(
+        global_value(&executor, "hit"),
+        Some(ox_types::Typval::Number(1))
+    );
+    assert!(
+        editor.editor().autocmds().definitions().is_empty(),
+        "++once must be consumed by its first fire"
+    );
+    executor.execute_line(&editor, "unlet g:hit").unwrap();
+    executor.execute_line(&editor, "edit once.py").unwrap();
+    assert_eq!(global_value(&executor, "hit"), None);
+}
+
+/// `++nested` and the deprecated bare `nested` both set the nested flag, a
+/// repeated flag is `E983`, and flag-like command text stays a command.
+#[test]
+fn autocmd_nested_flag_parses_and_duplicates_are_e983() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py ++nested let g:n = 1")
+        .unwrap();
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.py nested let g:m = 1")
+        .unwrap();
+    let definitions = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    assert_eq!(definitions.len(), 2);
+    for definition in &definitions {
+        assert_eq!(definition.pattern, "*.py");
+        assert!(definition.nested, "nested flag must store");
+    }
+    assert_vim_error(
+        executor.execute_line(&editor, "autocmd BufEnter *.py ++once ++once let g:d = 1"),
+        "E983",
+    );
+    executor
+        .execute_line(&editor, "autocmd BufEnter *.x nested_call()")
+        .unwrap();
+    let flagged = editor.editor().autocmds().query(&AutocmdFilter {
+        events: Some(&[Event::BufEnter]),
+        ..AutocmdFilter::default()
+    });
+    let trailing = flagged
+        .iter()
+        .find(|definition| definition.pattern == "*.x")
+        .expect("flag-like body must still register");
+    assert!(!trailing.nested);
+    assert_eq!(
+        trailing.kind,
+        AutocmdKind::ExString {
+            source: "nested_call()".to_owned(),
+            script: None,
+        }
+    );
+}
+// ---------------------------------------------------------------------------
+// dictwatcheradd(): the `:let`/`:unlet` mutation routes fire registered
+// Vimscript watchers. Upstream: `tv_dict_watcher_notify` (`eval/typval.c:2054`)
+// passes the dict, the key, and a change dict carrying `new` and/or `old`
+// (`old` omitted for a newly added key, `new` omitted for a removal).
+// ---------------------------------------------------------------------------
+
+/// Reads back a `g:` list recorded by a watcher handler.
+fn global_list(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<ox_types::Typval> {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::List(list)) => list.borrow().items.clone(),
+        other => panic!("expected a List in g:{name}, got {other:?}"),
+    }
+}
+
+/// Projects `[[key, has_new, has_old], ...]` rows recorded with `has_key()`.
+fn change_rows(values: &[ox_types::Typval]) -> Vec<(String, i64, i64)> {
+    values
+        .iter()
+        .map(|row| match row {
+            ox_types::Typval::List(list) => {
+                let items = &list.borrow().items;
+                let [
+                    ox_types::Typval::String(key),
+                    ox_types::Typval::Number(has_new),
+                    ox_types::Typval::Number(has_old),
+                ] = items.as_slice()
+                else {
+                    panic!("expected [key, has_new, has_old], got {items:?}");
+                };
+                (key.to_string_lossy().into_owned(), *has_new, *has_old)
+            }
+            other => panic!("expected a List row, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn dictwatcher_fires_on_let_add_and_change() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch.vim",
+            "function! WatchCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {}\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:d, '*', 'WatchCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    executor.execute_line(&editor, "let g:d.k = 2").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 1, 1),]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+#[test]
+fn dictwatcher_fires_on_unlet_with_old_only() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_unlet.vim",
+            "function! WatchUnletCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:e = {'k': 1}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:e, '*', 'WatchUnletCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "unlet g:e.k").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("k".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `remove()` on a watched dictionary notifies with `old` and no `new`,
+/// the same change shape as `unlet` (`tv_dict_watcher_notify`).
+#[test]
+fn dictwatcher_fires_on_remove_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_remove.vim",
+            "function! WatchRemoveCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'k': 1}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:d, '*', 'WatchRemoveCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call remove(g:d, 'k')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("k".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `extend()` notifies once per added or replaced key: a replaced key
+/// carries both `old` and `new`, a new key carries `new` only.
+#[test]
+fn dictwatcher_fires_on_extend_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_extend.vim",
+            "function! WatchExtendCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'k': 1}\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:d, '*', 'WatchExtendCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call extend(g:d, {'k': 2, 'n': 3})")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 1), ("n".to_owned(), 1, 0)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(2), ox_types::Typval::Number(3)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `filter()` notifies once per removed key with `old` and no `new`;
+/// kept keys notify nothing.
+#[test]
+fn dictwatcher_fires_on_filter_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_filter.vim",
+            "function! WatchFilterCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {'a': 1, 'b': 2}\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:d, '*', 'WatchFilterCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call filter(g:d, 'v:val > 1')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("a".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `remove()` on a scope namespace notifies the scope watcher with `old`
+/// and no `new`, and drops the variable itself: the snapshot would only
+/// drop it from a copy.
+#[test]
+fn dictwatcher_fires_on_scope_remove_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_remove.vim",
+            "function! WatchScopeRemoveCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:swatched = 1\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:, '*', 'WatchScopeRemoveCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call remove(g:, 'swatched')")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("swatched".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+    assert!(
+        executor
+            .evaluate_expression(&editor, "exists('g:swatched')")
+            .is_ok_and(|value| value == ox_types::Typval::Number(0)),
+        "remove(g:, 'swatched') must drop the variable"
+    );
+}
+/// `extend()` on a scope namespace notifies once per added or replaced
+/// key: a replaced key carries both `old` and `new`, a new key `new` only.
+#[test]
+fn dictwatcher_fires_on_scope_extend_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_extend.vim",
+            "function! WatchScopeExtendCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:exk = 1\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:, '*', 'WatchScopeExtendCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call extend(g:, {'exk': 2, 'exn': 3})")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("exk".to_owned(), 1, 1), ("exn".to_owned(), 1, 0)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(2), ox_types::Typval::Number(3)]
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+/// `filter()` on a scope namespace notifies once per removed key with `old`
+/// and no `new`; kept keys notify nothing.
+#[test]
+fn dictwatcher_fires_on_scope_filter_builtin() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_filter.vim",
+            "function! WatchScopeFilterCb(d, k, c)\n  call add(g:removed, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:removed_old, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:sfa = 1\nlet g:sfb = 2\nlet g:removed = []\nlet g:removed_old = []\ncall dictwatcheradd(g:, '*', 'WatchScopeFilterCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call filter(g:, \"v:key != 'sfa'\")")
+        .unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "removed")),
+        vec![("sfa".to_owned(), 0, 1)]
+    );
+    let olds = global_list(&executor, "removed_old");
+    assert!(
+        matches!(&olds[..], [ox_types::Typval::Number(1)]),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+/// A watcher callback that writes the same dictionary does not re-enter its
+/// own round: the nested mutation drains while the outer round still holds
+/// the watcher `busy`, and upstream skips busy watchers
+/// (`eval/typval.c:2090`). Exactly one fire; the nested write itself lands.
+#[test]
+fn dictwatcher_callback_write_does_not_reenter_busy_watcher() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_reenter.vim",
+            "function! WatchReenter(d, k, c)\n  call add(g:fires, a:k)\n  if g:armed\n    let g:armed = 0\n    let g:d.y = 1\n  endif\nendfunction\nlet g:d = {}\nlet g:fires = []\nlet g:armed = 1\ncall dictwatcheradd(g:d, '*', 'WatchReenter')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.x = 1").unwrap();
+    let fires = global_list(&executor, "fires");
+    assert!(
+        matches!(&fires[..], [ox_types::Typval::String(key)] if key.as_bytes() == b"x"),
+        "busy watcher must fire once, got: {fires:?}"
+    );
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            let value = dict.borrow().get(b"y").cloned();
+            assert!(
+                matches!(value, Some(ox_types::Typval::Number(1))),
+                "nested write must land, got: {value:?}"
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// A `g:`-namespace watcher fires when plain scope variables change:
+/// `let g:x = 1` notifies with `new` and no `old`, and a later `unlet g:x`
+/// notifies with `old` and no `new` — the same three-argument
+/// `(dict, key, {new, old})` round as a dict target
+/// (`tv_dict_watcher_notify`, `eval/typval.c:2054`).
+#[test]
+fn dictwatcher_fires_on_scope_variable_set() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope.vim",
+            "function! WatchScopeCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:news, get(a:c, 'new', 'MISSING'))\n  call add(g:olds, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:changes = []\nlet g:news = []\nlet g:olds = []\ncall dictwatcheradd(g:, '*', 'WatchScopeCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("x".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "unlet g:x").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("x".to_owned(), 1, 0), ("x".to_owned(), 0, 1)]
+    );
+    let news = global_list(&executor, "news");
+    assert!(
+        matches!(
+            &news[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::String(missing)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected news: {news:?}"
+    );
+    let olds = global_list(&executor, "olds");
+    assert!(
+        matches!(
+            &olds[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected olds: {olds:?}"
+    );
+}
+
+/// A scope-namespace watcher receives the same `g:` object the read path
+/// hands out: `a:dict isnot g:` inside the callback is false, because one
+/// stable dict mirrors the scope map for the session.
+#[test]
+fn dictwatcher_scope_callback_dict_is_the_scope_dict() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_identity.vim",
+            "function! Changed(d, k, c)\n  call add(g:log, a:d isnot g: ? 'identity-mismatch' : 'identity-ok')\nendfunction\nlet g:log = []\ncall dictwatcheradd(g:, 'watched', 'Changed')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:[\"watched\"] = \"test\"").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "log"),
+        vec!["identity-ok".to_owned()]
+    );
+}
+
+/// The `g:['k']` subscript spelling writes the scope variable itself (not a
+/// snapshot), so its watcher round matches the plain spelling: an add
+/// carries `new` only and the removal carries `old` only.
+#[test]
+fn dictwatcher_fires_on_scope_dict_subscript() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scope_sub.vim",
+            "function! WatchScopeSubCb(d, k, c)\n  call add(g:changes, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:changes = []\ncall dictwatcheradd(g:, '*', 'WatchScopeSubCb')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:['k'] = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "unlet g:['k']").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "changes")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 0, 1)]
+    );
+}
+
+fn recorded_strings(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<String> {
+    global_list(executor, name)
+        .iter()
+        .map(|value| match value {
+            ox_types::Typval::String(text) => text.to_string_lossy().into_owned(),
+            other => panic!("expected a String in g:{name}, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Reads a `g:` list of recorded keys as raw bytes, lossless for non-UTF-8 keys.
+fn recorded_keys(executor: &ExExecutor<MemoryFileIO>, name: &str) -> Vec<Vec<u8>> {
+    global_list(executor, name)
+        .iter()
+        .map(|value| match value {
+            ox_types::Typval::String(text) => text.as_bytes().to_vec(),
+            other => panic!("expected a String in g:{name}, got {other:?}"),
+        })
+        .collect()
+}
+
+/// Reads a `g:` number for before/after comparisons.
+fn global_number(executor: &ExExecutor<MemoryFileIO>, name: &str) -> i64 {
+    match global_value(executor, name) {
+        Some(ox_types::Typval::Number(value)) => value,
+        other => panic!("expected a Number in g:{name}, got {other:?}"),
+    }
+}
+
+    /// Assumption 1: a watcher callback that removes its own watcher mid-round.
+    /// The deleted watcher still fires later in the same round
+    /// (`tv_dict_watcher_notify` skips only `busy` watchers), and the
+    /// registry must not keep it alive afterwards (`dictwatcher_finish`
+    /// sweeps `needs_free`). `WatchFirst` deletes both `WatchSecond` and
+    /// itself, then fires; both records appear, and a later mutation must
+    /// fire nothing at all.
+    #[test]
+    fn dictwatcher_self_removal_skips_pending_and_frees_registry() {
+        let (editor, mut executor) = setup();
+        executor
+            .execute_script(
+                &editor,
+                "watch_selfdel.vim",
+                "function! WatchFirst(d, k, c)\n  call dictwatcherdel(g:d, '*', 'WatchSecond')\n  call dictwatcherdel(g:d, '*', 'WatchFirst')\n  call add(g:fires, 'first:' . a:k)\nendfunction\nfunction! WatchSecond(d, k, c)\n  call add(g:fires, 'second:' . a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchFirst')\ncall dictwatcheradd(g:d, '*', 'WatchSecond')\n",
+            )
+            .unwrap();
+        executor.execute_line(&editor, "let g:d.a = 1").unwrap();
+        assert_eq!(
+            recorded_strings(&executor, "fires"),
+            vec!["first:a".to_owned(), "second:a".to_owned()]
+        );
+    // Both registrations were swept at round end: a second mutation fires
+    // nothing, and deleting again reports no match.
+    executor.execute_line(&editor, "let g:d.b = 2").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "fires"),
+        vec!["first:a".to_owned(), "second:a".to_owned()]
+    );
+    assert!(
+        executor
+            .execute_line(&editor, "call dictwatcherdel(g:d, '*', 'WatchFirst')")
+            .is_err()
+    );
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            let data = dict.borrow();
+            assert_eq!(data.get(b"a"), Some(&ox_types::Typval::Number(1)));
+            assert_eq!(data.get(b"b"), Some(&ox_types::Typval::Number(2)));
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 2: a watcher callback that raises an error. The remaining
+/// watchers in the same round still run, and the mutation stays committed.
+#[test]
+fn dictwatcher_erroring_callback_spares_rest_and_keeps_mutation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_throw.vim",
+            "function! WatchBad(d, k, c)\n  throw 'boom'\nendfunction\nfunction! WatchGood(d, k, c)\n  call add(g:fires, a:k)\nendfunction\nlet g:d = {}\nlet g:fires = []\ncall dictwatcheradd(g:d, '*', 'WatchBad')\ncall dictwatcheradd(g:d, '*', 'WatchGood')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "fires"), vec!["k".to_owned()]);
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            assert_eq!(
+                dict.borrow().get(b"k"),
+                Some(&ox_types::Typval::Number(1))
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 3: pattern matching. An exact key fires only for that key, a
+/// trailing `*` matches a prefix, and the empty key `g:['']` matches only the
+/// empty pattern among exact patterns (`*` still matches everything).
+#[test]
+fn dictwatcher_pattern_exact_prefix_and_empty() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_pattern.vim",
+            "function! WatchExact(d, k, c)\n  call add(g:exact, a:k)\nendfunction\nfunction! WatchPrefix(d, k, c)\n  call add(g:prefix, a:k)\nendfunction\nfunction! WatchEmpty(d, k, c)\n  call add(g:empty, a:k)\nendfunction\nfunction! WatchStar(d, k, c)\n  call add(g:star, a:k)\nendfunction\nlet g:d = {}\nlet g:exact = []\nlet g:prefix = []\nlet g:empty = []\nlet g:star = []\ncall dictwatcheradd(g:d, 'k', 'WatchExact')\ncall dictwatcheradd(g:d, 'k*', 'WatchPrefix')\ncall dictwatcheradd(g:d, '', 'WatchEmpty')\ncall dictwatcheradd(g:d, '*', 'WatchStar')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(recorded_strings(&executor, "prefix"), vec!["k".to_owned()]);
+    assert!(recorded_strings(&executor, "empty").is_empty());
+    assert_eq!(recorded_strings(&executor, "star"), vec!["k".to_owned()]);
+    executor.execute_line(&editor, "let g:d.key = 2").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    executor.execute_line(&editor, "let g:d.other = 3").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    executor.execute_line(&editor, "let g:d[''] = 4").unwrap();
+    assert_eq!(recorded_strings(&executor, "exact"), vec!["k".to_owned()]);
+    assert_eq!(
+        recorded_strings(&executor, "prefix"),
+        vec!["k".to_owned(), "key".to_owned()]
+    );
+    assert_eq!(recorded_strings(&executor, "empty"), vec![String::new()]);
+    assert_eq!(
+        recorded_strings(&executor, "star"),
+        vec![
+            "k".to_owned(),
+            "key".to_owned(),
+            "other".to_owned(),
+            String::new()
+        ]
+    );
+}
+
+/// Assumption 4: `old`/`new` shape. An added key carries `new` and no `old`,
+/// a changed key carries both, and `unlet` carries `old` and no `new` — the
+/// `dictwatcher_arguments` contract (only present values get an entry).
+#[test]
+fn dictwatcher_change_shape_new_old_per_mutation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_shape.vim",
+            "function! WatchShape(d, k, c)\n  call add(g:rows, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\n  call add(g:newvals, get(a:c, 'new', 'MISSING'))\n  call add(g:oldvals, get(a:c, 'old', 'MISSING'))\nendfunction\nlet g:d = {}\nlet g:rows = []\nlet g:newvals = []\nlet g:oldvals = []\ncall dictwatcheradd(g:d, '*', 'WatchShape')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![("k".to_owned(), 1, 0)]
+    );
+    executor.execute_line(&editor, "let g:d.k = 2").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![("k".to_owned(), 1, 0), ("k".to_owned(), 1, 1)]
+    );
+    let newvals = global_list(&executor, "newvals");
+    assert!(
+        matches!(
+            &newvals[..],
+            [ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+        ),
+        "unexpected newvals: {newvals:?}"
+    );
+    executor.execute_line(&editor, "unlet g:d.k").unwrap();
+    assert_eq!(
+        change_rows(&global_list(&executor, "rows")),
+        vec![
+            ("k".to_owned(), 1, 0),
+            ("k".to_owned(), 1, 1),
+            ("k".to_owned(), 0, 1)
+        ]
+    );
+    let oldvals = global_list(&executor, "oldvals");
+    assert!(
+        matches!(
+            &oldvals[..],
+            [ox_types::Typval::String(missing), ox_types::Typval::Number(1), ox_types::Typval::Number(2)]
+                if missing.as_bytes() == b"MISSING"
+        ),
+        "unexpected oldvals: {oldvals:?}"
+    );
+}
+
+/// Assumption 5: a scope watcher registered on `g:` must not fire for a `b:`
+/// write, and vice versa. Watch targets key by namespace, not by key text.
+#[test]
+fn dictwatcher_scope_namespace_isolation() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_isolation.vim",
+            "function! WatchG(d, k, c)\n  call add(g:g_fires, a:k)\nendfunction\nfunction! WatchB(d, k, c)\n  call add(g:b_fires, a:k)\nendfunction\nlet g:g_fires = []\nlet g:b_fires = []\ncall dictwatcheradd(g:, '*', 'WatchG')\ncall dictwatcheradd(b:, '*', 'WatchB')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(recorded_strings(&executor, "g_fires"), vec!["x".to_owned()]);
+    assert!(recorded_strings(&executor, "b_fires").is_empty());
+    executor.execute_line(&editor, "let b:y = 2").unwrap();
+    assert_eq!(recorded_strings(&executor, "g_fires"), vec!["x".to_owned()]);
+    assert_eq!(recorded_strings(&executor, "b_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "unlet g:x").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "g_fires"),
+        vec!["x".to_owned(), "x".to_owned()]
+    );
+    assert_eq!(recorded_strings(&executor, "b_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "unlet b:y").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "g_fires"),
+        vec!["x".to_owned(), "x".to_owned()]
+    );
+    assert_eq!(
+        recorded_strings(&executor, "b_fires"),
+        vec!["y".to_owned(), "y".to_owned()]
+    );
+}
+
+/// Assumption 6: `:let g:x = 1` where the write fails (locked E741,
+/// read-only E46) must fire nothing. Covers the plain scope-variable path,
+/// the scope read-only entry, and the locked-dict-item path.
+#[test]
+fn dictwatcher_failed_write_fires_nothing() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_fail.vim",
+            "function! WatchLock(d, k, c)\n  call add(g:lock_fires, a:k)\nendfunction\nfunction! WatchB2(d, k, c)\n  call add(g:b2_fires, a:k)\nendfunction\nfunction! WatchDict(d, k, c)\n  call add(g:dict_fires, a:k)\nendfunction\nlet g:lock_fires = []\nlet g:b2_fires = []\nlet g:dict_fires = []\nlet g:d = {'k': 1}\ncall dictwatcheradd(g:, '*', 'WatchLock')\ncall dictwatcheradd(b:, '*', 'WatchB2')\ncall dictwatcheradd(g:d, '*', 'WatchDict')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:x = 1").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "lock_fires"),
+        vec!["x".to_owned()]
+    );
+    executor.execute_line(&editor, "lockvar g:x").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "let g:x = 2"), "E741");
+    assert_eq!(
+        recorded_strings(&executor, "lock_fires"),
+        vec!["x".to_owned()]
+    );
+    assert_eq!(global_number(&executor, "x"), 1);
+    assert_vim_error(
+        executor.execute_line(&editor, "let b:changedtick = 9"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "b2_fires").is_empty());
+    executor.execute_line(&editor, "lockvar g:d").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "let g:d.k = 2"), "E741");
+    assert!(recorded_strings(&executor, "dict_fires").is_empty());
+    match global_value(&executor, "d") {
+        Some(ox_types::Typval::Dict(dict)) => {
+            assert_eq!(
+                dict.borrow().get(b"k"),
+                Some(&ox_types::Typval::Number(1))
+            );
+        }
+        other => panic!("expected g:d to stay a Dict, got {other:?}"),
+    }
+}
+
+/// Assumption 7: the empty-key and non-UTF-8 key boundaries through the
+/// scope-dict form. Both round-trip as scope variables and notify a `g:`
+/// watcher with the exact key bytes.
+#[test]
+fn dictwatcher_scope_dict_empty_and_non_utf8_keys() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_scopekey.vim",
+            "function! WatchScopeKey(d, k, c)\n  call add(g:scope_keys, a:k)\nendfunction\nlet g:scope_keys = []\ncall dictwatcheradd(g:, '*', 'WatchScopeKey')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:[''] = 1").unwrap();
+    assert_eq!(recorded_keys(&executor, "scope_keys"), vec![Vec::<u8>::new()]);
+    executor.execute_line(&editor, "let b:probe = g:['']").unwrap();
+    assert_eq!(
+        executor.scope().get_scoped(ox_eval::scope::ScopeKind::Buffer, b"probe", 0),
+        Ok(&ox_types::Typval::Number(1))
+    );
+    executor.execute_line(&editor, "unlet g:['']").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new()]
+    );
+    executor.execute_line(&editor, "let g:[\"\\xff\"] = 1").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new(), vec![0xff]]
+    );
+    executor.execute_line(&editor, "let b:probe2 = g:[\"\\xff\"]").unwrap();
+    assert_eq!(
+        executor.scope().get_scoped(ox_eval::scope::ScopeKind::Buffer, b"probe2", 0),
+        Ok(&ox_types::Typval::Number(1))
+    );
+    executor.execute_line(&editor, "unlet g:[\"\\xff\"]").unwrap();
+    assert_eq!(
+        recorded_keys(&executor, "scope_keys"),
+        vec![Vec::<u8>::new(), Vec::<u8>::new(), vec![0xff], vec![0xff]]
+    );
+}
+
+/// Advisory: `let b:['changedtick']` must refuse with E46 like the plain
+/// `let b:changedtick` spelling does. The scope-dict lvalue branch bypasses
+/// the `scoped_target_flags` read-only check that `assign_target` performs,
+/// and `set_scoped` does not consult fixed flags — so the write silently
+/// succeeds and fires watchers. Same for the `unlet` spelling.
+#[test]
+fn dictwatcher_scope_dict_readonly_refuses_with_e46() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_e46.vim",
+            "function! WatchRo(d, k, c)\n  call add(g:ro_fires, a:k)\nendfunction\nlet g:ro_fires = []\ncall dictwatcheradd(b:, '*', 'WatchRo')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "let g:before = b:changedtick").unwrap();
+    assert_vim_error(
+        executor.execute_line(&editor, "let b:['changedtick'] = 999"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "ro_fires").is_empty());
+    executor.execute_line(&editor, "let g:after = b:changedtick").unwrap();
+    assert_eq!(
+        global_number(&executor, "before"),
+        global_number(&executor, "after")
+    );
+    assert_vim_error(
+        executor.execute_line(&editor, "unlet b:['changedtick']"),
+        "E46",
+    );
+    assert!(recorded_strings(&executor, "ro_fires").is_empty());
+    executor.execute_line(&editor, "let g:still = b:changedtick").unwrap();
+    assert_eq!(
+        global_number(&executor, "before"),
+        global_number(&executor, "still")
+    );
+}
+
+/// Advisory: check the lock before removing a scope variable. A locked
+/// `:unlet` must fail instead of succeeding and firing watchers. The
+/// scope-dict spelling routes through `remove_lvalue` (owned); the plain
+/// spelling routes through `remove_target` (see report).
+#[test]
+fn dictwatcher_locked_scope_unlet_refuses_without_firing() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_unlock.vim",
+            "function! WatchUn(d, k, c)\n  call add(g:un_fires, a:k)\nendfunction\nlet g:un_fires = []\ncall dictwatcheradd(g:, '*', 'WatchUn')\nlet g:y = 1\n",
+        )
+        .unwrap();
+    assert_eq!(recorded_strings(&executor, "un_fires"), vec!["y".to_owned()]);
+    executor.execute_line(&editor, "lockvar g:y").unwrap();
+    assert_vim_error(executor.execute_line(&editor, "unlet g:['y']"), "E741");
+    assert_eq!(recorded_strings(&executor, "un_fires"), vec!["y".to_owned()]);
+    assert_eq!(global_number(&executor, "y"), 1);
+}
+
+/// `dict_notifications_spec.lua` "errors out when adding to v:_null_dict":
+/// `dictwatcheradd()` on the null-dict sentinel must refuse with E46 naming
+/// the argument (`eval/funcs.c` `f_dictwatcheradd` rejects a null dict as a
+/// read-only variable). The `v:_null_dict` value must survive the `v:` scope
+/// sync as [`ox_types::Typval::null_dict`], not a plain empty dict.
+#[test]
+fn dictwatcher_add_null_dict_refuses_with_e46() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_nulldict.vim",
+            "function! g:Watcher1(dict, key, value)\nendfunction\n",
+        )
+        .unwrap();
+    match executor.execute_line(
+        &editor,
+        "call dictwatcheradd(v:_null_dict, \"x\", \"g:Watcher1\")",
+    ) {
+        Err(ExecError::Vim(exception)) => {
+            assert!(
+                matches!(&exception.kind, VimExceptionKind::Error(code) if code == "E46"),
+                "expected E46, got {:?}: {}",
+                exception.kind,
+                exception.message()
+            );
+            assert!(
+                exception.message().contains("dictwatcheradd() argument"),
+                "unexpected E46 message: {}",
+                exception.message()
+            );
+        }
+        other => panic!("expected E46 refusal, got {other:?}"),
+    }
+}
+
+/// `dict_notifications_spec.lua` "for b:changedtick": a watcher registered
+/// on `b:` for key `changedtick` observes text edits, with `old`/`new`
+/// carrying the script-visible tick before and after the edit. Upstream
+/// `buf_set_changedtick` (`buffer.c:4284`) notifies `b:` watchers
+/// synchronously on every text change; the port must queue the equivalent
+/// [`crate::userfunc::WatchTarget::Scope`] buffer event before the
+/// post-command drain.
+#[test]
+fn dictwatcher_fires_on_buffer_text_changedtick() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick.vim",
+            "function! OnTickChanged(d, k, c)\n  call add(g:tick_rows, [a:k, get(a:c, 'old', 'MISSING'), get(a:c, 'new', 'MISSING')])\nendfunction\nlet g:tick_rows = []\ncall dictwatcheradd(b:, 'changedtick', 'OnTickChanged')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:tick_before = b:changedtick")
+        .unwrap();
+    executor
+        .execute_line(&editor, "call setline(1, 't')")
+        .unwrap();
+    let before = global_number(&executor, "tick_before");
+    let rows = global_list(&executor, "tick_rows");
+    assert!(
+        matches!(
+            &rows[..],
+            [ox_types::Typval::List(row)] if row.borrow().items.len() == 3
+        ),
+        "expected one changedtick notification, got {rows:?}"
+    );
+    match &rows[..] {
+        [ox_types::Typval::List(row)] => {
+            let items = row.borrow();
+            assert_eq!(
+                items.items.first(),
+                Some(&ox_types::Typval::String(ox_types::OxStr::from("changedtick"))),
+            );
+            assert_eq!(
+                items.items.get(1),
+                Some(&ox_types::Typval::Number(before)),
+            );
+            assert_eq!(
+                items.items.last(),
+                Some(&ox_types::Typval::Number(before + 1)),
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `dict_notifications_spec.lua` "for b:changedtick" wipe half: a `bwipe!`
+/// inside the watcher callback fails with E937 (`can_unload_buffer`,
+/// `buffer.c:517`) instead of deleting the buffer in use. The drain consumes
+/// the failure so the round continues, but the `semsg` text still lands in
+/// `v:errmsg`.
+#[test]
+fn dictwatcher_tick_callback_wipe_fails_e937() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick_wipe.vim",
+            "function! OnTickWipe(d, k, c)\n  call execute('bwipe!')\nendfunction\ncall dictwatcheradd(b:, 'changedtick', 'OnTickWipe')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "call feedkeys(\"iT\\<Esc>\", 'x')")
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:wipe_errmsg = v:errmsg")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "wipe_errmsg"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from(
+            "E937: Attempt to delete a buffer that is in use: [No Name]"
+        ))),
+    );
+    // The wipe did not happen: the buffer is still current and alive.
+    assert!(editor.editor().current_buffer().is_some());
+}
+
+/// `dict_notifications_spec.lua` "for b:changedtick" split half: deleting a
+/// buffer notifies its `changedtick` watchers from inside the removal, and a
+/// window command inside that callback fails with E565 (`text_locked()`,
+/// `ex_docmd.c:1777`). The failure aborts the removal with the callback's
+/// error.
+#[test]
+fn dictwatcher_tick_callback_split_fails_e565() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "call setline(1, 'x')").unwrap();
+    executor
+        .execute_script(
+            &editor,
+            "watch_tick_split.vim",
+            "call dictwatcheradd(b:, 'changedtick', {-> execute('split')})\n",
+        )
+        .unwrap();
+    let error = executor.execute_line(&editor, "bdelete!").unwrap_err();
+    match error {
+        crate::excmd_exec::ExecError::Vim(exception) => {
+            // `execute()` wraps the callback failure port-wide (`E605`), so
+            // the split's E565 rides inside the message — exactly what the
+            // functional `matches()` anchors on.
+            let rendered = exception.message();
+            assert!(
+                rendered.contains("E565: Not allowed to change text or change window: split"),
+                "unexpected split error: {rendered}"
+            );
+            assert!(
+                rendered.ends_with(": split"),
+                "unexpected split error: {rendered}"
+            );
+        }
+        other => panic!("expected E565, got {other:?}"),
+    }
+}
+// ---------------------------------------------------------------------------
+// :pwd / :list / :number / :uptime / :tabs
+// ---------------------------------------------------------------------------
+
+/// Restores the process working directory and removes the scratch directory
+/// on drop, mirroring `CwdFixture` in `excmd_exec_state_tests.rs` (that
+/// type is module-private, so cwd-touching tests here carry their own).
+struct PwdFixture {
+    original: PathBuf,
+    directory: PathBuf,
+}
+
+impl PwdFixture {
+    fn new(name: &str) -> Self {
+        let original = std::env::current_dir().unwrap();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("ox-editor-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        // `getcwd(3)` answers the resolved path, so fixtures hold canonical
+        // paths, the only form a working-directory comparison can trust.
+        Self {
+            original: original.canonicalize().unwrap(),
+            directory: directory.canonicalize().unwrap(),
+        }
+    }
+}
+
+impl Drop for PwdFixture {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.original);
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+/// `:pwd` prints the effective working directory set by `:cd`.
+/// Upstream: `ex_docmd.c` `ex_pwd` prints `os_dirname`, `E187` when it
+/// fails. A bang is `E477` from the parser (the spec carries no `EX_BANG`,
+/// `ex_docmd.c:2201-2202`).
+#[test]
+fn pwd_prints_directory_set_by_cd() {
+    let _guard = crate::lock_process_state();
+    let fixture = PwdFixture::new("pwd");
+    let (editor, mut executor) = setup();
+    executor
+        .execute_line(&editor, &format!("cd {}", fixture.directory.display()))
+        .unwrap();
+    executor.execute_line(&editor, "pwd").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec![fixture.directory.display().to_string()]
+    );
+}
+
+/// `:list` renders each addressed line with Neovim's default listchars:
+/// tabs expand to `>` plus padding spaces and trailing whitespace shows
+/// as `-`, while plain lines pass through unchanged.
+/// Upstream: `ex_docmd.c` `ex_print` with `CMD_list` through `msg_prt_line`
+/// (`message.c:2176`) under the default `'listchars'` (`options.lua:5610`).
+#[test]
+fn list_renders_tabs_and_trailing_whitespace() {
+    let (editor, mut executor) = setup_with_content(&[
+        b"a\tb".to_vec(),
+        b"x  ".to_vec(),
+        b"plain".to_vec(),
+    ]);
+    executor.execute_line(&editor, "%list").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["a>      b", "x--", "plain"]
+    );
+}
+
+/// `:number` prefixes each addressed line with its right-aligned line
+/// number even when the `'number'` option is unset.
+/// Upstream: `ex_docmd.c` `ex_print` with `CMD_number` through
+/// `print_line_no_prefix` (`ex_cmds.c:1686`).
+#[test]
+fn number_prefixes_lines_without_number_option() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]);
+    executor.execute_line(&editor, "%number").unwrap();
+    assert_eq!(echo_messages(&editor), vec!["1 one", "2 two", "3 three"]);
+}
+
+/// `:uptime` echoes `Up <pretty time>` for the elapsed wall time since
+/// process start, always ending in seconds (`Up 0 seconds` at startup).
+/// Upstream: `ex_docmd.c:8177-8180` via `vim._core.ex_cmd` `ex_cmd.lua:266`
+/// with `fmt_rtime` (`_core/time.lua:24-44`).
+#[test]
+fn uptime_echoes_elapsed_pretty_time() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "uptime").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(messages.len(), 1);
+    // The executor anchors process start at creation, so only a whole
+    // stalled second between setup and the command could tick past zero.
+    assert!(
+        messages[0] == "Up 0 seconds" || messages[0] == "Up 1 second",
+        "unexpected uptime text: {:?}",
+        messages[0]
+    );
+}
+
+/// `:tabs` lists one `Tab page N` header per tabpage plus one row per
+/// window, marking the active window's row with `>`.
+/// Upstream: `ex_tabs` (`ex_docmd.c:5812-5870`).
+#[test]
+fn tabs_lists_each_tabpage_marking_the_active_window() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "file foo.txt").unwrap();
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "file bar.txt").unwrap();
+    executor.execute_line(&editor, "tabs").unwrap();
+    // `:file` reports each rename first; the listing is the tail.
+    let messages = echo_messages(&editor);
+    assert_eq!(
+        &messages[messages.len() - 4..],
+        &["Tab page 1", "    foo.txt", "Tab page 2", ">   bar.txt",]
+    );
+    // An unnamed buffer lists as `[No Name]` (`buffer.c` `buf_spname` via
+    // `buf_get_fname`, `ex_docmd.c:5848-5849`).
+    executor.execute_line(&editor, "tabnew").unwrap();
+    executor.execute_line(&editor, "tabs").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(&messages[messages.len() - 2..], &["Tab page 3", ">   [No Name]"]);
+}
+
+/// `:recover` reloads the current buffer from its swapfile: `:preserve`d
+/// content wins over later edits, a missing swapfile fails `E305`, and a
+/// modified buffer without a bang fails `E37`.
+/// Upstream: `ex_docmd.c` `ex_recover` → `ml_recover` (`memline.c:771+`);
+/// oldtest `test_recover.vim` (`E305` with no swapfile).
+#[test]
+fn recover_restores_swapfile_content() {
+    let io = MemoryFileIO::new();
+    io.insert("orig.txt", "original\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io.clone());
+    executor.execute_line(&editor, "edit orig.txt").unwrap();
+    executor.execute_line(&editor, "set directory=.").unwrap();
+    // The swapfile snapshot (`:preserve` output shape): port-written bytes
+    // stored through the seam at the `makeswapname` candidate.
+    let snapshot = Buffer::from_lines(&[b"recovered".to_vec()], true).unwrap();
+    let mut swap = Vec::new();
+    ox_text::SwapFile::new("orig.txt", snapshot)
+        .write(&mut swap)
+        .unwrap();
+    io.insert_blob(".orig.txt.swp", swap);
+    // A modified buffer without a bang refuses first (`E37`).
+    executor
+        .execute_line(&editor, "call setline(1, 'edited')")
+        .unwrap();
+    assert_vim_error(executor.execute_line(&editor, "recover"), "E37");
+    executor.execute_line(&editor, "recover!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["recovered"]);
+    assert!(
+        editor
+            .editor()
+            .current_buffer()
+            .is_some_and(|buffer| editor
+                .editor()
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED)))
+    );
+    assert!(
+        echo_messages(&editor)
+            .iter()
+            .any(|message| message.contains("Using swap file")),
+        "expected a swap-file notice, got {:?}",
+        echo_messages(&editor)
+    );
+    // No swapfile for an unnamed, unmodified buffer: `E305`.
+    let (clean, mut clean_executor) = setup();
+    assert_vim_error(clean_executor.execute_line(&clean, "recover"), "E305");
+}
+
+/// `:edit` runs the `findswapname` swapfile check before reading: a
+/// `SwapExists` `v:swapchoice` of `r` recovers the swapfile text, `q` aborts
+/// the open, and no choice prints `E325` and proceeds as Edit-anyway.
+/// Upstream: `findswapname` (`memline.c:3480+`).
+#[test]
+fn edit_detects_existing_swapfile_before_reading() {
+    fn editor_with_swap(recovered: &[u8]) -> (TestEditorAccess, ExExecutor<MemoryFileIO>) {
+        let io = MemoryFileIO::new();
+        io.insert("Xfile", "original\n");
+        let snapshot = Buffer::from_lines(&[recovered.to_vec()], true).unwrap();
+        let mut swap = Vec::new();
+        ox_text::SwapFile::new("Xfile", snapshot)
+            .write(&mut swap)
+            .unwrap();
+        io.insert_blob(".Xfile.swp", swap);
+        let editor = TestEditorAccess::new(Editor::new());
+        let buffer = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        (editor, ExExecutor::with_io(io))
+    }
+
+    // `r` recovers the swapfile text instead of reading the file.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor
+        .execute_line(&editor, "autocmd SwapExists Xfile let v:swapchoice='r'")
+        .unwrap();
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["recovered"]);
+
+    // `q` aborts the open and leaves the current buffer alone.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor
+        .execute_line(&editor, "autocmd SwapExists Xfile let v:swapchoice='q'")
+        .unwrap();
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(
+        editor.editor().current_buffer().and_then(|handle| editor
+            .editor()
+            .buffer(handle)
+            .ok()
+            .map(|state| state.name().to_string_lossy().into_owned())),
+        Some(String::new()),
+    );
+
+    // No choice (a default-written swapfile carries pid 0, so the live
+    // default stays quiet) prints `E325` and proceeds as Edit-anyway.
+    let (editor, mut executor) = editor_with_swap(b"recovered");
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["original"]);
+    assert!(
+        editor.editor().messages().iter().any(|message| match &message.content {
+            ox_types::Object::String(text) =>
+                text.to_string_lossy().contains("E325: ATTENTION"),
+            _ => false,
+        }),
+        "expected E325, got {:?}",
+        editor.editor().messages(),
+    );
+}
+/// The `nvim.swapfile` default skips the prompt with `W325` when the recorded
+/// pid names a live process: meta written for the current process and user.
+/// Upstream: `defaults.lua` `SwapExists` handler.
+#[test]
+fn edit_ignores_swapfile_from_running_process_with_w325() {
+    let user = current_login_for_test();
+    if user.is_empty() {
+        return;
+    }
+    let io = MemoryFileIO::new();
+    io.insert("Xfile", "original\n");
+    let snapshot = Buffer::from_lines(&[b"recovered".to_vec()], true).unwrap();
+    let meta = ox_text::SwapMeta {
+        pid: std::process::id(),
+        user,
+        ..Default::default()
+    };
+    let mut swap = Vec::new();
+    ox_text::SwapFile::new("Xfile", snapshot)
+        .with_meta(meta)
+        .write(&mut swap)
+        .unwrap();
+    io.insert_blob(".Xfile.swp", swap);
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit Xfile").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["original"]);
+    assert!(
+        editor.editor().messages().iter().any(|message| match &message.content {
+            ox_types::Object::String(text) =>
+                text.to_string_lossy().contains("W325: Ignoring swapfile"),
+            _ => false,
+        }),
+        "expected W325, got {:?}",
+        editor.editor().messages(),
+    );
+}
+
+#[cfg(unix)]
+fn current_login_for_test() -> String {
+    let uid = ox_sys::unix::real_uid();
+    ox_sys::unix::passwd_entry(uid)
+        .ok()
+        .flatten()
+        .map_or_else(String::new, |entry| entry.name)
+}
+
+#[cfg(not(unix))]
+fn current_login_for_test() -> String {
+    String::new()
+}
+
+/// `:diffsplit {file}` splits like `:split` and enables diff mode in both
+/// windows; a bare `:diffsplit` re-shows the current buffer in diff mode.
+/// Upstream: `ex_diffsplit` (`diff.c:1510-1558`); oldtest
+/// `test_diffmode.vim` (`vert diffsplit Xfile2`, bare `diffsplit`).
+#[test]
+fn diffsplit_opens_file_with_diff_on_both_windows() {
+    fn window_diff(editor: &TestEditorAccess, window: ox_types::WinHandle) -> bool {
+        matches!(
+            editor.editor().options().get_window(window, "diff"),
+            Ok(crate::options::OptionValue::Boolean(true))
+        )
+    }
+    let io = MemoryFileIO::new();
+    io.insert("one.txt", "aaa\n");
+    io.insert("two.txt", "bbb\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit one.txt").unwrap();
+    executor.execute_line(&editor, "diffsplit two.txt").unwrap();
+    let tab = editor.editor().current_tabpage().unwrap();
+    let windows = editor.editor().tabpage_windows(tab).unwrap();
+    assert_eq!(windows.len(), 2);
+    assert!(windows.iter().all(|window| window_diff(&editor, *window)));
+    // The new window is current and shows the requested file.
+    let current = editor.editor().current_window().unwrap();
+    let shown = editor.editor().window(current).unwrap().buffer;
+    assert_eq!(
+        editor
+            .editor()
+            .buffer(shown)
+            .unwrap()
+            .name()
+            .to_string_lossy()
+            .into_owned(),
+        "two.txt"
+    );
+    // A bare `:diffsplit` splits the current buffer with diff on everywhere.
+    executor.execute_line(&editor, "diffsplit").unwrap();
+    let windows = editor.editor().tabpage_windows(tab).unwrap();
+    assert_eq!(windows.len(), 3);
+    assert!(windows.iter().all(|window| window_diff(&editor, *window)));
+}
+
+/// `:helptags` builds a sorted `tags` file from `*tag*` markers, skipping
+/// markers inside `>...` example regions; `++t` writes only the index
+/// entry, and missing help files or a non-directory fail `E151`/`E150` while
+/// duplicate tags fail `E154`.
+/// Upstream: `vim._core.help.gen_tags`
+/// (`runtime/lua/vim/_core/help.lua:537-600`); oldtest
+/// `test_help.vim:Test_helptag_cmd`.
+#[test]
+fn helptags_builds_tags_from_help_markers() {
+    let io = MemoryFileIO::new();
+    for dir in ["Xtagdir", "Xtagdir/a", "Xtagdir/a/doc"] {
+        io.insert_directory(dir);
+    }
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io.clone());
+    // No help file to process in the directory.
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir"),
+        "E151",
+    );
+    io.insert(
+        "Xtagdir/a/doc/sample.txt",
+        "*tag1*\nExample: >\n  *notag1*\nExample end: *tag2*\n>\n  *notag2*\n<\n*tag3*\nCode: >vim\n  *notag3*\nCode end: *tag4*\n>i3config\n  *notag4*\n<\n",
+    );
+    executor.execute_line(&editor, "helptags Xtagdir").unwrap();
+    assert_eq!(
+        io.content("Xtagdir/tags").unwrap(),
+        "tag1\ta/doc/sample.txt\t/*tag1*\ntag2\ta/doc/sample.txt\t/*tag2*\ntag3\ta/doc/sample.txt\t/*tag3*\ntag4\ta/doc/sample.txt\t/*tag4*\n"
+    );
+    // Duplicate tags in the help file.
+    io.insert("Xtagdir/a/doc/sample.txt", "*tag1*\n*tag1*\n*tag2*\n");
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir"),
+        "E154",
+    );
+    // `++t` writes only the index entry for an empty help file.
+    io.insert("Xtagdir/a/doc/sample.txt", "");
+    executor.execute_line(&editor, "helptags ++t Xtagdir").unwrap();
+    assert_eq!(io.content("Xtagdir/tags").unwrap(), "help-tags\ttags\t1\n");
+    // Not a directory.
+    assert_vim_error(
+        executor.execute_line(&editor, "helptags Xtagdir/a/doc/sample.txt"),
+        "E150",
+    );
+}
+
+/// `:[range]match` arms, clears, and redefines the window-local `:match`
+/// highlights (IDs 1-3, default 1); out-of-range IDs fail `E476`, a group
+/// without a pattern fails `E475`, and trailing text fails `E488`.
+/// Upstream: `ex_match` (`match.c:1154-1216`); oldtest
+/// `test_match.vim:14-27,154-157`.
+#[test]
+fn match_manages_window_highlights() {
+    let (editor, mut executor) = setup_with_content(&[b"TODO: fix".to_vec()]);
+    executor.execute_line(&editor, "match MyGroup1 /TODO/").unwrap();
+    let window = editor.editor().current_window().unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, 1);
+    assert_eq!(items[0].priority, 10);
+    assert_eq!(items[0].group, "MyGroup1");
+    assert_eq!(items[0].pattern.as_deref(), Some("TODO"));
+    executor.execute_line(&editor, "2match Other /fix/").unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 2);
+    // A bare `:match` clears ID 1 only.
+    executor.execute_line(&editor, "match").unwrap();
+    let items = editor.editor().get_matches(window);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, 2);
+    // `:match none` (and an explicit ID) clears.
+    executor.execute_line(&editor, "match none").unwrap();
+    assert_eq!(editor.editor().get_matches(window).len(), 1);
+    executor.execute_line(&editor, "2match none").unwrap();
+    assert!(editor.editor().get_matches(window).is_empty());
+    assert_vim_error(
+        executor.execute_line(&editor, "4match Error /x/"),
+        "E476",
+    );
+    assert_vim_error(executor.execute_line(&editor, "match Error"), "E475");
+    assert_vim_error(
+        executor.execute_line(&editor, "match Error /x/ y"),
+        "E488",
+    );
+}
+
+/// `:checkpath` lists only includes missing from `'path'`; `:checkpath!`
+/// prints the whole nested tree with ` -->` arrows, `NOT FOUND`, and
+/// `(Already listed)` markers.
+/// Upstream: `ex_checkpath` → `find_pattern_in_path` with `CHECK_PATH`
+/// (`search.c:2974+`); oldtest `test_checkpath.vim:Test_checkpath1`.
+#[test]
+fn checkpath_lists_includes_missing_from_path() {
+    let io = MemoryFileIO::new();
+    io.insert("Xbase.a", "#include    \"foo.a\"\n#include    \"gone.a\"\n");
+    io.insert("Xdir1/dir2/foo.a", "#include    \"bar.a\"\n");
+    io.insert("Xdir1/dir2/bar.a", "#include    \"baz.a\"\n");
+    io.insert("Xdir1/dir2/baz.a", "#include    \"foo.a\"\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io);
+    executor.execute_line(&editor, "edit Xbase.a").unwrap();
+    executor
+        .execute_line(&editor, "set path=Xdir1/dir2")
+        .unwrap();
+    executor.execute_line(&editor, "checkpath").unwrap();
+    assert_eq!(
+        echo_messages(&editor),
+        vec!["--- Included files not found in path ---", "\"gone.a\""]
+    );
+    executor.execute_line(&editor, "checkpath!").unwrap();
+    let messages = echo_messages(&editor);
+    assert_eq!(
+        &messages[messages.len() - 9..],
+        &[
+            "--- Included files in path ---",
+            "Xdir1/dir2/foo.a",
+            "Xdir1/dir2/foo.a -->",
+            "  Xdir1/dir2/bar.a",
+            "  Xdir1/dir2/bar.a -->",
+            "    Xdir1/dir2/baz.a",
+            "    Xdir1/dir2/baz.a -->",
+            "      \"foo.a\"  (Already listed)",
+            "\"gone.a\"  NOT FOUND",
+        ]
+    );
+}
+
+/// `:browse` without an argument opens the current directory (`.`) for
+/// `:edit`, `:split`, `:vsplit`, `:tabedit`, and `:tabnew`
+/// (`set_browse_edit_arg`, `ex_docmd.c:5652-5662`).
+#[test]
+fn browse_modifier_without_file_opens_current_directory() {
+    let mut raw = Editor::new();
+    let scratch = raw.create_buffer(true).unwrap();
+    raw.create_tabpage(scratch, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(raw);
+    let mut executor = ExExecutor::new();
+    let expected = format!("{}/", std::env::current_dir().unwrap().display());
+
+    // Bare `:edit` without an argument on an unnamed buffer fails with E32.
+    assert_vim_error(executor.execute_line(&editor, "edit"), "E32");
+
+    // `:browse edit` rewrites argument to "." and opens the current directory buffer.
+    executor.execute_line(&editor, "browse edit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+    assert!(matches!(
+        editor.editor().options().get_buffer(current, "filetype"),
+        Ok(crate::OptionValue::String(value)) if value == "directory"
+    ));
+
+    // `:browse split` opens the current directory in a split.
+    executor.execute_line(&editor, "browse split").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse vsplit` opens the current directory in a vertical split.
+    executor.execute_line(&editor, "browse vsplit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse tabedit` opens the current directory in a new tabpage.
+    executor.execute_line(&editor, "browse tabedit").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+
+    // `:browse tabnew` opens the current directory in a new tabpage.
+    executor.execute_line(&editor, "browse tabnew").unwrap();
+    let current = editor.editor().current_buffer().unwrap();
+    let name = editor
+        .editor()
+        .buffer(current)
+        .unwrap()
+        .name()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(name, expected);
+}
+
+/// `f_mkdir` reads its mode through `tv_get_number`, which coerces a string:
+/// `vim.fs.mkdir` passes `tostring(opts.mode or 493)`
+/// (`runtime/lua/vim/fs.lua:941`). A string mode must therefore create the
+/// directory, and a Float mode must still raise E805. This runs against the real
+/// filesystem so the assertion is the created directory, not a stub's reply.
+#[test]
+fn mkdir_coerces_a_string_mode_and_rejects_a_float_mode() {
+    let mut editor = Editor::new();
+    let buffer = editor.create_buffer(true).unwrap();
+    editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let editor = TestEditorAccess::new(editor);
+    let mut executor = ExExecutor::with_io(crate::script::RealFileIO);
+    let root = std::env::temp_dir().join(format!("oxvim-mkdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let nested = root.join("nested");
+    executor
+        .execute_script(
+            &editor,
+            "mkdir.vim",
+            &format!(
+                "let g:made = mkdir('{}', 'p', '493')\n",
+                nested.display()
+            ),
+        )
+        .unwrap();
+    assert!(
+        nested.is_dir(),
+        "a string mode creates the directory: {}",
+        nested.display()
+    );
+    let rejected = executor
+        .execute_script(
+            &editor,
+            "mkdir_float.vim",
+            &format!(
+                "let g:made = mkdir('{}', 'p', 1.5)\n",
+                root.join("float").display()
+            ),
+        )
+        .expect_err("a Float mode is rejected");
+    assert!(
+        format!("{rejected:?}").contains("E805"),
+        "a Float mode still raises E805: {rejected:?}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn call_with_trailing_comment_containing_parentheses() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "call_comment.vim",
+            "function! Foo(arg)\n  let g:arg = a:arg\nendfunction\ncall Foo(\"bar\") \" note (x)\n",
+        )
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "arg"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("bar")))
+    );
+}
+
+#[test]
+fn find_closing_paren_handles_single_quote_trailing_backslash() {
+    assert_eq!(find_closing_paren(r#"foo('a\')"#, 3), Some(8));
+    assert_eq!(
+        find_closing_paren(r#"call s:NetrwInit("g:netrw_glob_escape",'*[]?`{~$\')"#, 16),
+        Some(50)
+    );
+}
+
+#[test]
+fn find_closing_paren_handles_double_quote_escapes() {
+    assert_eq!(find_closing_paren(r#"foo("a\")")"#, 3), Some(10));
+    assert_eq!(find_closing_paren(r#"foo("a\\")"#, 3), Some(9));
+}
+
+#[test]
+fn find_closing_paren_handles_single_quote_doubled() {
+    assert_eq!(find_closing_paren(r#"foo('it''s')"#, 3), Some(11));
+}
+
+#[test]
+fn split_comma_args_handles_single_quote_trailing_backslash() {
+    assert_eq!(split_comma_args(r"'a\', 'b'"), vec![r"'a\'", r"'b'"]);
+}
+
+#[test]
+fn split_comma_args_handles_double_quote_escapes() {
+    assert_eq!(split_comma_args(r#""a,\"b", "c""#), vec![r#""a,\"b""#, r#""c""#]);
+    assert_eq!(split_comma_args(r#""a\\", "b""#), vec![r#""a\\""#, r#""b""#]);
+}
+
+#[test]
+fn split_comma_args_handles_single_quote_doubled() {
+    assert_eq!(split_comma_args(r"'it''s', 'b'"), vec![r"'it''s'", r"'b'"]);
+}
+
+#[test]
+fn strip_expression_comment_handles_single_quote_trailing_backslash() {
+    assert_eq!(strip_expression_comment(r#"'a\' " comment"#), r"'a\'");
+}
+
+#[test]
+fn strip_expression_comment_handles_double_quote_escapes() {
+    assert_eq!(strip_expression_comment(r#""a\"" " comment"#), r#""a\"""#);
+    assert_eq!(strip_expression_comment(r#""a\\" " comment"#), r#""a\\""#);
+}
+
+#[test]
+fn strip_expression_comment_handles_single_quote_doubled() {
+    assert_eq!(strip_expression_comment(r#"'it''s' " comment"#), r"'it''s'");
+}
+
+#[test]
+fn split_assignment_handles_single_quote_trailing_backslash() {
+    assert_eq!(
+        split_assignment(r"d['a\'] = 1"),
+        Some(("d['a\\']", "=", "1"))
+    );
+}
+
+#[test]
+fn split_assignment_handles_double_quote_escapes() {
+    assert_eq!(
+        split_assignment(r#"d["a\"="] = 1"#),
+        Some((r#"d["a\"="]"#, "=", "1"))
+    );
+    assert_eq!(
+        split_assignment(r#"d["a\\"] = 1"#),
+        Some((r#"d["a\\"]"#, "=", "1"))
+    );
+}
+
+#[test]
+fn split_assignment_handles_single_quote_doubled() {
+    assert_eq!(
+        split_assignment(r"d['it''s'] = 1"),
+        Some(("d['it''s']", "=", "1"))
+    );
+}
+
+#[test]
+fn netrw_line_378_call_parses_without_e107() {
+    let (editor, mut executor) = setup();
+    let result = executor.execute_script(
+        &editor,
+        "netrw_test.vim",
+        "function! s:NetrwInit(var, val)\nendfunction\ncall s:NetrwInit(\"g:netrw_glob_escape\",'*[]?`{~$\\')\n",
+    );
+    assert!(result.is_ok(), "netrw init call must parse: {result:?}");
+}
+
+#[test]
+fn single_quoted_doubled_quote_unquotes_in_assignment() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(&editor, "unquote.vim", "let g:res = 'it''s'\n")
+        .unwrap();
+    assert_eq!(
+        global_value(&executor, "res"),
+        Some(ox_types::Typval::String(ox_types::OxStr::from("it's")))
+    );
+}
+
+#[test]
+fn api_set_container_retains_self_reference_after_eval_append() {
+    let (editor, mut executor) = setup();
+    executor
+        .set_global_var(
+            &editor,
+            &ox_types::OxStr::from("l"),
+            ox_types::Object::Array(vec![]),
+        )
+        .unwrap();
+    executor
+        .evaluate_expression(&editor, "add(l, l)")
+        .unwrap();
+    let val = executor.evaluate_expression(&editor, "l").unwrap();
+    let ox_types::Typval::List(l) = &val else {
+        panic!("expected List, got {val:?}");
+    };
+    let item0 = l.borrow().items[0].clone();
+    let ox_types::Typval::List(inner) = &item0 else {
+        panic!("expected inner item to be List, got {item0:?}");
+    };
+    assert!(
+        std::rc::Rc::ptr_eq(l, inner),
+        "item 0 must reference the list itself"
+    );
+
+    executor
+        .set_global_var(
+            &editor,
+            &ox_types::OxStr::from("d"),
+            ox_types::Object::Dict(ox_types::Dict(Vec::new())),
+        )
+        .unwrap();
+    executor
+        .evaluate_expression(&editor, "extend(d, {'d': d})")
+        .unwrap();
+    let d_val = executor.evaluate_expression(&editor, "d").unwrap();
+    let ox_types::Typval::Dict(d) = &d_val else {
+        panic!("expected Dict, got {d_val:?}");
+    };
+    let d_inner = d
+        .borrow()
+        .get(b"d")
+        .unwrap()
+        .clone();
+    let ox_types::Typval::Dict(inner_dict) = &d_inner else {
+        panic!("expected inner entry to be Dict, got {d_inner:?}");
+    };
+    assert!(
+        std::rc::Rc::ptr_eq(d, inner_dict),
+        "entry 'd' must reference the dict itself"
+    );
+}
+
+#[test]
+fn verbose_set_cursorline_from_script_reports_last_set_script_path() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("custom_opt.vim", "set cursorline\n");
+    executor
+        .execute_line(&editor, "source custom_opt.vim")
+        .unwrap();
+    executor
+        .execute_line(&editor, "verbose set cursorline?")
+        .unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("verbose message");
+    assert!(
+        text.contains("cursorline\n\tLast set from custom_opt.vim line 1"),
+        "expected script last set text, got: {text}"
+    );
+}
+
+#[test]
+fn set_cursorline_without_verbose_has_no_last_set_line() {
+    let (editor, mut executor) = setup();
+    executor
+        .scripts()
+        .io()
+        .insert("custom_opt.vim", "set cursorline\n");
+    executor
+        .execute_line(&editor, "source custom_opt.vim")
+        .unwrap();
+    editor.editor_mut().truncate_messages(0);
+    executor.execute_line(&editor, "set cursorline?").unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("option query message");
+    assert_eq!(text, "cursorline");
+}
+
+#[test]
+fn verbose_set_cursorline_interactively_has_no_last_set_line() {
+    let (editor, mut executor) = setup();
+    executor.execute_line(&editor, "set cursorline").unwrap();
+    editor.editor_mut().truncate_messages(0);
+    executor
+        .execute_line(&editor, "verbose set cursorline?")
+        .unwrap();
+    let messages = echo_messages(&editor);
+    let text = messages.last().expect("option query message");
+    assert_eq!(text, "cursorline");
 }

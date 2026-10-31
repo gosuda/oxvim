@@ -45,27 +45,60 @@ impl Keys {
         Self(encoded)
     }
 
-    /// Quotes a trailing literal [`K_SPECIAL`] while preserving complete
-    /// three-byte internal key codes.
+    /// Escapes literal [`K_SPECIAL`] bytes for the typeahead buffer
+    /// (`vim_strsave_escape_ks`, `keycodes.c:882-906`).
+    ///
+    /// At a character boundary a `K_SPECIAL` byte starts a complete
+    /// three-byte key code and is copied unmodified; otherwise the next
+    /// character is re-encoded byte by byte, escaping any literal
+    /// `K_SPECIAL` inside multi-byte characters as
+    /// `K_SPECIAL KS_SPECIAL KE_FILLER`. Stepping character by character is
+    /// what keeps a UTF-8 continuation byte (`0x80..=0xbf`) from ever being
+    /// mistaken for a key-code introducer.
     #[must_use]
     pub fn escape_ks(bytes: &[u8]) -> Self {
         let mut escaped = Vec::with_capacity(bytes.len().saturating_add(2));
         let mut offset = 0;
         while offset < bytes.len() {
-            if bytes[offset] != K_SPECIAL {
-                escaped.push(bytes[offset]);
-                offset += 1;
-                continue;
-            }
-            if bytes.len() - offset >= 3 {
+            if bytes[offset] == K_SPECIAL && bytes.len() - offset >= 3 {
                 escaped.extend_from_slice(&bytes[offset..offset + 3]);
                 offset += 3;
                 continue;
             }
-            escaped.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
-            offset += 1;
+            let width = utf_char_width(&bytes[offset..]);
+            for byte in &bytes[offset..offset + width] {
+                if *byte == K_SPECIAL {
+                    escaped.extend_from_slice(&[K_SPECIAL, KS_SPECIAL, KE_FILLER]);
+                } else {
+                    escaped.push(*byte);
+                }
+            }
+            offset += width;
         }
         Self(escaped)
+    }
+
+    /// Removes `K_SPECIAL` quoting (`vim_unescape_ks`,
+    /// `keycodes.c:908-924`): only the `K_SPECIAL KS_SPECIAL KE_FILLER`
+    /// quoting form folds back to a literal `K_SPECIAL`; every other triple
+    /// passes through untouched, so real special keys survive.
+    #[must_use]
+    pub fn unescape_ks(bytes: &[u8]) -> Vec<u8> {
+        let mut unescaped = Vec::with_capacity(bytes.len());
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if bytes[offset] == K_SPECIAL
+                && bytes.get(offset + 1) == Some(&KS_SPECIAL)
+                && bytes.get(offset + 2) == Some(&KE_FILLER)
+            {
+                unescaped.push(K_SPECIAL);
+                offset += 3;
+            } else {
+                unescaped.push(bytes[offset]);
+                offset += 1;
+            }
+        }
+        unescaped
     }
 
     /// Creates a key string from bytes already in internal form.
@@ -85,9 +118,11 @@ impl Keys {
     /// # Errors
     ///
     /// Returns [`KeyDecodeError::InvalidThirdByte`] when `third` is outside
-    /// the reserved `0x02..=0x7f` range.
+    /// the reserved `0x02..=0x7f` range. Modifier masks (`KS_MODIFIER`) are
+    /// bit combinations (`keycodes.h:467-474`) where the command-key bit
+    /// alone is already `0x80`, so any third byte is accepted for them.
     pub fn special(second: u8, third: u8) -> Result<Self, KeyDecodeError> {
-        if !(0x02..=0x7f).contains(&third) {
+        if second != KS_MODIFIER && !(0x02..=0x7f).contains(&third) {
             return Err(KeyDecodeError::InvalidThirdByte(third));
         }
         Ok(Self(vec![K_SPECIAL, second, third]))
@@ -334,14 +369,46 @@ pub fn special_notation(bytes: &[u8], replace_spaces: bool, replace_lt: bool) ->
     while offset < bytes.len() {
         // `mb_unescape` runs first in `str2special`, so a quoted literal byte
         // is rendered as the byte it stands for, not as a special key.
+        if let [K_SPECIAL, KS_MODIFIER, modifiers, K_SPECIAL, second, third, ..] = bytes[offset..] {
+            out.push(b'<');
+            push_modifiers(&mut out, modifiers);
+            if let Some(name) = special_key_name(second, third) {
+                out.extend_from_slice(name.as_bytes());
+            } else {
+                out.extend_from_slice(b"t_");
+                out.push(second);
+                out.push(third);
+            }
+            out.push(b'>');
+            offset += 6;
+            continue;
+        }
+        if let [K_SPECIAL, KS_MODIFIER, modifiers, raw_byte, ..] = bytes[offset..] {
+            out.push(b'<');
+            push_modifiers(&mut out, modifiers);
+            if raw_byte == b' ' {
+                out.extend_from_slice(b"Space");
+            } else if raw_byte < 0x20 {
+                out.push(raw_byte | 0x40);
+            } else {
+                out.push(raw_byte);
+            }
+            out.push(b'>');
+            offset += 4;
+            continue;
+        }
         let (byte, width) = match bytes[offset..] {
             [K_SPECIAL, KS_ZERO, KE_FILLER, ..] => (0u8, 3),
             [K_SPECIAL, KS_SPECIAL, KE_FILLER, ..] => (K_SPECIAL, 3),
             [K_SPECIAL, second, third, ..] => {
-                // A named special key this port cannot name; upstream prints
-                // its termcap pair as `<t_xx>` (`keycodes.c:324-327`).
-                out.extend_from_slice(b"<t_");
-                out.extend_from_slice(&[second, third, b'>']);
+                if let Some(name) = special_key_name(second, third) {
+                    out.push(b'<');
+                    out.extend_from_slice(name.as_bytes());
+                    out.push(b'>');
+                } else {
+                    out.extend_from_slice(b"<t_");
+                    out.extend_from_slice(&[second, third, b'>']);
+                }
                 offset += 3;
                 continue;
             }
@@ -367,6 +434,82 @@ pub fn special_notation(bytes: &[u8], replace_spaces: bool, replace_lt: bool) ->
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn push_modifiers(out: &mut Vec<u8>, modifiers: u8) {
+    if modifiers & MOD_MASK_ALT != 0 {
+        out.extend_from_slice(b"M-");
+    }
+    if modifiers & MOD_MASK_META != 0 {
+        out.extend_from_slice(b"T-");
+    }
+    if modifiers & MOD_MASK_CTRL != 0 {
+        out.extend_from_slice(b"C-");
+    }
+    if modifiers & MOD_MASK_SHIFT != 0 {
+        out.extend_from_slice(b"S-");
+    }
+    if modifiers & MOD_MASK_CMD != 0 {
+        out.extend_from_slice(b"D-");
+    }
+}
+
+/// Maps an internal two-byte special key code (`mapping.c:264`, `keycodes.c:377-395`,
+/// `keycodes.h:235-385`) to its canonical `<...>` key name.
+#[must_use]
+pub fn special_key_name(second: u8, third: u8) -> Option<&'static str> {
+    match (second, third) {
+        (b'k', b'1') => Some("F1"),
+        (b'k', b'2') => Some("F2"),
+        (b'k', b'3') => Some("F3"),
+        (b'k', b'4') => Some("F4"),
+        (b'k', b'5') => Some("F5"),
+        (b'k', b'6') => Some("F6"),
+        (b'k', b'7') => Some("F7"),
+        (b'k', b'8') => Some("F8"),
+        (b'k', b'9') => Some("F9"),
+        (b'k', b';') => Some("F10"),
+        (b'F', b'1') => Some("F11"),
+        (b'F', b'2') => Some("F12"),
+        (b'F', b'3') => Some("F13"),
+        (b'F', b'4') => Some("F14"),
+        (b'F', b'5') => Some("F15"),
+        (b'F', b'6') => Some("F16"),
+        (b'F', b'7') => Some("F17"),
+        (b'F', b'8') => Some("F18"),
+        (b'F', b'9') => Some("F19"),
+        (b'F', b'A') => Some("F20"),
+        (b'F', b'B') => Some("F21"),
+        (b'F', b'C') => Some("F22"),
+        (b'F', b'D') => Some("F23"),
+        (b'F', b'E') => Some("F24"),
+        (b'F', b'F') => Some("F25"),
+        (b'F', b'G') => Some("F26"),
+        (b'F', b'H') => Some("F27"),
+        (b'F', b'I') => Some("F28"),
+        (b'F', b'J') => Some("F29"),
+        (b'F', b'K') => Some("F30"),
+        (b'F', b'L') => Some("F31"),
+        (b'F', b'M') => Some("F32"),
+        (b'F', b'N') => Some("F33"),
+        (b'F', b'O') => Some("F34"),
+        (b'F', b'P') => Some("F35"),
+        (b'F', b'Q') => Some("F36"),
+        (b'F', b'R') => Some("F37"),
+        (b'k', b'u') => Some("Up"),
+        (b'k', b'd') => Some("Down"),
+        (b'k', b'l') => Some("Left"),
+        (b'k', b'r') => Some("Right"),
+        (b'k', b'h') => Some("Home"),
+        (b'@', b'7') => Some("End"),
+        (b'k', b'P') => Some("PageUp"),
+        (b'k', b'N') => Some("PageDown"),
+        (b'k', b'I') => Some("Insert"),
+        (b'k', b'D') => Some("Del"),
+        (b'k', b'B') => Some("Tab"),
+        (KS_EXTRA, 104) => Some("Cmd"),
+        _ => None,
+    }
 }
 
 /// One decoded logical key.
@@ -681,6 +824,49 @@ impl Typeahead {
     }
 }
 
+/// Width of the UTF-8 character starting a fragment, mirroring
+/// `utf_ptr2len`: a complete multi-byte sequence counts whole, anything
+/// illegal counts one byte so escaping still makes progress.
+fn utf_char_width(fragment: &[u8]) -> usize {
+    let Some(first) = fragment.first().copied() else {
+        return 0;
+    };
+    match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            2
+        }
+        0xe0..=0xef
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(2)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            3
+        }
+        0xf0..=0xf4
+            if fragment
+                .get(1)
+                .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(2)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                && fragment
+                    .get(3)
+                    .is_some_and(|byte| (0x80..=0xbf).contains(byte)) =>
+        {
+            4
+        }
+        _ => 1,
+    }
+}
+
 fn validate_encoded(bytes: &[u8]) -> Result<(), KeyDecodeError> {
     let mut offset = 0;
     while offset < bytes.len() {
@@ -705,7 +891,7 @@ fn decode_one(bytes: &[u8]) -> Result<(Key, usize), KeyDecodeError> {
     }
     let second = bytes[1];
     let third = bytes[2];
-    if !(0x02..=0x7f).contains(&third) {
+    if second != KS_MODIFIER && !(0x02..=0x7f).contains(&third) {
         return Err(KeyDecodeError::InvalidThirdByte(third));
     }
     match second {

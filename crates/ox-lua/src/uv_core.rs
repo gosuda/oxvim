@@ -13,7 +13,7 @@ use mlua::{
 use ox_uv::fs::{
     self as uvfs, DirEntryType, FileHandle, FsError, FsResult, FsTime, OpenFlags, Stat, StatFs,
 };
-use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop, misc};
+use ox_uv::{CallbackError, Handle, RunMode, Timer, UvLoop, misc, process};
 
 use crate::host::RuntimeRoot;
 use crate::uv_handles::LoopAccess;
@@ -242,17 +242,51 @@ pub(crate) fn install(
 
     let uv_loop = Rc::new(RefCell::new(UvLoop::new().map_err(mlua::Error::external)?));
     let loop_access = LoopAccess::new(uv_loop.clone());
+    // One descriptor registry per Lua host, shared by `uv.pipe`, `pipe:open`,
+    // `uv.spawn` and `uv.fs_close`.
+    let pipe_registry = crate::pipe_fds::Registry::new();
     let state = Rc::new(CoreState::new());
     let vim: Table = lua.globals().get("vim")?;
     let core: Table = vim.get("_core")?;
     core.set("ui_flush", lua.create_function(|_, ()| Ok(()))?)?;
     core.set("check_interrupt", lua.create_function(|_, ()| Ok(false))?)?;
+    // `vim._core.keyparse` (`nlua_keyparse`, lua/stdlib.c:692): the internal
+    // key encoding parsed into one table per chord, so `vim.keycode(keys,
+    // true)` can report modifiers, the bare key, its keytrans spelling, and
+    // the alternate name. The parser itself lives beside `keytrans` in
+    // ox-eval, so both spellings come from one implementation.
+    core.set(
+        "keyparse",
+        lua.create_function(|lua, keys: mlua::LuaString| {
+            let chords = ox_eval::keyparse(&keys.as_bytes());
+            let list = lua.create_table()?;
+            for (index, chord) in chords.into_iter().enumerate() {
+                let entry = lua.create_table()?;
+                let mods = lua.create_table()?;
+                // `mod_mask_table` order (keycodes.c:31-44), stopping before
+                // its 'A' sentinel.
+                for (bit, name) in [(8_u8, "M"), (16, "T"), (4, "C"), (2, "S")] {
+                    if chord.mods & bit != 0 {
+                        mods.push(name)?;
+                    }
+                }
+                entry.set("mod", mods)?;
+                entry.set("key", lua.create_string(&chord.key)?)?;
+                entry.set("keys", chord.keys)?;
+                if let Some(alt) = chord.key_alt {
+                    entry.set("key_alt", lua.create_string(&alt)?)?;
+                }
+                list.set(index + 1, entry)?;
+            }
+            Ok(list)
+        })?,
+    )?;
 
     let poll_access = loop_access.clone();
     let pump_scheduler = scheduler.clone();
     core.set(
         "loop_poll",
-        lua.create_function(move |_, (timeout, _fast_only): (i64, bool)| {
+        lua.create_function(move |_, (timeout, fast_only): (i64, bool)| {
             // Serve the `vim.schedule` queue on every wait turn: without
             // this a blocking `vim.wait` never advances the continuations
             // it waits on (upstream `LOOP_PROCESS_EVENTS`, executor.c).
@@ -262,6 +296,16 @@ pub(crate) fn install(
             // `vim.wait(t, cond, 0)` runs without a dummy wake timer
             // (editor.lua:146-148), so blocking first would strand
             // pre-queued work until the timeout fires.
+            //
+            // `fast_only` forbids non-fast events (`vim.wait(..., true)`,
+            // editor.lua:171): the scheduled queue is a non-fast event, so a
+            // fast-only wait must leave it alone and keep `vim.schedule`
+            // callbacks for the main loop. `SystemObj:wait()` relies on this
+            // (api_level → `vim.wait(..., nil, true)`).
+            if fast_only {
+                poll_access.poll(timeout)?;
+                return Ok(());
+            }
             if !pump_scheduler.pump_scheduled() {
                 poll_access.poll(timeout)?;
                 let _ = pump_scheduler.pump_scheduled();
@@ -323,8 +367,8 @@ pub(crate) fn install(
     )?;
 
     install_misc(lua, &uv)?;
-    install_fs(lua, &uv, &state, &scheduler, &fast)?;
-    crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast)?;
+    install_fs(lua, &uv, &state, &scheduler, &fast, &pipe_registry)?;
+    crate::uv_handles::install(lua, &uv, loop_access, scheduler, fast, pipe_registry.clone())?;
     vim.set("uv", uv.clone())?;
     vim.set("loop", uv)?;
     Ok(EventLoopPump { uv_loop })
@@ -343,6 +387,11 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
         "hrtime",
         lua.create_function(|_, ()| Ok(lua_int(misc::hrtime())))?,
     )?;
+
+    uv.set(
+        "available_parallelism",
+        lua.create_function(|_, ()| Ok(lua_int(misc::available_parallelism())))?,
+    );
 
     uv.set(
         "sleep",
@@ -405,6 +454,26 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
     uv.set(
         "os_getpid",
         lua.create_function(|_, ()| Ok(misc::getpid()))?,
+    )?;
+    uv.set("getuid", lua.create_function(|_, ()| Ok(misc::getuid()))?)?;
+    uv.set(
+        "kill",
+        lua.create_function(|lua, (pid, signal): (i64, Option<Value>)| {
+            let signal = match parse_signal(signal) {
+                Ok(sig) => sig,
+                Err((name, msg)) => return kill_fail(lua, name, msg),
+            };
+            let Ok(pid_u32) = u32::try_from(pid) else {
+                return kill_fail(lua, "EINVAL", "EINVAL: invalid argument".to_string());
+            };
+            match process::kill(pid_u32, signal) {
+                Ok(()) => single_value(lua, 0_i64),
+                Err(error) => {
+                    let (name, message) = error.luv_error_parts();
+                    kill_fail(lua, name, message)
+                }
+            }
+        })?,
     )?;
 
     uv.set(
@@ -510,8 +579,9 @@ fn install_fs(
     state: &Rc<CoreState>,
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
+    pipe_registry: &crate::pipe_fds::PipeRegistry,
 ) -> mlua::Result<()> {
-    install_fs_file_ops(lua, uv, state, scheduler, fast)?;
+    install_fs_file_ops(lua, uv, state, scheduler, fast, pipe_registry)?;
     install_fs_attribute_ops(lua, uv, state, scheduler, fast)?;
     install_fs_path_ops(lua, uv, state, scheduler, fast)?;
     install_fs_stat_ops(lua, uv, state, scheduler, fast)?;
@@ -540,14 +610,15 @@ fn install_fs(
                     Ok(values)
                 }
                 Err(error) => {
+                    let err_msg = format!("{error}: {path}");
                     if let Some(callback) = callback {
                         let args = MultiValue::from_vec(vec![Value::String(
-                            lua.create_string(error.to_string())?,
+                            lua.create_string(&err_msg)?,
                         )]);
                         schedule_callback(&scandir_scheduler, lua, callback, args, &scandir_fast)
                             .map_err(mlua::Error::runtime)?;
                     }
-                    fs_fail(lua, &error)
+                    fs_fail_msg(lua, &err_msg, error.name)
                 }
             }
         })?,
@@ -586,7 +657,9 @@ fn install_fs_file_ops(
     state: &Rc<CoreState>,
     scheduler: &Rc<dyn Scheduler>,
     fast: &FastCallbackState,
+    pipe_registry: &crate::pipe_fds::PipeRegistry,
 ) -> mlua::Result<()> {
+    let pipe_registry = std::rc::Rc::clone(pipe_registry);
     register_fs_op(
         lua,
         uv,
@@ -611,11 +684,21 @@ fn install_fs_file_ops(
         state,
         scheduler,
         fast,
-        |lua, state, args| {
+        move |lua, state, args| {
             let (descriptor, callback) = <(i64, Option<Function>)>::from_lua_multi(args, lua)?;
+            // A real file handle wins: a number can be reused for `fs_open`
+            // while a stale pipe marker still names it.
             let result = match state.files.borrow_mut().remove(&descriptor) {
                 Some(handle) => uvfs::close(&handle).map(|()| true),
-                None => Err(bad_file_descriptor()),
+                None => {
+                    let descriptor = i32::try_from(descriptor)
+                        .map_err(mlua::Error::external)?;
+                    if pipe_registry.borrow_mut().close(descriptor) {
+                        Ok(true)
+                    } else {
+                        Err(bad_file_descriptor())
+                    }
+                }
             };
             Ok((result, callback))
         },
@@ -1202,10 +1285,106 @@ fn finish_fs<T: mlua::IntoLuaMulti + 'static>(
 
 /// Synchronous failure shape: `nil, err, name` (luv `fail` returns).
 fn fs_fail(lua: &Lua, error: &FsError) -> mlua::Result<MultiValue> {
+    fs_fail_msg(lua, &error.to_string(), error.name)
+}
+
+fn fs_fail_msg(lua: &Lua, message: &str, name: &str) -> mlua::Result<MultiValue> {
     Ok(MultiValue::from_vec(vec![
         Value::Nil,
-        Value::String(lua.create_string(error.message.as_str())?),
-        Value::String(lua.create_string(error.name)?),
+        Value::String(lua.create_string(message)?),
+        Value::String(lua.create_string(name)?),
+    ]))
+}
+
+#[cfg(unix)]
+const SIGNALS: &[(&str, i32)] = &[
+    ("sighup", signal_hook::consts::SIGHUP),
+    ("sigint", signal_hook::consts::SIGINT),
+    ("sigquit", signal_hook::consts::SIGQUIT),
+    ("sigill", signal_hook::consts::SIGILL),
+    ("sigtrap", signal_hook::consts::SIGTRAP),
+    ("sigabrt", signal_hook::consts::SIGABRT),
+    ("sigbus", signal_hook::consts::SIGBUS),
+    ("sigfpe", signal_hook::consts::SIGFPE),
+    ("sigkill", signal_hook::consts::SIGKILL),
+    ("sigusr1", signal_hook::consts::SIGUSR1),
+    ("sigsegv", signal_hook::consts::SIGSEGV),
+    ("sigusr2", signal_hook::consts::SIGUSR2),
+    ("sigpipe", signal_hook::consts::SIGPIPE),
+    ("sigalrm", signal_hook::consts::SIGALRM),
+    ("sigterm", signal_hook::consts::SIGTERM),
+    ("sigchld", signal_hook::consts::SIGCHLD),
+    ("sigcont", signal_hook::consts::SIGCONT),
+    ("sigstop", signal_hook::consts::SIGSTOP),
+    ("sigtstp", signal_hook::consts::SIGTSTP),
+    ("sigttin", signal_hook::consts::SIGTTIN),
+    ("sigttou", signal_hook::consts::SIGTTOU),
+    ("sigurg", signal_hook::consts::SIGURG),
+    ("sigxcpu", signal_hook::consts::SIGXCPU),
+    ("sigxfsz", signal_hook::consts::SIGXFSZ),
+    ("sigvtalrm", signal_hook::consts::SIGVTALRM),
+    ("sigprof", signal_hook::consts::SIGPROF),
+    ("sigwinch", signal_hook::consts::SIGWINCH),
+    ("sigio", signal_hook::consts::SIGIO),
+    ("sigsys", signal_hook::consts::SIGSYS),
+    ("sigiot", signal_hook::consts::SIGABRT),
+    ("sigpoll", signal_hook::consts::SIGIO),
+];
+
+fn parse_signal(value: Option<Value>) -> Result<Option<i32>, (&'static str, String)> {
+    let Some(value) = value else {
+        #[cfg(unix)]
+        return Ok(Some(signal_hook::consts::SIGTERM));
+        #[cfg(not(unix))]
+        return Ok(Some(15));
+    };
+
+    match value {
+        Value::Nil => {
+            #[cfg(unix)]
+            {
+                Ok(Some(signal_hook::consts::SIGTERM))
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(Some(15))
+            }
+        }
+        Value::Integer(number) => {
+            if number == 0 {
+                return Ok(Some(0));
+            }
+            i32::try_from(number)
+                .map(Some)
+                .map_err(|_| ("EINVAL", "EINVAL: invalid argument".to_string()))
+        }
+        Value::String(name) => {
+            let name_bytes = name.as_bytes();
+            let name_str = std::str::from_utf8(&name_bytes)
+                .map_err(|_| ("EINVAL", "EINVAL: invalid argument".to_string()))?
+                .to_ascii_lowercase();
+            #[cfg(unix)]
+            {
+                if let Some((_, number)) = SIGNALS.iter().find(|(candidate, _)| {
+                    *candidate == name_str
+                        || candidate.strip_prefix("sig") == Some(name_str.as_str())
+                }) {
+                    return Ok(Some(*number));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = name_str;
+            Err(("EINVAL", "EINVAL: invalid argument".to_string()))
+        }
+        _ => Err(("EINVAL", "EINVAL: invalid argument".to_string())),
+    }
+}
+
+fn kill_fail(lua: &Lua, name: &'static str, message: String) -> mlua::Result<MultiValue> {
+    Ok(MultiValue::from_vec(vec![
+        Value::Nil,
+        Value::String(lua.create_string(message.as_str())?),
+        Value::String(lua.create_string(name)?),
     ]))
 }
 

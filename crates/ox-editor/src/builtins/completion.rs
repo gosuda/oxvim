@@ -8,10 +8,64 @@
 //! `getcompletion({pat}, {type} [, {filtered}])` returns a List of completion
 //! candidates for the given pattern and type.
 
-use ox_eval::{EvalError, builtin_spec};
+use ox_eval::{EvalError, Scope, builtin_spec};
 use ox_types::{OxStr, Typval};
 
 use crate::Editor;
+use crate::excmd_exec::{EvalHost, ExEditorAccess};
+use crate::script::FileIO;
+
+pub(crate) fn call_host<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    name: &str,
+    args: &[Typval],
+    _scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    if name == "complete_check" {
+        return call_complete_check(host, args);
+    }
+    host.access.with_ex_editor(|editor| call(editor, name, args))
+}
+
+/// `complete_check()` (`insexpand.c:3620-3629`): 1 when a key was typed while
+/// a completion lookup runs, 0 otherwise. Upstream polls the typeahead buffer
+/// (`ins_compl_check_keys`) and answers `ins_compl_interrupted()`; without an
+/// active session there is nothing to interrupt. Only a `complete-functions`
+/// lookup should call this, like upstream.
+fn call_complete_check<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let Some(spec) = builtin_spec("complete_check") else {
+        unreachable!("completion builtin route and dispatcher disagree");
+    };
+    if args.len() < spec.min_args {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            "Not enough arguments for function: complete_check",
+        ));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: complete_check",
+        ));
+    }
+    let active = host
+        .runtime
+        .mode_machine
+        .as_ref()
+        .is_some_and(|machine| machine.borrow().completion.is_active());
+    if !active {
+        return Ok(Typval::Number(0));
+    }
+    let interrupted = host
+        .access
+        .with_ex_editor(|editor| !editor.typeahead().is_empty());
+    Ok(Typval::Number(i64::from(interrupted)))
+}
 
 /// Routes one completion builtin.
 use crate::options::OptionValue;
@@ -182,6 +236,7 @@ fn complete_commands(pat: &str) -> Vec<OxStr> {
         "print",
         "iabbrev",
         "abclear",
+        "iput",
         "put",
         "quit",
         "read",
@@ -2433,6 +2488,34 @@ mod tests {
     use super::*;
     use ox_text::Buffer;
 
+    /// `complete_check()` (`insexpand.c:3620-3629`): without an active
+    /// completion session there is nothing to interrupt, so the answer is 0
+    /// — the oracle ground truth for `echo complete_check()`.
+    #[test]
+    fn complete_check_idle_answers_zero() {
+        let editor = crate::TestEditorAccess::new(crate::Editor::new());
+        let mut exec = crate::ExExecutor::new();
+        exec.execute_script(&editor, "complete_check.vim", "let g:idle = complete_check()")
+            .unwrap();
+        match exec
+            .scope()
+            .get_scoped(ox_eval::ScopeKind::Global, b"idle", 0)
+        {
+            Ok(Typval::Number(value)) => assert_eq!(*value, 0),
+            other => panic!("expected Number(0), got {other:?}"),
+        }
+        let error = exec
+            .execute_line(&editor, "call complete_check(1)")
+            .unwrap_err();
+        match error {
+            crate::excmd_exec::ExecError::Vim(exception) => match &exception.kind {
+                crate::VimExceptionKind::Error(code) => assert_eq!(code, "E118"),
+                crate::VimExceptionKind::Throw => panic!("expected E118, got Throw"),
+            },
+            other => panic!("expected Vim error, got {other:?}"),
+        }
+    }
+
     #[test]
     fn command_completion_accepts_wildcard_patterns() {
         let commands = complete_commands("*add");
@@ -2509,9 +2592,7 @@ fn line_bytes(editor: &Editor, buffer: BufHandle, lnum: usize) -> Result<Vec<u8>
 
 #[cfg(test)]
 mod completion_engine_tests {
-    use super::{
-        CTRL_D, CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession,
-    };
+    use super::{CTRL_D, CTRL_E, CTRL_N, CTRL_P, CTRL_X, CompletionOutcome, CompletionSession};
     use crate::layout::Geometry;
     use ox_text::{Buffer, Position};
 

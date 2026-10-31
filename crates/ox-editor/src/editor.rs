@@ -18,16 +18,19 @@ use crate::builtins::position::cursor_vcol;
 use crate::decoration::Decorations;
 use crate::extmark::{ExtmarkPosition, NamespaceId, SignGroup, TextExtent, TextSplice};
 use crate::fold::{FoldError, Position as FoldPosition};
+use crate::indent::ExprEval;
 use crate::layout::{
     CursorScreenPosition, Geometry, Layout, LayoutError, RelativeTo, TabpageState, WinConfig,
     WindowState,
 };
 use crate::mapping::Mappings;
-use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
+use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError, MarkLocation, MarkTarget};
+use crate::ops::{self, EditRange, Operator, OperatorRequest};
 use crate::options::{OptionStore, OptionValue};
-use crate::put::{PutDirection, PutEdit, PutPlan, plan_put, put_origin};
-use crate::register::{RegisterError, RegisterKind, Registers};
+use crate::put::{PutDirection, PutEdit, PutPlan, PutRequest, plan_put, put_origin};
+use crate::register::{RegisterContent, RegisterError, RegisterKind, Registers};
 use crate::typeahead::Typeahead;
+use crate::visual::VisualKind;
 
 pub(crate) const LOWEST_WINDOW_ID: i64 = 1_000;
 
@@ -136,6 +139,35 @@ pub struct Message {
     /// search (`show_pat_in_path`) writes the first match on the current
     /// command line, so capture must not invent a leading newline.
     pub leading_newline: bool,
+}
+
+impl Message {
+    /// Returns the text content of this message, whether stored as a plain
+    /// string or as an array of `nvim_echo` highlight chunks.
+    #[must_use]
+    pub fn text_lossy(&self) -> Option<String> {
+        match &self.content {
+            Object::String(text) => Some(text.to_string_lossy().into_owned()),
+            Object::Array(chunks) => {
+                let mut out = String::new();
+                for chunk in chunks {
+                    match chunk {
+                        Object::Array(pair) => {
+                            if let Some(Object::String(text)) = pair.first() {
+                                out.push_str(&text.to_string_lossy());
+                            }
+                        }
+                        Object::String(text) => {
+                            out.push_str(&text.to_string_lossy());
+                        }
+                        _ => {}
+                    }
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// `nvim_echo` identity retained parallel to the message sink: the
@@ -300,12 +332,22 @@ pub enum EditorError {
     /// A named-mark operation failed.
     #[error(transparent)]
     Mark(#[from] MarkError),
+    /// An operator pipeline step failed (boxed: [`OperatorError`] already
+    /// wraps [`EditorError`]).
+    #[error(transparent)]
+    Operator(Box<crate::ops::OperatorError>),
     /// A fold operation failed.
     #[error(transparent)]
     Fold(#[from] FoldError),
     /// An extmark store operation failed.
     #[error(transparent)]
     Extmark(#[from] crate::ExtmarkError),
+}
+
+impl From<crate::ops::OperatorError> for EditorError {
+    fn from(error: crate::ops::OperatorError) -> Self {
+        Self::Operator(Box::new(error))
+    }
 }
 
 /// What to do with an old buffer after its last window switches away.
@@ -333,16 +375,31 @@ pub enum BufferEditMode {
     Insert,
 }
 
-/// Scope of a directory change: session-global (`:cd`) or window-local
-/// (`:lcd`), matching upstream `changedir_func`'s `local` flag.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Scope of a directory change: session-global (`:cd`), tabpage-local
+/// (`:tcd`), window-local (`:lcd`), or buffer-local (`:bcd`), matching
+/// upstream `CdScope` (`vim_defs.h:33-39`). The declaration order matters:
+/// `post_chdir` (`ex_docmd.c:6262-6322`) clears the window-local directory
+/// for every scope at or above [`DirectoryScope::Window`] and the
+/// tabpage-local directory for every scope at or above
+/// [`DirectoryScope::Tabpage`], so the variants are ordered
+/// buffer < window < tabpage < global exactly like upstream's
+/// `kCdScopeBuffer < kCdScopeWindow < kCdScopeTabpage < kCdScopeGlobal`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum DirectoryScope {
-    /// `:cd` — changes the process cwd and clears the current window's local
-    /// directory so every window without its own `:lcd` follows it.
-    Global,
-    /// `:lcd` — changes the process cwd and records it on the current window
-    /// only; other windows are unaffected.
+    /// `:bcd` — records the process cwd on the current buffer only; every
+    /// other scope keeps its directory and the buffer-local one stays in
+    /// effect over later `:lcd`/`:tcd`/`:cd` moves.
+    Buffer,
+    /// `:lcd` — records the process cwd on the current window only; other
+    /// windows are unaffected.
     Window,
+    /// `:tcd` — records the process cwd on the current tabpage (clearing
+    /// the current window's local directory); other tabpages are unaffected.
+    Tabpage,
+    /// `:cd` — records the process cwd as the session fallback, clearing
+    /// the current window's and the current tabpage's local directories so
+    /// every scope without its own `:lcd`/`:tcd` follows it.
+    Global,
 }
 
 /// Failures from [`Editor::change_directory`]. The Ex layer maps these to
@@ -382,6 +439,27 @@ pub struct TerminalChannelInfo {
     pub replies: Vec<u8>,
 }
 
+#[derive(Clone, Debug)]
+struct ContextDirsSnapshot {
+    window: WinHandle,
+    target_buffer: BufHandle,
+    window_local_dir: Option<PathBuf>,
+    window_prev_dir: Option<PathBuf>,
+    tab: Option<TabHandle>,
+    tab_local_dir: Option<PathBuf>,
+    global_dir: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufferSwitchView {
+    cursor: Position,
+    topline: usize,
+    skiprows: usize,
+    curswant: i64,
+    set_curswant: bool,
+    coladd: i64,
+}
 /// All mutable editor state under a single `&mut self` discipline.
 ///
 /// No state is process-global. Event-loop and RPC layers can serialize their
@@ -421,6 +499,10 @@ pub struct Editor {
     /// Per-window location list stacks (`quickfix.c` `w_llist`), freed with
     /// their window (`win_free` → `qf_free_all`, window.c:5667).
     loclists: std::collections::BTreeMap<WinHandle, crate::quickfix::QuickfixStack>,
+    /// Command-line, search, expression, input and debug history tables
+    /// (`cmdhist.c` `history[]`), newest last, each entry carrying its stable
+    /// `hisnum`.
+    history: crate::history::History,
     /// Diff-mode state: saved window options and per-tabpage diff blocks
     /// (`diff.c` `w_p_diff_saved` and `tp_first_diff`).
     pub diff: crate::diffmode::DiffState,
@@ -509,7 +591,7 @@ pub struct Editor {
     /// to the process cwd on first tabpage creation; `None` in a fresh
     /// editor with no tabpage so [`Editor::new`] stays cwd-inert.
     global_directory: Option<PathBuf>,
-
+    context_dirs_stack: Vec<ContextDirsSnapshot>,
     next_buffer: i64,
     next_window: i64,
     next_tabpage: i64,
@@ -536,6 +618,75 @@ impl Default for Editor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// One register put through the buffer mutation pipeline: named fields keep
+/// the window, register, placement, count, and cursor/indent modes from being
+/// transposed at a call site.
+///
+/// `cursend` is upstream `PUT_CURSEND` (`gp`/`gP`): the cursor lands after
+/// the inserted text. `fixindent` is upstream `PUT_FIXINDENT` (`[p`, `]p`,
+/// `:iput`): linewise rows are reindented to the cursor line.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegisterPut {
+    /// Window whose cursor positions the put.
+    pub window: WinHandle,
+    /// Register to put (`%`/`#` resolve against live buffers).
+    pub name: char,
+    /// `p` (after) or `P` (before) placement.
+    pub direction: PutDirection,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text.
+    pub cursend: bool,
+    /// Reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Undo timestamp.
+    pub timestamp: i64,
+}
+
+/// One put of already-resolved content: the same fields as [`RegisterPut`]
+/// without the register name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResolvedPut {
+    /// Window whose cursor positions the put.
+    pub window: WinHandle,
+    /// `p` (after) or `P` (before) placement.
+    pub direction: PutDirection,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text.
+    pub cursend: bool,
+    /// Reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Undo timestamp.
+    pub timestamp: i64,
+}
+
+/// One visual-mode put: the selection is deleted, then the register is put
+/// over the deletion (`nv_put`, `normal.c:6630-6690`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VisualPut {
+    /// Window showing the selection.
+    pub window: WinHandle,
+    /// Normalized selection range (from `VisualState::range`).
+    pub range: EditRange,
+    /// Selection shape.
+    pub kind: VisualKind,
+    /// Register to put.
+    pub name: char,
+    /// Repetition count.
+    pub count: usize,
+    /// Land the cursor after the inserted text (`gp`).
+    pub cursend: bool,
+    /// Reindent linewise rows (`[p`).
+    pub fixindent: bool,
+    /// Delete the selection to the black hole (`P` keeps registers).
+    pub keep_registers: bool,
+    /// `p` (after) or `P` (before) placement at the deletion point.
+    pub direction: PutDirection,
+    /// Undo timestamp.
+    pub timestamp: i64,
 }
 
 /// One domain request to replace an inclusive line range: named fields keep
@@ -576,6 +727,7 @@ impl Editor {
             jumplist: Jumplist::new(),
             quickfix: crate::quickfix::QuickfixStack::new(),
             loclists: std::collections::BTreeMap::new(),
+            history: crate::history::History::new(),
             diff: crate::diffmode::DiffState::default(),
             changelists: Changelists::new(),
             arglist: ArgList::new(),
@@ -609,6 +761,36 @@ impl Editor {
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
                 ("register".into(), Object::String(OxStr::from("\""))),
+                // `v:vim_did_enter` is 0 through startup and 1 from the
+                // moment VimEnter is fired (`eval.c` `set_vim_var_nr`, main.c),
+                // so a runtime plugin that branches on it during startup sees
+                // the true value. An absent key made `vim.v.vim_did_enter > 0`
+                // a nil comparison.
+                ("vim_did_enter".into(), Object::Integer(0)),
+                // The six `v:option_*` values an `OptionSet` dispatch
+                // publishes. Upstream always has them defined and empty
+                // between dispatches (`reset_v_option_vars`, eval/vars.c:3382).
+                ("option_new".into(), Object::String(OxStr::from(""))),
+                ("option_old".into(), Object::String(OxStr::from(""))),
+                ("option_oldlocal".into(), Object::String(OxStr::from(""))),
+                ("option_oldglobal".into(), Object::String(OxStr::from(""))),
+                ("option_type".into(), Object::String(OxStr::from(""))),
+                ("option_command".into(), Object::String(OxStr::from(""))),
+                // `v:msgpack_types` (`eval.c` `set_internal_string_var`): the
+                // five marker lists that name the special msgpack maps, so
+                // `msgpackparse()` can build them and `msgpackdump()` can
+                // recognise them by list identity.
+                ("msgpack_types".into(), Object::Dict(Dict(vec![
+                    ("nil".into(), Object::Array(Vec::new())),
+                    ("boolean".into(), Object::Array(Vec::new())),
+                    ("integer".into(), Object::Array(Vec::new())),
+                    ("float".into(), Object::Array(Vec::new())),
+                    ("string".into(), Object::Array(Vec::new())),
+                    ("array".into(), Object::Array(Vec::new())),
+                    ("map".into(), Object::Array(Vec::new())),
+                    ("binary".into(), Object::Array(Vec::new())),
+                    ("ext".into(), Object::Array(Vec::new())),
+                ]))),
             ]),
             gvars_version: 1,
             vvars_version: 1,
@@ -634,7 +816,7 @@ impl Editor {
             // An unreadable cwd leaves it `None`, and later reapplies then
             // leave the process cwd unchanged.
             global_directory: std::env::current_dir().ok(),
-
+            context_dirs_stack: Vec::new(),
             next_buffer: 1,
             next_window: LOWEST_WINDOW_ID,
             next_tabpage: 1,
@@ -926,6 +1108,13 @@ impl Editor {
         self.windows.keys().copied().collect()
     }
 
+    /// Returns the next window handle, which advances whenever a window is
+    /// allocated and therefore identifies layout mutations across redraws.
+    #[must_use]
+    pub const fn window_epoch(&self) -> i64 {
+        self.next_window
+    }
+
     /// Returns live tabpage handles in tab order.
     #[must_use]
     pub fn tabpages(&self) -> Vec<TabHandle> {
@@ -1008,65 +1197,6 @@ impl Editor {
             .ok_or(EditorError::UnknownBuffer(resolved))
     }
 
-    /// Places a multicursor at `position` in `buffer` (`mc_add`,
-    /// src/nvim/mcursor.c): the cursor rides the extmark store so it tracks
-    /// later edits and dies with the buffer, and an existing cursor at the
-    /// position is left alone rather than duplicated. The namespace is the
-    /// session-global `nvim.multicursor` id (`mc_ns`): one id shared by
-    /// every buffer, so a buffer store only `ensure`s it locally.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`EditorError::NoCurrentTabpage`] or
-    /// [`EditorError::UnknownBuffer`] like [`Self::buffer`], plus extmark
-    /// store failures.
-    ///
-    /// Returns whether a cursor was placed.
-    pub fn add_mcursor(
-        &mut self,
-        buffer: BufHandle,
-        position: Position,
-        namespace: NamespaceId,
-    ) -> Result<bool, EditorError> {
-        let state = self.buffer_mut(buffer)?;
-        state.extmarks.ensure_namespace(namespace)?;
-        let point = ExtmarkPosition::new(position.lnum.saturating_sub(1), position.col);
-        if !state
-            .extmarks
-            .query(namespace, point, point, Some(1))?
-            .is_empty()
-        {
-            return Ok(false);
-        }
-        state
-            .extmarks
-            .set(namespace, None, crate::ExtmarkPlacement::new(point))?;
-        Ok(true)
-    }
-
-    /// Counts multicursors across every live buffer (`mc_count`,
-    /// src/nvim/mcursor.c) under the session-global `nvim.multicursor`
-    /// namespace id.
-    #[must_use]
-    pub fn mcursor_count(&self, namespace: NamespaceId) -> usize {
-        self.buffers()
-            .iter()
-            .filter_map(|handle| self.buffer(*handle).ok())
-            .filter_map(|state| {
-                state
-                    .extmarks
-                    .query(
-                        namespace,
-                        ExtmarkPosition::new(0, 0),
-                        ExtmarkPosition::new(usize::MAX, usize::MAX),
-                        None,
-                    )
-                    .ok()
-            })
-            .map(|marks| marks.len())
-            .sum()
-    }
-
     /// Renames a live buffer and preserves its old name as the alternate buffer.
     ///
     /// # Errors
@@ -1112,10 +1242,14 @@ impl Editor {
         Ok(alternate)
     }
 
-    /// `do_autochdir` (buffer.c:1890): when 'autochdir' is set and the current
-    /// buffer has a file name, change the window-local directory to the
-    /// buffer's parent directory.  Matches upstream `vim_chdirfile` which
-    /// strips the tail from `b_ffname` and `os_chdir`s to the result.
+    /// `do_autochdir` (`buffer.c:1897`): when 'autochdir' is set and the
+    /// current buffer has a file name, change to the buffer's parent
+    /// directory. This is a bare process move (`vim_chdirfile`,
+    /// `file_search.c:1900-1928`, reports `kCdScopeWindow` to the autocmd
+    /// only): unlike `:lcd` it records no scope-local directory, so the
+    /// window/tab/global scopes keep theirs and `getcwd({winnr})` still
+    /// answers the scope chain while the effective directory follows the
+    /// file.
     pub fn do_autochdir(&mut self) {
         let autochdir = self
             .options
@@ -1127,28 +1261,29 @@ impl Editor {
         let Some(buffer) = self.current_buffer() else {
             return;
         };
-        let name = match self.buffer(buffer) {
-            Ok(state) => state.name().clone(),
+        let path = match self.buffer(buffer) {
+            Ok(state) => {
+                if state.name().as_bytes().is_empty() {
+                    return;
+                }
+                state.file_path.clone().unwrap_or_else(|| {
+                    std::path::PathBuf::from(expand_buffer_name(&state.name()).to_string_lossy().as_ref())
+                })
+            }
             Err(_) => return,
         };
-        if name.as_bytes().is_empty() {
-            return;
-        }
-        // `vim_chdirfile`: strip the filename tail, keeping the directory.
-        let name_lossy = name.to_string_lossy();
-        let path = std::path::Path::new(name_lossy.as_ref());
         let Some(parent) = path.parent() else {
             return;
         };
-        // Nothing to do if already there.
+        // Nothing to do if already there (`path_equal` early return).
         if let Ok(cwd) = std::env::current_dir()
             && parent == cwd
         {
             return;
         }
-        // Change to the buffer's directory (window-local scope, matching
-        // upstream `kCdScopeWindow`).
-        let _ = self.change_directory(parent, DirectoryScope::Window);
+        // WHY: `vim_chdirfile` ignores the `os_chdir` failure — the buffer
+        // switch that triggered it has already committed.
+        Self::apply_current_dir(parent);
     }
 
     /// Returns an immutable live tabpage state.
@@ -1246,6 +1381,7 @@ impl Editor {
             .set_current(resolved)?;
         self.current_tab = Some(tab);
         self.apply_effective_directory();
+        self.do_autochdir();
         Ok(())
     }
 
@@ -1261,12 +1397,13 @@ impl Editor {
         self.previous_window = window;
     }
 
-    /// Returns the previous directory for `cd -` / `lcd -` resolution.
+    /// Returns the previous directory for `cd -` / `lcd -` / `tcd -` /
+    /// `bcd -` resolution (`get_prevdir`, `ex_docmd.c:6247-6260`).
     ///
-    /// [`DirectoryScope::Global`] reads the session-global previous directory;
-    /// [`DirectoryScope::Window`] reads the current window's previous
-    /// directory, or `None` when the current window has none or no current
-    /// window exists.
+    /// Each scope owns its slot: [`DirectoryScope::Global`] reads the
+    /// session-global slot, the rest read the current window's, tabpage's,
+    /// or buffer's slot, or `None` when that scope recorded nothing (or no
+    /// current object exists).
     #[must_use]
     pub fn previous_directory(&self, scope: DirectoryScope) -> Option<PathBuf> {
         match scope {
@@ -1274,6 +1411,14 @@ impl Editor {
             DirectoryScope::Window => self
                 .current_window()
                 .and_then(|window| self.window(window).ok())
+                .and_then(|state| state.previous_directory.clone()),
+            DirectoryScope::Tabpage => self
+                .current_tab
+                .and_then(|tab| self.tabpages.get(&tab))
+                .and_then(|state| state.previous_directory.clone()),
+            DirectoryScope::Buffer => self
+                .current_buffer()
+                .and_then(|buffer| self.buffers.get(&buffer))
                 .and_then(|state| state.previous_directory.clone()),
         }
     }
@@ -1286,8 +1431,8 @@ impl Editor {
     /// Returns [`EditorError::NoCurrentTabpage`] when a current-window request
     /// has no live tabpage, [`EditorError::UnknownWindow`] when the window is
     /// not live, [`EditorError::UnknownTabpage`] when its owning tabpage is
-    /// missing, or [`EditorError::Layout`] when the tabpage does not contain
-    /// the window.
+    /// missing, or [`EditorError::Layout`] when the tabpage layout rejects the
+    /// window.
     pub fn window_local_directory(
         &self,
         window: WinHandle,
@@ -1295,79 +1440,216 @@ impl Editor {
         Ok(self.window(window)?.local_directory.clone())
     }
 
-    /// Returns the session-global fallback directory, or `None` before the
-    /// first tabpage is created.
+    /// Returns the tabpage-local directory set by `:tcd`, or `None` when the
+    /// tabpage has none (`tp_localdir`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::NoCurrentTabpage`] when a current-tabpage
+    /// request has no live tabpage, or [`EditorError::UnknownTabpage`] when
+    /// the tabpage is not live.
+    pub fn tab_local_directory(
+        &self,
+        tab: TabHandle,
+    ) -> Result<Option<PathBuf>, EditorError> {
+        Ok(self.tabpage(tab)?.local_directory.clone())
+    }
+
+    /// Returns the buffer-local directory set by `:bcd`, or `None` when the
+    /// buffer has none (`b_localdir`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError::UnknownBuffer`] when the buffer is not live.
+    pub fn buffer_local_directory(
+        &self,
+        buffer: BufHandle,
+    ) -> Result<Option<PathBuf>, EditorError> {
+        Ok(self.buffer(buffer)?.local_directory.clone())
+    }
+
+    /// Returns the session-global fallback directory (`globaldir`), or `None`
+    /// when the process is parked in a scope-local directory and the global
+    /// one was consumed by a scope switch, or before the first tabpage is
+    /// created.
     #[must_use]
     pub fn global_directory(&self) -> Option<&Path> {
         self.global_directory.as_deref()
+    }
+
+    /// Returns the process directory the current context effectively runs
+    /// tabpage-local one, else the saved session-global fallback, else the
+    /// live process directory. Mirrors the `update_cwd` precedence
+    /// (`window.c:5367-5383`) without consuming the saved fallback.
+    #[must_use]
+    pub fn effective_directory(&self) -> Option<PathBuf> {
+        self.current_buffer()
+            .and_then(|buffer| self.buffers.get(&buffer))
+            .and_then(|state| state.local_directory.clone())
+            .or_else(|| {
+                self.current_window()
+                    .and_then(|window| self.window(window).ok())
+                    .and_then(|state| state.local_directory.clone())
+            })
+            .or_else(|| {
+                self.current_tab
+                    .and_then(|tab| self.tabpages.get(&tab))
+                    .and_then(|state| state.local_directory.clone())
+            })
+            .or_else(|| self.global_directory.clone())
+            .or_else(|| std::env::current_dir().ok())
     }
 
     /// Changes the process working directory and records the directory left
     /// behind as the previous directory for the given scope.
     ///
     /// `target` is an already-resolved path (the Ex layer handles `-` and
-    /// `cdpath`). The window is resolved *before* the OS mutation so a failure
-    /// leaves no model state changed. On success the old `current_dir()` is
-    /// stored as the previous directory and the new `current_dir()` (read back
-    /// as an absolute path) is stored as the local or global directory.
+    /// `cdpath`). The scope object is resolved *before* the OS mutation so a
+    /// failure leaves no model state changed. On success the old
+    /// `current_dir()` is stored as the scope's previous directory and the
+    /// new `current_dir()` (read back as an absolute path) is stored on the
+    /// scope, following upstream `do_chdir` + `post_chdir`
+    /// (`ex_docmd.c:6262-6394`):
     ///
-    /// A [`DirectoryScope::Global`] change clears the current window's
-    /// `local_directory` so every window without its own `:lcd` follows the
-    /// global directory, matching upstream `:cd`.
+    /// - [`DirectoryScope::Buffer`] overwrites only the buffer-local
+    ///   directory; the window/tab scopes keep theirs.
+    /// - [`DirectoryScope::Window`] overwrites only the window-local
+    ///   directory.
+    /// - [`DirectoryScope::Tabpage`] overwrites the tabpage-local directory
+    ///   and clears the current window's local directory.
+    /// - [`DirectoryScope::Global`] clears the current window's and the
+    ///   current tabpage's local directories and resets the session-global
+    ///   fallback, so every scope without its own directory follows it.
+    ///
+    /// A buffer-local directory is never cleared by another scope's move and
+    /// stays in effect: the new directory is still entered (so the scope
+    /// slot records its resolved name) and the process is then parked back
+    /// in the buffer-local directory, exactly like upstream's `bcd_active`
+    /// path.
     ///
     /// # Errors
     ///
-    /// Returns [`DirectoryError::NoCurrentWindow`] when a window-scoped change
-    /// has no current window, or [`DirectoryError::ChangeFailed`] when the OS
-    /// refuses the transition.
+    /// Returns [`DirectoryError::NoCurrentWindow`] when a scoped change has
+    /// no current window/tabpage/buffer, or [`DirectoryError::ChangeFailed`]
+    /// when the OS refuses the transition.
     pub fn change_directory(
         &mut self,
         target: &Path,
         scope: DirectoryScope,
     ) -> Result<PathBuf, DirectoryError> {
-        let window = match scope {
-            DirectoryScope::Window => Some(
-                self.current_window()
-                    .ok_or(DirectoryError::NoCurrentWindow)?,
-            ),
-            DirectoryScope::Global => self.current_window(),
-        };
-        // Unreadable outgoing cwd records no previous path (empty PathBuf),
-        // matching upstream `post_chdir` which leaves `prevdir` unset when
-        // `os_dirname` fails.
-        let mut previous: Option<PathBuf> = None;
-        if let Ok(path) = std::env::current_dir() {
-            previous = Some(path);
+        // Resolve the scope object before touching the OS so a missing
+        // current window/tabpage/buffer refuses the move with no state
+        // changed, like upstream's NULL `curwin`/`curtab`/`curbuf` guard in
+        // `do_chdir`.
+        let window = self.current_window();
+        let tab = self.current_tab;
+        let buffer = self.current_buffer();
+        match scope {
+            DirectoryScope::Window => {
+                window.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Tabpage => {
+                tab.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Buffer => {
+                buffer.ok_or(DirectoryError::NoCurrentWindow)?;
+            }
+            DirectoryScope::Global => {}
         }
+        // Unreadable outgoing cwd records no previous path, matching upstream
+        // `do_chdir` which leaves `prevdir` NULL when `os_dirname` fails.
+        let previous: Option<PathBuf> = std::env::current_dir().ok();
+        // Whether a buffer-local directory is in effect for a non-buffer
+        // move (`bcd_active`, `ex_docmd.c:6364`): the move still enters the
+        // new directory, then parks back in the buffer-local one.
+        let buffer_local_active = scope != DirectoryScope::Buffer
+            && buffer
+                .and_then(|buffer| self.buffers.get(&buffer))
+                .and_then(|state| state.local_directory.clone())
+                .is_some();
         std::env::set_current_dir(target).map_err(|error| DirectoryError::ChangeFailed {
             target: target.to_path_buf(),
             error,
         })?;
         // Unreadable readback leaves the effective path unrecorded (None):
-        // neither the local nor global state is set, and later reapplies
-        // fall back to global_directory.
-        let mut new_directory: Option<PathBuf> = None;
-        if let Ok(path) = std::env::current_dir() {
-            new_directory = Some(path);
+        // neither the local nor global state is set.
+        let new_directory: Option<PathBuf> = std::env::current_dir().ok();
+        // `post_chdir` (`ex_docmd.c:6262-6322`): only `:bcd` overwrites the
+        // buffer-local directory; `:cd`/`:tcd`/`:lcd` overwrite the
+        // window-local one; `:cd`/`:tcd` overwrite the tabpage-local one.
+        if scope == DirectoryScope::Buffer
+            && let Some(buffer) = buffer
+            && let Some(state) = self.buffers.get_mut(&buffer)
+        {
+            state.local_directory.clone_from(&new_directory);
         }
+        if scope >= DirectoryScope::Window
+            && let Some(window) = window
+            && let Ok(state) = self.window_mut(window)
+        {
+            state.local_directory = None;
+        }
+        if scope >= DirectoryScope::Tabpage
+            && let Some(tab) = tab
+            && let Some(state) = self.tabpages.get_mut(&tab)
+        {
+            state.local_directory = None;
+        }
+        // The first scope-local move out of the global directory remembers
+        // it, so a later scope switch can return to it: `post_chdir` copies
+        // the just-left directory into `globaldir` when it is NULL
+        // (`ex_docmd.c:6282-6288`). The scope's own previous-directory slot
+        // records the same directory (`do_chdir`'s `*pp = pdir`).
+        if scope < DirectoryScope::Global && let Some(previous) = previous.clone() {
+            if self.global_directory.is_none() {
+                self.global_directory = Some(previous.clone());
+            }
+            if let Some(slot) = self.previous_directory_slot(scope, window, tab, buffer) {
+                *slot = Some(previous);
+            }
+        }
+        // A global move records only the session-global previous directory
+        // here; `post_chdir` resets the fallback below.
+        if scope == DirectoryScope::Global {
+            self.previous_directory.clone_from(&previous);
+        }
+        // Record the entered directory on the scope. A global move forgets
+        // the saved fallback first — unless a buffer-local directory is in
+        // effect, in which case the entered directory becomes the remembered
+        // global one (`post_chdir`'s `kCdScopeGlobal` arm).
         match scope {
+            DirectoryScope::Global => {
+                self.global_directory = None;
+                if buffer_local_active {
+                    self.global_directory = new_directory;
+                }
+            }
+            DirectoryScope::Tabpage => {
+                if let Some(tab) = tab
+                    && let Some(state) = self.tabpages.get_mut(&tab)
+                {
+                    state.local_directory = new_directory;
+                }
+            }
+            DirectoryScope::Buffer => {}
             DirectoryScope::Window => {
                 if let Some(window) = window
                     && let Ok(state) = self.window_mut(window)
                 {
-                    state.previous_directory.clone_from(&previous);
                     state.local_directory = new_directory;
                 }
             }
-            DirectoryScope::Global => {
-                self.previous_directory.clone_from(&previous);
-                self.global_directory = new_directory;
-                if let Some(window) = window
-                    && let Ok(state) = self.window_mut(window)
-                {
-                    state.local_directory = None;
-                }
-            }
+        }
+        // A buffer-local directory stays in effect over other scopes' moves:
+        // park back in it after recording the move above.
+        if buffer_local_active
+            && let Some(buffer) = buffer
+            && let Some(local) = self
+                .buffers
+                .get(&buffer)
+                .and_then(|state| state.local_directory.clone())
+        {
+            std::mem::drop(std::env::set_current_dir(local));
         }
         Ok(match previous {
             Some(path) => path,
@@ -1375,48 +1657,139 @@ impl Editor {
         })
     }
 
-    /// Reapplies the effective working directory for the current window.
+    /// Returns the previous-directory slot for `scope`, or `None` when the
+    fn previous_directory_slot(
+        &mut self,
+        scope: DirectoryScope,
+        window: Option<WinHandle>,
+        tab: Option<TabHandle>,
+        buffer: Option<BufHandle>,
+    ) -> Option<&mut Option<PathBuf>> {
+        match scope {
+            DirectoryScope::Global => Some(&mut self.previous_directory),
+            DirectoryScope::Window => {
+                let window = window?;
+                // `window_mut` resolves through the owning tabpage, the same
+                // lookup `previous_directory` uses for the read path.
+                self.window_mut(window)
+                    .ok()
+                    .map(|state| &mut state.previous_directory)
+            }
+            DirectoryScope::Tabpage => {
+                let tab = tab?;
+                self.tabpages
+                    .get_mut(&tab)
+                    .map(|state| &mut state.previous_directory)
+            }
+            DirectoryScope::Buffer => {
+                let buffer = buffer?;
+                self.buffers
+                    .get_mut(&buffer)
+                    .map(|state| &mut state.previous_directory)
+            }
+        }
+    }
+
+    /// Clears the scope-local directory (`chdir_clear`, `ex_docmd.c:6396-6411`).
     ///
-    /// If the current window has a `local_directory`, the process cwd is set
-    /// to it; otherwise, if a `global_directory` is recorded, the process cwd
-    /// is set to that. When neither is available the process cwd is left
-    /// unchanged. This is called after buffer replacement, window switches,
-    /// tab switches, and window closes to maintain the best-effort
-    /// invariant that the process cwd reflects the current window's effective directory.
+    /// Only the scope's own directory is cleared: `:lcd!` never touches the
+    /// tabpage or buffer slots and `:cd!` never unsets anything. A no-op when
+    /// the scope has no local directory. On a real clear the effective
+    /// directory is reapplied, matching upstream's `update_cwd` call.
+    pub fn clear_local_directory(&mut self, scope: DirectoryScope) {
+        let cleared = match scope {
+            DirectoryScope::Global => false,
+            DirectoryScope::Window => self
+                .current_window()
+                .and_then(|window| self.window_mut(window).ok())
+                .is_some_and(|state| state.local_directory.take().is_some()),
+            DirectoryScope::Tabpage => self
+                .current_tab
+                .and_then(|tab| self.tabpages.get_mut(&tab))
+                .is_some_and(|state| state.local_directory.take().is_some()),
+            DirectoryScope::Buffer => self
+                .current_buffer()
+                .and_then(|buffer| self.buffers.get_mut(&buffer))
+                .is_some_and(|state| state.local_directory.take().is_some()),
+        };
+        if cleared {
+            self.apply_effective_directory();
+        }
+    }
+
+    /// Reapplies the effective working directory for the current context.
     ///
-    /// Matches upstream `update_cwd` (`window.c:5365`): the window/tab/buffer
-    /// transition has already committed, so a failure to `os_chdir` does not
-    /// undo the transition. The state change remains valid and the process
-    /// simply stays at its prior cwd — no error is queued or surfaced.
-    fn apply_effective_directory(&self) {
-        let target = self
+    /// Precedence is buffer-local, then window-local, then tabpage-local,
+    /// then the saved session-global fallback (`update_cwd`,
+    /// `window.c:5365-5425`). A scope-local directory also remembers the
+    /// directory left behind as the session-global fallback when none is
+    /// saved, so a later scope switch can return to it. When no local
+    /// directory applies but a global one was saved while entering a scope,
+    /// the process returns to it and the saved value is consumed. When
+    /// nothing applies the process cwd is left unchanged.
+    ///
+    /// Matches upstream `update_cwd`: the window/tab/buffer transition has
+    /// already committed, so a failure to `os_chdir` does not undo the
+    /// transition. The state change remains valid and the process simply
+    /// stays at its prior cwd — no error is queued or surfaced.
+    fn apply_effective_directory(&mut self) {
+        // Buffer-local wins: the buffer belongs to no particular
+        // window/tabpage, so it is consulted first regardless of context.
+        let buffer_local = self
+            .current_buffer()
+            .and_then(|buffer| self.buffers.get(&buffer))
+            .and_then(|state| state.local_directory.clone());
+        let window_local = self
             .current_window()
             .and_then(|window| self.window(window).ok())
-            .and_then(|state| state.local_directory.as_ref())
-            .or(self.global_directory.as_ref());
-        if let Some(target) = target {
-            // WHY: upstream `update_cwd` ignores `os_chdir` failure — the
-            // transition is already committed and the old process cwd stays
-            // in effect. No E344 is queued or surfaced.
-            //
-            // WHY(process-state guard): the process cwd is shared by every
-            // test in this binary; a window/tab/buffer switch in an unrelated
-            // editor must not overwrite the directory a cwd-sensitive test
-            // just `lcd`'d into. While a sibling test holds the guard this
-            // restore is skipped — the write is advisory (`update_cwd`
-            // ignores its own failure anyway) and the holder owns the cwd
-            // for its duration. The holding thread itself, and any thread
-            // while the guard is free, still applies it normally.
-            #[cfg(test)]
+            .and_then(|state| state.local_directory.clone());
+        let tab_local = self
+            .current_tab
+            .and_then(|tab| self.tabpages.get(&tab))
+            .and_then(|state| state.local_directory.clone());
+        if let Some(target) = buffer_local.or(window_local).or(tab_local) {
+            // A scope-local directory applies: remember the directory left
+            // behind as the session-global fallback when none is saved
+            // (`update_cwd`'s `globaldir == NULL` arm, `window.c:5391-5397`).
+            if self.global_directory.is_none()
+                && let Ok(cwd) = std::env::current_dir()
             {
-                let free = crate::PROCESS_STATE_GUARD.try_lock().ok();
-                if crate::holds_process_state_guard() || free.is_some() {
-                    std::mem::drop(std::env::set_current_dir(target));
-                }
+                self.global_directory = Some(cwd);
             }
-            #[cfg(not(test))]
-            std::mem::drop(std::env::set_current_dir(target));
+            Self::apply_current_dir(&target);
+            return;
         }
+        // No local directory applies and the process is parked elsewhere:
+        // return to the saved global directory and consume it, matching
+        // upstream's `globaldir` clear on the way back.
+        if let Some(target) = self.global_directory.take() {
+            Self::apply_current_dir(&target);
+        }
+    }
+
+    /// Best-effort `os_chdir` for [`Self::apply_effective_directory`].
+    ///
+    /// WHY: upstream `update_cwd` ignores `os_chdir` failure — the transition
+    /// is already committed and the old process cwd stays in effect. No E344
+    /// is queued or surfaced.
+    ///
+    /// WHY(process-state guard): the process cwd is shared by every test in
+    /// this binary; a window/tab/buffer switch in an unrelated editor must
+    /// not overwrite the directory a cwd-sensitive test just `lcd`'d into.
+    /// While a sibling test holds the guard this restore is skipped — the
+    /// write is advisory (`update_cwd` ignores its own failure anyway) and
+    /// the holder owns the cwd for its duration. The holding thread itself,
+    /// and any thread while the guard is free, still applies it normally.
+    fn apply_current_dir(target: &Path) {
+        #[cfg(test)]
+        {
+            let free = crate::PROCESS_STATE_GUARD.try_lock().ok();
+            if crate::holds_process_state_guard() || free.is_some() {
+                std::mem::drop(std::env::set_current_dir(target));
+            }
+        }
+        #[cfg(not(test))]
+        std::mem::drop(std::env::set_current_dir(target));
     }
 
     /// Displays a live buffer in the current window.
@@ -1695,13 +2068,14 @@ impl Editor {
             .get(&window)
             .copied()
             .ok_or(EditorError::UnknownWindow(window))?;
+        let laststatus = self.laststatus();
         let (topline, skiprows) = {
             let state = self.window(window)?;
             let tabpage = self
                 .tabpages
                 .get(&tab)
                 .ok_or(EditorError::UnknownTabpage(tab))?;
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let mut topline = cursor_visible_topline(state.topline, position.lnum, height);
             let mut skiprows = 0;
             let geometry = self.window_geometry(window)?;
@@ -1843,18 +2217,21 @@ impl Editor {
             .get(&window)
             .copied()
             .ok_or(EditorError::UnknownWindow(window))?;
+        let view = self.initial_window_view_for_buffer(window, tab, buffer);
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         if let Err(error) = tabpage.window_mut(window).map(|state| {
             state.alternate_buffer = Some(old_buffer);
-            // Upstream's `w_llist_ref` is meaningful only while the window
-            // displays a quickfix buffer (`IS_LL_WINDOW`, quickfix.c:274-276).
-            // Replacing that buffer ends the display, so the reference must
-            // not follow the window into its next buffer.
             state.loclist_ref = None;
             state.buffer = buffer;
+            state.cursor = view.cursor;
+            state.topline = view.topline;
+            state.skiprows = view.skiprows;
+            state.curswant = view.curswant;
+            state.set_curswant = view.set_curswant;
+            state.coladd = view.coladd;
         }) {
             if let Some(state) = self.buffers.get_mut(&buffer) {
                 state.detach(true);
@@ -1864,13 +2241,117 @@ impl Editor {
         if let Some(state) = self.buffers.get_mut(&old_buffer) {
             state.detach(release == BufferRelease::KeepLoaded);
         }
+        if let Some(snapshot) = self.context_dirs_stack.pop() {
+            if snapshot.window == window && buffer != snapshot.target_buffer {
+                if let Ok(w) = self.window_mut(window) {
+                    w.local_directory = snapshot.window_local_dir;
+                    w.previous_directory = snapshot.window_prev_dir;
+                }
+                let tab_local_dir_after =
+                    snapshot.tab.and_then(|t| self.tab_local_directory(t).ok().flatten());
+                if tab_local_dir_after == snapshot.tab_local_dir {
+                    self.global_directory = snapshot.global_dir;
+                    if let Some(cwd) = snapshot.cwd {
+                        Self::apply_current_dir(&cwd);
+                    }
+                }
+            } else {
+                self.context_dirs_stack.push(snapshot);
+            }
+        }
         // Reapply the current window's effective cwd after the buffer swap
         // has committed, matching upstream `update_cwd(kCdCauseBuffer)`.
         if self.current_window() == Some(window) {
             self.apply_effective_directory();
+            self.do_autochdir();
         }
         Ok(())
     }
+    fn window_showing_buffer(
+        &self,
+        buffer: BufHandle,
+        exclude: WinHandle,
+        preferred_tab: TabHandle,
+    ) -> Option<&WindowState> {
+        self.windows
+            .iter()
+            .filter(|&(w, t)| *w != exclude && *t == preferred_tab)
+            .find_map(|(&w, _)| {
+                let state = self.window(w).ok()?;
+                (state.buffer == buffer).then_some(state)
+            })
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(|&(w, t)| *w != exclude && *t != preferred_tab)
+                    .find_map(|(&w, _)| {
+                        let state = self.window(w).ok()?;
+                        (state.buffer == buffer).then_some(state)
+                    })
+            })
+    }
+
+    fn initial_window_view_for_buffer(
+        &self,
+        window: WinHandle,
+        tab: TabHandle,
+        buffer: BufHandle,
+    ) -> BufferSwitchView {
+        let existing = self.window_showing_buffer(buffer, window, tab);
+        let startofline = matches!(
+            self.options.get_global("startofline"),
+            Ok(OptionValue::Boolean(true))
+        );
+        let (mut cursor, raw_topline, skiprows, curswant, set_curswant, coladd) = match existing {
+            Some(state) if startofline => (
+                Position {
+                    lnum: state.cursor.lnum,
+                    col: 0,
+                },
+                state.topline,
+                state.skiprows,
+                0,
+                true,
+                0,
+            ),
+            Some(state) => (
+                state.cursor,
+                state.topline,
+                state.skiprows,
+                state.curswant,
+                state.set_curswant,
+                state.coladd,
+            ),
+            None => (Position { lnum: 1, col: 0 }, 1, 0, 0, true, 0),
+        };
+        if let Some(buf_state) = self.buffers.get(&buffer)
+            && let Ok(text) = buf_state.text()
+        {
+            let line_count = text.line_count().max(1);
+            cursor.lnum = cursor.lnum.clamp(1, line_count);
+            let line_len = text.line(cursor.lnum).map_or(0, |line| line.len());
+            let max_col = if line_len == 0 {
+                0
+            } else {
+                line_len.saturating_sub(1)
+            };
+            cursor.col = cursor.col.min(max_col);
+        }
+        let height = self
+            .tabpages
+            .get(&tab)
+            .map_or(1, |page| viewport_height(page, window, self.laststatus()));
+        let topline = cursor_visible_topline(raw_topline, cursor.lnum, height);
+        BufferSwitchView {
+            cursor,
+            topline,
+            skiprows,
+            curswant,
+            set_curswant,
+            coladd,
+        }
+    }
+
 
     /// Enters a buffer for a silent context switch without opening its file.
     ///
@@ -1882,6 +2363,24 @@ impl Editor {
         let state = self.buffer_mut(buffer)?;
         if !state.residency.is_loaded() {
             state.load(Buffer::new());
+        }
+        if let Some(caller) = self.current_window() {
+            let window_local_dir = self.window(caller).ok().and_then(|w| w.local_directory.clone());
+            let window_prev_dir = self.window(caller).ok().and_then(|w| w.previous_directory.clone());
+            let tab = self.current_tab;
+            let tab_local_dir = tab.and_then(|t| self.tab_local_directory(t).ok().flatten());
+            let global_dir = self.global_directory.clone();
+            let cwd = std::env::current_dir().ok();
+            self.context_dirs_stack.push(ContextDirsSnapshot {
+                window: caller,
+                target_buffer: buffer,
+                window_local_dir,
+                window_prev_dir,
+                tab,
+                tab_local_dir,
+                global_dir,
+                cwd,
+            });
         }
         self.set_current_buffer(buffer, BufferRelease::KeepLoaded)
     }
@@ -1921,6 +2420,10 @@ impl Editor {
         let Some(caller) = self.current_window() else {
             return Err(EditorError::NoCurrentTabpage);
         };
+        let caller_cursor = self
+            .window(caller)
+            .ok()
+            .map(|state| (state.cursor, state.topline, state.skiprows));
         let caller_buffer = self.window(caller).ok().map(|state| state.buffer);
         let visible: Vec<_> = self
             .windows()
@@ -1966,6 +2469,13 @@ impl Editor {
             && self.buffer(original).is_ok()
         {
             let _ = self.set_window_buffer(window, original, BufferRelease::KeepLoaded);
+            if let Some((cursor, topline, skiprows)) = caller_cursor
+                && let Ok(state) = self.window_mut(window)
+            {
+                state.cursor = cursor;
+                state.topline = topline;
+                state.skiprows = skiprows;
+            }
         }
         if self.current_window() != Some(caller) && self.window(caller).is_ok() {
             let _ = self.set_current_window(caller);
@@ -1996,6 +2506,10 @@ impl Editor {
         let Some(caller) = self.current_window() else {
             return Err(EditorError::NoCurrentTabpage);
         };
+        let caller_cursor = self
+            .window(caller)
+            .ok()
+            .map(|state| (state.cursor, state.topline, state.skiprows));
         let caller_buffer = self.window(caller).ok().map(|state| state.buffer);
         let previous_before = self.previous_window;
         // The window this call took over and the buffer it showed before, so
@@ -2030,6 +2544,13 @@ impl Editor {
             && self.buffer(expected).is_ok()
         {
             let _ = self.set_window_buffer(window, expected, BufferRelease::KeepLoaded);
+            if let Some((cursor, topline, skiprows)) = caller_cursor
+                && let Ok(state) = self.window_mut(window)
+            {
+                state.cursor = cursor;
+                state.topline = topline;
+                state.skiprows = skiprows;
+            }
         }
         let prior_previous = self.previous_window;
         if self.current_window() != Some(caller) && self.window(caller).is_ok() {
@@ -2110,6 +2631,17 @@ impl Editor {
         &mut self.options
     }
 
+    /// Returns the validated global `'laststatus'` value used by layout and
+    /// viewport calculations. The default keeps rendering resilient if option
+    /// metadata is unavailable during early startup.
+    #[must_use]
+    fn laststatus(&self) -> i64 {
+        match self.options.get_global("laststatus") {
+            Ok(OptionValue::Number(value)) => *value,
+            _ => 2,
+        }
+    }
+
     /// Returns register state.
     #[must_use]
     pub const fn registers(&self) -> &Registers {
@@ -2151,6 +2683,17 @@ impl Editor {
     #[must_use]
     pub const fn quickfix(&self) -> &crate::quickfix::QuickfixStack {
         &self.quickfix
+    }
+
+    /// Returns the editor's history tables.
+    #[must_use]
+    pub const fn history(&self) -> &crate::history::History {
+        &self.history
+    }
+
+    /// Returns the editor's history tables for mutation.
+    pub const fn history_mut(&mut self) -> &mut crate::history::History {
+        &mut self.history
     }
 
     /// Returns the location list stack owned by `window`, if it has one
@@ -2321,6 +2864,36 @@ impl Editor {
         self.jumplist = Jumplist::new();
     }
 
+    /// Records a jump destination in the jumplist (`setpcmark`, `mark.c:259`).
+    ///
+    /// Skips when the previous entry matches `buffer` and `position` (lnum and col).
+    pub fn push_jump(&mut self, buffer: BufHandle, position: Position) {
+        let prev = if self.jumplist.index() < self.jumplist.entries().len() {
+            self.jumplist.entries().get(self.jumplist.index())
+        } else {
+            self.jumplist.entries().last()
+        };
+        if let Some(prev) = prev {
+            let is_same_target = match &prev.target {
+                MarkTarget::Buffer(b) => *b == buffer,
+                MarkTarget::File(path) => {
+                    self.buffer(buffer)
+                        .ok()
+                        .and_then(|buf| buf.file_path.as_ref())
+                        == Some(path)
+                }
+            };
+            if is_same_target
+                && prev.position.lnum == position.lnum
+                && prev.position.col == position.col
+            {
+                return;
+            }
+        }
+        self.jumplist
+            .push(MarkLocation::in_buffer(buffer, position));
+    }
+
     /// Returns registered autocmd and augroup state.
     #[must_use]
     pub const fn autocmds(&self) -> &Autocmds {
@@ -2384,10 +2957,83 @@ impl Editor {
         &mut self.vvars
     }
 
+    /// Publishes the six `v:option_*` values an `OptionSet` dispatch shows,
+    /// and returns what they were so the caller can put them back
+    /// (`apply_optionset_autocmd_now`, option.c:2099-2134, resets them with
+    /// `reset_v_option_vars` afterwards).
+    ///
+    /// The caller owns the restore because it also owns the dispatch: a
+    /// callback may set another option, which publishes its own values and
+    /// restores them on its way out, in either order.
+    pub fn publish_option_set(
+        &mut self,
+        scope: OptionSetScope,
+        old: &Object,
+        old_local: Option<&Object>,
+        old_global: Option<&Object>,
+        new: &Object,
+    ) -> OptionSetVars {
+        let saved = OptionSetVars {
+            saved: OPTION_SET_VARS.map(|key| {
+                self.vvars
+                    .get(&OxStr::from(key))
+                    .cloned()
+                    .unwrap_or_else(|| Object::String(OxStr::from("")))
+            }),
+        };
+        // `option.c:2108-2129`: `oldlocal` and `oldglobal` are written only
+        // by the branch that names them, and stay reset otherwise.
+        let empty = Object::String(OxStr::from(""));
+        let (command, option_type, local_old, global_old) = match scope {
+            OptionSetScope::Set => (
+                "set",
+                "global",
+                old_local.cloned().unwrap_or_else(|| empty.clone()),
+                old_global.cloned().unwrap_or_else(|| empty.clone()),
+            ),
+            OptionSetScope::Local => ("setlocal", "local", old.clone(), empty.clone()),
+            OptionSetScope::Global => ("setglobal", "global", empty.clone(), old.clone()),
+            OptionSetScope::Modeline => ("modeline", "local", old.clone(), empty.clone()),
+        };
+        let values = [
+            new.clone(),
+            old.clone(),
+            local_old,
+            global_old,
+            Object::String(OxStr::from(option_type)),
+            Object::String(OxStr::from(command)),
+        ];
+        {
+            let vars = self.vvars_mut();
+            for (key, value) in OPTION_SET_VARS.into_iter().zip(values) {
+                vars.insert(OxStr::from(key), value);
+            }
+        }
+        saved
+    }
+
+    /// Puts the `v:option_*` values back as [`Self::publish_option_set`] found
+    /// them. The names are always present, empty until a dispatch publishes
+    /// them (`reset_v_option_vars`, `eval/vars.c:3382`).
+    pub fn restore_option_set(&mut self, saved: OptionSetVars) {
+        let vars = self.vvars_mut();
+        for (key, value) in OPTION_SET_VARS.into_iter().zip(saved.saved) {
+            vars.insert(OxStr::from(key), value);
+        }
+    }
+
     /// Returns the `v:` variable-map version used by the differential sync.
     #[must_use]
     pub const fn vvars_version(&self) -> u64 {
         self.vvars_version
+    }
+
+    /// Marks startup finished for `v:vim_did_enter` (`set_vim_var_nr`,
+    /// main.c: just before `VimEnter` is applied).
+    pub fn set_v_vim_did_enter(&mut self) {
+        self.vvars
+            .insert("vim_did_enter".into(), Object::Integer(1));
+        self.vvars_version = self.vvars_version.wrapping_add(1);
     }
 
     /// Sets the read-only `v:register` to `name` and bumps `vvars_version`
@@ -2484,10 +3130,10 @@ impl Editor {
     /// with the sink decision that applies to it.
     pub fn push_message(&mut self, message: Message) {
         if message.kind == MessageKind::Error
-            && let Object::String(text) = &message.content
+            && let Some(text) = message.text_lossy()
         {
             self.vvars_mut()
-                .insert(OxStr::from("errmsg"), Object::String(text.clone()));
+                .insert(OxStr::from("errmsg"), Object::String(OxStr::from(text.as_str())));
         }
         let kind = message.kind;
         let destination = self.message_destination();
@@ -2705,22 +3351,26 @@ impl Editor {
         } else {
             tab
         };
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.resize(geometry)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
     /// Scrolls each tiled window's topline back into view after its frame
-    /// changed, the way `win_new_height`/`validate_cursor` do after a
-    /// resize (window.c) — a shrunken frame can otherwise leave the cursor
-    /// below the new text area and emit it past the window grid.
-    fn revalidate_window_toplines(tabpage: &mut TabpageState) -> Result<(), EditorError> {
+    /// changed, the way `win_new_height`/`validate_cursor` do after a resize
+    /// (window.c) — a shrunken frame can otherwise leave the cursor below the
+    /// new text area and emit it past the window grid.
+    fn revalidate_window_toplines(
+        tabpage: &mut TabpageState,
+        laststatus: i64,
+    ) -> Result<(), EditorError> {
         for window in tabpage.layout().windows() {
-            let height = tabpage.tiled_window_text_height(window)?;
+            let height = tabpage.tiled_window_text_height(window, laststatus)?;
             let state = tabpage.window_mut(window)?;
             state.topline = cursor_visible_topline(state.topline, state.cursor.lnum, height);
             state.skiprows = 0;
@@ -2742,12 +3392,13 @@ impl Editor {
         } else {
             tab
         };
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&resolved)
             .ok_or(EditorError::UnknownTabpage(resolved))?;
         tabpage.equalize()?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
@@ -3032,12 +3683,13 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         tabpage.set_window_width(resolved, width)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
 
@@ -3061,14 +3713,50 @@ impl Editor {
             window
         };
         let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         tabpage.set_window_height(resolved, height)?;
-        Self::revalidate_window_toplines(tabpage)?;
+        Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
+    /// Changes a window's renderable text height.
+    ///
+    /// The layout stores tiled-window extents as frames, while the editor
+    /// APIs and Ex commands address the rows available to buffer text. Keep
+    /// that conversion here so statusline and message-row reservations are
+    /// shared with [`Self::window_text_height`]. Floating windows have no
+    /// reservation and therefore receive the requested height unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::set_window_height`].
+    pub fn set_window_text_height(
+        &mut self,
+        window: WinHandle,
+        height: usize,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
+        let frame_height = {
+            let tabpage = self
+                .tabpages
+                .get(&tab)
+                .ok_or(EditorError::UnknownTabpage(tab))?;
+            let geometry = tabpage.window_geometry(resolved)?;
+            let text_height = viewport_height(tabpage, resolved, laststatus);
+            height.saturating_add(geometry.height.saturating_sub(text_height))
+        };
+        self.set_window_height(resolved, frame_height)
+    }
+
     /// Returns the renderable text-row count for a window.
     ///
     /// # Errors
@@ -3085,7 +3773,7 @@ impl Editor {
             .tabpages
             .get(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
-        Ok(viewport_height(tabpage, resolved))
+        Ok(viewport_height(tabpage, resolved, self.laststatus()))
     }
 
     /// Returns floating configuration, or `None` for a tiled window.
@@ -3343,8 +4031,17 @@ impl Editor {
         if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
             buffer_state.attach()?;
         }
+        // A new tabpage inherits the previous current tabpage's tab-local
+        // directory (`win_new_tabpage`, `window.c:4509-4510`); its own
+        // previous-directory slot starts empty, like the zeroed `tabpage_T`.
+        let inherited_tab_directory = self
+            .current_tab
+            .and_then(|tab| self.tabpages.get(&tab))
+            .and_then(|state| state.local_directory.clone());
+        let mut tabpage = TabpageState::new(layout);
+        tabpage.local_directory = inherited_tab_directory;
         self.windows.insert(window, tab);
-        self.tabpages.insert(tab, TabpageState::new(layout));
+        self.tabpages.insert(tab, tabpage);
         self.tab_order.insert(index.min(self.tab_order.len()), tab);
         self.current_tab = Some(tab);
         self.apply_effective_directory();
@@ -3404,6 +4101,24 @@ impl Editor {
         enter: bool,
     ) -> Result<WinHandle, EditorError> {
         self.split_window(tab, target, buffer, SplitDirection::Below, enter)
+    }
+
+    /// Splits the tabpage horizontally and displays `buffer` across the
+    /// bottom, spanning every existing window.
+    ///
+    /// This is the `:botright` split that `:copen` needs, where upstream
+    /// splits the outermost frame instead of the current column.
+    ///
+    /// # Errors
+    ///
+    /// Same failures as [`Editor::split_horizontal`].
+    pub fn split_root_horizontal(
+        &mut self,
+        tab: TabHandle,
+        buffer: BufHandle,
+        enter: bool,
+    ) -> Result<WinHandle, EditorError> {
+        self.split_window_root(tab, buffer, enter)
     }
 
     /// Splits a tiled window vertically and displays `buffer` to the left.
@@ -3931,23 +4646,89 @@ impl Editor {
         }
     }
 
+    /// Whether the buffer accepts text changes (`'modifiable'`).
+    #[must_use]
+    pub(crate) fn is_modifiable(&self, buffer: BufHandle) -> bool {
+        self.options()
+            .get_buffer(buffer, "modifiable")
+            .is_ok_and(|value| !matches!(value, crate::options::OptionValue::Boolean(false)))
+    }
+
     /// Puts a stored register through the buffer mutation pipeline.
     ///
     /// Returns false when the selected register has no retained content.
-    pub(crate) fn put_register(
-        &mut self,
-        window: WinHandle,
-        name: char,
-        direction: PutDirection,
-        count: usize,
-        timestamp: i64,
-    ) -> Result<bool, EditorError> {
+    pub(crate) fn put_register(&mut self, put: RegisterPut) -> Result<bool, EditorError> {
+        let RegisterPut {
+            window,
+            name,
+            direction,
+            count,
+            cursend,
+            fixindent,
+            timestamp,
+        } = put;
         let window = self.resolve_window_handle(window)?;
-        let state = self.window(window)?;
-        let buffer = state.buffer;
-        let mut cursor = state.cursor;
-        let Some(content) = self.registers.get(name)?.cloned() else {
-            return Ok(false);
+        let buffer = self.window(window)?.buffer;
+        let owned;
+        let content = match name {
+            // `get_spec_reg` (`register.c:850-949`): `%` and `#` synthesize
+            // their text from buffer names at paste time.
+            '%' | '#' => {
+                owned = self.spec_reg_content(window, buffer, name)?;
+                let Some(content) = owned.as_ref() else {
+                    return Ok(false);
+                };
+                content.clone()
+            }
+            _ => {
+                let Some(content) = self.registers.get(name)?.cloned() else {
+                    return Ok(false);
+                };
+                content
+            }
+        };
+        self.put_resolved(
+            &content,
+            ResolvedPut {
+                window,
+                direction,
+                count,
+                cursend,
+                fixindent,
+                timestamp,
+            },
+        )
+    }
+
+    /// Puts already-resolved content through the buffer mutation pipeline.
+    /// `put_register` funnels here after resolving names; visual put funnels
+    /// here with the pre-delete clone, so a `"` put never re-reads the
+    /// just-deleted selection.
+    pub(crate) fn put_resolved(
+        &mut self,
+        content: &RegisterContent,
+        put: ResolvedPut,
+    ) -> Result<bool, EditorError> {
+        let ResolvedPut {
+            window,
+            direction,
+            count,
+            cursend,
+            fixindent,
+            timestamp,
+        } = put;
+        let window = self.resolve_window_handle(window)?;
+        let buffer = self.window(window)?.buffer;
+        let mut cursor = self.window(window)?.cursor;
+        let owned;
+        let content = if fixindent && matches!(content.kind(), RegisterKind::LineWise) {
+            owned = Some(self.reindent_for_put(buffer, cursor, content)?);
+            let Some(content) = owned.as_ref() else {
+                return Ok(false);
+            };
+            content
+        } else {
+            content
         };
         let kind = content.kind();
         let text = self.buffer(buffer)?.text()?;
@@ -3968,16 +4749,367 @@ impl Editor {
         };
         let origin_line = target_lines.first().map_or(&[][..], Vec::as_slice);
         let origin = put_origin(origin_line, line_count, cursor, kind, direction);
-        let plan = plan_put(
-            &target_lines,
+        let plan = plan_put(&PutRequest {
+            target_lines: &target_lines,
             line_count,
             origin,
-            &content,
-            count.max(1),
-            cursor,
-        )?;
+            content,
+            count: count.max(1),
+            cursor_before: cursor,
+            cursend,
+        })?;
         self.commit_put_plan(buffer, Some(window), plan, timestamp)?;
         Ok(true)
+    }
+
+    /// Synthesizes `%`/`#` register text from live buffer names
+    /// (`get_spec_reg`, `register.c:850-892`). Returns `None` (a silent
+    /// no-op put, like upstream's NULL return) when the name is empty.
+    fn spec_reg_content(
+        &self,
+        window: WinHandle,
+        buffer: BufHandle,
+        name: char,
+    ) -> Result<Option<RegisterContent>, EditorError> {
+        let handle = if name == '%' {
+            Some(buffer)
+        } else {
+            self.window(window).ok().and_then(|state| {
+                state
+                    .alternate_buffer
+                    .filter(|alternate| *alternate != buffer)
+            })
+        };
+        let Some(handle) = handle else {
+            return Ok(None);
+        };
+        let name = self
+            .buffer(handle)
+            .map_err(|_| EditorError::UnknownBuffer(handle))?
+            .name()
+            .to_string_lossy()
+            .into_owned();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        RegisterContent::characterwise(name.as_bytes())
+            .map(Some)
+            .map_err(EditorError::from)
+    }
+
+    /// Reindents linewise put rows to the cursor line (`PUT_FIXINDENT`,
+    /// `register.c:2056-2095`): every non-empty row keeps its own indent
+    /// below the base indent of the put target, rendered with the buffer's
+    /// `'expandtab'`/`'tabstop'` settings.
+    pub(crate) fn reindent_for_put(
+        &self,
+        buffer: BufHandle,
+        cursor: Position,
+        content: &RegisterContent,
+    ) -> Result<RegisterContent, EditorError> {
+        use crate::indent::{IndentOptions, indent_columns, leading_len, whitespace_for};
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        let base_line = text
+            .line(cursor.lnum.clamp(1, line_count.max(1)))
+            .map_err(crate::buffer::BufferStateError::from)?;
+        let opts = IndentOptions::capture(self, buffer);
+        let base = indent_columns(&base_line, &opts);
+        let mut lines = Vec::with_capacity(content.lines().len());
+        for row in content.lines() {
+            if row.iter().all(|byte| matches!(byte, b' ' | b'\t')) {
+                // Upstream leaves empty rows (and `#` preprocessor rows)
+                // alone; whitespace-only rows stay empty here.
+                lines.push(Vec::new());
+                continue;
+            }
+            let stripped = &row[leading_len(row)..];
+            let total = base.saturating_add(indent_columns(row, &opts));
+            let mut rendered = whitespace_for(total, row, &opts);
+            rendered.extend_from_slice(stripped);
+            lines.push(rendered);
+        }
+        RegisterContent::linewise(lines).map_err(EditorError::from)
+    }
+
+    /// Puts a register over a visual selection.
+    ///
+    /// The selection is deleted first (into the unnamed/numbered registers,
+    /// or the black hole for `keep_registers`), then the register is put at
+    /// the deletion point — upstream's delete-then-`do_put` shape
+    /// (`nv_put`, `normal.c:6630-6690`). A linewise-forced put (visual-line
+    /// mode, or `:put`-style callers) replaces whole lines; a characterwise
+    /// single-line register over a block repeats on every selected line, the
+    /// way `do_put` loops over visual lines (`register.c:2007-2036`).
+    /// `']` after the put marks the inserted span (`commit_put_plan`).
+    ///
+    /// Returns false when the selected register has no retained content.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EditorError`] when the window, buffer, or register cannot
+    /// be resolved, or the operator pipeline fails.
+    pub(crate) fn put_visual(
+        &mut self,
+        put: VisualPut,
+        eval: &mut dyn ExprEval,
+    ) -> Result<bool, EditorError> {
+        let window = self.resolve_window_handle(put.window)?;
+        let buffer = self.window(window)?.buffer;
+        let text = self.buffer(buffer)?.text()?;
+        let old_count = text.line_count();
+        // `'<'`/`'>` track the selection (`b_visual`), with `MAXCOL` for a
+        // linewise end (`getpos("'>")` answers `v:maxcol`, `test_put.vim`).
+        let mut visual_end = put.range.end;
+        if matches!(put.kind, VisualKind::Line) {
+            // Largest valid cursor column (`MAXCOL`, `pos_defs.h:17-19`).
+            visual_end.col = 0x7FFF_FFFF;
+        }
+        let _ = self.set_local_mark(buffer, '<', put.range.start);
+        let _ = self.set_local_mark(buffer, '>', visual_end);
+        // Clone the register before the delete below swings `"` elsewhere;
+        // upstream saves and restores it for the same reason (`nv_put`).
+        // Every branch below threads this clone: re-reading by name would
+        // put the just-deleted selection for `"`.
+        let owned;
+        let content = match put.name {
+            '%' | '#' => {
+                owned = self.spec_reg_content(window, buffer, put.name)?;
+                let Some(content) = owned.as_ref() else {
+                    return Ok(false);
+                };
+                content.clone()
+            }
+            _ => {
+                let Some(content) = self.registers.get(put.name)?.cloned() else {
+                    return Ok(false);
+                };
+                content
+            }
+        };
+        let deleted_all = matches!(put.kind, VisualKind::Line)
+            && put.range.start.lnum <= 1
+            && put.range.end.lnum >= old_count;
+        let resolved = ResolvedPut {
+            window,
+            direction: put.direction,
+            count: put.count,
+            cursend: put.cursend,
+            fixindent: put.fixindent,
+            timestamp: put.timestamp,
+        };
+        // The delete below is part of the same undo step shape as the put;
+        // run it through the operator pipeline first, then branch on the
+        // selection/register shapes (`nv_put`, `normal.c:6630-6690`).
+        self.delete_visual_range(buffer, window, put, eval)?;
+        if matches!(put.kind, VisualKind::Line) {
+            // Whole-line replacement: the register lands as lines, whatever
+            // it held (`PUT_LINE`).
+            let lines = content.getreg_lines();
+            let lines = self.maybe_reindent(buffer, window, put, lines)?;
+            self.insert_visual_lines(buffer, window, &lines, put.timestamp)?;
+            if deleted_all {
+                self.drop_trailing_empty_line(buffer, put.timestamp)?;
+            }
+        } else if matches!(put.kind, VisualKind::Block)
+            && matches!(content.kind(), RegisterKind::CharacterWise)
+            && content.lines().len() == 1
+        {
+            // One-line text over a block repeats on every selected line
+            // (`register.c:2007-2036`); multi-line text over a block falls
+            // through to the single put below.
+            let start = put.range.start;
+            for offset in 0..=put.range.end.lnum.saturating_sub(start.lnum) {
+                let lnum = start.lnum.saturating_add(offset);
+                self.set_window_cursor(window, Position { lnum, col: start.col })?;
+                self.put_resolved(&content, resolved)?;
+            }
+        } else {
+            // Characterwise over characterwise (including the linewise
+            // register split in between, `PUT_LINE_SPLIT`): the deletion
+            // above left one merged line, so a normal put at the deletion
+            // point reproduces the split shape.
+            let content = if matches!(content.kind(), RegisterKind::LineWise) {
+                RegisterContent::characterwise(&content.to_bytes())
+                    .map_err(EditorError::from)?
+            } else {
+                content
+            };
+            self.put_resolved(&content, resolved)?;
+        }
+        Ok(true)
+    }
+
+    /// Deletes a visual-put selection through the operator pipeline
+    /// (`nv_put` deletes before `do_put`, routing to numbered registers or
+    /// to the black hole for `P`).
+    fn delete_visual_range(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        put: VisualPut,
+        eval: &mut dyn ExprEval,
+    ) -> Result<(), EditorError> {
+        ops::apply(
+            self,
+            OperatorRequest {
+                buffer,
+                window,
+                operator: Operator::Delete,
+                range: put.range,
+                register: put.keep_registers.then_some('_'),
+                timestamp: put.timestamp,
+                eval,
+            },
+        )
+        .map(|_| ())
+        .map_err(EditorError::from)
+    }
+
+    /// Reindents put rows for visual `[p`/`]p` (`PUT_FIXINDENT`); other puts
+    /// keep the register rows verbatim.
+    fn maybe_reindent(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        put: VisualPut,
+        lines: Vec<Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>, EditorError> {
+        if !put.fixindent {
+            return Ok(lines);
+        }
+        let content = RegisterContent::linewise(lines).map_err(EditorError::from)?;
+        let cursor = self.window(window)?.cursor;
+        Ok(self
+            .reindent_for_put(buffer, cursor, &content)?
+            .lines()
+            .to_vec())
+    }
+
+    /// Inserts linewise put rows at the window cursor after a visual-line
+    /// deletion, then leaves the cursor on the first inserted line's first
+    /// non-blank byte (`do_put` linewise cursor, `register.c:2216-2226`).
+    fn insert_visual_lines(
+        &mut self,
+        buffer: BufHandle,
+        window: WinHandle,
+        lines: &[Vec<u8>],
+        timestamp: i64,
+    ) -> Result<(), EditorError> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let window_state = self.window(window)?;
+        let cursor = window_state.cursor;
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        // An emptied buffer holds one empty line: replace it instead of
+        // inserting after it, so a whole-buffer put leaves no residue.
+        if line_count == 1
+            && text
+                .line(1)
+                .map_err(crate::buffer::BufferStateError::from)?
+                .is_empty()
+        {
+            let last = lines.len();
+            let cursor_after = Position {
+                lnum: last,
+                col: 0,
+            };
+            self.replace_buffer_lines(crate::LineReplaceRequest {
+                buffer,
+                start: 1,
+                end: 1,
+                lines,
+                cursor_before: cursor,
+                cursor_after,
+                timestamp,
+            })?;
+            let _ = self.set_local_mark(buffer, '[', Position { lnum: 1, col: 0 });
+            let _ = self.set_local_mark(buffer, ']', Self::last_byte_of(lines, last));
+            self.set_first_nonblank(window, buffer, last)?;
+            return Ok(());
+        }
+        let after_lnum = cursor.lnum.saturating_sub(1).min(line_count);
+        let before = Position {
+            lnum: after_lnum.saturating_add(1).min(line_count),
+            col: 0,
+        };
+        self.buffer_mut(buffer)?.insert_lines(
+            after_lnum,
+            lines,
+            cursor,
+            Position {
+                lnum: before.lnum,
+                col: 0,
+            },
+            timestamp,
+        )?;
+        let first_lnum = after_lnum.saturating_add(1);
+        let last_lnum = after_lnum.saturating_add(lines.len());
+        let _ = self.set_local_mark(buffer, '[', Position { lnum: first_lnum, col: 0 });
+        let _ = self.set_local_mark(buffer, ']', Self::last_byte_of(lines, last_lnum));
+        self.set_first_nonblank(window, buffer, first_lnum)?;
+        Ok(())
+    }
+
+    /// `']` for a linewise put: the last byte of the last inserted row
+    /// (`register.c:2187-2198`), zero for an empty row.
+    pub(crate) fn last_byte_of(lines: &[Vec<u8>], lnum: usize) -> Position {
+        let row = lines.last().map_or(&[][..], Vec::as_slice);
+        Position {
+            lnum,
+            col: if row.is_empty() {
+                0
+            } else {
+                row.len().saturating_sub(crate::put::last_scalar_len(row))
+            },
+        }
+    }
+
+    /// Moves the window cursor to the first non-blank byte of `lnum`.
+    fn set_first_nonblank(
+        &mut self,
+        window: WinHandle,
+        buffer: BufHandle,
+        lnum: usize,
+    ) -> Result<(), EditorError> {
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count().max(1);
+        let lnum = lnum.clamp(1, line_count);
+        let line = text
+            .line(lnum)
+            .map_err(crate::buffer::BufferStateError::from)?;
+        let col = line
+            .iter()
+            .position(|byte| !matches!(byte, b' ' | b'\t'))
+            .unwrap_or(0);
+        self.set_window_cursor(window, Position { lnum, col })?;
+        Ok(())
+    }
+
+    /// Drops a leftover empty last line after a whole-buffer visual put
+    /// (`nv_put`'s `empty` cleanup, `normal.c:6684-6695`).
+    fn drop_trailing_empty_line(
+        &mut self,
+        buffer: BufHandle,
+        timestamp: i64,
+    ) -> Result<(), EditorError> {
+        let text = self.buffer(buffer)?.text()?;
+        let line_count = text.line_count();
+        if line_count > 1
+            && text
+                .line(line_count)
+                .map_err(crate::buffer::BufferStateError::from)?
+                .is_empty()
+        {
+            let cursor = Position {
+                lnum: line_count.saturating_sub(1),
+                col: 0,
+            };
+            self.buffer_mut(buffer)?.delete_lines(line_count, line_count, cursor, timestamp)?;
+        }
+        Ok(())
     }
 
     /// Inserts explicit content through the same undo-aware pipeline as a register put.
@@ -4012,9 +5144,51 @@ impl Editor {
         } else {
             Vec::new()
         };
-        let plan = plan_put(&target_lines, line_count, position, content, 1, position)?;
+        let plan = plan_put(&PutRequest {
+            target_lines: &target_lines,
+            line_count,
+            origin: position,
+            content,
+            count: 1,
+            cursor_before: position,
+            cursend: false,
+        })?;
         self.commit_put_plan(buffer, None, plan, timestamp)?;
         Ok(())
+    }
+
+    /// Caps put cursor and marks at their lines, the way `do_put` caps
+    /// `w_cursor.col` at the line length after every put
+    /// (`register.c:2208-2215`). Positions stay on the buffer; callers pass
+    /// the uncapped plan values.
+    fn clamp_put_positions(
+        &self,
+        buffer: BufHandle,
+        cursor: Position,
+        start: Position,
+        end: Position,
+    ) -> (Position, Position, Position) {
+        let clamp = |position: Position| {
+            let line_count = self
+                .buffer(buffer)
+                .ok()
+                .and_then(|state| state.text().ok())
+                .map_or(1, |text| text.line_count().max(1));
+            let lnum = position.lnum.clamp(1, line_count);
+            let len = self
+                .buffer(buffer)
+                .ok()
+                .and_then(|state| state.text().ok())
+                .and_then(|text| text.line(lnum).ok())
+                .map_or(0, |line| line.len());
+            // Byte columns from the planner already sit on character
+            // boundaries; only the length cap can move them.
+            Position {
+                lnum,
+                col: position.col.min(len),
+            }
+        };
+        (clamp(cursor), clamp(start), clamp(end))
     }
 
     fn commit_put_plan(
@@ -4028,6 +5202,8 @@ impl Editor {
             edits,
             cursor_before,
             cursor_after,
+            mark_start,
+            mark_end,
         } = plan;
         if edits.is_empty() {
             return Ok(false);
@@ -4095,6 +5271,13 @@ impl Editor {
         if let Some((after_lnum, line_count)) = inserted_lines {
             self.splice_positions(buffer, after_lnum + 1, 0, line_count);
         }
+        // `do_put` always records the put span in `'[`/`']`
+        // (`register.c:2179-2200`); the cursor never rests past the line end
+        // (`register.c:2208-2215` caps `w_cursor.col` at the line length).
+        let (cursor_after, mark_start, mark_end) =
+            self.clamp_put_positions(buffer, cursor_after, mark_start, mark_end);
+        let _ = self.set_local_mark(buffer, '[', mark_start);
+        let _ = self.set_local_mark(buffer, ']', mark_end);
         self.changelists.push(buffer, cursor_after);
         if opens_active_edit {
             self.active_text_edit = Some(buffer);
@@ -4152,6 +5335,7 @@ impl Editor {
             }
         };
         let previous = self.current_window();
+        let laststatus = self.laststatus();
         let (old_topline, old_cursor, old_height, old_buffer, local_directory, previous_directory) = {
             let tabpage = self
                 .tabpages
@@ -4161,7 +5345,7 @@ impl Editor {
             (
                 state.topline,
                 state.cursor,
-                tabpage.tiled_window_text_height(target)?,
+                tabpage.tiled_window_text_height(target, laststatus)?,
                 state.buffer,
                 state.local_directory.clone(),
                 state.previous_directory.clone(),
@@ -4201,7 +5385,7 @@ impl Editor {
             }
             return Err(error.into());
         }
-        let new_height = tabpage.tiled_window_text_height(target)?;
+        let new_height = tabpage.tiled_window_text_height(target, laststatus)?;
         let old_row = old_cursor
             .lnum
             .saturating_sub(old_topline)
@@ -4217,6 +5401,85 @@ impl Editor {
         }
         self.windows.insert(window, tab);
         self.options.copy_window_options(target, window);
+        self.apply_effective_directory();
+        Ok(window)
+    }
+
+    /// Bottom split of the whole tabpage: the new window spans the width and
+    /// every existing window keeps its buffer and view above it.
+    fn split_window_root(
+        &mut self,
+        tab: TabHandle,
+        buffer: BufHandle,
+        enter: bool,
+    ) -> Result<WinHandle, EditorError> {
+        let tab = self.resolve_tabpage_handle(tab)?;
+        let buffer = self.resolve_buffer_handle(buffer)?;
+        self.require_buffer(buffer)?;
+        self.require_tabpage(tab)?;
+        let windows = self
+            .tabpages
+            .get(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?
+            .layout()
+            .windows();
+        let first = *windows
+            .first()
+            .ok_or(EditorError::UnknownWindow(WinHandle::CURRENT))?;
+        let tabpage = self
+            .tabpages
+            .get(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        let (cursor, local_directory, previous_directory) = {
+            let state = tabpage.window(first)?;
+            (
+                state.cursor,
+                state.local_directory.clone(),
+                state.previous_directory.clone(),
+            )
+        };
+        // The columns lose height, so the first window's view keeps its cursor
+        // on screen with the same fraction arithmetic a ordinary split uses.
+        let laststatus = self.laststatus();
+        let (old_topline, old_height) = {
+            let state = tabpage.window(first)?;
+            (state.topline, tabpage.tiled_window_text_height(first, laststatus)?)
+        };
+        let previous = self.current_window();
+        let window = allocate_window_handle(&mut self.next_window)?;
+        let mut state = WindowState::new(buffer, Position { lnum: 1, col: 0 });
+        state.local_directory = local_directory;
+        state.previous_directory = previous_directory;
+        let _ = cursor;
+        if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
+            buffer_state.attach()?;
+        }
+        let tabpage = self
+            .tabpages
+            .get_mut(&tab)
+            .ok_or(EditorError::UnknownTabpage(tab))?;
+        if let Err(error) = tabpage.split_root_horizontal(window, state, enter) {
+            if let Some(buffer_state) = self.buffers.get_mut(&buffer) {
+                buffer_state.detach(true);
+            }
+            return Err(error.into());
+        }
+        let new_height = tabpage.tiled_window_text_height(first, laststatus)?;
+        let old_row = cursor
+            .lnum
+            .saturating_sub(old_topline)
+            .min(old_height.saturating_sub(1));
+        let new_row = old_row.saturating_mul(new_height) / old_height;
+        let fraction_topline = cursor.lnum.saturating_sub(new_row).max(1);
+        let target_state = tabpage.window_mut(first)?;
+        target_state.topline =
+            cursor_visible_topline(fraction_topline, target_state.cursor.lnum, new_height);
+        target_state.skiprows = 0;
+        if enter {
+            self.previous_window = previous.filter(|current| *current != window);
+        }
+        self.windows.insert(window, tab);
+        self.options.copy_window_options(first, window);
         self.apply_effective_directory();
         Ok(window)
     }
@@ -4238,6 +5501,7 @@ impl Editor {
             .buffers
             .get(&buffer)
             .and_then(|state| state.text().ok());
+        let laststatus = self.laststatus();
         let line_count = buffer_text.map_or(1, Buffer::line_count).max(1);
         let old_end = start.saturating_add(old_count);
         let windows = &self.windows;
@@ -4246,7 +5510,7 @@ impl Editor {
             let Some(tabpage) = tabpages.get_mut(&tab) else {
                 continue;
             };
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let Ok(state) = tabpage.window_mut(window) else {
                 continue;
             };
@@ -4302,6 +5566,7 @@ impl Editor {
         let line_count = buffer_text.map_or(1, Buffer::line_count).max(1);
         // Byte length of the replacement's final row, which upstream reads
         // with `ml_get_buf_len` when collapsing rows the edit removed.
+        let laststatus = self.laststatus();
         let new_end_row_len = buffer_text
             .and_then(|text| text.line(splice.new_end().row.saturating_add(1)).ok())
             .map_or(0, |line| line.len());
@@ -4311,7 +5576,7 @@ impl Editor {
             let Some(tabpage) = tabpages.get_mut(&tab) else {
                 continue;
             };
-            let height = viewport_height(tabpage, window);
+            let height = viewport_height(tabpage, window, laststatus);
             let Ok(state) = tabpage.window_mut(window) else {
                 continue;
             };
@@ -4419,14 +5684,13 @@ fn wrapped_line_rows(cells: usize, width: usize) -> usize {
 
 /// Renderable text rows for a window's viewport.
 ///
-/// Tiled windows reserve a statusline row and the message row from their
-/// layout frame (`tiled_window_text_height`), matching upstream
-/// `w_winrow_height` minus `--statusline`/`-2` reservations; floating frames
-/// already exclude their borders. Falls back to the frame height when the
-/// window has no geometry.
-fn viewport_height(tabpage: &TabpageState, window: WinHandle) -> usize {
+/// Tiled windows reserve the configured statusline row and the message row
+/// from their layout frame, matching upstream `w_winrow_height` minus
+/// `--statusline`/`-2` reservations; floating frames already exclude their
+/// borders. Falls back to the frame height when the window has no geometry.
+fn viewport_height(tabpage: &TabpageState, window: WinHandle, laststatus: i64) -> usize {
     tabpage
-        .tiled_window_text_height(window)
+        .tiled_window_text_height(window, laststatus)
         .or_else(|_| {
             tabpage
                 .window_geometry(window)
@@ -4801,8 +6065,13 @@ pub fn expand_buffer_name(name: &OxStr) -> OxStr {
     if bytes.is_empty() {
         return name.clone();
     }
-    // Already absolute — use as-is.
+    // Already absolute — use as-is. A URL counts as absolute
+    // (`vim_isAbsName`, path.c:1750), so `example:///x` keeps its spelling
+    // instead of gaining the working directory in front of it.
     let path_str = std::str::from_utf8(bytes).unwrap_or("");
+    if ox_types::path_with_url(path_str) {
+        return name.clone();
+    }
     let path = std::path::Path::new(path_str);
     if path.is_absolute() {
         return name.clone();
@@ -5208,3 +6477,35 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// Which option command produced the `OptionSet` dispatch
+/// (`apply_optionset_autocmd_now`, option.c:2099).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionSetScope {
+    /// `:set` and a script assignment that reached both scopes.
+    Set,
+    /// `:setlocal`.
+    Local,
+    /// `:setglobal`.
+    Global,
+    /// `:set` from a modeline.
+    Modeline,
+}
+
+/// The `v:option_*` values that were in force before a dispatch, kept so the
+/// caller can restore them without knowing which of them existed.
+#[derive(Clone, Debug)]
+pub struct OptionSetVars {
+    saved: [Object; 6],
+}
+
+/// The `v:option_*` names in `reset_v_option_vars` order
+/// (`eval/vars.c:3382`).
+const OPTION_SET_VARS: [&str; 6] = [
+    "option_new",
+    "option_old",
+    "option_oldlocal",
+    "option_oldglobal",
+    "option_type",
+    "option_command",
+];

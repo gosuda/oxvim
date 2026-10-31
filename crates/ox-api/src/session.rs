@@ -58,6 +58,9 @@ pub struct SessionState {
     /// In-flight `FileType` dispatches as `(buffer, raw filetype)` pairs. A
     /// a changed value may fire again.
     pub(crate) filetype_dispatches: Vec<(BufHandle, String)>,
+    /// Set while an `OptionSet` dispatch runs: the event never nests into
+    /// itself (`apply_optionset_autocmd_now`, option.c:2102).
+    pub(crate) option_set_in_flight: bool,
     /// Lua registry references awaiting a free while every Lua host slot is
     /// checked out (a nested decoration-provider replacement inside a
     /// callback). Lifetime-ordered: the same integer may appear again after
@@ -126,6 +129,7 @@ impl Default for SessionState {
             paste_cancelled: false,
             channel_sink: None,
             filetype_dispatches: Vec::new(),
+            option_set_in_flight: false,
             pending_lua_callback_releases: Vec::new(),
             pending_autocmd_callback_releases: Vec::new(),
             callers: Rc::new(RefCell::new(Vec::new())),

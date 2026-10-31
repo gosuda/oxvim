@@ -15,6 +15,10 @@ use thiserror::Error;
 /// See `src/nvim/fold.c:78-84`.
 pub const MAX_FOLD_DEPTH: usize = 20;
 
+/// The same bound as an `i32` for level arithmetic (`MAX_LEVEL` in
+/// `src/nvim/fold.c:78-84`).
+const MAX_LEVEL: i32 = 20;
+
 /// A zero-based, byte-oriented buffer position.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Position {
@@ -326,6 +330,10 @@ pub enum FoldError {
 pub struct Folds {
     method: FoldMethod,
     shift_width: usize,
+    tab_width: usize,
+    fold_ignore: Vec<u8>,
+    nest_max: i64,
+    min_lines: usize,
     marker_start: Vec<u8>,
     marker_end: Vec<u8>,
     manual: Vec<Fold>,
@@ -348,6 +356,10 @@ impl Folds {
         Self {
             method: FoldMethod::Manual,
             shift_width: 8,
+            tab_width: 8,
+            fold_ignore: b"#".to_vec(),
+            nest_max: i64::try_from(MAX_FOLD_DEPTH).unwrap_or(i64::MAX),
+            min_lines: 1,
             marker_start: b"{{{".to_vec(),
             marker_end: b"}}}".to_vec(),
             manual: Vec::new(),
@@ -365,10 +377,25 @@ impl Folds {
     }
 
     /// Selects a fold method and invalidates computed data.
+    ///
+    /// Upstream's `foldUpdate` (`src/nvim/fold.c:742-776`) is a no-op for the
+    /// manual method: the window's fold tree survives a method switch, so
+    /// moving *to* manual adopts the computed folds as manual ones instead
+    /// of dropping them (`set fdm=manual` after indent keeps the folds).
+    /// A non-empty manual set wins over adopted folds.
     pub fn set_method(&mut self, method: FoldMethod) {
         if self.method != method {
+            let previous = self.method;
             self.method = method;
-            self.computed.clear();
+            if method == FoldMethod::Manual
+                && previous != FoldMethod::Manual
+                && self.manual.is_empty()
+                && !self.computed.is_empty()
+            {
+                self.manual = std::mem::take(&mut self.computed);
+            } else {
+                self.computed.clear();
+            }
             self.changedtick = None;
             self.requested_tick = None;
             self.dirty = true;
@@ -397,6 +424,81 @@ impl Folds {
             }
         }
         Ok(())
+    }
+
+    /// Returns the tab-stop width used when measuring indent columns.
+    ///
+    /// Upstream's `get_indent_buf` counts a tab against `'tabstop'`
+    /// (`src/nvim/indent.c:369-372`), while the level divisor is the
+    /// effective shift width.
+    #[must_use]
+    pub const fn tab_width(&self) -> usize {
+        self.tab_width
+    }
+
+    /// Sets the nonzero tab-stop width used when measuring indent columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FoldError::ZeroShiftWidth`] when `tab_width` is zero.
+    pub fn set_tab_width(&mut self, tab_width: usize) -> Result<(), FoldError> {
+        if tab_width == 0 {
+            return Err(FoldError::ZeroShiftWidth);
+        }
+        if self.tab_width != tab_width {
+            self.tab_width = tab_width;
+            if self.method == FoldMethod::Indent {
+                self.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the `'foldignore'` bytes: lines whose first non-blank byte is
+    /// one of these have an undefined indent level.
+    #[must_use]
+    pub fn fold_ignore(&self) -> &[u8] {
+        &self.fold_ignore
+    }
+
+    /// Sets the `'foldignore'` bytes.
+    pub fn set_fold_ignore(&mut self, ignore: impl Into<Vec<u8>>) {
+        let ignore = ignore.into();
+        if self.fold_ignore != ignore {
+            self.fold_ignore = ignore;
+            if self.method == FoldMethod::Indent {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Returns the `'foldnestmax'` cap, clamped at use to `0..=MAX_FOLD_DEPTH`.
+    #[must_use]
+    pub const fn nest_max(&self) -> i64 {
+        self.nest_max
+    }
+
+    /// Sets the `'foldnestmax'` cap (`src/nvim/fold.c:2783-2799` clamps each
+    /// indent level to `MAX(0, 'foldnestmax')`).
+    pub fn set_nest_max(&mut self, nest_max: i64) {
+        if self.nest_max != nest_max {
+            self.nest_max = nest_max;
+            if self.method == FoldMethod::Indent {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Returns the `'foldminlines'` floor: a closed fold with no more rows
+    /// than this is displayed open (`checkSmall`, `src/nvim/fold.c:1466-1491`).
+    #[must_use]
+    pub const fn min_lines(&self) -> usize {
+        self.min_lines
+    }
+
+    /// Sets the `'foldminlines'` floor.
+    pub fn set_fold_min_lines(&mut self, min_lines: usize) {
+        self.min_lines = min_lines;
     }
 
     /// Returns the marker byte strings as `(start, end)`.
@@ -493,15 +595,15 @@ impl Folds {
 
     /// Lazily refreshes local methods or returns typed host work.
     ///
-    /// Each line is treated as bytes. Indentation counts ASCII spaces as one
-    /// column and advances an ASCII tab to the next shift-width boundary.
+    /// Each line is treated as bytes. Indent levels count ASCII spaces as one
+    /// column and advance an ASCII tab to the next tab-stop boundary, divided
+    /// by the shift width (`get_indent_buf`, `src/nvim/indent.c:369-372`).
     ///
     /// # Errors
     ///
     /// Returns [`FoldError::ZeroShiftWidth`] if indent computation runs with a
-    /// zero shift width, [`FoldError::EmptyRange`] or [`FoldError::CrossingRanges`]
-    /// if computed ranges are degenerate, or [`FoldError::WrongHostMethod`] when
-    /// the active method has no host kind.
+    /// zero shift or tab width, or [`FoldError::WrongHostMethod`] when the
+    /// active method has no host kind.
     pub fn refresh<B: AsRef<[u8]>>(
         &mut self,
         changedtick: u64,
@@ -521,14 +623,20 @@ impl Folds {
                 self.dirty = false;
             }
             FoldMethod::Indent => {
-                let levels = indent_levels(lines, self.shift_width)?;
-                self.replace_computed(ranges_from_levels(&levels)?)?;
+                let records = indent_records(
+                    lines,
+                    self.shift_width,
+                    self.tab_width,
+                    &self.fold_ignore,
+                    self.nest_max,
+                )?;
+                self.replace_computed(folds_from_records(&records)?)?;
                 self.changedtick = Some(changedtick);
                 self.dirty = false;
             }
             FoldMethod::Marker => {
-                let levels = marker_levels(lines, &self.marker_start, &self.marker_end);
-                self.replace_computed(ranges_from_levels(&levels)?)?;
+                let records = marker_records(lines, &self.marker_start, &self.marker_end);
+                self.replace_computed(folds_from_records(&records)?)?;
                 self.changedtick = Some(changedtick);
                 self.dirty = false;
             }
@@ -731,12 +839,18 @@ impl Folds {
     /// fold and stops at the first closed one, so a closed fold nested inside
     /// an open one is reported while an open fold nested inside a closed one is
     /// not: the answer is always the outermost closed fold covering `row`.
+    /// A fold with no more rows than [`Self::min_lines`] is never reported
+    /// closed (`checkSmall`, `src/nvim/fold.c:1466-1491`); the search then
+    /// continues into its nested folds, which is how a two-line fold shrunk
+    /// to one line by an edit reads open again.
     #[must_use]
     pub fn closed_rows_at(&self, row: usize) -> Option<(usize, usize)> {
         self.active()
             .iter()
-            .find(|fold| fold.range.covers_row(row) && fold.state == FoldState::Closed)
+            .filter(|fold| fold.range.covers_row(row) && fold.state == FoldState::Closed)
+            .filter(|fold| fold.range.last_row() + 1 - fold.range.start.row > self.min_lines)
             .map(|fold| (fold.range.start.row, fold.range.last_row()))
+            .next()
     }
 
     /// Returns the nesting level at a zero-based row, zero when no fold covers
@@ -1040,50 +1154,131 @@ pub fn indent_levels<B: AsRef<[u8]>>(
     Ok(levels)
 }
 
-fn marker_levels<B: AsRef<[u8]>>(lines: &[B], start: &[u8], end: &[u8]) -> Vec<usize> {
-    let mut level = 0usize;
-    let mut levels = Vec::with_capacity(lines.len());
+/// One line's fold-level record for [`folds_from_records`].
+///
+/// The fields mirror the per-line state `foldUpdateIEMSRecurse`
+/// (`src/nvim/fold.c:2074-2425`) threads through a refresh: the level getter
+/// fills them in for every line in order, then the builder walks them to cut
+/// folds. `start` counts start markers on the line (marker `{{{`, expr `>`
+/// and `a`); `had_end` carries the *previous* line's end value (expr `<` and
+/// `s`), closing folds the line after it was set.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LevelRecord {
+    /// Fold level of this line; negative means undefined (blank line under
+    /// indent, or a negative expression result), resolved by looking ahead.
+    level: i32,
+    /// Start markers found on this line.
+    start: u32,
+    /// Previous line's end value, or [`NO_FOLD_END`] when the previous line
+    /// set none.
+    had_end: i32,
+}
+
+/// [`LevelRecord::had_end`] value meaning the previous line ended no fold.
+const NO_FOLD_END: i32 = i32::MAX;
+
+/// Computes one [`LevelRecord`] per line for the marker method.
+///
+/// This is `foldlevelMarker` (`src/nvim/fold.c:2924-2980`) in record form:
+/// the carried level starts at the previous line's next level, a start
+/// marker raises both the line level and the next level (an explicit
+/// `{{{n` sets both to `n`), and an end marker only lowers the next level
+/// (an explicit `}}}n` additionally sets the line level to `n`, capped so
+/// it never starts a fold above the level the line began at).
+fn marker_records<B: AsRef<[u8]>>(lines: &[B], start: &[u8], end: &[u8]) -> Vec<LevelRecord> {
+    let mut level: i32 = 0;
+    let mut records = Vec::with_capacity(lines.len());
     for line in lines {
         let bytes = line.as_ref();
-        let mut offset = 0usize;
+        let start_level = level;
         let mut next_level = level;
-        let mut line_level = level;
+        let mut starts: u32 = 0;
+        let mut offset = 0usize;
         while offset < bytes.len() {
             let start_at = find_bytes(&bytes[offset..], start).map(|at| offset + at);
             let end_at = find_bytes(&bytes[offset..], end).map(|at| offset + at);
-            match (start_at, end_at) {
-                (None, None) => break,
-                (Some(at), None) => {
-                    let explicit = decimal_after(bytes, at + start.len());
-                    next_level = explicit
-                        .unwrap_or_else(|| next_level.saturating_add(1))
-                        .min(MAX_FOLD_DEPTH);
-                    line_level = line_level.max(next_level);
-                    offset = at + start.len();
-                }
-                (Some(start_at), Some(end_at)) if start_at <= end_at => {
-                    let explicit = decimal_after(bytes, start_at + start.len());
-                    next_level = explicit
-                        .unwrap_or_else(|| next_level.saturating_add(1))
-                        .min(MAX_FOLD_DEPTH);
-                    line_level = line_level.max(next_level);
-                    offset = start_at + start.len();
-                }
-                (_, Some(at)) => {
-                    line_level = line_level.max(next_level);
-                    let explicit = decimal_after(bytes, at + end.len());
-                    next_level = explicit.map_or_else(
-                        || next_level.saturating_sub(1),
-                        |value| value.saturating_sub(1),
-                    );
-                    offset = at + end.len();
-                }
+            if start_at.is_some_and(|at| end_at.is_none_or(|end| at <= end)) {
+                let at = start_at.unwrap_or(offset);
+                (level, next_level, starts) = apply_start_marker(
+                    bytes,
+                    at + start.len(),
+                    level,
+                    next_level,
+                    start_level,
+                    starts,
+                );
+                offset = at + start.len();
+            } else if let Some(at) = end_at {
+                (level, next_level) =
+                    apply_end_marker(bytes, at + end.len(), level, next_level, start_level);
+                offset = at + end.len();
+            } else {
+                break;
             }
         }
-        levels.push(line_level.min(MAX_FOLD_DEPTH));
-        level = next_level.min(MAX_FOLD_DEPTH);
+        next_level = next_level.max(0);
+        records.push(LevelRecord {
+            level,
+            start: starts,
+            had_end: NO_FOLD_END,
+        });
+        level = next_level;
     }
-    levels
+    records
+}
+
+/// Applies one start marker found at `digit_at` (the first byte after it).
+///
+/// Mirrors the start branch of `foldlevelMarker`: a plain marker raises both
+/// the line level and the next level and counts one start, while an explicit
+/// `{{{n` sets both levels to `n` and reports `MAX(n - start_level, 1)`
+/// starts, which is how the builder knows the line begins new folds.
+fn apply_start_marker(
+    bytes: &[u8],
+    digit_at: usize,
+    level: i32,
+    next_level: i32,
+    start_level: i32,
+    starts: u32,
+) -> (i32, i32, u32) {
+    if let Some(number) = decimal_after(bytes, digit_at)
+        && number > 0
+    {
+        let numbered = i32::try_from(number).unwrap_or(i32::MAX).min(MAX_LEVEL);
+        let count = numbered
+            .saturating_sub(start_level)
+            .max(1)
+            .try_into()
+            .unwrap_or(u32::MAX);
+        return (numbered, numbered, count);
+    }
+    (
+        level.saturating_add(1).min(MAX_LEVEL),
+        next_level.saturating_add(1).min(MAX_LEVEL),
+        starts.saturating_add(1),
+    )
+}
+
+/// Applies one end marker found at `digit_at` (the first byte after it).
+///
+/// Mirrors the end branch of `foldlevelMarker`: a plain marker only lowers
+/// the next level, so the end-marker line keeps the fold's level, while an
+/// explicit `}}}n` additionally sets the line level to `n` without ever
+/// starting a fold above the level the line began at.
+fn apply_end_marker(
+    bytes: &[u8],
+    digit_at: usize,
+    level: i32,
+    next_level: i32,
+    start_level: i32,
+) -> (i32, i32) {
+    if let Some(number) = decimal_after(bytes, digit_at)
+        && number > 0
+    {
+        let numbered = i32::try_from(number).unwrap_or(i32::MAX).min(MAX_LEVEL);
+        return (numbered, numbered.saturating_sub(1).min(start_level));
+    }
+    (level, next_level.saturating_sub(1))
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -1107,29 +1302,194 @@ fn decimal_after(bytes: &[u8], start: usize) -> Option<usize> {
     found.then_some(value)
 }
 
-fn ranges_from_levels(levels: &[usize]) -> Result<Vec<FoldRange>, FoldError> {
-    let max_level = levels
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(0)
-        .min(MAX_FOLD_DEPTH);
-    let mut ranges = Vec::new();
-    for depth in 1..=max_level {
-        let mut start = None;
-        for row in 0..=levels.len() {
-            let folded = levels.get(row).is_some_and(|&level| level >= depth);
-            match (start, folded) {
-                (None, true) => start = Some(row),
-                (Some(start_row), false) => {
-                    ranges.push(FoldRange::lines(start_row, row)?);
-                    start = None;
+/// Computes one [`LevelRecord`] per line for the indent method.
+///
+/// This is `foldlevelIndent` (`src/nvim/fold.c:2783-2801`) in record form:
+/// the level is the indent width (spaces count one column, tabs advance to
+/// the next `tab_width` boundary) divided by `shift_width`, capped at
+/// `MAX(0, nest_max)`. A blank line, or one whose first non-blank byte is in
+/// `ignore` (`'foldignore'`), has an undefined (`-1`) level, except that the
+/// first and last buffer lines always report zero
+/// (`src/nvim/fold.c:2852-2854`).
+///
+/// # Errors
+///
+/// Returns [`FoldError::ZeroShiftWidth`] when `shift_width` or `tab_width`
+/// is zero.
+fn indent_records<B: AsRef<[u8]>>(
+    lines: &[B],
+    shift_width: usize,
+    tab_width: usize,
+    ignore: &[u8],
+    nest_max: i64,
+) -> Result<Vec<LevelRecord>, FoldError> {
+    if shift_width == 0 || tab_width == 0 {
+        return Err(FoldError::ZeroShiftWidth);
+    }
+    let cap = nest_max
+        .clamp(0, MAX_LEVEL.into())
+        .try_into()
+        .unwrap_or(0usize);
+    let last = lines.len().saturating_sub(1);
+    let mut records = Vec::with_capacity(lines.len());
+    for (index, line) in lines.iter().enumerate() {
+        let bytes = line.as_ref();
+        let mut columns = 0usize;
+        let mut first_content = None;
+        for &byte in bytes {
+            match byte {
+                b' ' => columns = columns.saturating_add(1),
+                b'\t' => {
+                    let advance = tab_width.saturating_sub(columns % tab_width);
+                    columns = columns.saturating_add(advance.max(1));
                 }
-                _ => {}
+                _ => {
+                    first_content = Some(byte);
+                    break;
+                }
             }
         }
+        let undefined = match first_content {
+            None => true,
+            Some(byte) => ignore.contains(&byte),
+        };
+        let level = if undefined {
+            if index == 0 || index == last { 0 } else { -1 }
+        } else {
+            columns
+                .saturating_div(shift_width)
+                .min(cap)
+                .try_into()
+                .unwrap_or(MAX_LEVEL)
+        };
+        records.push(LevelRecord {
+            level,
+            start: 0,
+            had_end: NO_FOLD_END,
+        });
+    }
+    Ok(records)
+}
+
+/// Cuts whole-line fold ranges from per-line [`LevelRecord`]s.
+///
+/// This is a fresh whole-buffer `foldUpdateIEMSRecurse`
+/// (`src/nvim/fold.c:2074-2425`) without incremental reuse: a level-1 fold
+/// starts at the first line with a positive level, and each fold extends
+/// while following lines report at least its level. A line past the first
+/// whose `start` count exceeds its level surplus (`level > lvl - start`,
+/// `src/nvim/fold.c:2410`) or whose `had_end` reaches the fold level
+/// (`level >= had_end`) ends the current fold and starts a new one, which is
+/// how adjacent same-level marker folds stay apart. Undefined (`-1`) lines
+/// are skipped to the next defined line: they join the fold when that line
+/// continues it, and are left out when it ends the fold, exactly like the
+/// `ll` lookahead in `src/nvim/fold.c:2332-2372`.
+///
+/// # Errors
+///
+/// Returns [`FoldError::EmptyRange`] if a computed range is degenerate.
+fn folds_from_records(records: &[LevelRecord]) -> Result<Vec<FoldRange>, FoldError> {
+    let mut ranges = Vec::new();
+    let mut row = 0;
+    while row < records.len() {
+        if records[row].level <= 0 {
+            row += 1;
+            continue;
+        }
+        row = build_fold(records, 1, row, &mut ranges)?;
     }
     Ok(ranges)
+}
+
+/// Builds the single fold at `level` starting at the defined row `first`
+/// (whose level is at least `level`), appends its range when the scan
+/// created one, and answers the first row below it.
+///
+/// The loop mirrors `foldUpdateIEMSRecurse` for a fresh build: each visit
+/// first offers the line to fold creation (a fold starts here when the level
+/// differs, a start marker sits on it, the previous line ended a fold, or it
+/// is the last line), then ends the fold below the line when the effective
+/// level drops below `level`, and otherwise recurses into nested folds or
+/// advances past undefined lines through [`next_defined_row`]. A frame that
+/// ends before creating anything emits no range, which is how a lone deeper
+/// line over a lower one leaves no nested fold.
+fn build_fold(
+    records: &[LevelRecord],
+    level: i32,
+    first: usize,
+    ranges: &mut Vec<FoldRange>,
+) -> Result<usize, FoldError> {
+    let last = records.len().saturating_sub(1);
+    let top = first;
+    let mut lnum = first;
+    let mut save = first;
+    let mut current = records[first];
+    let mut created = false;
+    loop {
+        if lnum >= records.len() {
+            break;
+        }
+        if !created
+            && (current.level != level
+                || current.start != 0
+                || current.had_end != NO_FOLD_END
+                || save == last
+                || lnum == last)
+        {
+            created = true;
+        }
+        let forced = lnum > top
+            && (level > current.level - start_level(current) || level >= current.had_end);
+        let effective = if forced { 0 } else { current.level };
+        if effective < level {
+            break;
+        }
+        if effective > level && created {
+            let below = build_fold(records, level + 1, save, ranges)?;
+            lnum = below;
+            if lnum >= records.len() {
+                break;
+            }
+            // The last buffer row always carries a defined level, so a
+            // defined row at or after `below` always exists; keeping the
+            // previous records on the impossible miss ends the fold here
+            // instead of looping forever.
+            if let Some(defined) = next_defined_row(records, lnum) {
+                save = defined;
+                current = records[defined];
+            }
+            continue;
+        }
+        // The last buffer row always carries a defined level, so reaching
+        // past it means the fold runs to the end of the buffer.
+        let Some(next_save) = next_defined_row(records, save + 1) else {
+            lnum = records.len();
+            break;
+        };
+        lnum = save + 1;
+        save = next_save;
+        current = records[next_save];
+    }
+    if created {
+        ranges.push(FoldRange::lines(top, lnum)?);
+    }
+    Ok(lnum)
+}
+
+/// Answers the first row at or after `from` whose level is defined
+/// (non-negative), or `None` when every remaining line is undefined.
+fn next_defined_row(records: &[LevelRecord], from: usize) -> Option<usize> {
+    records
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, record)| record.level >= 0)
+        .map(|(row, _)| row)
+}
+
+/// Reads the `start` count as an `i32` for level arithmetic.
+fn start_level(record: LevelRecord) -> i32 {
+    record.start.try_into().unwrap_or(i32::MAX)
 }
 
 fn normalize_folds(folds: &mut Vec<Fold>) -> Result<(), FoldError> {
@@ -1190,4 +1550,184 @@ fn set_all(folds: &mut [Fold], state: FoldState) -> usize {
         }
     }
     changed
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    //! Every expectation below is the value the oracle at
+    //! `.references/neovim/build/bin/nvim` (v0.13.0-dev-1390) answers for the
+    //! same buffer, recorded next to each assertion.
+
+    use super::*;
+
+    fn byte_lines(lines: &[&str]) -> Vec<Vec<u8>> {
+        lines.iter().map(|line| line.as_bytes().to_vec()).collect()
+    }
+
+    /// Refreshes `folds` over `lines` and answers `(start, end)` row pairs.
+    fn computed_ranges(folds: &mut Folds, lines: &[&str]) -> Vec<(usize, usize)> {
+        let owned = byte_lines(lines);
+        let tick = folds.cached_changedtick().unwrap_or(0) + 1;
+        folds.invalidate(tick);
+        match folds.refresh(tick, &owned).unwrap() {
+            FoldRefresh::Ready { .. } => {}
+            FoldRefresh::Host(_) => panic!("unexpected host request"),
+        }
+        folds
+            .folds()
+            .iter()
+            .map(|fold| (fold.range.start.row, fold.range.last_row()))
+            .collect()
+    }
+
+    // fold.c:2924 — adjacent same-level marker folds stay apart: the second
+    // `{{{` line starts a new fold instead of merging into the first.
+    // Oracle (`['{{{','}}}','{{{','', '}}}']`): folds [1,2] and [3,5].
+    #[test]
+    fn marker_folds_split_at_each_start_marker() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Marker);
+        assert_eq!(
+            computed_ranges(&mut folds, &["{{{", "}}}", "{{{", "", "}}}"]),
+            vec![(0, 1), (2, 4)]
+        );
+    }
+
+    // fold.c:2924 — `['{{{','}}}','{{{','}}}']` gives [1,2] and [3,4].
+    #[test]
+    fn marker_folds_split_adjacent_pairs() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Marker);
+        assert_eq!(
+            computed_ranges(&mut folds, &["{{{", "}}}", "{{{", "}}}"]),
+            vec![(0, 1), (2, 3)]
+        );
+    }
+
+    // fold.c:2946 — an end marker with an explicit level sets the line's
+    // level to that number. Oracle (`['one }}}4','two']`): levels [4, 0],
+    // i.e. four nested single-line folds on line one.
+    #[test]
+    fn marker_end_digit_sets_the_line_level() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Marker);
+        assert_eq!(
+            computed_ranges(&mut folds, &["one }}}4", "two"]),
+            vec![(0, 0), (0, 0), (0, 0), (0, 0)]
+        );
+        assert_eq!(folds.level_at_row(0), 4);
+        assert_eq!(folds.level_at_row(1), 0);
+    }
+
+    // fold.c:2924 — a lone `{{{ }}}` line is a single-line fold, which stays
+    // open because it is no bigger than 'foldminlines'. Oracle: level 1,
+    // `foldclosed(1)` is -1.
+    #[test]
+    fn marker_single_line_fold_is_reported_open() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Marker);
+        assert_eq!(computed_ranges(&mut folds, &["{{{ }}}"]), vec![(0, 0)]);
+        assert_eq!(folds.closed_rows_at(0), None);
+    }
+
+    // fold.c:2783 — a tab counts against 'tabstop', not 'shiftwidth':
+    // six tabs at `tabstop=8` indent 48 columns, i.e. level 24 at sw=2,
+    // capped by the default 'foldnestmax' of 20. Oracle: foldlevel 20.
+    #[test]
+    fn indent_tabs_measure_against_tabstop() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Indent);
+        folds.set_shift_width(2).unwrap();
+        folds.set_tab_width(8).unwrap();
+        let owned = byte_lines(&["\t\t\t\t\t\ta"]);
+        folds.invalidate(1);
+        folds.refresh(1, &owned).unwrap();
+        assert_eq!(folds.level_at_row(0), 20);
+    }
+
+    // fold.c:2783 — `'foldnestmax'` caps the reported level. Oracle:
+    // `setlocal foldnestmax=10` gives 10, `=-1` gives 0.
+    #[test]
+    fn indent_respects_foldnestmax() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Indent);
+        folds.set_shift_width(2).unwrap();
+        folds.set_tab_width(8).unwrap();
+        folds.set_nest_max(10);
+        let owned = byte_lines(&["\t\t\t\t\t\ta"]);
+        folds.invalidate(1);
+        folds.refresh(1, &owned).unwrap();
+        assert_eq!(folds.level_at_row(0), 10);
+        folds.set_nest_max(-1);
+        folds.invalidate(2);
+        folds.refresh(2, &owned).unwrap();
+        assert_eq!(folds.level_at_row(0), 0);
+    }
+
+    // fold.c:2794 — a line whose first non-blank byte is in 'foldignore'
+    // has an undefined level. Oracle (`['  a','  # x','  b']`, fdi=#):
+    // the comment line joins the surrounding fold.
+    #[test]
+    fn indent_ignores_foldignore_lines() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Indent);
+        folds.set_shift_width(2).unwrap();
+        let owned = byte_lines(&["  a", "  # x", "  b"]);
+        folds.invalidate(1);
+        folds.refresh(1, &owned).unwrap();
+        assert_eq!(folds.level_at_row(1), 1);
+        assert_eq!(
+            computed_ranges(&mut folds, &["  a", "  # x", "  b"]),
+            vec![(0, 2)]
+        );
+    }
+
+    // fold.c:1466 — a fold shrunk to one line by an edit reads open again:
+    // its single row is no bigger than the default 'foldminlines' of 1.
+    // Oracle (`['line 1','  line 2']` after deleting line 3): fc2=-1, fl2=1.
+    #[test]
+    fn shrunk_single_line_fold_reads_open() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Indent);
+        folds.set_shift_width(2).unwrap();
+        assert_eq!(
+            computed_ranges(&mut folds, &["line 1", "  line 2"]),
+            vec![(1, 1)]
+        );
+        assert_eq!(folds.level_at_row(1), 1);
+        assert_eq!(folds.closed_rows_at(1), None);
+    }
+
+    // fold.c:1466 — `'foldminlines'=5` keeps a two-line manual fold displayed
+    // open. Oracle: `foldclosed(2)` is -1 while the window uses 5.
+    #[test]
+    fn foldminlines_keeps_small_folds_open() {
+        let mut folds = Folds::new();
+        folds
+            .create_manual(Position::new(1, 0), Position::new(3, 0))
+            .unwrap();
+        assert_eq!(folds.closed_rows_at(1), Some((1, 2)));
+        folds.set_fold_min_lines(5);
+        assert_eq!(folds.closed_rows_at(1), None);
+        folds.set_fold_min_lines(0);
+        assert_eq!(folds.closed_rows_at(1), Some((1, 2)));
+    }
+
+    // fold.c:742 — switching to manual adopts the computed folds instead of
+    // dropping them. Oracle (`set fdm=indent`, redraw, `set fdm=manual`):
+    // the indent folds answer `foldclosed` as manual ones.
+    #[test]
+    fn switching_to_manual_adopts_computed_folds() {
+        let mut folds = Folds::new();
+        folds.set_method(FoldMethod::Indent);
+        folds.set_shift_width(2).unwrap();
+        let owned = byte_lines(&["a", "  b", "  c"]);
+        folds.invalidate(1);
+        folds.refresh(1, &owned).unwrap();
+        assert_eq!(folds.method(), FoldMethod::Indent);
+        folds.set_method(FoldMethod::Manual);
+        assert_eq!(folds.method(), FoldMethod::Manual);
+        assert_eq!(folds.closed_rows_at(1), Some((1, 2)));
+    }
 }

@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::ffi::OsString;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -11,12 +12,16 @@ use ox_types::{OxStr, Special, Typval};
 use ox_uv::process::PtySize;
 
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, LuaExec, call_user_function_with_self, flow_to_eval_error,
+    EvalHost, ExEditorAccess, ExRuntime, LuaExec,
+    call_user_function_with_self, flow_to_eval_error, object_to_typval,
 };
 use crate::job::DEFAULT_PTY_SIZE;
 use crate::options::OptionValue;
 use crate::script::FileIO;
-use crate::{Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions};
+use crate::{
+    ChannelCloseError, ChannelPart, Editor, JobCallbacks, JobEvent, JobManager, JobStartOptions,
+    RpcCallError, SocketStream,
+};
 
 /// Routes one process builtin.
 ///
@@ -60,7 +65,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "chansend" | "jobsend" => {
             let id = job_id(args.first())?;
             let data = channel_bytes(args.get(1))?;
-            let Some(manager) = runtime.jobs.take() else {
+            let Some(mut manager) = runtime.jobs.take() else {
                 return Ok(Typval::Number(0));
             };
             let terminal = access.with_ex_editor(|editor| editor.terminal_channel(id).is_some());
@@ -72,6 +77,16 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             // them here would run Lua callbacks while the executor is in
             // user code, and their `vim.fn` re-entry would land on the
             // nested executor's never-pumped job manager.
+            // Byte sockets send through `chansend` too (upstream `channel.txt`),
+            // so route by channel kind first: socket bytes must not be copied
+            // through the job path only to miss the table.
+            if manager.is_socket_channel(id) {
+                let sent = manager
+                    .socket_send(id, &data)
+                    .map_err(|message| EvalError::new("E900", 0, message))?;
+                runtime.jobs = Some(manager);
+                return Ok(Typval::Number(i64::from(sent)));
+            }
             let (manager, sent) = chansend_send(manager, id, data, terminal);
             runtime.jobs = Some(manager);
             let sent = sent?;
@@ -124,6 +139,20 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
                 "system" => call_system_builtin(runtime, &shell, args, scope),
                 _ => call_systemlist_builtin(runtime, &shell, args, scope),
             }
+        }
+        "termopen" => {
+            let shell = access.with_ex_editor(|editor| shell_argv(editor));
+            call_term_open(runtime, access, &shell, args)
+        }
+        // `jobclose` is the obsolete name for `chanclose` (upstream
+        // `eval.lua`): both share `f_chanclose`, so an omitted stream closes
+        // every part — there is no stdin default.
+        "jobclose" | "chanclose" => call_chan_close(runtime, args, ChannelPart::All),
+        "rpcnotify" => call_rpc_notify(runtime, args),
+        "rpcrequest" => call_rpc_request(runtime, args),
+        "sockconnect" => call_sock_connect(runtime, args),
+        "timer_info" | "timer_pause" | "timer_start" | "timer_stop" | "timer_stopall" => {
+            crate::timers::call(host, name, args, scope)
         }
         _ => unreachable!("process builtin route and dispatcher disagree"),
     }
@@ -391,13 +420,7 @@ pub(crate) fn start_terminal<F: FileIO, E: ExEditorAccess>(
     }
     let shell = access.with_ex_editor(|editor| shell_argv(editor));
     let job_command = if command.trim().is_empty() {
-        Typval::List(Rc::new(RefCell::new(ox_types::ListData {
-            items: shell
-                .iter()
-                .map(|part| Typval::String(OxStr::from(part.as_str())))
-                .collect(),
-            lock: ox_types::LockState::default(),
-        })))
+        shell_command(&shell)
     } else {
         Typval::String(OxStr::from(command))
     };
@@ -409,25 +432,17 @@ pub(crate) fn start_terminal<F: FileIO, E: ExEditorAccess>(
     let Ok(id) = u64::try_from(id) else {
         return Err(EvalError::new("E475", 0, "Invalid argument"));
     };
-    let Some(buffer) =
-        access.with_ex_editor(|editor| editor.terminal_channel(id).map(|terminal| terminal.buffer))
-    else {
-        return Err(EvalError::new("E475", 0, "Invalid argument"));
-    };
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let terminal_command = if command.trim().is_empty() {
         shell.join(" ")
     } else {
         command.trim().to_owned()
     };
-    let name_text = format!("term://{}//{id}:{terminal_command}", cwd.display());
-    let name = OxStr::from(name_text.as_str());
-    access
-        .with_ex_editor(|editor| editor.buffer_mut(buffer).map(|state| state.set_name(name)))
-        .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
-    if let Some(manager) = runtime.jobs.as_mut() {
-        manager.set_terminal_exit_message(id, runtime.terminal_exit_message);
-    }
+    finish_terminal_spawn(runtime, access, id, &terminal_command, None)?;
+    let Some(buffer) =
+        access.with_ex_editor(|editor| editor.terminal_channel(id).map(|terminal| terminal.buffer))
+    else {
+        return Err(EvalError::new("E475", 0, "Invalid argument"));
+    };
     Ok((id, buffer))
 }
 
@@ -554,6 +569,581 @@ fn call_systemlist_builtin<F: FileIO>(
     Ok(Typval::list(lines))
 }
 
+/// `termopen({cmd}[, {opts}])` (upstream `eval.lua`, `channel.c`): opens the
+/// terminal in the current buffer instead of allocating one, sets
+/// `buftype=terminal`, and names it `term://{cwd}//{id}:{cmd}`. Options mirror
+/// `jobstart`'s terminal options (`cwd`, `env`, callbacks); `term` itself is
+/// forced on. Answers the channel id. A buffer already running a terminal job
+/// fails instead of double-attaching (upstream `terminal_running` guard).
+fn call_term_open<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    shell: &[String],
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let command = args
+        .first()
+        .ok_or_else(|| EvalError::new("E119", 0, "Not enough arguments"))?;
+    let display = term_command_text(shell, command)?;
+    let spawn = match command {
+        Typval::String(text) if text.as_bytes().is_empty() => shell_command(shell),
+        command => command.clone(),
+    };
+    let mut entries = Vec::new();
+    if let Some(options) = args.get(1) {
+        match options {
+            Typval::Dict(options) => {
+                for entry in options.borrow().iter() {
+                    if entry.key.as_bytes() == b"term" {
+                        continue;
+                    }
+                    entries.push((entry.key.clone(), entry.value.clone()));
+                }
+            }
+            // `f_termopen` (`eval/deprecated.c`) rejects a non-Dictionary
+            // second argument with `e_invarg2`, not jobstart's `E1206`.
+            _ => {
+                return Err(EvalError::new(
+                    "E475",
+                    0,
+                    "Invalid argument: expected dictionary",
+                ));
+            }
+        }
+    }
+    entries.push((OxStr::from("term"), Typval::Bool(true)));
+    // The `term://` name records the spawn directory, not the editor's: a
+    // `termopen(..., {'cwd': dir})` terminal lives in `dir`.
+    let name_cwd = entries
+        .iter()
+        .find(|(key, _)| key.as_bytes() == b"cwd")
+        .and_then(|(_, value)| value_text(value).ok())
+        .map(PathBuf::from);
+    let spawned = call_job_start(runtime, access, shell, &[spawn, Typval::dict(entries)])?;
+    let Typval::Number(id) = spawned else {
+        return Err(EvalError::new("E475", 0, "Invalid argument"));
+    };
+    if id <= 0 {
+        // A guarded attach (modified buffer, busy terminal) answers 0 and a
+        // failed spawn answers -1; neither owns a terminal to name.
+        return Ok(Typval::Number(id));
+    }
+    let id = u64::try_from(id)
+        .map_err(|_| EvalError::new("E475", 0, "Invalid argument: expected job id"))?;
+    finish_terminal_spawn(runtime, access, id, &display, name_cwd.as_ref())?;
+    Ok(Typval::Number(
+        i64::try_from(id).unwrap_or(-1),
+    ))
+}
+
+/// Display text for the `term://` buffer name: a String command verbatim (the
+/// shell argv when empty), a List command's resolved executable path.
+fn term_command_text(shell: &[String], command: &Typval) -> ox_eval::Result<String> {
+    match command {
+        Typval::String(text) => {
+            let text = text.to_string_lossy().into_owned();
+            Ok(if text.trim().is_empty() {
+                shell.join(" ")
+            } else {
+                text
+            })
+        }
+        Typval::List(items) => {
+            let mut words = Vec::new();
+            for item in &items.borrow().items {
+                words.push(value_text(item)?);
+            }
+            // An empty List names nothing (upstream `tv_to_argv` rejects it
+            // with `e_invarg`); checking the first word alone would index an
+            // empty vector.
+            if words.first().is_none_or(String::is_empty) {
+                return Err(EvalError::new("E474", 0, "Invalid argument"));
+            }
+            // Upstream names a List command with the resolved executable
+            // (`tv_to_argv`: `*cmd = exe_resolved`), not the joined argv. The
+            // resolution is `os_can_exe` against the process working
+            // directory, and a program it cannot find is refused before any
+            // spawn: `E475: Invalid value for argument cmd: '<word>' is not
+            // executable` (verified against the oracle for `./tool` that only
+            // exists under the requested `cwd`).
+            match resolve_command_path(&words[0]) {
+                Some(resolved) => Ok(resolved),
+                None => Err(EvalError::new(
+                    "E475",
+                    0,
+                    format!(
+                        "Invalid value for argument cmd: '{}' is not executable",
+                        words[0]
+                    ),
+                )),
+            }
+        }
+        _ => Err(EvalError::new("E475", 0, "Invalid argument")),
+    }
+}
+
+/// Resolve `program` to the absolute path upstream `os_can_exe` reports for
+/// the `term://` name: an absolute slashful path used as-is when executable,
+/// a relative one joined onto the cwd (`save_abs_path`), a bare word searched
+/// along `PATH`. `None` leaves the word verbatim (the spawn itself reports an
+/// unexecutable program).
+fn resolve_command_path(program: &str) -> Option<String> {
+    #[cfg(unix)]
+    fn is_executable(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        path.is_file()
+            && path
+                .metadata()
+                .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    fn is_executable(path: &Path) -> bool {
+        path.is_file()
+    }
+    if program.contains('/') {
+        // Upstream stores `save_abs_path(name)`: a relative slashful path
+        // is joined onto the cwd and normalized lexically, never verbatim.
+        let path = Path::new(program);
+        if !is_executable(path) {
+            return None;
+        }
+        if path.is_absolute() {
+            return Some(program.to_owned());
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut absolute = PathBuf::new();
+        for component in cwd.join(path).components() {
+            match component {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    absolute.pop();
+                }
+                other => absolute.push(other.as_os_str()),
+            }
+        }
+        return Some(absolute.to_string_lossy().into_owned());
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path_var) {
+        let candidate = directory.join(program);
+        if is_executable(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// The shell argv as a List command, for an empty `termopen("")` or
+/// `:terminal` with no command: upstream runs the shell itself.
+fn shell_command(shell: &[String]) -> Typval {
+    Typval::List(Rc::new(RefCell::new(
+        ox_types::ListData {
+            items: shell
+                .iter()
+                .map(|part| Typval::String(OxStr::from(part.as_str())))
+                .collect(),
+            lock: ox_types::LockState::default(),
+        },
+    )))
+}
+
+/// Render `path` with a `~` prefix when it sits under `$HOME`, the buffer-name
+/// rendering upstream `home_replace` applies before formatting `term://...`.
+fn home_replaced(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => text
+            .strip_prefix(home.as_str())
+            .map(|rest| format!("~{rest}"))
+            .unwrap_or(text),
+        _ => text,
+    }
+}
+
+/// Name a freshly spawned terminal `term://{cwd}//{pid}:{cmd}`, flag its
+/// default exit message, and mark its buffer `buftype=terminal` (upstream
+/// `terminal_open`, `terminal.c:585-611`). Shared by `:terminal` and
+/// `termopen`, which both spawn before they name.
+fn finish_terminal_spawn<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    id: u64,
+    command: &str,
+    name_cwd: Option<&PathBuf>,
+) -> ox_eval::Result<()> {
+    let Some(buffer) =
+        access.with_ex_editor(|editor| editor.terminal_channel(id).map(|terminal| terminal.buffer))
+    else {
+        return Err(EvalError::new("E475", 0, "Invalid argument"));
+    };
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = name_cwd.unwrap_or(&current);
+    // Upstream names the buffer `term://{cwd}//{pid}:{cmd}` with the child's
+    // pid (not the channel id) and a `$HOME`-relative cwd (`eval/funcs.c`
+    // `f_jobstart` term branch).
+    let pid = runtime
+        .jobs
+        .as_ref()
+        .and_then(|manager| manager.pid(id))
+        .map_or_else(
+            || i64::try_from(id).unwrap_or(-1),
+            |pid| i64::from(pid),
+        );
+    let name_text = format!("term://{}//{pid}:{command}", home_replaced(cwd));
+    let name = OxStr::from(name_text.as_str());
+    access
+        .with_ex_editor(|editor| editor.buffer_mut(buffer).map(|state| state.set_name(name)))
+        .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+    if let Some(manager) = runtime.jobs.as_mut() {
+        manager.set_terminal_exit_message(id, runtime.terminal_exit_message);
+    }
+    access
+        .with_ex_editor(|editor| {
+            editor.options_mut().set_buffer(
+                buffer,
+                "buftype",
+                OptionValue::String("terminal".to_owned()),
+            )
+        })
+        .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+    Ok(())
+}
+
+/// `jobclose({id}[, {stream}])` and `chanclose({id}[, {stream}])` (upstream
+/// `channel.c` `f_chanclose`, shared by both names): close one stream or, when
+/// `{stream}` is omitted, every stream. Double closes succeed; an unknown id
+/// is `E900`, a stream the channel does not have is `E906`.
+fn call_chan_close<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    args: &[Typval],
+    default: ChannelPart,
+) -> ox_eval::Result<Typval> {
+    let channel = args
+        .first()
+        .and_then(value_number)
+        .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument"))?;
+    // Upstream casts to `uint64_t` before the lookup, so a negative id misses
+    // the table and reports `e_invchan` rather than `e_invarg`.
+    let id = u64::try_from(channel)
+        .map_err(|_| EvalError::new("E900", 0, "Invalid channel id"))?;
+    let part = match args.get(1) {
+        None => default,
+        Some(Typval::String(name)) => match name.as_bytes() {
+            b"stdin" => ChannelPart::Stdin,
+            b"stdout" => ChannelPart::Stdout,
+            b"stderr" => ChannelPart::Stderr,
+            b"rpc" => ChannelPart::Rpc,
+            _ => {
+                return Err(EvalError::new(
+                    "E906",
+                    0,
+                    format!(
+                        "Invalid channel stream \"{}\"",
+                        name.to_string_lossy().into_owned()
+                    ),
+                ));
+            }
+        },
+        Some(_) => return Err(EvalError::new("E475", 0, "Invalid argument")),
+    };
+    let Some(mut manager) = runtime.jobs.take() else {
+        return Err(EvalError::new("E900", 0, "Invalid channel id"));
+    };
+    let closed = manager.close_job_stream(id, part);
+    runtime.jobs = Some(manager);
+    match closed {
+        Ok(_) => Ok(Typval::Number(1)),
+        Err(error) => Err(match error {
+            ChannelCloseError::UnknownChannel => {
+                EvalError::new("E900", 0, "Invalid channel id")
+            }
+            ChannelCloseError::InvalidStream => {
+                EvalError::new("E906", 0, "invalid stream for channel")
+            }
+            ChannelCloseError::InvalidRpcStream => {
+                EvalError::new("E906", 0, "invalid stream for rpc channel, use 'rpc'")
+            }
+        }),
+    }
+}
+
+/// `rpcnotify({channel}, {event}[, {args}...])` (upstream `eval/funcs.c`
+/// `f_rpcnotify`): encode a `[2, event, args]` notification over an RPC job or
+/// socket and return 1. Channel 0 broadcasts to every open RPC channel.
+/// Anything that is not an open RPC channel is `E475: Channel doesn't exist`.
+fn call_rpc_notify<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let channel = match args.first().and_then(value_number) {
+        Some(id) if id >= 0 => id,
+        _ => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Channel id must be a positive integer",
+            ));
+        }
+    };
+    let event = match args.get(1) {
+        Some(Typval::String(event)) => event.clone(),
+        _ => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Event type must be a string",
+            ));
+        }
+    };
+    let params = args
+        .get(2..)
+        .unwrap_or(&[])
+        .iter()
+        .map(ox_rpc::typval_to_object)
+        .collect::<Vec<_>>();
+    let Some(manager) = runtime.jobs.as_mut() else {
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: Channel doesn't exist",
+        ));
+    };
+    if channel == 0 {
+        // Broadcast is best-effort: every open RPC channel gets the event.
+        for id in manager.rpc_channel_ids() {
+            let _ignored = manager.rpc_notify(id, &event, params.clone());
+        }
+        let _ignored = manager.notify_client(&event.to_string_lossy(), &params);
+        return Ok(Typval::Number(1));
+    }
+    if channel == 1 {
+        if manager.notify_client(&event.to_string_lossy(), &params) {
+            return Ok(Typval::Number(1));
+        }
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: Channel doesn't exist",
+        ));
+    }
+    let id = u64::try_from(channel).unwrap_or(u64::MAX);
+    match manager.rpc_notify(id, &event, params) {
+        Ok(true) => Ok(Typval::Number(1)),
+        _ => Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: Channel doesn't exist",
+        )),
+    }
+}
+
+/// `rpcrequest({channel}, {method}[, {args}...])` (upstream `eval/funcs.c`
+/// `f_rpcrequest`): encode a `[0, msgid, method, args]` request and block for
+/// the `[1, msgid, error, result]` reply. A remote error raises the peer's
+/// message; anything that is not an open RPC channel is `E475`.
+fn call_rpc_request<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let channel = match args.first().and_then(value_number) {
+        Some(id) if id > 0 => id,
+        _ => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Channel id must be a positive integer",
+            ));
+        }
+    };
+    let method = match args.get(1) {
+        Some(Typval::String(method)) => method.clone(),
+        _ => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Method name must be a string",
+            ));
+        }
+    };
+    let params = args
+        .get(2..)
+        .unwrap_or(&[])
+        .iter()
+        .map(ox_rpc::typval_to_object)
+        .collect::<Vec<_>>();
+    let id = u64::try_from(channel).unwrap_or(u64::MAX);
+    let Some(mut manager) = runtime.jobs.take() else {
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: Channel doesn't exist",
+        ));
+    };
+    // Thirty seconds bounds one slow dependency; the peer normally answers in
+    // milliseconds and the loop still pumps the reactor every millisecond, so
+    // callbacks for other jobs keep their FIFO delivery through the deferred
+    // queue instead of stalling behind the wait.
+    let reply = manager.rpc_call(id, &method, params, std::time::Duration::from_secs(30));
+    runtime.jobs = Some(manager);
+    match reply {
+        Ok(object) => Ok(object_to_typval(&object)),
+        Err(error) => Err(match error {
+            RpcCallError::NotRpc => EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: Channel doesn't exist",
+            ),
+            RpcCallError::Encode(detail) => {
+                EvalError::new("E475", 0, format!("Invalid argument: {detail}"))
+            }
+            RpcCallError::Transport(detail) => {
+                EvalError::new("E900", 0, format!("Invalid channel id ({detail})"))
+            }
+            RpcCallError::PeerGone => EvalError::new(
+                "E900",
+                0,
+                "Invalid channel id (channel closed while waiting for reply)",
+            ),
+            RpcCallError::Timeout => EvalError::new(
+                "E900",
+                0,
+                "Invalid channel id (timed out waiting for rpc reply)",
+            ),
+            RpcCallError::Remote(message) => EvalError::new(
+                "E605",
+                0,
+                format!(
+                    "Exception not caught: Invoking '{}' on channel {channel}:\n{message}",
+                    method.to_string_lossy().into_owned()
+                ),
+            ),
+        }),
+    }
+}
+
+/// `sockconnect({mode}, {address}[, {opts}])` (upstream `eval/funcs.c`
+/// `f_sockconnect`): connect a channel to a Unix socket (`'pipe'`) or TCP
+/// address (`'tcp'`, `host:port`). `{opts}` honours `rpc`. Answers the channel
+/// id, or 0 when the peer refuses the connection.
+fn call_sock_connect<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    args: &[Typval],
+) -> ox_eval::Result<Typval> {
+    let (mode, address) = match (args.first(), args.get(1)) {
+        (Some(Typval::String(mode)), Some(Typval::String(address))) => (mode.clone(), address.clone()),
+        _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
+    };
+    let rpc = match args.get(2) {
+        None => false,
+        Some(Typval::Dict(options)) => options
+            .borrow()
+            .get(b"rpc")
+            .is_some_and(|value| value_number(value).is_some_and(|value| value != 0)),
+        Some(_) => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: expected dictionary",
+            ));
+        }
+    };
+    let stream = match mode.as_bytes() {
+        b"pipe" => sock_connect_pipe(&address)?,
+        b"tcp" => sock_connect_tcp(&address)?,
+        _ => {
+            return Err(EvalError::new(
+                "E475",
+                0,
+                "Invalid argument: invalid mode",
+            ));
+        }
+    };
+    let Some(stream) = stream else {
+        // Upstream reports the refused handshake and answers 0.
+        return Ok(Typval::Number(0));
+    };
+    let mut manager = match runtime.jobs.take() {
+        Some(manager) => manager,
+        None => match JobManager::new() {
+            Ok(manager) => manager,
+            Err(_) => return Ok(Typval::Number(0)),
+        },
+    };
+    let id = runtime.channel_ids.allocate();
+    let Ok(result) = i64::try_from(id) else {
+        runtime.jobs = Some(manager);
+        return Ok(Typval::Number(-1));
+    };
+    manager.add_socket(id, stream, rpc);
+    runtime.jobs = Some(manager);
+    Ok(Typval::Number(result))
+}
+
+/// Connect a Unix-domain socket: every read carries a short timeout so the
+/// `rpcrequest` pump stays bounded by its own deadline instead of one slow
+/// peer. A refused path is `Ok(None)` — the documented 0 return.
+#[cfg(unix)]
+fn sock_connect_pipe(
+    address: &OxStr,
+) -> ox_eval::Result<Option<SocketStream>> {
+    use std::os::unix::net::UnixStream as StdUnixStream;
+    let path = address.to_string_lossy().into_owned();
+    match StdUnixStream::connect(&path) {
+        Ok(stream) => {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+            // A peer that stops reading must not wedge `rpcrequest` past its
+            // deadline inside a blocking write.
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+            Ok(Some(SocketStream::Pipe(stream)))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+/// `sockconnect('pipe', ...)` has no transport off Unix.
+#[cfg(not(unix))]
+fn sock_connect_pipe(_address: &OxStr) -> ox_eval::Result<Option<SocketStream>> {
+    Err(EvalError::new(
+        "E475",
+        0,
+        "Invalid argument: pipe sockets are unsupported on this platform",
+    ))
+}
+
+/// Connect TCP `host:port` with a bounded handshake; refused hosts are the
+/// documented 0 return, not an error.
+fn sock_connect_tcp(address: &OxStr) -> ox_eval::Result<Option<SocketStream>> {
+    use std::net::ToSocketAddrs as _;
+    let text = address.to_string_lossy().into_owned();
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument: invalid address"))?;
+    let port: u16 = port
+        .parse()
+        .map_err(|_| EvalError::new("E475", 0, "Invalid argument: invalid port"))?;
+    let endpoint = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| EvalError::new("E475", 0, "Invalid argument: invalid address"))?
+        .next()
+        .ok_or_else(|| EvalError::new("E475", 0, "Invalid argument: invalid address"))?;
+    match TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(10)) {
+        Ok(stream) => {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
+            Ok(Some(SocketStream::Tcp(stream)))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<JobStartOptions> {
     let (program, command_args) = job_command(shell, args.first())?;
     let options = match args.get(1) {
@@ -575,7 +1165,7 @@ fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<J
         None => None,
         Some(Typval::Dict(values)) => {
             let mut environment = std::env::vars_os().collect::<Vec<_>>();
-            for entry in &values.borrow().entries {
+            for entry in values.borrow().iter() {
                 let value = value_text(&entry.value)?;
                 let name = OsString::from(entry.key.to_string_lossy().into_owned());
                 if let Some((_, current)) =
@@ -593,10 +1183,28 @@ fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<J
     let cwd = get("cwd")
         .map(|value| value_text(&value).map(PathBuf::from))
         .transpose()?;
+    // `f_jobstart` rejects a `cwd` that is not a directory
+    // (`eval/funcs.c`: `semsg(e_invarg2, "expected valid directory")`).
+    if cwd.as_ref().is_some_and(|cwd| !cwd.as_os_str().is_empty() && !cwd.is_dir()) {
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: expected valid directory",
+        ));
+    }
     let detached = get("detach").is_some_and(|value| value_bool(&value));
     let term = get("term").is_some_and(|value| value_bool(&value));
     let pty = get("pty").is_some_and(|value| value_bool(&value)) || term;
     let rpc = get("rpc").is_some_and(|value| value_bool(&value));
+    // A channel is either a pty or RPC (`eval/funcs.c`: `semsg(e_invarg2,
+    // "job cannot have both 'pty' and 'rpc' options set")`).
+    if pty && rpc {
+        return Err(EvalError::new(
+            "E475",
+            0,
+            "Invalid argument: job cannot have both 'pty' and 'rpc' options set",
+        ));
+    }
     // Always a pipe when unset, even for empty input: the child must see EOF
     // on standard input rather than inherit the parent's.
     let stdin_pipe = match get("stdin") {
@@ -706,6 +1314,13 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
     let mut lua_deferred = false;
     let mut batch = std::mem::take(events).into_iter();
     while let Some(event) = batch.next() {
+        // Counts timer-callback failures (`emsg_count`); the id must be
+        // read before the event moves into the call, and receiver-`Rc`
+        // identity means job events never match.
+        let timer_id = runtime
+            .jobs
+            .as_ref()
+            .and_then(|manager| manager.timer_id_for_event(&event));
         if event_lua_reference(&event).is_some() {
             if lua.is_none() {
                 redefer_job_events(runtime, vec![event]);
@@ -722,12 +1337,53 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             lua_deferred = true;
             continue;
         }
+        // A stored Funcref is a value: a lambda keeps its body in the closure
+        // registry, and a name redispatch would look for `<lambda>N` among
+        // user functions, where it does not exist.
+        if matches!(
+            event.callback,
+            Typval::Funcref(_) | Typval::Partial(_)
+        ) {
+            let regex = crate::excmd_exec::VimRegex;
+            let ambiguous_wide = access.with_ex_editor(|editor| {
+                matches!(
+                    editor.options().get_global("ambiwidth"),
+                    Ok(OptionValue::String(value)) if value == "double"
+                )
+            });
+            let mut host = EvalHost {
+                runtime,
+                access,
+                lua,
+                builtins: ox_eval::Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
+                submatches: None,
+                escaped_exception: None,
+                call_receiver: Some(event.receiver),
+            };
+            let outcome =
+                ox_eval::Evaluator::new(&mut host, &regex).invoke(event.callback, event.args, scope);
+            if outcome.is_err()
+                && let Some(id) = timer_id
+                && let Some(manager) = host.runtime.jobs.as_mut()
+            {
+                manager.record_timer_error(id);
+            }
+            if let Some(id) = timer_id
+                && let Some(manager) = host.runtime.jobs.as_mut()
+            {
+                manager.timer_delivered(id);
+            }
+            if let Err(error) = outcome {
+                redefer_job_events(host.runtime, batch.collect());
+                return Err(error);
+            }
+            continue;
+        }
         let name = match event.callback {
             Typval::String(name) => name,
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.name,
             _ => continue,
         };
-        if let Err(flow) = call_user_function_with_self(
+        let outcome = call_user_function_with_self(
             runtime,
             access,
             scope,
@@ -737,9 +1393,21 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             1,
             1,
             Some(event.receiver),
-        ) {
+        );
+        let error = outcome
+            .err()
+            .map(|flow| flow_to_eval_error(flow, &name.to_string_lossy()));
+        if let Some(id) = timer_id
+            && let Some(manager) = runtime.jobs.as_mut()
+        {
+            if error.is_some() {
+                manager.record_timer_error(id);
+            }
+            manager.timer_delivered(id);
+        }
+        if let Some(error) = error {
             redefer_job_events(runtime, batch.collect());
-            return Err(flow_to_eval_error(flow, &name.to_string_lossy()));
+            return Err(error);
         }
     }
     if lua_deferred {
@@ -759,11 +1427,13 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
 /// re-enters the executor through the Lua host, which is what the
 /// in-user-code delivery must not run; the server's outer driver
 /// keeps the same classification in `lua_job_reference`.
+/// Lua registry reference carried by a callback, if any.
+///
+/// Delegates to the shared predicate: a Lua function value has an empty name
+/// and only a registry slot, a callback returned to Vimscript carries the
+/// pseudo name, and a Vimscript lambda has a non-empty `<lambda>N` name.
 fn event_lua_reference(event: &JobEvent) -> Option<usize> {
-    match &event.callback {
-        Typval::Funcref(funcref) | Typval::Partial(funcref) => funcref.registry,
-        _ => None,
-    }
+    crate::excmd_exec::lua_reference(event)
 }
 
 /// Puts events this stack must not deliver back on the installed manager's
@@ -939,8 +1609,10 @@ mod tests {
     }
 
     // `f_jobstart` sizes a `term` job's pty from the current window
-    // (eval/funcs.c:3505-3506): a 120x40 window has 39 text rows (the
-    // message row is reserved), so the child must see "39 120".
+    // (`eval/funcs.c:3505-3506`): with default `'laststatus'=2`, a 120x40
+    // window has 38 text rows after the message/statusline reservations
+    // (`drawscreen.c:2759-2762`, `window.c:1164-1171`), so the child must see
+    // "38 120".
     #[test]
     fn terminal_job_pty_matches_the_window_geometry() {
         let _guard = crate::lock_process_state();
@@ -958,7 +1630,7 @@ mod tests {
         )
         .unwrap();
         let job = global_number(exec.scope(), "job").unwrap();
-        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((38, 120)));
     }
 
     // A bare `jobstart(..., {'pty': v:true})` takes the same window default:
@@ -981,7 +1653,7 @@ mod tests {
         )
         .unwrap();
         let job = global_number(exec.scope(), "job").unwrap();
-        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((39, 120)));
+        assert_eq!(pty_size_seen_by_child(&mut exec, job), Some((38, 120)));
     }
 
     // With no window to inherit from, each dimension keeps the
@@ -1010,6 +1682,12 @@ mod tests {
     // tick in interactive mode -- delivers them. Delivering them inline
     // while the executor is in user code is what sent a Lua callback's
     // `vim.fn` re-entry to the nested executor's never-pumped manager.
+    //
+    // There is deliberately no `sleep` between the spawns and the write:
+    // upstream `:sleep` pumps the event loop (`do_sleep` with events), so a
+    // sleeping setup would deliver the writer's callback before `chansend`
+    // runs and defeat the arrangement. The pin is that the write itself
+    // never delivers, whatever has arrived by then.
     #[test]
     fn chansend_poll_defers_swept_events_for_a_later_drain() {
         let _guard = crate::lock_process_state();
@@ -1023,7 +1701,7 @@ mod tests {
         exec.execute_script(
             &editor,
             "<test>",
-            "function! Bcb(id, data, event)\nlet g:seen = 1\nendfunction\nlet g:seen = 0\nlet g:writer = jobstart(['sh', '-c', 'echo ready'], {'on_stdout': 'Bcb'})\nlet g:term = jobstart(['cat'], {'term': v:true})\nsleep 250m\ncall chansend(g:term, \"go\\n\")\nlet g:seen_after_chansend = g:seen\ncall jobwait([g:writer], 2000)\nlet g:seen_after_drain = g:seen",
+            "function! Bcb(id, data, event)\nlet g:seen = 1\nendfunction\nlet g:seen = 0\nlet g:writer = jobstart(['sh', '-c', 'echo ready'], {'on_stdout': 'Bcb'})\nlet g:term = jobstart(['cat'], {'term': v:true})\ncall chansend(g:term, \"go\\n\")\nlet g:seen_after_chansend = g:seen\ncall jobwait([g:writer], 2000)\nlet g:seen_after_drain = g:seen",
         )
         .unwrap();
         assert!(
@@ -1080,9 +1758,12 @@ mod tests {
                 Typval::String(OxStr::from(event)),
             ]
         };
+        // A Lua callback is recognised by the pseudo name that wraps its
+        // registry slot (`lua_ref_function_name`); a Vimscript lambda also
+        // owns a registry id, so the registry alone cannot classify it.
         let lua_event = JobEvent {
             callback: Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(42),
@@ -1198,7 +1879,7 @@ mod tests {
         exec.defer_job_events(vec![
             event(Typval::String(OxStr::from("VimCb"))),
             event(Typval::Funcref(Funcref {
-                name: OxStr::from("probe"),
+                name: OxStr::from(""),
                 args: Vec::new(),
                 dict: None,
                 registry: Some(7),
@@ -1231,6 +1912,112 @@ mod tests {
                 |event| matches!(&event.callback, Typval::Funcref(funcref) if funcref.registry == Some(7))
             ),
             "the offending Lua-registered event itself must be requeued"
+        );
+    }
+
+    #[test]
+    fn sink_receives_client_channel_notification() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        exec.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = exec
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect("rpcnotify(1, ...) with a sink must succeed");
+        assert_eq!(result, Typval::Number(1));
+        let received = received.borrow();
+        assert_eq!(received.len(), 1, "the sink must see exactly one event");
+        assert_eq!(received[0].0, "ev");
+        assert_eq!(received[0].1, vec![Object::Integer(1)]);
+    }
+
+    #[test]
+    fn sink_receives_broadcast_notification() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        exec.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = exec
+            .evaluate_expression(&editor, "rpcnotify(0, 'ev', 1)")
+            .expect("broadcast with a sink must succeed");
+        assert_eq!(result, Typval::Number(1));
+        let received = received.borrow();
+        assert_eq!(received.len(), 1, "the broadcast must also reach the sink");
+        assert_eq!(received[0].0, "ev");
+        assert_eq!(received[0].1, vec![Object::Integer(1)]);
+    }
+
+    #[test]
+    fn isolation() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut first = ExExecutor::new();
+        let mut second = ExExecutor::new();
+        // Arm a sinkless manager on the sibling so its E475 comes from
+        // `notify_client` finding no sink, not from a missing manager.
+        second.defer_job_events(Vec::new());
+        let received: Rc<std::cell::RefCell<Vec<(String, Vec<Object>)>>> =
+            Rc::new(std::cell::RefCell::new(Vec::new()));
+        let probe = received.clone();
+        first.set_client_notifier(Box::new(move |event, params| {
+            probe
+                .borrow_mut()
+                .push((event.to_owned(), params.to_vec()));
+            true
+        }));
+        let result = first
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect("notify through the sink owner must succeed");
+        assert_eq!(result, Typval::Number(1));
+        assert_eq!(received.borrow().len(), 1);
+        // The sibling executor owns a different manager with no sink: the
+        // same call must report E475 and never reach the first sink.
+        let error = second
+            .evaluate_expression(&editor, "rpcnotify(1, 'ev', 1)")
+            .expect_err("notify without a sink must fail");
+        assert!(
+            error.to_string().contains("E475"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            received.borrow().len(),
+            1,
+            "the sibling must not reach the first executor's sink"
+        );
+    }
+
+    #[test]
+    fn unknown_channel_still_reports_e475() {
+        let _guard = crate::lock_process_state();
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.set_client_notifier(Box::new(|_, _| true));
+        let error = exec
+            .evaluate_expression(&editor, "rpcnotify(999998, 'ev')")
+            .expect_err("an id that is neither job, socket, nor 1 must fail");
+        assert!(
+            error.to_string().contains("E475"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.to_string().contains("Channel doesn't exist"),
+            "the E475 text must stay intact, got {error}"
         );
     }
 }

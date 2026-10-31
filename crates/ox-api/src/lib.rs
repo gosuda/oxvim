@@ -21,8 +21,8 @@ mod registry;
 mod runtime;
 mod session;
 
-pub use session::{ApiCallerGuard, ApiSession};
 pub use buffer::{EnteredResidency, restore_buffer_context};
+pub use session::{ApiCallerGuard, ApiSession};
 mod tabpage;
 mod ui;
 mod window;

@@ -43,6 +43,9 @@ pub struct QuickfixItem {
 /// One list in the quickfix history (`qf_list_T`).
 #[derive(Clone, Debug)]
 pub struct QuickfixList {
+    /// No entry in this list is valid, so jumps ignore validity
+    /// (upstream `qfl->qf_nonevalid`, quickfix.c:2569).
+    none_valid: bool,
     items: Vec<QuickfixItem>,
     title: OxStr,
     id: u64,
@@ -59,6 +62,7 @@ impl QuickfixList {
             title,
             id,
             idx: 0,
+            none_valid: false,
             changedtick: 0,
             context: Typval::String(OxStr::from("")),
             quickfixtextfunc: Typval::String(OxStr::from("")),
@@ -94,6 +98,7 @@ impl QuickfixList {
     /// Replaces all entries and resets the cursor to the first valid one.
     pub fn set_items(&mut self, items: Vec<QuickfixItem>) {
         self.items = items;
+        self.refresh_none_valid();
         self.idx = self
             .items
             .iter()
@@ -108,6 +113,7 @@ impl QuickfixList {
     pub fn set_items_update(&mut self, items: Vec<QuickfixItem>) {
         let previous = self.idx;
         self.items = items;
+        self.refresh_none_valid();
         self.idx = if previous != 0 && self.items.get(previous - 1).is_some_and(|item| item.valid) {
             previous
         } else {
@@ -122,6 +128,7 @@ impl QuickfixList {
     pub fn append_items(&mut self, items: Vec<QuickfixItem>) {
         let was_empty = self.items.is_empty();
         self.items.extend(items);
+        self.refresh_none_valid();
         if was_empty {
             self.idx = self
                 .items
@@ -136,6 +143,18 @@ impl QuickfixList {
     /// marks the list changed for title/context edits too).
     pub fn touch(&mut self) {
         self.changedtick = self.changedtick.saturating_add(1);
+    }
+
+    /// Upstream marks a list `qf_nonevalid` when it has no valid entry, and
+    /// every jump then ignores validity instead of failing `E553`
+    /// (`qf_get_nth_valid_entry`, quickfix.c:2569).
+    fn refresh_none_valid(&mut self) {
+        self.none_valid = !self.items.iter().any(|item| item.valid);
+    }
+
+    /// Validity for a jump: an all-invalid list counts every entry as usable.
+    fn jumpable(&self, index: usize) -> bool {
+        self.none_valid || self.items.get(index).is_some_and(|item| item.valid)
     }
 
     fn set_idx(&mut self, idx: i64) {
@@ -365,7 +384,6 @@ impl QuickfixStack {
         // step at most `count` valid entries (upstream `get_nth_valid_entry`,
         // quickfix.c:2600-2631). Only `:cc` addresses a literal index.
         if !matches!(movement, QuickfixMove::Absolute(_)) {
-            let items = &quickfix_list.items;
             let forward = !matches!(movement, QuickfixMove::Previous(_) | QuickfixMove::Last);
             match movement {
                 QuickfixMove::Next(count) | QuickfixMove::Previous(count) => {
@@ -373,9 +391,9 @@ impl QuickfixStack {
                     let mut first_step = true;
                     while remaining > 0 {
                         let found = if forward {
-                            (selected + 1..=last_index).find(|&index| items[index].valid)
+                            (selected + 1..=last_index).find(|&index| quickfix_list.jumpable(index))
                         } else {
-                            (0..selected).rev().find(|&index| items[index].valid)
+                            (0..selected).rev().find(|&index| quickfix_list.jumpable(index))
                         };
                         if let Some(index) = found {
                             selected = index;
@@ -393,7 +411,7 @@ impl QuickfixStack {
                     }
                 }
                 _ => loop {
-                    if items.get(selected).is_some_and(|item| item.valid) {
+                    if quickfix_list.jumpable(selected) {
                         break;
                     }
                     if forward {
@@ -877,8 +895,7 @@ fn get_list(editor: &mut Editor, scope: QfScope, args: &[Typval]) -> Result<Typv
     let what = reference
         .try_borrow()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-        .entries
-        .clone();
+        .to_vec();
     // 'lines' parses raw text through 'errorformat' (or what.efm) into a
     // throwaway list and returns early with just 'items' (upstream
     // qf_get_list_from_lines, quickfix.c:6219-6255).
@@ -1236,8 +1253,7 @@ fn dict_entries(value: &Typval) -> Result<Option<Vec<DictEntry>>> {
     let entries = reference
         .try_borrow()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-        .entries
-        .clone();
+        .to_vec();
     Ok(Some(entries))
 }
 
@@ -1246,6 +1262,8 @@ fn dict_entries(value: &Typval) -> Result<Option<Vec<DictEntry>>> {
 #[allow(clippy::too_many_lines)] // one entry mapping, upstream-ordered
 fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<QuickfixItem> {
     let mut bufnr = dict_number(entries, "bufnr").unwrap_or(0);
+    let filename_is_empty = dict_string(entries, "filename")
+        .is_none_or(|filename| filename.as_bytes().is_empty());
     if bufnr == 0
         && let Some(filename) = dict_string(entries, "filename")
         && !filename.as_bytes().is_empty()
@@ -1263,7 +1281,12 @@ fn dict_entry_item(editor: &mut Editor, entries: &[DictEntry]) -> Result<Quickfi
     }
     let lnum = dict_number(entries, "lnum").unwrap_or(0);
     let pattern = dict_string(entries, "pattern").unwrap_or_else(|| OxStr::from(""));
-    let detected_valid = bufnr != 0 && (lnum != 0 || !pattern.as_bytes().is_empty());
+    // Upstream `dict_to_qf_item` (quickfix.c:6652-6660): an entry is invalid
+    // when it names neither a buffer nor a file, or when it has neither a line
+    // nor a pattern. Both conditions have to hold for an entry to be valid, so
+    // a filename alone is not enough.
+    let named = bufnr != 0 || !filename_is_empty;
+    let detected_valid = named && (lnum != 0 || !pattern.as_bytes().is_empty());
     Ok(QuickfixItem {
         bufnr,
         module: dict_string(entries, "module").unwrap_or_else(|| OxStr::from("")),
@@ -1414,9 +1437,13 @@ pub fn open(editor: &mut Editor, scope: QfScope) -> std::result::Result<WinHandl
         return Ok(window);
     }
     let window =
-        if let (Some(tab), Some(current)) = (editor.current_tabpage(), editor.current_window()) {
+        if let (Some(tab), Some(_current)) = (editor.current_tabpage(), editor.current_window()) {
+            // `:botright copen` splits the outermost frame at the bottom
+            // (`qf_open` uses `win_split(0, WSP_BOT)`, quickfix.c:3869-3890),
+            // so the list window spans the tabpage width instead of nesting
+            // inside the current column.
             editor
-                .split_horizontal(tab, current, buffer, true)
+                .split_root_horizontal(tab, buffer, true)
                 .map_err(|error| QuickfixError::editor(&error))?
         } else {
             let tab = editor
@@ -1754,8 +1781,7 @@ fn what_argument(args: &[Typval], no_items: bool) -> Result<(Vec<DictEntry>, Opt
             let entries = reference
                 .try_borrow()
                 .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                .entries
-                .clone();
+                .to_vec();
             if !no_items {
                 return Err(EvalError::new(
                     "E475",
@@ -2098,10 +2124,10 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        let answer = answer.borrow();
-        assert_eq!(dict_number(&answer.entries, "nr"), Some(1));
-        assert_eq!(dict_number(&answer.entries, "id"), Some(1));
-        let Some(Typval::List(items)) = dict_value(&answer.entries, "items") else {
+        let answer = answer.borrow().to_vec();
+        assert_eq!(dict_number(&answer, "nr"), Some(1));
+        assert_eq!(dict_number(&answer, "id"), Some(1));
+        let Some(Typval::List(items)) = dict_value(&answer, "items") else {
             panic!("items expected")
         };
         assert_eq!(items.borrow().items.len(), 1);
@@ -2201,6 +2227,64 @@ mod tests {
         assert_eq!(editor.quickfix().current().unwrap().idx(), 1);
     }
 
+    /// `nvim.difftool` builds entries with a filename but no line and no
+    /// pattern, so every entry is invalid. Upstream marks such a list
+    /// `qf_nonevalid` and jumps ignore validity (quickfix.c:2569); without the
+    /// flag `:cfirst` answered `E553` on a populated list.
+    #[test]
+    fn all_invalid_list_jumps_to_its_first_entry() {
+        let (mut editor, _) = setup();
+        let entries: Vec<Typval> = ["A", "M", "D"]
+            .into_iter()
+            .map(|text| {
+                Typval::dict(vec![
+                    pair("filename", Typval::String(OxStr::from("a.txt"))),
+                    pair("text", Typval::String(OxStr::from(text))),
+                ])
+            })
+            .collect();
+        call(&mut editor, "setqflist", &[Typval::list(entries)]).unwrap();
+        let list = editor.quickfix().current().unwrap();
+        assert!(
+            list.items().iter().all(|item| !item.valid),
+            "every entry is invalid without a line or a pattern"
+        );
+
+        jump(&mut editor, QuickfixMove::First, false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 1);
+        jump(&mut editor, QuickfixMove::Next(1), false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 2);
+        jump(&mut editor, QuickfixMove::Last, false).unwrap();
+        assert_eq!(editor.quickfix().current().unwrap().idx(), 3);
+    }
+
+    /// A mixed list still skips invalid entries: `qf_nonevalid` only applies
+    /// when no entry is valid at all.
+    #[test]
+    fn mixed_list_still_skips_invalid_entries() {
+        let (mut editor, _) = setup();
+        let buffer = editor.current_buffer().unwrap();
+        let entries = vec![
+            Typval::dict(vec![
+                pair("filename", Typval::String(OxStr::from("a.txt"))),
+                pair("text", Typval::String(OxStr::from("invalid"))),
+            ]),
+            item(buffer, 2, "valid"),
+        ];
+        call(&mut editor, "setqflist", &[Typval::list(entries)]).unwrap();
+        assert!(
+            !editor.quickfix().current().unwrap().items()[0].valid,
+            "the first entry stays invalid"
+        );
+
+        jump(&mut editor, QuickfixMove::First, false).unwrap();
+        assert_eq!(
+            editor.quickfix().current().unwrap().idx(),
+            2,
+            "the first valid entry wins"
+        );
+    }
+
     #[test]
     fn invalid_action_reports_e927() {
         let (mut editor, _) = setup();
@@ -2275,7 +2359,7 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        assert_eq!(dict_number(&answer.borrow().entries, "size"), Some(1));
+        assert_eq!(dict_number(&answer.borrow().to_vec(), "size"), Some(1));
         let answer = call(
             &mut editor,
             "getqflist",
@@ -2288,7 +2372,7 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        assert_eq!(dict_number(&answer.borrow().entries, "size"), Some(1));
+        assert_eq!(dict_number(&answer.borrow().to_vec(), "size"), Some(1));
     }
     #[test]
     fn first_and_last_skip_invalid_entries() {
@@ -2506,31 +2590,31 @@ mod tests {
             let Typval::Dict(answer) = answer else {
                 panic!("dictionary expected")
             };
-            let answer = answer.borrow();
+            let answer = answer.borrow().to_vec();
             assert_eq!(
-                dict_value(&answer.entries, "nr").is_some(),
+                dict_value(&answer, "nr").is_some(),
                 present,
                 "nr presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "winid").is_some(),
+                dict_value(&answer, "winid").is_some(),
                 present,
                 "winid presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "qfbufnr").is_some(),
+                dict_value(&answer, "qfbufnr").is_some(),
                 present,
                 "qfbufnr presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "title").is_some(),
+                dict_value(&answer, "title").is_some(),
                 present,
                 "title presence"
             );
             if present {
-                assert_eq!(dict_number(&answer.entries, "nr"), Some(1));
-                assert!(dict_number(&answer.entries, "winid").is_some_and(|id| id != 0));
-                assert!(dict_number(&answer.entries, "qfbufnr").is_some_and(|id| id != 0));
+                assert_eq!(dict_number(&answer, "nr"), Some(1));
+                assert!(dict_number(&answer, "winid").is_some_and(|id| id != 0));
+                assert!(dict_number(&answer, "qfbufnr").is_some_and(|id| id != 0));
             }
         }
     }
@@ -2705,11 +2789,11 @@ mod tests {
         let Typval::Dict(dict) = answer else {
             panic!("dict expected")
         };
-        let entries = &dict.borrow().entries;
-        assert_eq!(dict_value(entries, "id"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "idx"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "size"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "changedtick"), Some(&Typval::Number(0)));
+        let entries = dict.borrow().to_vec();
+        assert_eq!(dict_value(&entries, "id"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "idx"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "size"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "changedtick"), Some(&Typval::Number(0)));
     }
 
     #[test]

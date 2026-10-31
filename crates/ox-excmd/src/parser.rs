@@ -372,7 +372,11 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
         cursor = skip_ascii_space(input, cursor);
         let range_offset = cursor;
         let range = parse_range(input, &mut cursor)?;
-        cursor = skip_ascii_space(input, cursor);
+        // `ea.cmd = skip_colon_white(ea.cmd, true)` (ex_docmd.c:2093-2094):
+        // after the addresses, any mix of white space and `:` still separates
+        // the range from the command, so `:1,2:s/x/y/` runs the substitute
+        // rather than reporting a range with no command.
+        cursor = skip_space_and_colons(input, cursor);
 
         let command_offset = cursor;
         let unknown_command = || {
@@ -516,7 +520,7 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
             args = args.replace("\\\n", "\n");
         }
         let register = if flags.contains(CommandFlags::REGSTR) {
-            take_register(&mut args)
+            take_register(&mut args, flags, command)
         } else {
             None
         };
@@ -546,7 +550,12 @@ impl<'a, P: UserCommandProvider + ?Sized> Parser<'a, P> {
                 "Argument required",
             ));
         }
+        // The `=` expression is not trailing text: `parse_register` consumed
+        // the rest of the argument into the expression, leaving `ea.arg`
+        // empty — which is why `:put =lineA` never raises E488.
+        let expression_register = register == Some('=');
         if !flags.contains(CommandFlags::EXTRA)
+            && !expression_register
             && !matches!(command.name(), "append" | "change" | "insert")
             && !args.trim().is_empty()
         {
@@ -637,7 +646,10 @@ fn is_one_letter_command(bytes: &[u8], start: usize) -> bool {
 /// # Errors
 ///
 /// Returns an error when a modifier is malformed.
-pub fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandModifier>, ParseError> {
+pub fn parse_modifiers(
+    input: &str,
+    cursor: &mut usize,
+) -> Result<Vec<CommandModifier>, ParseError> {
     let mut modifiers = Vec::new();
     loop {
         let saved = *cursor;
@@ -728,8 +740,13 @@ pub fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandMod
         // A modifier must not be a prefix of a longer identifier. "filter"
         // is exempt because probe has advanced past its pattern, where a
         // following identifier is the nested command, not a word extension
-        // (":filter /pat/delete" has no separating space).
+        // (":filter /pat/delete" has no separating space). A consumed `!`
+        // also ends the modifier word upstream (`checkforcmd` only checks
+        // the byte after the name, which is the `!`, then `skipwhite`s past
+        // it), so `:silent!cdo` is the modifier plus a command with no
+        // separating space.
         if !is_filter
+            && !bang
             && input
                 .as_bytes()
                 .get(probe)
@@ -747,7 +764,12 @@ pub fn parse_modifiers(input: &str, cursor: &mut usize) -> Result<Vec<CommandMod
         if modifiers.len() == MAX_MODIFIERS {
             return Err(error(ErrorCode::E488, probe, "too many modifiers"));
         }
-        *cursor = skip_ascii_space(input, probe);
+        // The next modifier may be separated by more white space and colons:
+        // upstream re-runs the leading space/tab/`:` skip at the top of every
+        // iteration (parse_command_modifiers, ex_docmd.c:2494-2499), so
+        // `:unsilent :norm! n` keeps parsing modifiers past the colon and
+        // hands `norm! n` to the command.
+        *cursor = skip_space_and_colons(input, probe);
     }
     Ok(modifiers)
 }
@@ -786,6 +808,82 @@ fn parse_vimgrep_pattern(input: &str, start: usize) -> Result<(String, usize), P
 /// for `|` separators and `"` comments.
 fn is_grep_command(name: &str) -> bool {
     matches!(name, "vimgrep" | "lvimgrep" | "vimgrepadd" | "lvimgrepadd")
+}
+
+/// A split `:vimgrep`-family argument: the search pattern, the trailing
+/// `g`/`j`/`f` flags, and the file list that follows
+/// (`skip_vimgrep_pat` plus the flag scan, ex_cmds.c:4972-5040).
+pub struct VimgrepArgs<'a> {
+    /// The search pattern text (empty for `//`, which reuses the last
+    /// search pattern).
+    pub pattern: &'a str,
+    /// `g`: list every match on a line, not just the first.
+    pub global: bool,
+    /// `j`: collect matches without jumping to the first one.
+    pub nojump: bool,
+    /// `f`: fuzzy match (parsed here; evaluation is the executor's job).
+    pub fuzzy: bool,
+    /// The raw file list following the pattern and flags.
+    pub files: &'a str,
+}
+
+/// Splits a `:vimgrep`-family argument into pattern, flags, and file list.
+/// Returns `None` when no pattern can be scanned (`skip_vimgrep_pat`
+/// returning NULL, which the caller reports as E682).
+#[must_use]
+pub fn split_vimgrep_args(args: &str) -> Option<VimgrepArgs<'_>> {
+    let start = skip_ascii_space(args, 0);
+    let bytes = args.as_bytes();
+    let first = *bytes.get(start)?;
+    let (pattern, mut cursor) = if !first.is_ascii() || first.is_ascii_alphanumeric() || first == b'_'
+    {
+        // Bare-word pattern up to whitespace (`:vimgrep foo fname`).
+        let mut end = start;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        (&args[start..end], end)
+    } else {
+        // Delimited pattern; `parse_pattern` consumes the closing
+        // delimiter (`:vimgrep /pat/ files`).
+        //
+        // The pattern text must borrow from `args`, so re-scan the same
+        // span the parser found instead of cloning it.
+        let after = parse_pattern(args, start, first, true).ok()?.1;
+        let raw = &args[start..after];
+        let pattern = raw
+            .strip_prefix(char::from(first))
+            .and_then(|rest| rest.strip_suffix(char::from(first)))
+            .unwrap_or(raw);
+        (pattern, after)
+    };
+    let (mut global, mut nojump, mut fuzzy) = (false, false, false);
+    while let Some(&byte) = bytes.get(cursor) {
+        match byte {
+            b'g' => global = true,
+            b'j' => nojump = true,
+            b'f' => fuzzy = true,
+            _ => break,
+        }
+        cursor += 1;
+    }
+    let files = args[cursor..].trim_start();
+    if files.is_empty() {
+        return None;
+    }
+    Some(VimgrepArgs {
+        pattern,
+        global,
+        nojump,
+        fuzzy,
+        files,
+    })
 }
 
 /// Returns the cursor just past a vimgrep-family leading pattern, or
@@ -1169,13 +1267,11 @@ fn shell_arg_family(name: &str, flags: CommandFlags, usefilter: bool) -> bool {
 /// the text just past the previous `|`/`\n` separator — or the start of the
 /// input — through the first non-blank byte (eval/vars.c:772-776). A `|` or
 /// `\n` earlier than the separator cannot precede a parsed command: anything
-/// that swallows it (`:normal`, user commands, quoted arguments) also
+/// that swallows it (user commands, quoted arguments) also
 /// swallows the text this command was read from, so the last separator
 /// before `before` is always the real chunk boundary.
 fn chunk_ws(input: &str, before: usize) -> &str {
-    let chunk_start = input[..before]
-        .rfind(['|', '\n'])
-        .map_or(0, |pos| pos + 1);
+    let chunk_start = input[..before].rfind(['|', '\n']).map_or(0, |pos| pos + 1);
     let indent_len = input[chunk_start..]
         .bytes()
         .take_while(|byte| matches!(byte, b' ' | b'\t'))
@@ -1201,8 +1297,7 @@ fn command_end(
     // `separate_nextcmd` scans a `TRLBAR` argument for `|`/comment/newline
     // (ex_docmd.c:4130-4178). The substitute family shares the scan so a
     // separator after its flags still splits the command.
-    if flags.contains(CommandFlags::TRLBAR)
-        || matches!(name, "substitute" | "smagic" | "snomagic")
+    if flags.contains(CommandFlags::TRLBAR) || matches!(name, "substitute" | "smagic" | "snomagic")
     {
         return trlbar_command_end(input, args_start, flags, name);
     }
@@ -1210,7 +1305,23 @@ fn command_end(
     // argument with a `skip_expr` loop, so the command ends at the first
     // `|` or `\n` the expression scan cannot consume.
     if matches!(name, "execute" | "echo" | "echon" | "echomsg" | "echoerr") {
-        return expression_command_end(input, args_start, NewlineEnd::AnyDepth);
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::AnyDepth,
+            QuoteMode::String,
+        );
+    }
+    // `:unlet` has no EX_TRLBAR metadata, but `ex_unletlock` still calls
+    // `check_nextcmd` after parsing its names. Its bars and quote comments
+    // therefore terminate the command just like the handler-owned scanners.
+    if name == "unlet" {
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::Toplevel,
+            QuoteMode::TopLevelComment,
+        );
     }
     // Handlers that evaluate their own argument and then split the tail with
     // `check_nextcmd`: a newline separates only at the expression's top
@@ -1235,7 +1346,12 @@ fn command_end(
             | "caddexpr"
             | "laddexpr"
     ) {
-        return expression_command_end(input, args_start, NewlineEnd::Toplevel);
+        return expression_command_end(
+            input,
+            args_start,
+            NewlineEnd::Toplevel,
+            QuoteMode::String,
+        );
     }
     // `ex_wincmd` (ex_docmd.c:6523-6549) consumes the window-command key
     // itself and then splits the tail with `check_nextcmd`
@@ -1244,17 +1360,10 @@ fn command_end(
     if name == "wincmd" {
         return wincmd_command_end(input, args_start);
     }
-    // Commands whose argument is the whole remainder of the cmdline: script
-    // source a language handler evaluates, a `:command`/`:autocmd` body that
-    // keeps following lines as its definition, `:normal` keys, a nested
-    // cmdline the handler re-executes (`:windo let a\nlet b` runs both per
-    // window), and user commands (`:Mc a\nlet x` puts the newline in
-    // `<args>`). A newline is content here, never a separator.
     if matches!(command, ResolvedCommand::User(_))
         || matches!(
             name,
-            "normal"
-                | "command"
+            "command"
                 | "autocmd"
                 | "debug"
                 | "lua"
@@ -1273,6 +1382,10 @@ fn command_end(
                 | "tcldo"
                 | "argdo"
                 | "bufdo"
+                | "cdo"
+                | "ldo"
+                | "cfdo"
+                | "lfdo"
                 | "tabdo"
                 | "windo"
                 | "confirm"
@@ -1297,9 +1410,7 @@ fn newline_command_end(input: &str, args_start: usize, continuation: bool) -> us
     let bytes = input.as_bytes();
     let mut cursor = args_start;
     while let Some(&byte) = bytes.get(cursor) {
-        if byte == b'\n'
-            && !(continuation && cursor > args_start && bytes[cursor - 1] == b'\\')
-        {
+        if byte == b'\n' && !(continuation && cursor > args_start && bytes[cursor - 1] == b'\\') {
             return cursor;
         }
         cursor += 1;
@@ -1307,15 +1418,11 @@ fn newline_command_end(input: &str, args_start: usize, continuation: bool) -> us
     input.len()
 }
 
+
 /// The `separate_nextcmd` scan for a `TRLBAR` argument: the command ends at
 /// `|` (except :append/:change/:insert), a `"` comment (except `EX_NOTRLCOM`),
 /// or a newline (ex_docmd.c:4130-4178).
-fn trlbar_command_end(
-    input: &str,
-    args_start: usize,
-    flags: CommandFlags,
-    name: &str,
-) -> usize {
+fn trlbar_command_end(input: &str, args_start: usize, flags: CommandFlags, name: &str) -> usize {
     let bar_breaks = !matches!(name, "append" | "change" | "insert");
     let bytes = input.as_bytes();
     let mut escaped = false;
@@ -1409,8 +1516,18 @@ enum NewlineEnd {
     AnyDepth,
     Toplevel,
 }
+#[derive(Clone, Copy)]
+enum QuoteMode {
+    String,
+    TopLevelComment,
+}
 
-fn expression_command_end(input: &str, start: usize, newline: NewlineEnd) -> usize {
+fn expression_command_end(
+    input: &str,
+    start: usize,
+    newline: NewlineEnd,
+    quote_mode: QuoteMode,
+) -> usize {
     let bytes = input.as_bytes();
     let mut cursor = start;
     let mut quote = None;
@@ -1433,6 +1550,9 @@ fn expression_command_end(input: &str, start: usize, newline: NewlineEnd) -> usi
             continue;
         }
         match byte {
+            b'"' if nesting == 0 && matches!(quote_mode, QuoteMode::TopLevelComment) => {
+                return cursor;
+            }
             b'\'' | b'"' => quote = Some(byte),
             b'(' | b'[' | b'{' => nesting = nesting.saturating_add(1),
             b')' | b']' | b'}' => nesting = nesting.saturating_sub(1),
@@ -1496,10 +1616,7 @@ fn heredoc_command_end(input: &str, after_shift: usize, args_start: usize) -> us
     // A missing or invalid marker fails inside `heredoc_get` before any body
     // line is consumed: the command owns the rest of the string and the
     // handler reports E172/E221/E991.
-    if marker.is_empty()
-        || marker.starts_with('"')
-        || marker.as_bytes()[0].is_ascii_lowercase()
-    {
+    if marker.is_empty() || marker.starts_with('"') || marker.as_bytes()[0].is_ascii_lowercase() {
         return input.len();
     }
     // `trim` allows the terminator to repeat the whitespace prefix of
@@ -1531,55 +1648,89 @@ fn is_comment_quote_exception(
     bytes: &[u8],
     args_start: usize,
     cursor: usize,
-    flags: CommandFlags,
+    _flags: CommandFlags,
     command_name: &str,
 ) -> bool {
-    is_initial_quoted_register(bytes, args_start, cursor, flags)
-        || (command_name == "@" && cursor == args_start)
+    // `separate_nextcmd` leaves only the `@"` and `redir @"` quote forms in
+    // the argument (ex_docmd.c:4165-4178): a register-argument command never
+    // quotes its register, so `:delete "a` comments out the rest of the line
+    // exactly like upstream (`:delete` has no `NOTRLCOM`).
+    (command_name == "@" && cursor == args_start)
         || (command_name == "redir"
             && cursor == args_start + 1
             && bytes.get(args_start) == Some(&b'@'))
 }
 
-fn is_initial_quoted_register(
-    bytes: &[u8],
-    args_start: usize,
-    cursor: usize,
-    flags: CommandFlags,
-) -> bool {
-    flags.contains(CommandFlags::REGSTR)
-        && cursor == args_start
-        && bytes
-            .get(cursor + 1)
-            .copied()
-            .is_some_and(|byte| is_register(char::from(byte)))
+/// `valid_yank_reg(regname, writing)` (register.c:153-165): named and
+/// numbered registers work everywhere. A writing command (`:delete`,
+/// `:yank`) may only name the writable set; a reading command
+/// (`:put`/`:iput`) additionally takes the read-only `/`, `#`, `.`, `%`,
+/// `:`, `=` sources.
+fn valid_writing_register(register: char) -> bool {
+    valid_yank_register_chars(register, "")
 }
 
-fn take_register(args: &mut String) -> Option<char> {
+fn valid_reading_register(register: char) -> bool {
+    valid_yank_register_chars(register, "/#.%:=")
+}
+
+fn valid_yank_register_chars(register: char, read_only: &str) -> bool {
+    if register.is_ascii_alphanumeric() {
+        return true;
+    }
+    if read_only.contains(register) {
+        return true;
+    }
+    matches!(register, '"' | '-' | '_' | '*' | '+')
+}
+
+/// `parse_register` (ex_docmd.c:1348-1369): the register is the argument's
+/// first character, with `=` taking the rest of the argument as its
+/// expression — which is why `:put =lineA` parses in any position, while
+/// `:delete =x` reports the `=` as trailing characters and a leading digit
+/// on a count command is the count, never a register (`:delete 2`,
+/// `:yank 0` → E939).
+fn take_register(
+    args: &mut String,
+    flags: CommandFlags,
+    command: &ResolvedCommand,
+) -> Option<char> {
     let trimmed = args.trim_start();
     let skipped = args.len() - trimmed.len();
-    let mut chars = trimmed.char_indices();
-    let (first_offset, first) = chars.next()?;
-    let (register, consumed) = if first == '"' {
-        let (offset, register) = chars.next()?;
-        (register, offset + register.len_utf8())
-    } else {
-        let next = chars.next();
-        if next.is_some_and(|(_, character)| !character.is_ascii_whitespace()) {
-            return None;
-        }
-        (first, first_offset + first.len_utf8())
-    };
-    if !is_register(register) {
+    let first = trimmed.chars().next()?;
+    // "Accept numbered register only when no count allowed (:put)"
+    // (ex_docmd.c:1352): a digit leading a count command's argument is the
+    // count (`:delete 2` deletes two lines, `:yank 0` is E939).
+    if flags.contains(CommandFlags::COUNT) && first.is_ascii_digit() {
         return None;
     }
-    args.drain(..skipped + consumed);
+    // `valid_yank_reg(*arg, !IS_USER && cmd != put && cmd != iput)`:
+    // reading commands (`:put`/`:iput`, and user commands) also take the
+    // read-only `/`, `#`, `.`, `%`, `:`, `=` names, while writing commands
+    // (`:delete`/`:yank`) reject them as trailing text.
+    let is_user = matches!(command, ResolvedCommand::User(_));
+    let reading = is_user || matches!(command.name(), "put" | "iput");
+    // "Do not allow register = for user commands" (ex_docmd.c:1353).
+    if first == '=' && (is_user || !reading) {
+        return None;
+    }
+    let valid = if reading {
+        valid_reading_register(first)
+    } else {
+        valid_writing_register(first)
+    };
+    if !valid {
+        return None;
+    }
+    args.drain(..skipped + first.len_utf8());
+    if first == '=' {
+        // `parse_register`'s `=` case: the rest of the line is the
+        // expression, so it stays verbatim in `args` and is never trailing
+        // text (upstream moves it to `expr_line`, leaving `ea.arg` empty).
+        return Some('=');
+    }
     *args = args.trim_start().to_owned();
-    Some(register)
-}
-
-fn is_register(character: char) -> bool {
-    character.is_ascii_alphanumeric() || "\"-:.%#=*+_/@".contains(character)
+    Some(first)
 }
 
 /// `parse_count` (`ex_docmd.c:1395-1430`): a leading digit run on a `COUNT`

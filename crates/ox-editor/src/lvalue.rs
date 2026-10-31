@@ -11,11 +11,12 @@ use ox_types::{DictEntry, DictEntryFlags, DictRef, ListRef, OxStr, Typval};
 
 use crate::editor::Editor;
 use crate::excmd_exec::{
-    EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option, eval_text,
-    read_option, typval_to_text,
+    DictWatchEvent, EvalHost, ExEditorAccess, ExRuntime, Flow, LuaExec, VimRegex, assign_option,
+    eval_text, push_scope_watch_event, read_option, skip_quoted, typval_to_text,
 };
 use crate::register::RegisterContent;
 use crate::script::FileIO;
+use crate::userfunc::WatchTarget;
 
 /// `parse_expression_prefix`: parse one leading expression and report how
 /// many bytes it consumed.
@@ -133,6 +134,7 @@ pub(crate) fn parse_and_bind_lvalue<F: FileIO, E: ExEditorAccess>(
                 format!("Trailing characters: {target}"),
             ));
         }
+        let register = if register == '@' { '"' } else { register };
         return Ok(Lvalue::Register(register as u8));
     }
     if let Some(rest) = target.strip_prefix('$') {
@@ -228,6 +230,43 @@ pub(crate) fn assign_lvalue<F: FileIO, E: ExEditorAccess>(
             name,
             scope_kind,
             subs,
+        } if name.as_bytes().is_empty()
+            && let Some(kind) = *scope_kind
+            && subs.len() == 1
+            && let BoundSub::Key(key) = &subs[0] =>
+        {
+            // `get_lval_dict_item` (eval.c:949): a read-only scope entry
+            // (e.g. `b:changedtick`) refuses the write with E46, the same
+            // refusal the plain spelling meets in `assign_target`.
+            // `set_scoped` only consults value/variable locks, so without
+            // this the scope-dict spelling silently rewrites the entry and
+            // fires watchers for a change upstream rejects.
+            if let Some((flags, _)) = ox_eval::scope::scope_entry_flags(kind, key.as_bytes())
+                && flags.intersects(DictEntryFlags::READ_ONLY)
+            {
+                return Err(lvalue_error(
+                    runtime,
+                    "E46",
+                    format!(
+                        "Cannot change read-only variable \"{}\"",
+                        rendered_target(*scope_kind, b"", subs)
+                    ),
+                ));
+            }
+            // `g:['k'] = v` writes the scope variable itself. `scope_dict`
+            // hands back a per-read snapshot, so assigning into that would
+            // drop the value; the scope setter is the live path.
+            let old = scope.get_scoped(kind, key.as_bytes(), 0).ok().cloned();
+            scope
+                .set_scoped(kind, key.as_bytes(), 0, value.clone())
+                .map_err(|error| eval_error(runtime, error))?;
+            push_scope_watch_event(runtime, kind, key.as_bytes(), old, Some(value));
+            Ok(())
+        }
+        Lvalue::Variable {
+            name,
+            scope_kind,
+            subs,
         } => {
             let lock_name = scoped_lock_name(*scope_kind, name.as_bytes());
             scope
@@ -261,7 +300,66 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             name,
             scope_kind,
             subs,
-        } if subs.is_empty() => Ok(remove_root_variable(scope, name.as_bytes(), *scope_kind)),
+        } if subs.is_empty() => Ok(remove_root_variable(
+            runtime,
+            scope,
+            name.as_bytes(),
+            *scope_kind,
+        )),
+        Lvalue::Variable {
+            name,
+            scope_kind,
+            subs,
+        } if name.as_bytes().is_empty()
+            && let Some(kind) = *scope_kind
+            && subs.len() == 1
+            && let BoundSub::Key(key) = &subs[0] =>
+        {
+            // `unlet g:['k']` removes the scope variable itself; the snapshot
+            // `scope_dict` hands back would remove it from a copy. A missing
+            // key is E716 quoting the key, not the E108 a bare name gets
+            // (`ex_unlet`, ex_docmds.c:5544-5560).
+            // A subscripted target resolves as a dict item (`do_unlet_var`,
+            // eval/vars.c:1653): a read-only entry refuses with E46 and a
+            // locked value with E741, before anything is removed. The flag
+            // check is metadata-based like the plain-name pre-check in
+            // `command_unlet`; the lock check runs only when the key exists
+            // so a missing key still reports E716.
+            if let Some((flags, _)) = ox_eval::scope::scope_entry_flags(kind, key.as_bytes())
+                && flags.intersects(DictEntryFlags::READ_ONLY)
+            {
+                return Err(lvalue_error(
+                    runtime,
+                    "E46",
+                    format!(
+                        "Cannot change read-only variable \"{}\"",
+                        rendered_target(*scope_kind, b"", subs)
+                    ),
+                ));
+            }
+            let old = scope.get_scoped(kind, key.as_bytes(), 0).ok().cloned();
+            if old.is_some() {
+                scope
+                    .check_value_lock(&scoped_lock_name(Some(kind), key.as_bytes()), 0)
+                    .map_err(|error| eval_error(runtime, error))?;
+            }
+            let removed = scope.remove_pair(kind, key.as_bytes());
+            if removed {
+                push_scope_watch_event(runtime, kind, key.as_bytes(), old, None);
+                return Ok(true);
+            }
+            if bang {
+                return Ok(false);
+            }
+            Err(lvalue_error(
+                runtime,
+                "E716",
+                format!(
+                    "Key not present in Dictionary: \"{}\"",
+                    key.to_string_lossy()
+                ),
+            ))
+        }
         Lvalue::Variable {
             name,
             scope_kind,
@@ -528,7 +626,18 @@ fn bind_expression_chain<F: FileIO, E: ExEditorAccess>(
     loop {
         match &current.kind {
             ExprKind::Variable(name) => {
-                let (mut scope_kind, bare) = split_scoped_name(name.as_bytes());
+                let (mut scope_kind, mut bare) = split_scoped_name(name.as_bytes());
+                // `g:['k']` names the scope dictionary itself; only a bare
+                // `g:` with no subscript is E461 (`get_lval`, eval.c).
+                if scope_kind.is_none()
+                    && !subs.is_empty()
+                    && name.as_bytes().len() == 2
+                    && name.as_bytes()[1] == b':'
+                    && let Some(kind) = ScopeKind::from_byte(name.as_bytes()[0])
+                {
+                    scope_kind = Some(kind);
+                    bare = b"";
+                }
                 if bare.contains(&b'#') {
                     scope_kind = Some(ScopeKind::Global);
                 }
@@ -592,6 +701,7 @@ fn eval_expression<F: FileIO, E: ExEditorAccess>(
         builtins: Builtins::new(&regex).with_ambiguous_width(ambiguous_wide),
         submatches: None,
         escaped_exception: None,
+        call_receiver: None,
     };
     Evaluator::new(&mut host, &regex)
         .eval(expression, scope)
@@ -810,7 +920,7 @@ fn assign_leaf_subscript<F: FileIO>(
 }
 
 fn remove_subscript_chain<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     container: Typval,
     subs: &[BoundSub],
     index: usize,
@@ -823,12 +933,12 @@ fn remove_subscript_chain<F: FileIO>(
     if index + 1 == subs.len() {
         return remove_leaf_subscript(runtime, container, &subs[index], bang, target);
     }
-    let next = read_one_subscript(runtime, container, &subs[index])?;
+    let next = read_one_subscript(runtime, container.clone(), &subs[index])?;
     remove_subscript_chain(runtime, next, subs, index + 1, bang, target)
 }
 
 fn remove_leaf_subscript<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     container: Typval,
     sub: &BoundSub,
     bang: bool,
@@ -868,7 +978,7 @@ fn dict_read_key<F: FileIO>(
                 runtime,
                 "E716",
                 format!(
-                    "Key not present in Dictionary: {}",
+                    "Key not present in Dictionary: \"{}\"",
                     String::from_utf8_lossy(key)
                 ),
             )
@@ -886,11 +996,8 @@ fn dict_write_key<F: FileIO>(
     if data.lock.locked {
         return Err(lvalue_error(runtime, "E741", "Value is locked"));
     }
-    if let Some(entry) = data
-        .entries
-        .iter_mut()
-        .find(|entry| entry.key.as_bytes() == key.as_bytes())
-    {
+    let old = data.get(key.as_bytes()).cloned();
+    if let Some(entry) = data.get_entry_mut(key.as_bytes()) {
         // `get_lval_dict_item` (eval.c:949): the reached item's read-only
         // flag refuses the write with E46, naming the target verbatim.
         if entry.flags.intersects(DictEntryFlags::READ_ONLY) {
@@ -900,15 +1007,24 @@ fn dict_write_key<F: FileIO>(
                 format!("Cannot change read-only variable \"{target}\""),
             ));
         }
-        entry.value = value;
+        entry.value = value.clone();
     } else {
-        data.entries.push(DictEntry::new(key.clone(), value));
+        data.insert_entry(DictEntry::new(key.clone(), value.clone()));
     }
+    let event = DictWatchEvent {
+        target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
+        dict: Some(Typval::Dict(Rc::clone(dict))),
+        key: key.as_bytes().to_vec(),
+        old,
+        new: Some(value),
+    };
+    drop(data);
+    runtime.dict_watch_events.push(event);
     Ok(())
 }
 
 fn dict_remove_key<F: FileIO>(
-    runtime: &ExRuntime<F>,
+    runtime: &mut ExRuntime<F>,
     dict: &DictRef,
     key: &OxStr,
     bang: bool,
@@ -918,33 +1034,45 @@ fn dict_remove_key<F: FileIO>(
     if data.lock.locked {
         return Err(lvalue_error(runtime, "E741", "Value is locked"));
     }
-    let Some(index) = data
-        .entries
-        .iter()
-        .position(|entry| entry.key.as_bytes() == key.as_bytes())
-    else {
+    let Some(entry) = data.get_entry(key.as_bytes()) else {
         if bang {
             return Ok(false);
         }
         return Err(lvalue_error(
             runtime,
             "E716",
-            format!("Key not present in Dictionary: {}", key.to_string_lossy()),
+            format!(
+                "Key not present in Dictionary: \"{}\"",
+                key.to_string_lossy()
+            ),
         ));
     };
-    // Dict-item resolution checks the read-only flag only; the fixed bit is
-    // not consulted on this path (`do_unlet_var`).
-    if data.entries[index]
-        .flags
-        .intersects(DictEntryFlags::READ_ONLY)
-    {
+    if entry.flags.intersects(DictEntryFlags::READ_ONLY) {
         return Err(lvalue_error(
             runtime,
             "E46",
             format!("Cannot change read-only variable \"{target}\""),
         ));
     }
-    data.entries.remove(index);
+    let removed = data.remove(key.as_bytes()).ok_or_else(|| {
+        lvalue_error(
+            runtime,
+            "E716",
+            format!(
+                "Key not present in Dictionary: \"{}\"",
+                key.to_string_lossy()
+            ),
+        )
+    })?;
+    let event = DictWatchEvent {
+        target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
+        dict: Some(Typval::Dict(Rc::clone(dict))),
+        key: key.as_bytes().to_vec(),
+        old: Some(removed.value),
+        new: None,
+    };
+    drop(data);
+    runtime.dict_watch_events.push(event);
     Ok(true)
 }
 
@@ -1213,13 +1341,19 @@ fn assign_root_variable<F: FileIO>(
         if kind == ScopeKind::Vim {
             return assign_vim_variable(runtime, scope, name, value);
         }
+        let old = scope.get_scoped(kind, name, 0).ok().cloned();
         scope
-            .set_scoped(kind, name, 0, value)
-            .map_err(|error| eval_error(runtime, error))
+            .set_scoped(kind, name, 0, value.clone())
+            .map_err(|error| eval_error(runtime, error))?;
+        push_scope_watch_event(runtime, kind, name, old, Some(value));
+        Ok(())
     } else {
+        let old = scope.get_scoped(ScopeKind::Local, name, 0).ok().cloned();
         scope
-            .set(name, value)
-            .map_err(|error| eval_error(runtime, error))
+            .set(name, value.clone())
+            .map_err(|error| eval_error(runtime, error))?;
+        push_scope_watch_event(runtime, ScopeKind::Local, name, old, Some(value));
+        Ok(())
     }
 }
 
@@ -1273,28 +1407,45 @@ fn assign_register<F: FileIO, E: ExEditorAccess>(
     access
         .with_ex_editor(|editor| editor.registers_mut().set(register as char, content))
         .map_err(|error| lvalue_error(runtime, "E354", error.to_string()))?;
-    scope.set_register(&[register], value);
+    scope.set_register(&[register], value.clone());
+    if register == b'"' {
+        scope.set_register(b"@", value);
+    }
     Ok(())
 }
 
 /// `ex_let_env` (`eval/vars.c`:1349-1351): the assignment *is*
 /// `vim_setenv_ext`, a process-environment change that children inherit.
 fn assign_environment(name: &str, value: &Typval) {
-    let text = typval_to_text(value);
+    let text = typval_to_text(&value);
     ox_sys::set_env(name, &text);
 }
 
-fn remove_root_variable(scope: &mut Scope, name: &[u8], scope_kind: Option<ScopeKind>) -> bool {
+fn remove_root_variable<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    scope: &mut Scope,
+    name: &[u8],
+    scope_kind: Option<ScopeKind>,
+) -> bool {
+    let previous = |scope: &Scope, kind: ScopeKind| scope.get_scoped(kind, name, 0).ok().cloned();
+    let remove = |runtime: &mut ExRuntime<F>, scope: &mut Scope, kind: ScopeKind| {
+        let old = previous(scope, kind);
+        let removed = scope.remove_pair(kind, name);
+        if removed {
+            push_scope_watch_event(runtime, kind, name, old, None);
+        }
+        removed
+    };
     match scope_kind {
-        Some(ScopeKind::Global) => scope.remove_pair(ScopeKind::Global, name),
-        Some(ScopeKind::Buffer) => scope.remove_pair(ScopeKind::Buffer, name),
-        Some(ScopeKind::Window) => scope.remove_pair(ScopeKind::Window, name),
-        Some(ScopeKind::Tab) => scope.remove_pair(ScopeKind::Tab, name),
-        Some(ScopeKind::Script) => scope.remove_pair(ScopeKind::Script, name),
-        Some(ScopeKind::Local) => scope.remove_pair(ScopeKind::Local, name),
+        Some(ScopeKind::Global) => remove(runtime, scope, ScopeKind::Global),
+        Some(ScopeKind::Buffer) => remove(runtime, scope, ScopeKind::Buffer),
+        Some(ScopeKind::Window) => remove(runtime, scope, ScopeKind::Window),
+        Some(ScopeKind::Tab) => remove(runtime, scope, ScopeKind::Tab),
+        Some(ScopeKind::Script) => remove(runtime, scope, ScopeKind::Script),
+        Some(ScopeKind::Local) => remove(runtime, scope, ScopeKind::Local),
         Some(ScopeKind::Argument | ScopeKind::Vim) => false,
         None => {
-            scope.remove_pair(ScopeKind::Local, name) || scope.remove_pair(ScopeKind::Global, name)
+            remove(runtime, scope, ScopeKind::Local) || remove(runtime, scope, ScopeKind::Global)
         }
     }
 }
@@ -1311,6 +1462,9 @@ fn clear_register(editor: &mut Editor, scope: &mut Scope, register: u8) -> bool 
         return false;
     }
     scope.set_register(&[register], Typval::String(OxStr::from("")));
+    if register == b'"' {
+        scope.set_register(b"@", Typval::String(OxStr::from("")));
+    }
     true
 }
 
@@ -1351,21 +1505,12 @@ fn split_top_level(source: &str, delimiter: u8, exact: bool) -> Vec<&str> {
     let bytes = source.as_bytes();
     let mut result = Vec::new();
     let mut start = 0usize;
-    let mut quote = None;
     let mut depth = 0usize;
     let mut index = 0usize;
     while index < bytes.len() {
         let byte = bytes[index];
-        if let Some(active) = quote {
-            if byte == active && (index == 0 || bytes[index - 1] != b'\\') {
-                quote = None;
-            }
-            index += 1;
-            continue;
-        }
         if matches!(byte, b'\'' | b'"') {
-            quote = Some(byte);
-            index += 1;
+            skip_quoted(bytes, &mut index);
             continue;
         }
         if matches!(byte, b'(' | b'[' | b'{') {
@@ -1423,6 +1568,21 @@ mod unit {
     #[test]
     fn split_comma_args_respects_quotes() {
         assert_eq!(split_comma_args(r"'a,b', c"), vec!["'a,b'", "c"]);
+    }
+    #[test]
+    fn split_comma_args_handles_single_quote_trailing_backslash() {
+        assert_eq!(split_comma_args(r"'a\', c"), vec![r"'a\'", "c"]);
+    }
+
+    #[test]
+    fn split_comma_args_handles_double_quote_escapes() {
+        assert_eq!(split_comma_args(r#""a,\"b", c"#), vec![r#""a,\"b""#, "c"]);
+        assert_eq!(split_comma_args(r#""a\\", c"#), vec![r#""a\\""#, "c"]);
+    }
+
+    #[test]
+    fn split_comma_args_handles_single_quote_doubled() {
+        assert_eq!(split_comma_args(r"'it''s', c"), vec![r"'it''s'", "c"]);
     }
 
     #[test]

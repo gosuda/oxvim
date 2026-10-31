@@ -18,7 +18,7 @@ use ox_eval::builtins::string_arg;
 use ox_eval::closure_index;
 use ox_eval::exists as exists_in_scope;
 use ox_excmd::{ResolveError, ResolvedCommand, resolve_command};
-use ox_types::{Funcref, Object, OxStr, Special, Typval};
+use ox_types::{BufHandle, Funcref, Object, OxStr, Special, Typval};
 use std::rc::Rc;
 
 use super::input_string_arg;
@@ -37,6 +37,8 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 ) -> ox_eval::Result<Typval> {
     match name {
         "eval" => call_eval_builtin(host, args, scope),
+        "call" => call_call_builtin(host, args, scope),
+        "uniq" => call_uniq_builtin(host, args, scope),
         "execute" => call_execute_builtin(host.runtime, host.access, scope, host.lua, args),
         "exists" => exists_with_editor(host.runtime, host.access, scope, args),
         "expand" => call_expand_builtin(host.runtime, host.access, args),
@@ -54,6 +56,157 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 
 /// `eval()`: parse the argument and evaluate it against this same host, so the
 /// editor seams stay reachable from the nested expression (`f_eval`).
+/// `uniq({list} [, {func} [, {dict}]])` (`eval/list.c` `f_uniq`).
+///
+/// Without a comparator adjacent items are removed when they are equal; with
+/// one, the comparator decides. The comparator runs with no borrow on the list
+/// held, because it may reenter the editor, and a comparator that changes the
+/// list is refused the way upstream refuses it.
+fn call_uniq_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let container = args[0].clone();
+    let Typval::List(reference) = &container else {
+        return Err(EvalError::new(
+            "E686",
+            0,
+            "Argument of uniq() must be a List",
+        ));
+    };
+    let comparator = match args.get(1) {
+        None | Some(Typval::Special(Special::Null)) => None,
+        Some(value) => Some(value.clone()),
+    };
+    let receiver = match args.get(2) {
+        None | Some(Typval::Special(Special::Null)) => None,
+        Some(value @ Typval::Dict(_)) => Some(value.clone()),
+        Some(_) => return Err(EvalError::new("E731", 0, "Using a List as a Dict")),
+    };
+    let snapshot = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .items
+        .clone();
+    let mut removals = Vec::new();
+    // Both paths compare the last kept item with the next original one, which
+    // is what upstream does; comparing snapshot[index - 1] instead keeps an
+    // item that the last kept item would have swallowed.
+    let mut kept = 0_usize;
+    for index in 1..snapshot.len() {
+        let duplicate = match &comparator {
+            None => snapshot[kept] == snapshot[index],
+            Some(comparator) => {
+                let callable = match (&receiver, comparator) {
+                    (Some(receiver), Typval::String(name)) => {
+                        let function = resolve_function_reference(
+                            host.runtime,
+                            None,
+                            &Typval::String(name.clone()),
+                        )?;
+                        let function =
+                            bind_function_arguments(function, std::slice::from_ref(receiver))?;
+                        Typval::Partial(function)
+                    }
+                    (Some(receiver), Typval::Funcref(funcref) | Typval::Partial(funcref)) => {
+                        let function = bind_function_arguments(
+                            funcref.clone(),
+                            std::slice::from_ref(receiver),
+                        )?;
+                        Typval::Partial(function)
+                    }
+                    (None, comparator) => comparator.clone(),
+                    (Some(_), _) => return Err(EvalError::new("E1085", 0, "not a callable value")),
+                };
+                let value = Evaluator::new(host, &VimRegex).invoke(
+                    callable,
+                    vec![snapshot[kept].clone(), snapshot[index].clone()],
+                    scope,
+                )?;
+                // The item is dropped when the comparator answers false:
+                // `uniq([1,2,3], {a,b -> a < b})` keeps every item while
+                // `{a,b -> a > b}` keeps only the first, and both follow from
+                // that rule.
+                match value {
+                    Typval::Number(number) => number == 0,
+                    Typval::Float(number) => number == 0.0,
+                    Typval::Bool(value) => !value,
+                    _ => return Err(EvalError::new("E474", 0, "Invalid argument")),
+                }
+            }
+        };
+        if duplicate {
+            removals.push(index);
+        } else {
+            kept = index;
+        }
+    }
+    let mut data = reference
+        .try_borrow_mut()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    if data.items.len() != snapshot.len() {
+        return Err(EvalError::new("E741", 0, "Cannot change list"));
+    }
+    for index in removals.into_iter().rev() {
+        data.items.remove(index);
+    }
+    drop(data);
+    Ok(container)
+}
+
+/// `call({func}, {arglist} [, {dict}])` (`eval/funcs.c` `f_call`).
+///
+/// The callee may be a Funcref or Partial, which goes through the evaluator's
+/// own invocation path, or a function name, which goes through the host so a
+/// user function and a builtin both resolve. A third argument binds `self`
+/// for the duration of the call, exactly as a dictionary method call does.
+fn call_call_builtin<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let callee = args[0].clone();
+    let Typval::List(reference) = &args[1] else {
+        return Err(EvalError::new("E714", 0, "List required"));
+    };
+    let call_args = reference
+        .try_borrow()
+        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
+        .items
+        .clone();
+    // A third argument binds `self`: upstream turns the call into
+    // `function({func}, {dict})` and runs that partial, which is the only
+    // path whose frame the callee reads `self` from.
+    let callable = match args.get(2) {
+        None | Some(Typval::Special(Special::Null)) => callee,
+        Some(value @ Typval::Dict(_)) => match &callee {
+            Typval::String(_) => {
+                let function = resolve_function_reference(host.runtime, None, &callee)?;
+                let function = bind_function_arguments(function, std::slice::from_ref(value))?;
+                Typval::Partial(function)
+            }
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+                let function =
+                    bind_function_arguments(funcref.clone(), std::slice::from_ref(value))?;
+                Typval::Partial(function)
+            }
+            _ => return Err(EvalError::new("E1085", 0, "not a callable value")),
+        },
+        Some(_) => return Err(EvalError::new("E731", 0, "Using a List as a Dict")),
+    };
+    match callable {
+        Typval::Funcref(_) | Typval::Partial(_) => {
+            Evaluator::new(host, &VimRegex).invoke(callable, call_args, scope)
+        }
+        Typval::String(name) => {
+            let name = OxStr(name.as_bytes().into());
+            host.call(&name, call_args, scope)
+        }
+        _ => Err(EvalError::new("E1085", 0, "not a callable value")),
+    }
+}
+
 fn call_eval_builtin<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
     args: &[Typval],
@@ -153,7 +306,12 @@ fn call_execute_builtin<F: FileIO, E: ExEditorAccess>(
         let Object::String(text) = &message.content else {
             continue;
         };
-        if message.leading_newline || !output.is_empty() {
+        // Upstream captures raw redirected output: a message contributes its
+        // separator only when it starts a new line (`:echo`/`:echomsg` do,
+        // `:echon` continues the current one). A continuation appends
+        // directly even after earlier output (`echo "a" | echon "b"` captures
+        // `"\nab"`, not `"\na\nb"`).
+        if message.leading_newline {
             output.push('\n');
         }
         output.push_str(&text.to_string_lossy());
@@ -242,49 +400,218 @@ fn call_luaeval_builtin<F: FileIO, E: ExEditorAccess>(
 /// Leading cmdline `sp_token` table for `expand()` (`find_cmdline_var`,
 /// `ex_docmd.c:7488`), limited to the tokens this port resolves. Ordered
 /// longest-first so a later `<argname>`-style addition cannot be shadowed.
-const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%"];
+const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%", "#"];
 
-/// The `eval_vars` (`ex_docmd.c:7551`) bases behind `expand()`'s special
-/// tokens. A token this port does not know yields an empty base.
-fn expand_special_base<F: FileIO, E: ExEditorAccess>(
-    runtime: &ExRuntime<F>,
-    access: &E,
-    token: &str,
-) -> OxStr {
-    match token {
-        "%" => access.with_ex_editor(|editor| {
-            editor
-                .current_buffer()
-                .and_then(|buffer| editor.buffer(buffer).ok())
-                .map_or_else(|| OxStr(Vec::new()), |buffer| {
-                    let name = buffer.name().to_string_lossy();
-                    OxStr::from(name.as_ref())
-                })
-        }),
-        "<SID>" => runtime.scripts.current_sid().map_or_else(
-            || OxStr(Vec::new()),
-            |sid| {
-                let name = format!("<SNR>{sid}_");
-                OxStr::from(name.as_str())
-            },
-        ),
-        "<amatch>" => runtime.active_autocmd.matched.clone(),
-        "<afile>" => runtime.active_autocmd.file.clone(),
-        "<abuf>" => runtime.active_autocmd.buffer.map_or_else(|| OxStr(Vec::new()), |buffer| {
-            let number = i64::from(buffer).to_string();
-            OxStr::from(number.as_str())
-        }),
-        _ => OxStr(Vec::new()),
+const VALID_PATH: u32 = 1;
+const VALID_HEAD: u32 = 2;
+
+fn skip_substitution(bytes: &[u8]) -> usize {
+    let offset = if bytes.starts_with(b":gs") {
+        3
+    } else if bytes.starts_with(b":s") {
+        2
+    } else {
+        return 0;
+    };
+    let Some(&sep) = bytes.get(offset) else {
+        return 0;
+    };
+    let rest = &bytes[offset + 1..];
+    let Some(first) = rest.iter().position(|&b| b == sep) else {
+        return 0;
+    };
+    let after_pat = &rest[first + 1..];
+    let Some(second) = after_pat.iter().position(|&b| b == sep) else {
+        return 0;
+    };
+    offset + 1 + first + 1 + second + 1
+}
+
+fn modifier_validity(modifiers: &[u8]) -> u32 {
+    let mut valid = 0;
+    let mut cursor = 0;
+    let mut can_accept_p = true;
+
+    while cursor < modifiers.len() {
+        let rest = &modifiers[cursor..];
+        if rest.starts_with(b":p") {
+            if !can_accept_p {
+                break;
+            }
+            valid |= VALID_PATH;
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        if rest.starts_with(b":h") {
+            valid |= VALID_HEAD;
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        if rest.starts_with(b":.")
+            || rest.starts_with(b":~")
+            || rest.starts_with(b":8")
+            || rest.starts_with(b":t")
+            || rest.starts_with(b":e")
+            || rest.starts_with(b":r")
+            || rest.starts_with(b":S")
+        {
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        let sub_len = skip_substitution(rest);
+        if sub_len > 0 {
+            can_accept_p = true;
+            cursor += sub_len;
+            continue;
+        }
+        break;
+    }
+
+    valid
+}
+
+enum ExpandTarget {
+    Absent,
+    UnnamedBuffer,
+    Named(OxStr),
+}
+
+fn alternate_window_buffer(editor: &crate::Editor) -> Option<&crate::BufferState> {
+    let window = editor.current_window()?;
+    let alternate = editor.window(window).ok()?.alternate_buffer?;
+    editor.buffer(alternate).ok()
+}
+
+fn classify_buffer(buffer: Option<&crate::BufferState>) -> ExpandTarget {
+    match buffer {
+        None => ExpandTarget::Absent,
+        Some(buffer) if buffer.name().as_bytes().is_empty() => ExpandTarget::UnnamedBuffer,
+        Some(buffer) => {
+            let name = buffer.name().to_string_lossy();
+            ExpandTarget::Named(OxStr::from(name.as_ref()))
+        }
     }
 }
 
+fn resolve_buffer_target(editor: &crate::Editor, token: &str) -> ExpandTarget {
+    let digits = token.strip_prefix('#').unwrap_or_default();
+    let number = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i64>().unwrap_or(-1)
+    };
+    let buffer = if number == 0 {
+        alternate_window_buffer(editor)
+    } else if number > 0 {
+        BufHandle::try_from(number)
+            .ok()
+            .and_then(|handle| editor.buffer(handle).ok())
+    } else {
+        None
+    };
+    classify_buffer(buffer)
+}
+
+fn autocmd_text_target(value: &OxStr) -> ExpandTarget {
+    if value.as_bytes().is_empty() {
+        ExpandTarget::Absent
+    } else {
+        ExpandTarget::Named(value.clone())
+    }
+}
+
+fn expand_special_target<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    token: &str,
+) -> ExpandTarget {
+    match token {
+        "%" => access.with_ex_editor(|editor| {
+            let current = editor.current_buffer().and_then(|h| editor.buffer(h).ok());
+            classify_buffer(current)
+        }),
+        "<SID>" => runtime.scripts.current_sid().map_or(
+            ExpandTarget::Absent,
+            |sid| {
+                let name = format!("<SNR>{sid}_");
+                ExpandTarget::Named(OxStr::from(name.as_str()))
+            },
+        ),
+        "<amatch>" => autocmd_text_target(&runtime.active_autocmd.matched),
+        "<afile>" => autocmd_text_target(&runtime.active_autocmd.file),
+        "<abuf>" => runtime.active_autocmd.buffer.map_or(
+            ExpandTarget::Absent,
+            |buffer| {
+                let number = i64::from(buffer).to_string();
+                ExpandTarget::Named(OxStr::from(number.as_str()))
+            },
+        ),
+        token if token.starts_with('#') => {
+            access.with_ex_editor(|editor| resolve_buffer_target(editor, token))
+        }
+        _ => ExpandTarget::Absent,
+    }
+}
+
+fn find_expand_special<'a>(text: &'a str) -> Option<(&'a str, &'a str)> {
+    if let Some(rest) = text.strip_prefix('#') {
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        let (token, remaining) = text.split_at(1 + digits);
+        return Some((token, remaining));
+    }
+    EXPAND_SPECIAL_TOKENS
+        .iter()
+        .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)))
+}
+
+fn apply_unnamed_modifiers(rest: &str) -> ox_eval::Result<OxStr> {
+    if rest.is_empty() {
+        return Ok(OxStr(Vec::new()));
+    }
+    let modified = ox_eval::apply_filename_modifiers(Some(&VimRegex), "", rest.as_bytes())?;
+    let valid = modifier_validity(rest.as_bytes());
+    if modified.is_empty() || valid != (VALID_HEAD | VALID_PATH) {
+        Ok(OxStr(Vec::new()))
+    } else {
+        Ok(OxStr::from(modified.as_str()))
+    }
+}
+
+fn apply_named_modifiers(name: OxStr, rest: &str) -> ox_eval::Result<OxStr> {
+    if rest.is_empty() {
+        return Ok(name);
+    }
+    let base_text = name.to_string_lossy();
+    let modified = ox_eval::apply_filename_modifiers(
+        Some(&VimRegex),
+        base_text.as_ref(),
+        rest.as_bytes(),
+    )?;
+    if modified.is_empty() {
+        Ok(OxStr(Vec::new()))
+    } else {
+        Ok(OxStr::from(modified.as_str()))
+    }
+}
+
+fn apply_expand_target(target: ExpandTarget, rest: &str) -> ox_eval::Result<OxStr> {
+    match target {
+        ExpandTarget::Absent => Ok(OxStr(Vec::new())),
+        ExpandTarget::UnnamedBuffer => apply_unnamed_modifiers(rest),
+        ExpandTarget::Named(name) => apply_named_modifiers(name, rest),
+    }
+}
 /// `expand()` (`f_expand`).
 ///
-/// `%`, `#` and a `<...>` keyword go to `eval_vars`; this port resolves
-/// `%`, `<SID>`, `<amatch>`, `<afile>` and `<abuf>` as leading tokens with
-/// an optional trailing `:`-modifier chain applied through
+/// `%`, `#`, `#N` and a `<...>` keyword go to `eval_vars`; this port resolves
+/// `%`, `#`, `#N`, `<SID>`, `<amatch>`, `<afile>` and `<abuf>` as leading tokens
+/// with an optional trailing `:`-modifier chain applied through
 /// `ox_eval::apply_filename_modifiers` (`modify_fname` parity), so
-/// `expand('%:p')` is the absolute current-buffer name. Anything else is a
+/// `expand('%:p')` is the absolute current-buffer name and `expand('#:p')`
+/// is the absolute alternate-buffer name. Anything else is a
 /// file pattern handed to `ExpandOne`, which resolves `~` and `$NAME`
 /// through `expand_env_esc` before matching. Returning such a pattern
 /// verbatim leaves `expand('~')` as the literal `~`, and callers that hand
@@ -293,7 +620,7 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
 ///
 /// Named gap: the wildcard half of `ExpandOne` is not here, so a pattern
 /// with `*` or `?` still comes back as itself; `glob()` is where this port
-/// matches files. `#` and `<cword>`/`<sfile>`-style tokens are likewise
+/// matches files. `<cword>`/`<sfile>`-style tokens are likewise
 /// not recognized and pass through verbatim, and the `%<` extension-strip
 /// form is not implemented.
 fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
@@ -306,27 +633,13 @@ fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
     };
     let text = value.to_string_lossy();
     let text: &str = text.as_ref();
-    let special = EXPAND_SPECIAL_TOKENS
-        .iter()
-        .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)));
+    let special = find_expand_special(text);
     let expanded = match special {
         // Exact token or token-plus-`:`-modifier chain (`eval_vars` +
         // `modify_fname`).
         Some((token, rest)) if rest.is_empty() || rest.starts_with(':') => {
-            let base = expand_special_base(runtime, access, token);
-            // `expand()` on an unnamed source yields "" (upstream f_expand:
-            // eval_vars marks the result invalid and f_expand returns "").
-            if rest.is_empty() || base.as_bytes().is_empty() {
-                base
-            } else {
-                let base_text = base.to_string_lossy();
-                let modified = ox_eval::apply_filename_modifiers(
-                    Some(&VimRegex),
-                    base_text.as_ref(),
-                    rest.as_bytes(),
-                )?;
-                OxStr::from(modified.as_str())
-            }
+            let target = expand_special_target(runtime, access, token);
+            apply_expand_target(target, rest)?
         }
         _ => {
             let expanded = expand_env_esc(text);
@@ -371,11 +684,22 @@ fn resolve_function_reference<F: FileIO>(
                     }
                 }
             } else {
+                // `common_function` validates the *translated* name
+                // (`funcs.c:1573-1577` → `translated_function_exists`), and
+                // `save_function_name` strips a leading `g:` for a plain
+                // string (`eval/userfunc.c:2117`). A script-local `s:` (or
+                // `<SID>`) is expanded to its `<SNR>{sid}_` spelling so the
+                // reference stays callable from other scripts
+                // (`get_scriptlocal_funcname`, `userfunc.c:1559`); anything
+                // else keeps the spelling the caller wrote, as upstream
+                // stores `s`, not `trans_name`: `function('g:Fn')` prints
+                // `function('g:Fn')`.
+                let lookup = text.strip_prefix("g:").unwrap_or(&text);
                 let sid = runtime.scripts.current_sid().unwrap_or(0);
-                let known = builtin_spec(&text).is_some()
-                    || runtime.functions.contains(&text, sid)
-                    || text.contains('#')
-                    || crate::builtins::route(&text).is_some();
+                let known = builtin_spec(lookup).is_some()
+                    || runtime.functions.contains(lookup, sid)
+                    || lookup.contains('#')
+                    || crate::builtins::route(lookup).is_some();
                 if !known {
                     return Err(EvalError::new(
                         "E700",
@@ -383,6 +707,21 @@ fn resolve_function_reference<F: FileIO>(
                         format!("Unknown function: {text}"),
                     ));
                 }
+                let stored = if sid == 0 {
+                    name.clone()
+                } else if let Some(local) = text.strip_prefix("s:") {
+                    OxStr::from(format!("<SNR>{sid}_{local}").as_str())
+                } else if let Some(local) = text.strip_prefix("<SID>") {
+                    OxStr::from(format!("<SNR>{sid}_{local}").as_str())
+                } else {
+                    name.clone()
+                };
+                return Ok(Funcref {
+                    name: stored,
+                    args: Vec::new(),
+                    dict: None,
+                    registry: lambda_registry,
+                });
             }
             Ok(Funcref {
                 name: name.clone(),
@@ -417,15 +756,7 @@ fn bind_function_arguments(mut function: Funcref, args: &[Typval]) -> ox_eval::R
                 );
             }
             Typval::Dict(reference) if args.len() == 1 => {
-                dictionary = Some(
-                    reference
-                        .try_borrow()
-                        .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                        .entries
-                        .iter()
-                        .map(|entry| (entry.key.clone(), entry.value.clone()))
-                        .collect(),
-                );
+                dictionary = Some(reference.clone());
             }
             _ => {
                 return Err(EvalError::new(
@@ -440,15 +771,7 @@ fn bind_function_arguments(mut function: Funcref, args: &[Typval]) -> ox_eval::R
         let Typval::Dict(reference) = third else {
             return Err(EvalError::new("E922", 0, "Expected a dict"));
         };
-        dictionary = Some(
-            reference
-                .try_borrow()
-                .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                .entries
-                .iter()
-                .map(|entry| (entry.key.clone(), entry.value.clone()))
-                .collect(),
-        );
+        dictionary = Some(reference.clone());
     }
     if let Some(mut values) = bound {
         function.args.append(&mut values);
@@ -531,7 +854,10 @@ fn call_feedkeys_builtin<F: FileIO, E: ExEditorAccess>(
             .map_err(|error| EvalError::new("E475", 0, error.to_string()))
     })?;
     if execute {
-        let machine = std::rc::Rc::new(std::cell::RefCell::new(ModeMachine::default()));
+        let machine = runtime
+            .mode_machine
+            .clone()
+            .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(ModeMachine::default())));
         let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
         if !matches!(flow, Flow::Normal) {
             return Err(flow_to_eval_error(flow, "feedkeys"));
@@ -643,6 +969,7 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "cd",
     "cexpr",
     "cfirst",
+    "checkhealth",
     "clearjumps",
     "close",
     "cmap",
@@ -723,6 +1050,7 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "ounmap",
     "previous",
     "print",
+    "iput",
     "put",
     "qall",
     "quit",
@@ -739,7 +1067,9 @@ const DISPATCHED_COMMANDS: &[&str] = &[
     "rshada",
     "rviminfo",
     "scriptencoding",
+    "scriptnames",
     "set",
+    "setfiletype",
     "setglobal",
     "setlocal",
     "sleep",
@@ -836,4 +1166,241 @@ fn is_executed_command(name: &str) -> bool {
     DISPATCHED_COMMANDS.contains(&name)
         || PROGRAM_COMMANDS.contains(&name)
         || COMMAND_MODIFIERS.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_types::{OxStr, Typval};
+
+    use crate::script::RealFileIO;
+    use crate::{Editor, ExExecutor, ExecError, TestEditorAccess};
+
+    fn text(value: &str) -> Typval {
+        Typval::String(OxStr::from(value))
+    }
+
+    fn executor() -> ExExecutor<RealFileIO> {
+        ExExecutor::with_io(RealFileIO)
+    }
+
+    fn script(exec: &mut ExExecutor<RealFileIO>, editor: &TestEditorAccess, source: &str) {
+        exec.execute_script(editor, "<test>", source)
+            .expect("script runs");
+    }
+
+    fn eval(
+        exec: &mut ExExecutor<RealFileIO>,
+        editor: &TestEditorAccess,
+        expression: &str,
+    ) -> Typval {
+        exec.evaluate_expression(editor, expression)
+            .expect("expression evaluates")
+    }
+
+    fn failure(
+        exec: &mut ExExecutor<RealFileIO>,
+        editor: &TestEditorAccess,
+        expression: &str,
+    ) -> String {
+        match exec.evaluate_expression(editor, expression) {
+            Err(ExecError::Vim(exception)) => exception.message(),
+            other => panic!("expected a Vim error, got {other:?}"),
+        }
+    }
+
+    /// `call()` reaches a builtin by name, a Funcref, and a lambda, which are
+    /// the three callee shapes `f_call` accepts (`eval/funcs.c`).
+    #[test]
+    fn call_dispatches_names_funcrefs_and_lambdas() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(&mut exec, &editor, "let g:a = call('toupper', ['a'])");
+        script(
+            &mut exec,
+            &editor,
+            "let g:b = call(function('toupper'), ['abc'])",
+        );
+        script(&mut exec, &editor, "let g:c = call({x -> x * 2}, [21])");
+        assert_eq!(eval(&mut exec, &editor, "g:a"), text("A"));
+        assert_eq!(eval(&mut exec, &editor, "g:b"), text("ABC"));
+        assert_eq!(eval(&mut exec, &editor, "g:c"), Typval::Number(42));
+    }
+
+    /// A dictionary argument binds `self`, both through `call()` and through a
+    /// Partial built by `function({name}, {dict})`.
+    #[test]
+    fn a_dictionary_argument_binds_self() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let d = {'v': 5}\nfunction! Get() dict abort\nreturn self.v\nendfunction",
+        );
+        script(&mut exec, &editor, "let g:direct = call('Get', [], d)");
+        script(&mut exec, &editor, "let g:partial = function('Get', d)()");
+        assert_eq!(eval(&mut exec, &editor, "g:direct"), Typval::Number(5));
+        assert_eq!(eval(&mut exec, &editor, "g:partial"), Typval::Number(5));
+    }
+
+    /// The argument errors `f_call` reports: unknown callee, too few
+    /// arguments for the callee, and a third argument that is not a
+    /// dictionary.
+    #[test]
+    fn call_reports_upstream_argument_errors() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "function! Add(a, b) abort\nreturn a:a + a:b\nendfunction",
+        );
+        assert!(failure(&mut exec, &editor, "call('Nosuch', [])").contains("E117"));
+        assert!(failure(&mut exec, &editor, "call('Add', [1])").contains("E119"));
+        assert!(failure(&mut exec, &editor, "call('Add', [1, 2], [3])").contains("E731"));
+    }
+
+    /// `uniq()` without a comparator drops adjacent equal items.
+    #[test]
+    fn uniq_without_a_comparator_drops_adjacent_duplicates() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([1, 1, 2, 2, 1])"),
+            eval(&mut exec, &editor, "[1, 2, 1]")
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq(['a', 'a'])"),
+            eval(&mut exec, &editor, "['a']")
+        );
+    }
+
+    /// With a comparator, the walk compares the last kept item with the next
+    /// original one, and the item is dropped when the comparator is false.
+    /// These six cases are the oracle's answers.
+    #[test]
+    fn uniq_honours_the_comparator() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        let cases = [
+            ("[1,1,2]", "{a,b -> a == b}", "[1, 1]"),
+            ("[3,1,2]", "{a,b -> b > a}", "[3]"),
+            ("[1,2,1]", "{a,b -> a == b}", "[1, 1]"),
+            ("[1,2,3]", "{a,b -> a < b}", "[1, 2, 3]"),
+            ("[1,2,3]", "{a,b -> a > b}", "[1]"),
+        ];
+        for (list, comparator, expected) in cases {
+            assert_eq!(
+                eval(&mut exec, &editor, &format!("uniq({list}, {comparator})")),
+                eval(&mut exec, &editor, expected),
+                "uniq({list}, {comparator})"
+            );
+        }
+    }
+
+    /// A comparator can be a named function bound to a dictionary, which is
+    /// the `uniq(list, 'Name', dict)` form.
+    #[test]
+    fn uniq_comparator_can_be_a_dictionary_method() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let g:d = {'same': 1}\nfunction! Same(a, b) dict abort\nreturn self.same && a:a == a:b\nendfunction",
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([5, 5, 5], 'Same', g:d)"),
+            eval(&mut exec, &editor, "[5, 5, 5]")
+        );
+    }
+
+    /// `uniq()` refuses a non-list argument with upstream's error.
+    #[test]
+    fn uniq_rejects_a_non_list() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert!(failure(&mut exec, &editor, "uniq(1)").contains("E686"));
+    }
+
+    #[test]
+    fn expand_resolves_alternate_and_numbered_buffers_with_modifiers() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let buf1 = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buf1)
+            .unwrap()
+            .set_name(OxStr::from("foo.txt"));
+        editor
+            .editor_mut()
+            .create_tabpage(buf1, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+
+        let buf2 = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buf2)
+            .unwrap()
+            .set_name(OxStr::from("bar.txt"));
+
+        let buf3 = editor.editor_mut().create_buffer(true).unwrap();
+
+        let mut exec = executor();
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:p:h')"), text(""));
+
+        let win = editor.editor().current_window().unwrap();
+        editor.editor_mut().window_mut(win).unwrap().buffer = buf2;
+        editor.editor_mut().window_mut(win).unwrap().alternate_buffer = Some(buf1);
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text("foo.txt"));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2')"), text("bar.txt"));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2:h')"), text("."));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2:gs?a?b?')"), text("bbr.txt"));
+
+        let bar_p = eval(&mut exec, &editor, "expand('#2:p')");
+        let Typval::String(bar_str) = &bar_p else { panic!("expected string") };
+        assert!(bar_str.to_string_lossy().ends_with("bar.txt"));
+
+        let bar_p_h = eval(&mut exec, &editor, "expand('#2:p:h')");
+        let Typval::String(bar_dir) = &bar_p_h else { panic!("expected string") };
+        assert!(!bar_dir.to_string_lossy().is_empty());
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#3')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:gs?a?b?')"), text(""));
+
+        let unnamed_p_h = eval(&mut exec, &editor, "expand('#3:p:h')");
+        let Typval::String(unnamed_dir) = &unnamed_p_h else { panic!("expected string") };
+        assert_eq!(unnamed_dir, bar_dir);
+
+        let foo_p_gs = eval(&mut exec, &editor, "expand('#1:p:gs?\\?/?')");
+        let Typval::String(foo_str) = &foo_p_gs else { panic!("expected string") };
+        let foo_path = foo_str.to_string_lossy();
+        assert!(foo_path.ends_with("foo.txt"));
+        assert!(!foo_path.contains('\\'));
+
+        assert_eq!(eval(&mut exec, &editor, "expand('1#')"), text("1#"));
+
+        editor.editor_mut().window_mut(win).unwrap().alternate_buffer = Some(buf3);
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p:h')"), Typval::String(unnamed_dir.clone()));
+
+        editor.editor_mut().window_mut(win).unwrap().buffer = buf3;
+        assert_eq!(eval(&mut exec, &editor, "expand('%')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:p:h')"), Typval::String(unnamed_dir.clone()));
+    }
 }

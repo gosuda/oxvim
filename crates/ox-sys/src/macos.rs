@@ -76,7 +76,10 @@ pub fn proc_info(pid: i32) -> io::Result<Option<ProcInfo>> {
         return Err(error);
     }
     let comm = &info.pbi_comm;
-    let end = comm.iter().position(|byte| *byte == 0).unwrap_or(comm.len());
+    let end = comm
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(comm.len());
     let bytes = comm[..end]
         .iter()
         .map(|byte| *byte as u8)
@@ -112,11 +115,7 @@ pub fn child_pids(ppid: i32) -> io::Result<Vec<i64>> {
         }
         let count = usize::try_from(count).unwrap_or(0);
         if count < size {
-            return Ok(buffer
-                .into_iter()
-                .take(count)
-                .map(i64::from)
-                .collect());
+            return Ok(buffer.into_iter().take(count).map(i64::from).collect());
         }
         // A full buffer may have missed late arrivals; grow and retry.
         size = size.saturating_mul(2);

@@ -267,17 +267,31 @@ fn function_bang_replaces_existing() {
 }
 
 #[test]
-fn function_redefinition_without_bang_is_e122() {
-    // eval/userfunc.c: defining an existing function without `!` raises
-    // E122 "Function already exists, add ! to replace it".
-    // test_user_func.vim: E122 on redefinition.
+fn function_redefinition_without_bang_is_e122_across_scripts() {
+    // eval/userfunc.c:2854-2860: a definition without `!` fails when the
+    // existing function came from another script, or from the same script in
+    // the same sourcing pass. Only re-sourcing one script allows it.
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(MemoryFileIO::new());
     script(&mut exec, &editor, "function! Dup()\nendfunction");
     let err = exec
-        .execute_script(&editor, "<test>", "function Dup()\nendfunction")
+        .execute_script(&editor, "<other>", "function Dup()\nendfunction")
         .unwrap_err();
     assert_eq!(error_code(&err), "E122");
+}
+
+#[test]
+fn function_redefinition_without_bang_is_allowed_when_one_script_loads_twice() {
+    // eval/userfunc.c:2858-2860: the same script id with a new sequence number
+    // replaces the function, so `:source` of one file twice is silent.
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(&editor, "<test>", "function Dup()\nendfunction")
+        .expect("first definition");
+    exec.execute_script(&editor, "<test>", "function Dup()\nreturn 2\nendfunction")
+        .expect("re-sourcing one script replaces its function");
+    script(&mut exec, &editor, "let g:r = Dup()");
+    assert_eq!(global_number(exec.scope(), "r"), Some(2));
 }
 
 // ---------------------------------------------------------------------------
@@ -439,10 +453,7 @@ fn default_args_do_not_count_toward_a0() {
     let entry = |scope: &Scope, name: &str, key: &[u8]| match value(scope, name) {
         Some(Typval::Dict(cell)) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|candidate| candidate.key.as_bytes() == key)
-                .map(|entry| entry.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict for {name}"),
     };
@@ -1023,6 +1034,54 @@ fn nested_source_restores_caller_sid_and_script_scope() {
     // SID registry reflects both scripts
     let names = exec.scripts().script_names();
     assert_eq!(names, vec![(1, "/outer.vim"), (2, "/inner.vim")]);
+}
+
+#[test]
+fn computed_name_script_variable_assignment_visible_to_later_read() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    exec.execute_script(
+        &editor,
+        "test.vim",
+        "function! s:Init(n, v)\n  let {a:n} = a:v\nendfunction\ncall s:Init('s:foo', 42)\ncall s:Init('g:bar', 99)\nlet g:val = s:foo",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "val"), Some(42));
+    assert_eq!(global_number(exec.scope(), "bar"), Some(99));
+}
+
+#[test]
+fn nested_source_calling_defining_script_function_updates_script_scope() {
+    let io = MemoryFileIO::new();
+    io.insert(
+        "/inner.vim",
+        "call Init('s:foo', 42)\ncall Init('g:bar', 99)",
+    );
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &editor,
+        "/outer.vim",
+        "function! Init(n, v)\n  let {a:n} = a:v\nendfunction\nsource /inner.vim\nlet g:val = s:foo",
+    )
+    .unwrap();
+    assert_eq!(global_number(exec.scope(), "val"), Some(42));
+    assert_eq!(global_number(exec.scope(), "bar"), Some(99));
+}
+
+#[test]
+fn autocmd_ex_string_preserves_defining_script_scope() {
+    let io = MemoryFileIO::new();
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(io);
+    exec.execute_script(
+        &editor,
+        "/script.vim",
+        "let s:x = 100\nfunction! s:Get()\n  return s:x\nendfunction\nau User MyEvent let g:result = s:Get()",
+    )
+    .unwrap();
+    exec.execute_line(&editor, "doautocmd User MyEvent").unwrap();
+    assert_eq!(global_number(exec.scope(), "result"), Some(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,6 +1785,50 @@ fn jobstart_pty_allocates_terminal_buffer_and_records_pty() {
 }
 #[cfg(unix)]
 #[test]
+fn terminal_command_marks_the_buffer_and_sleep_pumps_its_output() {
+    let _guard = crate::lock_process_state();
+    let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "terminal echo terminal-marker\nsleep 500m\n",
+    );
+
+    let ed = editor.editor();
+    let buffer = ed.current_buffer().expect("terminal buffer is current");
+    let state = ed.buffer(buffer).expect("terminal buffer must exist");
+    // `terminal_open` marks the buffer before any output arrives
+    // (terminal.c:608), so 'buftype' reads "terminal" on the first frame.
+    assert_eq!(
+        ed.options().get_buffer(buffer, "buftype").unwrap(),
+        &crate::options::OptionValue::String("terminal".to_owned())
+    );
+    assert!(
+        state.name().to_string_lossy().starts_with("term://"),
+        "terminal buffer name: {}",
+        state.name().to_string_lossy()
+    );
+    // `:sleep` pumps the job reactor, so the child's output reaches the
+    // emulator while the script waits. A bare thread sleep would leave the
+    // screen empty and the buffer blank.
+    let text = {
+        let text = state.text().expect("terminal text is readable");
+        (1..=text.line_count())
+            .map(|lnum| {
+                String::from_utf8_lossy(&text.line(lnum).expect("row is in range")).into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        text.contains("terminal-marker"),
+        "terminal buffer did not receive the child's output: {text:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn pty_output_reaches_terminal_buffer_after_chansend() {
     let _guard = crate::lock_process_state();
     let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
@@ -2035,6 +2138,14 @@ fn window_screen_and_state_builtins_use_editor_state() {
             "let g:id = win_getid()\n",
             "let g:width = winwidth(0)\n",
             "let g:height = winheight(0)\n",
+            "let g:height_invalid = winheight(2)\n",
+            "let g:height_negative = winheight(-1)\n",
+            "set laststatus=0\n",
+            "let g:height_ls0 = winheight(0)\n",
+            "set laststatus=1\n",
+            "let g:height_ls1 = winheight(0)\n",
+            "set laststatus=2\n",
+            "let g:height_ls2 = winheight(0)\n",
             "let g:attr = screenattr(1, 1)\n",
             "let g:char = screenchar(1, 1)\n",
             "let g:chars = screenchars(1, 1)\n",
@@ -2043,13 +2154,57 @@ fn window_screen_and_state_builtins_use_editor_state() {
             "let g:bufvar = getbufvar(bufnr('%'), 'answer')\n",
             "let g:command = fullcommand('res')\n",
             "let g:event = eventhandler()\n",
+            "new\n",
+            "let g:split_current = winheight(0)\n",
+            "let g:split_saved = winheight(0)\n",
+            "resize 1\n",
+            "let g:split_changed = winheight(0)\n",
+            "execute 'resize ' . g:split_saved\n",
+            "let g:split_restored = winheight(0)\n",
+            "let g:split_first_id = winheight(win_getid(1))\n",
+            "let g:split_first = winheight(1)\n",
+            "let g:split_second = winheight(2)\n",
+            "let g:split_invalid = winheight(3)\n",
+            "set laststatus=0\n",
+            "let g:split_ls0_first = winheight(1)\n",
+            "let g:split_ls0_second = winheight(2)\n",
+            "set laststatus=1\n",
+            "let g:split_ls1_first = winheight(1)\n",
+            "let g:split_ls1_second = winheight(2)\n",
+            "set laststatus=2\n",
+            "let g:split_ls2_first = winheight(1)\n",
+            "let g:split_ls2_second = winheight(2)\n",
         ),
     )
     .unwrap();
 
     assert_eq!(global_number(exec.scope(), "id"), Some(i64::from(window)));
     assert_eq!(global_number(exec.scope(), "width"), Some(20));
-    assert_eq!(global_number(exec.scope(), "height"), Some(6));
+    assert_eq!(global_number(exec.scope(), "height"), Some(4));
+    assert_eq!(global_number(exec.scope(), "height_invalid"), Some(-1));
+    assert_eq!(
+        global_number(exec.scope(), "split_restored"),
+        global_number(exec.scope(), "split_saved")
+    );
+    assert!(
+        global_number(exec.scope(), "split_changed").unwrap()
+            < global_number(exec.scope(), "split_saved").unwrap()
+    );
+    assert_eq!(global_number(exec.scope(), "height_negative"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "height_ls0"), Some(5));
+    assert_eq!(global_number(exec.scope(), "height_ls1"), Some(5));
+    assert_eq!(global_number(exec.scope(), "height_ls2"), Some(4));
+    assert_eq!(global_number(exec.scope(), "split_current"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_first_id"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_second"), Some(1));
+    assert_eq!(global_number(exec.scope(), "split_invalid"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "split_ls0_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls0_second"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls1_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls1_second"), Some(1));
+    assert_eq!(global_number(exec.scope(), "split_ls2_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls2_second"), Some(1));
     assert_eq!(global_number(exec.scope(), "attr"), Some(0));
     assert_eq!(
         global_number(exec.scope(), "char"),
@@ -2069,6 +2224,85 @@ fn window_screen_and_state_builtins_use_editor_state() {
         &Typval::list(vec![Typval::Number(i64::from('口' as u32))])
     );
     assert_eq!(global_string(exec.scope(), "text").as_deref(), Some("口"));
+}
+
+/// Blank screen cells are spaces, not holes: upstream's default grid answers
+/// every in-range coordinate (`eval/funcs.c:5711-5729`), so a 24x80 screen
+/// reports 32 for window rows past the buffer's last line and for grid rows
+/// no window covers, and -1 only outside the grid. `Screenline(&lines - 1)`
+/// in the oldtest suite feeds those cells straight into `nr2char()`, where
+/// a -1 surfaces as `E5070: Character number must not be less than zero`.
+#[test]
+fn screen_builtins_answer_the_whole_grid_with_blanks() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    let _tabpage = editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 20, 6).unwrap())
+        .unwrap();
+    let mut exec = ExExecutor::new();
+
+    exec.execute_script(
+        &editor,
+        "builtins.vim",
+        concat!(
+            "set lines=24 columns=80\n",
+            "call setline(1, 'ab')\n",
+            // Inside the window, past the end of the line and past the last
+            // buffer line: blanks, never -1.
+            "let g:past_eol = screenchar(1, 3)\n",
+            "let g:past_eof = screenchar(2, 1)\n",
+            "let g:window_edge = screenchar(6, 20)\n",
+            // In-grid rows no window covers (status-line and message rows):
+            // blanks with default attributes.
+            "let g:uncovered = screenchar(23, 1)\n",
+            "let g:last_cell = screenchar(24, 80)\n",
+            "let g:uncovered_attr = screenattr(23, 1)\n",
+            "let g:uncovered_string = screenstring(23, 1)\n",
+            "let g:uncovered_chars = screenchars(23, 1)\n",
+            // Outside the grid: no cell at all.
+            "let g:beyond_rows = screenchar(25, 1)\n",
+            "let g:beyond_cols = screenchar(1, 81)\n",
+            "let g:row_zero = screenchar(0, 1)\n",
+            "let g:col_zero = screenchar(1, 0)\n",
+            "let g:beyond_attr = screenattr(25, 1)\n",
+            "let g:beyond_string = screenstring(25, 1)\n",
+            "let g:beyond_chars = screenchars(25, 1)\n",
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(global_number(exec.scope(), "past_eol"), Some(32));
+    assert_eq!(global_number(exec.scope(), "past_eof"), Some(32));
+    assert_eq!(global_number(exec.scope(), "window_edge"), Some(32));
+    assert_eq!(global_number(exec.scope(), "uncovered"), Some(32));
+    assert_eq!(global_number(exec.scope(), "last_cell"), Some(32));
+    assert_eq!(global_number(exec.scope(), "uncovered_attr"), Some(0));
+    assert_eq!(
+        global_string(exec.scope(), "uncovered_string").as_deref(),
+        Some(" ")
+    );
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"uncovered_chars", 0)
+            .unwrap(),
+        &Typval::list(vec![Typval::Number(32)])
+    );
+    assert_eq!(global_number(exec.scope(), "beyond_rows"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "beyond_cols"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "row_zero"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "col_zero"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "beyond_attr"), Some(-1));
+    assert_eq!(
+        global_string(exec.scope(), "beyond_string").as_deref(),
+        Some("")
+    );
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"beyond_chars", 0)
+            .unwrap(),
+        &Typval::list(vec![])
+    );
 }
 
 #[test]
@@ -2236,7 +2470,7 @@ fn expand_builtin_resolves_autocmd_special_tokens_during_event() {
             .register_legacy(
                 &[Event::FileReadPre],
                 pattern,
-                &AutocmdKind::ExString(body.to_owned()),
+                &AutocmdKind::ExString { source: body.to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -2286,7 +2520,7 @@ fn expand_builtin_restores_autocmd_context_after_nested_event() {
             .register_legacy(
                 &[Event::FileReadPre],
                 pattern,
-                &AutocmdKind::ExString(body.to_owned()),
+                &AutocmdKind::ExString { source: body.to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -2700,9 +2934,11 @@ fn function_builtin_constructs_named_and_bound_references() {
         panic!("expected bound Partial")
     };
     assert_eq!(bound.args, vec![Typval::Number(1)]);
-    assert!(
-        matches!(bound.dict.as_deref(), Some([(key, Typval::Number(42))]) if key == &OxStr::from("answer"))
-    );
+    let dict = bound.dict.as_ref().unwrap().borrow();
+    assert_eq!(dict.len(), 1);
+    let entry = dict.iter().next().unwrap();
+    assert_eq!(entry.key, OxStr::from("answer"));
+    assert_eq!(entry.value, Typval::Number(42));
 }
 
 #[test]
@@ -2799,6 +3035,161 @@ fn writefile_defer_flag_deletes_per_frame_on_return_and_on_abort() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Generic `:defer Func(args)` registers any call and fires
+/// last-registered-first when the frame ends (`ex_defer_inner`,
+/// `handle_defer_one`, eval/userfunc.c:3394-3524); a `Funcref` variable
+/// contributes its bound arguments before the call's own, exactly like
+/// `deref_func_name` supplying the partial.
+#[test]
+fn defer_registers_generic_calls_and_fires_last_registered_first() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func AddSeen(val)\n\
+         call add(g:order, a:val)\n\
+         endfunc\n\
+         func Main()\n\
+         defer AddSeen('one')\n\
+         defer AddSeen('two')\n\
+         call add(g:order, 'body')\n\
+         endfunc\n\
+         let g:order = []\n\
+         call Main()\n",
+    );
+    let order = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"order", 0)
+        .cloned();
+    match order {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["body", "two", "one"]);
+        }
+        other => panic!("expected g:order list, got {other:?}"),
+    }
+}
+
+/// `:defer` rejects a dictionary-bound partial (`E1300`), reports text after
+/// the balanced call as trailing (`E488`), and requires a function frame
+/// (`E193`); a partial without a dictionary fires with its bound arguments
+/// first (test_user_func.vim `Test_defer`).
+#[test]
+fn defer_rejects_dict_partial_trailing_text_and_top_level() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func OneArg(val)\n\
+         endfunc\n\
+         func TwoArgs(first, second)\n\
+         call add(g:pargs, a:first)\n\
+         call add(g:pargs, a:second)\n\
+         endfunc\n\
+         func Probe()\n\
+         let D = function('tr', {'x': 1})\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer D('x')\n\
+         let g:e1300 = v:errmsg\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x')->Another()\n\
+         let g:earrow = v:errmsg\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x').member\n\
+         let g:emember = v:errmsg\n\
+         let P = function('TwoArgs', ['bound'])\n\
+         defer P('own')\n\
+         endfunc\n\
+         let g:pargs = []\n\
+         call Probe()\n\
+         let v:errmsg = 'NONE'\n\
+         silent! defer OneArg('x')\n\
+         let g:e193 = v:errmsg\n",
+    );
+    let flag = |name: &[u8]| {
+        exec.scope()
+            .get_scoped(ScopeKind::Global, name, 0)
+            .cloned()
+    };
+    for (name, code) in [
+        ("e1300", "E1300"),
+        ("earrow", "E488"),
+        ("emember", "E488"),
+        ("e193", "E193"),
+    ] {
+        match flag(name.as_bytes()) {
+            Ok(Typval::String(text)) => assert!(
+                text.to_string_lossy().starts_with(code),
+                "{name} must report {code}, got {text:?}"
+            ),
+            other => panic!("expected {name} string, got {other:?}"),
+        }
+    }
+    match flag(b"pargs") {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["bound", "own"]);
+        }
+        other => panic!("expected g:pargs list, got {other:?}"),
+    }
+}
+
+/// `defer()` on a lambda fires through the closure registry captured in its
+/// Funcref — a `<lambda>N` name owns no user-function entry, so a name
+/// redispatch at frame end would hit `E117` instead of running the body.
+/// Covers the `defer()` builtin form and the `:defer` command resolving a
+/// lambda variable.
+#[test]
+fn defer_lambda_fires_through_its_captured_closure() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::with_io(MemoryFileIO::new());
+    script(
+        &mut exec,
+        &editor,
+        "func Main()\n\
+         let L = {-> add(g:seen, 'command')}\n\
+         call defer({-> add(g:seen, 'builtin')})\n\
+         defer L()\n\
+         call add(g:seen, 'body')\n\
+         endfunc\n\
+         let g:seen = []\n\
+         call Main()\n",
+    );
+    match exec.scope().get_scoped(ScopeKind::Global, b"seen", 0).cloned() {
+        Ok(Typval::List(items)) => {
+            let seen: Vec<String> = items
+                .borrow()
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(seen, ["body", "command", "builtin"]);
+        }
+        other => panic!("expected g:seen list, got {other:?}"),
+    }
 }
 
 // eval/funcs.c f_system through os_system, os/shell.c shell_build_argv 60-97 —
@@ -3092,10 +3483,7 @@ fn routed_dict_entry(value: &Typval, key: &[u8]) -> Option<Typval> {
     match value {
         Typval::Dict(cell) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|e| e.key.as_bytes() == key)
-                .map(|e| e.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict, got {value:?}"),
     }
@@ -3371,6 +3759,14 @@ fn split_assignment_at_equal_register_splits_at_second_equals() {
     assert_eq!(expr, r#"'"abc"'"#);
 }
 
+#[test]
+fn split_assignment_at_at_no_space_finds_equals() {
+    let (target, op, expr) = crate::excmd_exec::split_assignment("@@= ykeep").unwrap();
+    assert_eq!(target, "@@");
+    assert_eq!(op, "=");
+    assert_eq!(expr, "ykeep");
+}
+
 /// Item (c): setreg append with LineWise-incoming into CharacterWise-existing
 /// must concatenate the first incoming line onto the last existing line,
 /// then extend, then set kind=LineWise.
@@ -3498,6 +3894,597 @@ fn getchar_returns_full_multibyte_modified_character() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Family: channel/terminal builtins (channel.c f_chansend/f_chanclose,
+// f_sockconnect, f_rpcnotify, f_rpcrequest; terminal.c termopen;
+// channel.txt, job_control.txt)
+// ---------------------------------------------------------------------------
+
+/// `jobstart` fixtures share one process-state lock: the reactor-backed
+/// `JobManager` is process-global through the test host.
+#[cfg(unix)]
+fn channel_suite() -> (
+    TestEditorAccess,
+    ExExecutor<MemoryFileIO>,
+    crate::ProcessStateGuard,
+) {
+    let guard = crate::lock_process_state();
+    let editor = TestEditorAccess::new(editor_with_lines(&["alpha"]));
+    let exec = ExExecutor::with_io(MemoryFileIO::new());
+    (editor, exec, guard)
+}
+
+/// Unique socket path per test: parallel `nextest` workers share `/tmp`.
+#[cfg(unix)]
+fn unique_socket_path(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "oxvim-chan-{tag}-{}-{id}.sock",
+        std::process::id()
+    ));
+    let _ignored = std::fs::remove_file(&path);
+    path
+}
+
+/// Bind a peer listener synchronously so `sockconnect` cannot race it: the
+/// bound socket exists before the script connects.
+#[cfg(unix)]
+fn bind_peer(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).expect("peer binds its socket")
+}
+
+/// Accept one peer, record the first RPC notification, then hang up.
+#[cfg(unix)]
+fn spawn_notify_peer(
+    listener: std::os::unix::net::UnixListener,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<(String, Vec<Object>)>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut decoder = ox_rpc::IncrementalDecoder::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            use std::io::Read as _;
+            let read = stream
+                .read(&mut chunk)
+                .expect("peer reads the notification");
+            if read == 0 {
+                // The test closed its side without notifying: done.
+                return;
+            }
+            let feed = decoder.feed(&chunk[..read]).expect("peer decodes frames");
+            for message in feed {
+                if let ox_rpc::Message::Notification { method, params } = message {
+                    tx.send((method.to_string_lossy().into_owned(), params))
+                        .expect("peer reports the notification");
+                    return;
+                }
+            }
+        }
+    });
+    (handle, rx)
+}
+
+/// Accept one peer, answer the first RPC request with `answer`, then hang up.
+#[cfg(unix)]
+fn spawn_request_peer(
+    listener: std::os::unix::net::UnixListener,
+    answer: Result<Object, ox_types::ApiError>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut decoder = ox_rpc::IncrementalDecoder::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            use std::io::Read as _;
+            use std::io::Write as _;
+            let read = stream.read(&mut chunk).expect("peer reads the request");
+            if read == 0 {
+                // The test went away without asking: done.
+                return;
+            }
+            let feed = decoder.feed(&chunk[..read]).expect("peer decodes frames");
+            for message in feed {
+                if let ox_rpc::Message::Request {
+                    msgid, method: _method, params: _params,
+                } = message
+                {
+                    let frame = ox_rpc::Message::Response {
+                        msgid,
+                        result: match answer {
+                            Ok(ref object) => Ok(object.clone()),
+                            Err(ref error) => Err(error.clone()),
+                        },
+                    }
+                    .encode_bytes()
+                    .expect("peer encodes its reply");
+                    stream.write_all(&frame).expect("peer answers");
+                    stream.flush().expect("peer flushes");
+                    return;
+                }
+            }
+        }
+    })
+}
+
+/// Accept one peer, read exactly `want` bytes, report them.
+#[cfg(unix)]
+fn spawn_byte_peer(
+    listener: std::os::unix::net::UnixListener,
+    want: usize,
+) -> (
+    std::thread::JoinHandle<()>,
+    std::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("peer read timeout");
+        let mut bytes = vec![0_u8; want];
+        {
+            use std::io::Read as _;
+            stream.read_exact(&mut bytes).expect("peer reads raw bytes");
+        }
+        tx.send(bytes).expect("peer reports raw bytes");
+    });
+    (handle, rx)
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_spawns_a_terminal_and_names_it() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid = termopen(['sh', '-c', 'echo term-hi-marker'])\ncall jobwait([g:tid], 5000)\nlet g:tbuf = bufnr('%')\nlet g:tbtype = getbufvar('%', '&buftype')\nlet g:tlines = join(getbufline('%', 1, '$'), \"\\n\")\nlet g:tname = bufname('%')\n",
+    );
+    assert!(global_number(exec.scope(), "tid") > Some(0));
+    assert!(global_number(exec.scope(), "tbuf") > Some(0));
+    // `termopen` marks the current buffer, like `terminal_open` does.
+    assert_eq!(global_string(exec.scope(), "tbtype"), Some("terminal".to_owned()));
+    let lines = global_string(exec.scope(), "tlines").unwrap_or_default();
+    assert!(lines.contains("term-hi-marker"), "terminal output missing: {lines:?}");
+    assert!(
+        global_string(exec.scope(), "tname")
+            .is_some_and(|name| name.starts_with("term://")),
+        "terminal buffer must carry a term:// name"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_a_relative_program_outside_the_process_cwd() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (editor, mut exec, _guard) = channel_suite();
+    // Upstream checks executability with `os_can_exe` against the process
+    // working directory, not the requested `cwd` option, so `./tool` present
+    // only under `{'cwd': ...}` is refused with E475 (`eval/funcs.c`).
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-termrel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock runs forward")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test stages a cwd");
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "#!/bin/sh\necho rel-marker\n").expect("test stages a tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+        .expect("tool is executable");
+    let error = exec
+        .execute_script(
+            &editor,
+            "<test>",
+            &format!(
+                "let g:tid = termopen(['./tool'], {{'cwd': '{}'}})\n",
+                dir.display()
+            ),
+        )
+        .unwrap_err();
+    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(
+        error_code(&error),
+        "E475",
+        "a relative program outside the process cwd must be refused"
+    );
+}
+
+/// With the program resolvable from the process working directory, upstream
+/// stores the absolute form in the `term://` name (`save_abs_path`), not the
+/// word as typed.
+#[cfg(unix)]
+#[test]
+fn termopen_absolutizes_a_relative_program_the_process_cwd_resolves() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let (editor, mut exec, _guard) = channel_suite();
+    let dir = std::env::temp_dir().join(format!(
+        "oxvim-termabs-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock runs forward")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).expect("test stages a cwd");
+    let tool = dir.join("tool");
+    std::fs::write(&tool, "#!/bin/sh\necho abs-marker\n").expect("test stages a tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+        .expect("tool is executable");
+    let previous = std::env::current_dir().expect("cwd is readable");
+    std::env::set_current_dir(&dir).expect("test enters the staged cwd");
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid = termopen(['./tool'], {'cwd': getcwd()})\ncall jobwait([g:tid], 5000)\nlet g:absname = bufname('%')\n",
+    );
+    std::env::set_current_dir(&previous).expect("test restores the cwd");
+    let name = global_string(exec.scope(), "absname").unwrap_or_default();
+    std::fs::remove_dir_all(&dir).ok();
+    assert!(
+        name.ends_with(&format!(":{}/tool", dir.display())),
+        "a resolvable relative program must be stored absolute, got {name:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_a_busy_terminal_buffer() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:tid1 = termopen(['sh', '-c', 'sleep 5'])\nlet g:tid2 = termopen(['sh', '-c', 'echo late'])\ncall jobstop(g:tid1)\n",
+    );
+    assert!(global_number(exec.scope(), "tid1") > Some(0));
+    // The current buffer already runs a terminal job: no double attach.
+    assert_eq!(global_number(exec.scope(), "tid2"), Some(0));
+}
+
+#[cfg(unix)]
+#[test]
+fn termopen_rejects_bad_arguments() {
+    let (editor, mut exec, _guard) = channel_suite();
+    for (line, code) in [
+        ("call termopen(123)", "E475"),
+        ("call termopen()", "E119"),
+        ("call termopen(['true'], [1])", "E475"),
+        (
+            "call termopen(['true'], {'cwd': '/no/such/oxvim-dir'})",
+            "E475",
+        ),
+        (
+            "call jobstart(['cat'], {'pty': v:true, 'rpc': v:true})",
+            "E475",
+        ),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+        if line.contains("[1]") {
+            assert!(
+                error.to_string().contains("expected dictionary"),
+                "{line}: got {error}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn jobclose_defaults_to_stdin_and_chanclose_closes_all() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:closed = jobclose(g:job)\nlet g:exit = jobwait([g:job], 5000)[0]\nlet g:job2 = jobstart(['cat'])\nlet g:closed2 = chanclose(g:job2)\nlet g:again = chanclose(g:job2)\n",
+    );
+    assert_eq!(global_number(exec.scope(), "closed"), Some(1));
+    // Closing stdin gives `cat` its EOF, so it exits cleanly.
+    assert_eq!(global_number(exec.scope(), "exit"), Some(0));
+    assert_eq!(global_number(exec.scope(), "closed2"), Some(1));
+    assert_eq!(
+        global_number(exec.scope(), "again"),
+        Some(1),
+        "upstream allows double close"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chanclose_rejects_unknown_channels_and_streams() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:rj = jobstart(['cat'], {'rpc': v:true})\n",
+    );
+    for (line, code, message) in [
+        ("call chanclose(999998)", "E900", "Invalid channel id"),
+        ("call chanclose(g:job, 'bogus')", "E906", "Invalid channel stream"),
+        (
+            "call chanclose(g:job, 'rpc')",
+            "E906",
+            "invalid stream for channel",
+        ),
+        ("call jobclose('x')", "E475", "Invalid argument"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+        assert!(error.to_string().contains(message), "{line}: got {error}");
+    }
+    // `jobclose` is the obsolete name for `chanclose`: an omitted stream
+    // closes every part, even on an RPC job.
+    script(
+        &mut exec,
+        &editor,
+        "let g:rk = jobstart(['cat'], {'rpc': v:true})\nlet g:job_closed = jobclose(g:rk)\n",
+    );
+    assert_eq!(global_number(exec.scope(), "job_closed"), Some(1));
+    // Closing the RPC half answers 1 and retires the RPC channel.
+    script(&mut exec, &editor, "let g:rpc_closed = chanclose(g:rj, 'rpc')\n");
+    assert_eq!(global_number(exec.scope(), "rpc_closed"), Some(1));
+    let error = exec.execute_line(&editor, "call rpcrequest(g:rj, 'm')").unwrap_err();
+    assert_eq!(error_code(&error), "E475");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_notify_reaches_a_socket_peer() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("notify");
+    let (peer, rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:sent = rpcnotify(g:sock, 'hello', 1, 2)\n",
+            path.display()
+        ),
+    );
+    assert!(global_number(exec.scope(), "sock") > Some(0));
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+    let (method, params) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("peer receives the notification");
+    assert_eq!(method, "hello");
+    assert_eq!(
+        params,
+        vec![Object::Integer(1), Object::Integer(2)],
+        "notification params must cross the socket untouched"
+    );
+    peer.join().expect("peer exits after one notification");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_blocks_for_a_socket_reply() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("request");
+    let peer = spawn_request_peer(bind_peer(&path), Ok(Object::Integer(3)));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:answer = rpcrequest(g:sock, 'sum', 1, 2)\n",
+            path.display()
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "answer"), Some(3));
+    peer.join().expect("peer exits after answering");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_reports_remote_errors() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("remote-err");
+    let peer = spawn_request_peer(
+        bind_peer(&path),
+        Err(ox_types::ApiError::Exception("boom".to_owned())),
+    );
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\n",
+            path.display()
+        ),
+    );
+    let error = exec
+        .execute_line(&editor, "let g:bad = rpcrequest(g:sock, 'nope')")
+        .unwrap_err();
+    assert_eq!(error_code(&error), "E605");
+    assert!(error.to_string().contains("boom"), "got {error}");
+    peer.join().expect("peer exits after answering");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_request_answers_over_a_job_channel() {
+    // No msgpack helper ships with the shell, so the peer is a canned byte
+    // exchange: the request `[0,1,"ping",[]]` is exactly 9 bytes, and the
+    // reply `[1,1,nil,"pong"]` is written back verbatim.
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:rj = jobstart(['sh', '-c', 'head -c 9 >/dev/null; printf \"\\224\\001\\001\\300\\244pong\"'], {'rpc': v:true})\nlet g:pong = rpcrequest(g:rj, 'ping')\n",
+    );
+    assert_eq!(global_string(exec.scope(), "pong"), Some("pong".to_owned()));
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_notify_writes_to_a_job_channel() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:rj = jobstart(['cat'], {'rpc': v:true})\nlet g:sent = rpcnotify(g:rj, 'hello')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_broadcast_reaches_every_open_channel() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("broadcast");
+    let (peer, rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:sock = sockconnect('pipe', '{}', {{'rpc': v:true}})\nlet g:sent = rpcnotify(0, 'leaving')\n",
+            path.display()
+        ),
+    );
+    assert_eq!(global_number(exec.scope(), "sent"), Some(1));
+    let (method, _) = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("peer receives the broadcast");
+    assert_eq!(method, "leaving");
+    peer.join().expect("peer exits after one notification");
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_rejects_bad_channels_and_methods() {
+    let (editor, mut exec, _guard) = channel_suite();
+    script(
+        &mut exec,
+        &editor,
+        "let g:job = jobstart(['cat'])\nlet g:sock = sockconnect('pipe', '/no/such/oxvim-test.sock')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "sock"), Some(0));
+    for (line, code) in [
+        ("call rpcnotify('x', 'e')", "E475"),
+        ("call rpcnotify(-1, 'e')", "E475"),
+        ("call rpcnotify(g:job, 'e')", "E475"),
+        ("call rpcnotify(999998, 'e')", "E475"),
+        ("call rpcrequest(g:job, 'm')", "E475"),
+        ("call rpcrequest(999998, 'm')", "E475"),
+        ("call rpcrequest(g:job)", "E475"),
+        ("call rpcnotify(g:job)", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // A non-string event/method is E475 even on a live channel.
+    let path = unique_socket_path("rpc-types");
+    let (types_peer, _rx) = spawn_notify_peer(bind_peer(&path));
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:rsock = sockconnect('pipe', '{}', {{'rpc': v:true}})\n",
+            path.display()
+        ),
+    );
+    for (line, code) in [
+        ("call rpcnotify(g:rsock, 42)", "E475"),
+        ("call rpcrequest(g:rsock, 42)", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // Closing the RPC half of an RPC socket shuts it down, like `chanclose()`.
+    script(&mut exec, &editor, "let g:rsock_rpc = chanclose(g:rsock, 'rpc')\n");
+    assert_eq!(global_number(exec.scope(), "rsock_rpc"), Some(1));
+    types_peer.join().expect("types peer exits on EOF");
+}
+
+#[cfg(unix)]
+#[test]
+fn sockconnect_opens_pipes_and_tcp() {
+    let (editor, mut exec, _guard) = channel_suite();
+    // Raw pipe socket: `chansend` writes bytes the peer reads.
+    let pipe_path = unique_socket_path("bytes");
+    let (byte_peer, bytes) = spawn_byte_peer(bind_peer(&pipe_path), 5);
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:raw = sockconnect('pipe', '{}')\nlet g:wrote = chansend(g:raw, 'hello')\nlet g:raw_closed = chanclose(g:raw)\n",
+            pipe_path.display()
+        ),
+    );
+    assert!(global_number(exec.scope(), "raw") > Some(0));
+    assert_eq!(global_number(exec.scope(), "wrote"), Some(1));
+    assert_eq!(
+        bytes
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("peer reads raw bytes"),
+        b"hello".to_vec()
+    );
+    byte_peer.join().expect("byte peer exits");
+    assert_eq!(global_number(exec.scope(), "raw_closed"), Some(1));
+    // Raw TCP socket over loopback.
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let port = tcp.local_addr().expect("loopback port").port();
+    let tcp_peer = std::thread::spawn(move || {
+        let (mut stream, _) = tcp.accept().expect("accept tcp");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("tcp read timeout");
+        let mut bytes = [0_u8; 3];
+        {
+            use std::io::Read as _;
+            stream.read_exact(&mut bytes).expect("read tcp bytes");
+        }
+        bytes
+    });
+    script(
+        &mut exec,
+        &editor,
+        &format!("let g:tcp = sockconnect('tcp', '127.0.0.1:{port}')\nlet g:twrote = chansend(g:tcp, 'bye')\n"),
+    );
+    assert!(global_number(exec.scope(), "tcp") > Some(0));
+    assert_eq!(global_number(exec.scope(), "twrote"), Some(1));
+    assert_eq!(
+        tcp_peer.join().expect("tcp peer exits"),
+        *b"bye",
+        "tcp bytes must cross the socket"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sockconnect_rejects_bad_modes_and_reports_refusals() {
+    let (editor, mut exec, _guard) = channel_suite();
+    for (line, code) in [
+        ("call sockconnect('bogus', 'x')", "E475"),
+        ("call sockconnect('pipe')", "E475"),
+        ("call sockconnect(42, 'x')", "E475"),
+        ("call sockconnect('pipe', 'x', [1])", "E475"),
+    ] {
+        let error = exec.execute_line(&editor, line).unwrap_err();
+        assert_eq!(error_code(&error), code, "{line}");
+    }
+    // Refused peers answer 0 instead of raising.
+    script(
+        &mut exec,
+        &editor,
+        "let g:refused_pipe = sockconnect('pipe', '/no/such/oxvim-test.sock')\nlet g:refused_tcp = sockconnect('tcp', '127.0.0.1:1')\n",
+    );
+    assert_eq!(global_number(exec.scope(), "refused_pipe"), Some(0));
+    assert_eq!(global_number(exec.scope(), "refused_tcp"), Some(0));
+}
+
 /// Sourcing is not `:try`: upstream leaves `trylevel` alone in `do_source`,
 /// so an error inside a sourced script displays and `did_emsg` aborts the
 /// rest of the file — verified against the reference binary, where the
@@ -3511,11 +4498,10 @@ fn sourced_script_error_displays_and_aborts() {
     );
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::with_io(io);
-    let error = exec.source_file(&editor, "/inner.vim".as_ref()).unwrap_err();
-    assert!(
-        error.to_string().contains("NoSuchFunc123"),
-        "got {error}"
-    );
+    let error = exec
+        .source_file(&editor, "/inner.vim".as_ref())
+        .unwrap_err();
+    assert!(error.to_string().contains("NoSuchFunc123"), "got {error}");
     assert_eq!(global_number(exec.scope(), "inner_after"), None);
     assert!(exec.did_emsg());
 }

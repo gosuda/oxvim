@@ -282,6 +282,35 @@ fn keytrans_preserves_named_and_modified_escapes() {
     );
 }
 
+/// `vim.keycode(keys, true)` reports one chord per key: the modifier list in
+/// `mod_mask_table` order, the bare key, the `keytrans` spelling, and the
+/// alternate name. Every row below is the oracle's answer for the same
+/// notation.
+#[test]
+fn keyparse_reports_the_oracle_chords() {
+    fn chord(keys: &[u8]) -> crate::KeyChord {
+        let mut chords = crate::keyparse(keys);
+        assert_eq!(chords.len(), 1, "one key per probe: {keys:?}");
+        chords.remove(0)
+    }
+    let cases: &[(&[u8], u8, &[u8], &str, Option<&[u8]>)] = &[
+        (b"\x01", 4, b"a", "<C-A>", Some(b"A")),
+        (b"A", 2, b"a", "A", Some(b"A")),
+        (b"\x1b", 0, b"\x1b", "<Esc>", Some(b"Esc")),
+        (b" ", 0, b" ", "<Space>", Some(b"Space")),
+        (&[0x80, 0x6b, b'B'], 2, b"Tab", "<S-Tab>", None),
+        (&[0x80, 0x6b, b'b'], 0, b"BS", "<BS>", None),
+        (&[0x80, 0xfc, 2, 6], 6, b"f", "<C-S-F>", Some(b"F")),
+    ];
+    for &(keys, mods, key, rendered, alt) in cases {
+        let parsed = chord(keys);
+        assert_eq!(parsed.mods, mods, "mods for {keys:?}");
+        assert_eq!(parsed.key, key, "key for {keys:?}");
+        assert_eq!(parsed.keys, rendered, "keys for {keys:?}");
+        assert_eq!(parsed.key_alt.as_deref(), alt, "key_alt for {keys:?}");
+    }
+}
+
 #[test]
 fn sha256_hashes_strings_and_blobs_with_lowercase_hex() {
     // Oracle: test/old/testdir/test_sha256.vim Test_sha256().
@@ -402,7 +431,7 @@ fn environment_builtins_preserve_non_utf8_bytes() {
     let Typval::Dict(environment) = call("environ", Vec::new()).unwrap() else {
         panic!("environ() must return a Dict")
     };
-    assert!(environment.borrow().entries.iter().any(|entry| {
+    assert!(environment.borrow().iter().any(|entry| {
         entry.key.as_bytes() == name_bytes && entry.value == Typval::String(value.clone())
     }));
 }
@@ -694,6 +723,7 @@ case!(has_nvim, "has", [text("nvim")], number(1));
 case!(has_startuptime, "has", [text("startuptime")], number(1));
 case!(has_quickfix_present, "has", [text("quickfix")], number(1));
 case!(has_diff_present, "has", [text("diff")], number(1));
+case!(has_timers_present, "has", [text("timers")], number(1));
 
 // Subsystems upstream always compiles in that this build does not have. Each
 // name stays 0 because a test that stopped skipping would run against a
@@ -704,7 +734,6 @@ case!(has_conceal_absent, "has", [text("conceal")], number(0));
 case!(has_spell_absent, "has", [text("spell")], number(0));
 case!(has_syntax_absent, "has", [text("syntax")], number(0));
 case!(has_signs_absent, "has", [text("signs")], number(0));
-case!(has_timers_absent, "has", [text("timers")], number(0));
 case!(has_reltime_absent, "has", [text("reltime")], number(0));
 case!(has_profile_absent, "has", [text("profile")], number(0));
 case!(has_menu_absent, "has", [text("menu")], number(0));
@@ -1108,7 +1137,7 @@ case!(
         (OxStr::from("b"), number(2)),
         (OxStr::from("a"), number(1))
     ])],
-    text("{\"b\":2,\"a\":1}")
+    text("{\"a\":1,\"b\":2}")
 );
 case!(
     json_decode_null,
@@ -2341,15 +2370,15 @@ fn copy_is_outer_independent_but_keeps_nested_aliases() {
 fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
     let source = Typval::list(vec![]);
     call("add", vec![source.clone(), source.clone()]).unwrap();
-    assert_eq!(
-        call("string", vec![source.clone()]).unwrap(),
-        text("[[...]]")
-    );
+    assert!(matches!(
+        call("string", vec![source.clone()]),
+        Err(e) if e.code == "E724"
+    ));
     let copied = call("deepcopy", vec![source.clone()]).unwrap();
-    assert_eq!(
-        call("string", vec![copied.clone()]).unwrap(),
-        text("[[...]]")
-    );
+    assert!(matches!(
+        call("string", vec![copied.clone()]),
+        Err(e) if e.code == "E724"
+    ));
     let (Typval::List(source_ref), Typval::List(copy_ref)) = (&source, &copied) else {
         panic!("Lists expected")
     };
@@ -2358,6 +2387,45 @@ fn deepcopy_reproduces_cycles_and_breaks_source_aliases() {
         panic!("cycle expected")
     };
     assert!(std::rc::Rc::ptr_eq(copy_ref, cycle_ref));
+}
+#[test]
+fn string_builtin_raises_e724_on_self_referencing_container() {
+    let list = Typval::list(vec![Typval::Number(1)]);
+    let Typval::List(r) = &list else { unreachable!() };
+    r.borrow_mut().items.push(list.clone());
+    let err = call("string", vec![list]).unwrap_err();
+    assert_eq!(err.code, "E724");
+    assert_eq!(
+        err.message,
+        "unable to correctly dump variable with self-referencing container"
+    );
+
+    let dict = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]);
+    let Typval::Dict(d) = &dict else { unreachable!() };
+    d.borrow_mut().insert(OxStr::from("self"), dict.clone());
+    let err_d = call("string", vec![dict]).unwrap_err();
+    assert_eq!(err_d.code, "E724");
+    assert_eq!(
+        err_d.message,
+        "unable to correctly dump variable with self-referencing container"
+    );
+}
+
+
+#[test]
+fn string_builtin_quotes_and_escapes_via_shared_formatter() {
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from(&[0x80][..]))]).unwrap(),
+        Typval::String(OxStr::from("'<80>'"))
+    );
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from(&[0x03][..]))]).unwrap(),
+        Typval::String(OxStr::from("'^C'"))
+    );
+    assert_eq!(
+        call("string", vec![Typval::String(OxStr::from("it's"))]).unwrap(),
+        Typval::String(OxStr::from("'it''s'"))
+    );
 }
 
 #[test]
@@ -2916,6 +2984,19 @@ fn typval_dispatcher_leaves_buffer_builtins_unimplemented() {
 }
 
 #[test]
+/// `:p` leaves a URL alone: `vim_isAbsName` counts a URL as absolute
+/// (path.c:1750), so `fullpath` is never applied to it. Oracle:
+/// `fnamemodify('example:///x/y', ':p')` answers `example:///x/y`, and
+/// `nvim.dir` names its buffer with exactly such a URI.
+#[test]
+fn fnamemodify_keeps_urls_absolute() {
+    assert_eq!(
+        call("fnamemodify", vec![text("example:///x/y"), text(":p")]).unwrap(),
+        text("example:///x/y")
+    );
+}
+
+#[test]
 fn fnamemodify_obeys_filename_modifier_order() {
     // cmdline.txt `filename-modifiers`: :h/:t and repeated :r/:e.
     assert_eq!(
@@ -3140,6 +3221,38 @@ fn printf_formats_strings_numbers_and_radices() {
         text("100% and done")
     );
     assert!(call("printf", vec![text("%d %d"), number(1)]).is_err());
+}
+
+// Oracle: `strings.c:2205-2220` (`vim_vsnprintf_typval`). An unrecognized
+// conversion specifier (such as `netrw.vim:347`'s non-capturing group `\%(%s\)`)
+// emits the character literally and does not consume arguments, allowing the
+// subsequent `%s` to consume the string argument.
+#[test]
+fn printf_unknown_conversion_specifier_preserves_arguments_and_emits_literally() {
+    assert_eq!(
+        call("printf", vec![text(r"\%(%s\)"), text("txt")]).unwrap(),
+        text(r"\(txt\)")
+    );
+    assert_eq!(
+        call(
+            "printf",
+            vec![text(r"[\/]$,*,\%(%s\)[*@]\=$"), text("txt")]
+        )
+        .unwrap(),
+        text(r"[\/]$,*,\(txt\)[*@]\=$")
+    );
+    // `strings.c:2213-2217`: a trailing `%` emits nothing and consumes nothing.
+    assert_eq!(call("printf", vec![text("100%")]).unwrap(), text("100"));
+}
+
+// Oracle: `strings.c:2205-2220`. An unrecognized conversion specifier consumes
+// no arguments (so `%(` alone does not raise E766), ignores width and flags,
+// and a trailing `%` emits nothing without raising E806.
+#[test]
+fn printf_unknown_conversion_specifier_without_arguments_and_trailing_percent() {
+    assert_eq!(call("printf", vec![text("%(")]).unwrap(), text("("));
+    assert_eq!(call("printf", vec![text("foo %")]).unwrap(), text("foo "));
+    assert_eq!(call("printf", vec![text("%05(")]).unwrap(), text("("));
 }
 
 #[test]
@@ -4795,16 +4908,13 @@ fn getenv_and_environ_answer_the_process_environment() {
     let Typval::Dict(entries) = &environment else {
         panic!("environ() must answer a Dict: {environment:?}")
     };
-    let entries = entries.borrow().entries.clone();
+    let data = entries.borrow();
     assert_eq!(
-        entries
-            .iter()
-            .find(|entry| entry.key == OxStr::from(NAME))
-            .map(|entry| entry.value.clone()),
+        data.get(NAME.as_bytes()).cloned(),
         Some(text("value")),
     );
     assert!(
-        !entries
+        !data
             .iter()
             .any(|entry| entry.key == OxStr::from(MISSING))
     );
@@ -5065,4 +5175,220 @@ fn invalid_utf8_rides_composed_character_boundaries() {
         .unwrap(),
         Typval::String(OxStr(vec![0xff]))
     );
+}
+
+// `msgpackparse()`/`msgpackdump()` (`eval/funcs.c:4421-4574`): the byte
+// model is a readfile-style stream — list items join with NL while an NL
+// inside an item reads as NUL — and maps honour `v:msgpack_types`.
+#[test]
+fn msgpack_round_trips_values_through_blob_and_list() {
+    // nil / bool / number / float / string.
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc0])]).unwrap(),
+        Typval::list(vec![Typval::Special(Special::Null)])
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc3])]).unwrap(),
+        Typval::list(vec![Typval::Bool(true)])
+    );
+    // A string dumps as BIN8 (`0xC4`), keys dump as STR.
+    assert_eq!(
+        call("msgpackdump", vec![texts(&["Test"])]).unwrap(),
+        Typval::list(vec![Typval::String(OxStr(vec![
+            0xc4, 0x04, b'T', b'e', b's', b't',
+        ]))])
+    );
+    // Blob form carries the raw packed bytes.
+    assert_eq!(
+        call(
+            "msgpackdump",
+            vec![texts(&["Test"]), text("B")]
+        )
+        .unwrap(),
+        Typval::Blob(vec![0xc4, 0x04, b'T', b'e', b's', b't'])
+    );
+    // Round trip through both forms.
+    for value in [
+        Typval::Special(Special::Null),
+        Typval::Bool(false),
+        Typval::Number(-300),
+        Typval::Float(0.125),
+        text("hi"),
+        Typval::list(vec![number(1), text("two")]),
+        Typval::dict(vec![(OxStr::from("a"), number(1))]),
+    ] {
+        let dumped = call("msgpackdump", vec![Typval::list(vec![value.clone()])]).unwrap();
+        assert_eq!(
+            call("msgpackparse", vec![dumped]).unwrap(),
+            Typval::list(vec![value]),
+            "list-form round trip"
+        );
+    }
+}
+
+#[test]
+fn msgpack_parse_honours_special_types_and_stream_joins() {
+    // `0xCF FF..FF` is `uint64::MAX`: beyond `i64`, so it decodes to the
+    // integer special dict whose `_TYPE is v:msgpack_types.integer`.
+    let parsed = call(
+        "msgpackparse",
+        vec![Typval::Blob(vec![0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])],
+    )
+    .unwrap();
+    let Typval::List(items) = parsed else {
+        panic!("parse must answer a List");
+    };
+    let [value] = items
+        .try_borrow()
+        .map(|data| data.items.clone())
+        .unwrap()
+        .try_into()
+        .map_err(|_| "single value")
+        .unwrap();
+    let Typval::Dict(entries) = value else {
+        panic!("uint64::MAX must decode to a special dict");
+    };
+    let data = entries.try_borrow().unwrap();
+    let get = |key: &str| {
+        data.get(key.as_bytes())
+            .unwrap()
+            .clone()
+    };
+    assert!(matches!(get("_TYPE"), Typval::List(_)));
+    assert_eq!(
+        get("_VAL"),
+        Typval::list(vec![number(1), number(3), number(0x7fff_ffff), number(0x7fff_ffff)])
+    );
+    drop(data);
+    // List items join with NL: `0xC4 0x01` + NL reads BIN8 len 1 over the
+    // joiner, i.e. `"\n"`.
+    assert_eq!(
+        call(
+            "msgpackparse",
+            vec![Typval::list(vec![Typval::String(OxStr(vec![0xc4, 0x01])), text("")])]
+        )
+        .unwrap(),
+        Typval::list(vec![text("\n")])
+    );
+    // A map with a duplicate string key is the generic-map special dict.
+    let parsed = call(
+        "msgpackparse",
+        vec![Typval::Blob(vec![0x82, 0xa1, b'a', 0xc4, 0x01, 0x0a, 0xa1, b'a', 0xc4, 0x01, 0x0b])],
+    )
+    .unwrap();
+    let dumped = call("msgpackdump", vec![parsed.clone()]).unwrap();
+    assert_eq!(call("msgpackparse", vec![dumped]).unwrap(), parsed);
+}
+
+#[test]
+fn msgpack_rejects_bad_arguments_with_upstream_codes() {
+    assert_eq!(call("msgpackparse", vec![]).unwrap_err().code, "E119");
+    assert_eq!(
+        call("msgpackparse", vec![text("x"), text("y")]).unwrap_err().code,
+        "E118"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![text("x")]).unwrap_err().code,
+        "E899"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![number(1)]).unwrap_err().code,
+        "E899"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc4])])
+            .unwrap_err()
+            .code,
+        "E475"
+    );
+    assert_eq!(
+        call("msgpackparse", vec![Typval::Blob(vec![0xc1])])
+            .unwrap_err()
+            .code,
+        "E475"
+    );
+    assert_eq!(call("msgpackdump", vec![]).unwrap_err().code, "E119");
+    assert_eq!(
+        call("msgpackdump", vec![text("x")]).unwrap_err().code,
+        "E686"
+    );
+    // A Funcref cannot dump: `E5004` naming the top argument and `itself`.
+    let error = call("msgpackdump", vec![Typval::list(vec![funcref("tr")])]).unwrap_err();
+    assert_eq!(error.code, "E5004");
+    assert!(error.message.contains("itself"), "{}", error.message);
+    // A self-referencing list is `E5005` with the container path: three
+    // open levels render three positions, like upstream's
+    // `[[[todump]]]` shape.
+    let inner = Typval::list(vec![]);
+    let recursive = Typval::list(vec![Typval::list(vec![inner.clone()])]);
+    if let Typval::List(reference) = &inner {
+        reference
+            .borrow_mut()
+            .items
+            .push(recursive.clone());
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![recursive])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.contains("index 0, index 0, index 0"),
+        "{}",
+        error.message
+    );
+    // Shallower shapes render fewer levels: a directly self-referential
+    // list names one level, a two-level cycle two (oracle probes).
+    let direct = Typval::list(vec![]);
+    if let Typval::List(reference) = &direct {
+        reference
+            .borrow_mut()
+            .items
+            .push(Typval::List(reference.clone()));
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![direct])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.ends_with("in index 0"),
+        "{}",
+        error.message
+    );
+    let lower = Typval::list(vec![]);
+    let upper = Typval::list(vec![lower.clone()]);
+    if let Typval::List(reference) = &lower {
+        reference.borrow_mut().items.push(upper.clone());
+    }
+    let error = call("msgpackdump", vec![Typval::list(vec![upper])]).unwrap_err();
+    assert_eq!(error.code, "E5005");
+    assert!(
+        error.message.ends_with("in index 0, index 0"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
+fn single_quoted_string_with_trailing_backslash_parses_in_call() {
+    for source in [
+        &br#"NetrwInit("g:x",'*[]?`{~$\')"#[..],
+        &br#"s:NetrwInit("g:netrw_glob_escape",'*[]?`{~$\')"#[..],
+    ] {
+        let expr = Parser::new(source).parse().unwrap();
+        match expr.kind {
+            crate::parser::ExprKind::Call { args, .. } => {
+                assert_eq!(args.len(), 2);
+                match &args[1].kind {
+                    crate::parser::ExprKind::Literal(Typval::String(s)) => {
+                        assert_eq!(s.as_bytes(), br"*[]?`{~$\");
+                    }
+                    other => panic!("expected string literal, got {other:?}"),
+                }
+            }
+            other => panic!("expected call expr, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn unterminated_single_quoted_string_fails() {
+    let source = b"'unterminated";
+    let error = Parser::new(source).parse().unwrap_err();
+    assert_eq!(error.code, "E115");
 }

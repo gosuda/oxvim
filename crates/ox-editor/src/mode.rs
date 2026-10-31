@@ -1,11 +1,12 @@
 //! Modal input state machine, shaped like `state.c`'s check/execute loop.
 
 use ox_text::Position;
-use ox_types::{BufHandle, WinHandle};
+use ox_types::{BufHandle, Object, OxStr, WinHandle};
 use thiserror::Error;
 
 use crate::builtins::completion::{CompletionOutcome, CompletionSession};
 use crate::builtins::position::{cursor_vcol, display_len, getvcol, vcol_to_byte};
+use crate::editor::{RegisterPut, VisualPut};
 use crate::indent::{self, CinTrigger, ExprEval, IndentExprError};
 use crate::insert;
 use crate::motion::{FindDirection, FindMotion, Motion, resolve, resolve_find};
@@ -19,7 +20,7 @@ use crate::typeahead::{
 };
 use crate::{
     BufferRelease, BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkId,
-    ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind,
+    ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MotionKind,
     OperatorRequest, OptionValue, SearchError, VisualKind, VisualState,
 };
 use crate::{
@@ -36,6 +37,39 @@ pub enum CmdlineKind {
     Ex,
 }
 
+/// One normal-mode put request: the register, placement, and cursor/indent
+/// modes travel together so call sites keep a stable order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalPut {
+    /// Register to put (`=` entry stores source text for `getreg`).
+    pub register: char,
+    /// `p` (after) versus `P` (before) placement.
+    pub forward: bool,
+    /// `gp`/`gP`: land the cursor after the inserted text.
+    pub cursend: bool,
+    /// `[p`/`]p`: reindent linewise rows to the cursor line.
+    pub fixindent: bool,
+    /// Repetition count.
+    pub count: usize,
+}
+
+/// One visual-mode put request: the register handling and cursor/indent
+/// modes travel together so call sites keep a stable order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualPutKind {
+    /// Delete the selection, then put the register over it.
+    Put {
+        /// Delete to the black hole instead of routing registers (`P`).
+        keep_registers: bool,
+        /// Land the cursor after the inserted text (`gp`).
+        cursend: bool,
+        /// Reindent linewise rows (`[p`/`]p`).
+        fixindent: bool,
+        /// `p` (after) versus `P` (before) placement.
+        forward: bool,
+    },
+}
+
 /// Parser state retained between normal-mode keys.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NormalState {
@@ -45,6 +79,9 @@ pub struct NormalState {
     pub prefix: String,
     /// Explicit register selected with `"`.
     pub register: Option<char>,
+    /// Expression-register input after `"=` (`get_expr_line` source text),
+    /// collected until `<CR>`; `None` outside `=` entry.
+    pub expression: Option<String>,
 }
 /// Insert mode has no extra retained state for the supported basics.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -114,6 +151,10 @@ pub struct CmdlineState {
     pub text: String,
     /// Insertion position: a UTF-8 boundary in `text`, including its end.
     pub cursor_byte: usize,
+    /// Cursor column deferred by `setcmdpos()` (`ex_getln.c` `new_cmdpos`):
+    /// a 1-based character position consumed — and cleared — by the next
+    /// `CTRL-R` paste, never applied eagerly. `None` outside `setcmdpos`.
+    pub new_cmdpos: Option<usize>,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
     /// Cursor position when the command line was entered
@@ -318,6 +359,10 @@ pub struct ModeMachine {
     pub completion: CompletionSession,
     /// `CTRL-V` in command-line mode: insert the next character literally.
     pending_cmdline_literal: bool,
+    /// `CTRL-R` seen in command-line mode, waiting for the register name.
+    /// A second `CTRL-R` is consumed the same way: the single paste path
+    /// below inserts literally either way, so no second flag is needed.
+    pending_cmdline_ctrl_r: bool,
     /// Insert mode temporarily yielded to one Normal-mode command with
     /// `CTRL-O`.
     one_normal_command: bool,
@@ -366,6 +411,7 @@ impl Default for ModeMachine {
             pending_ctrl_bslash: false,
             completion: CompletionSession::new(),
             pending_cmdline_literal: false,
+            pending_cmdline_ctrl_r: false,
             one_normal_command: false,
             insert_literal: None,
             pending_insert_ctrl_r: false,
@@ -717,6 +763,17 @@ impl ModeMachine {
         self.pending_mapping_action.take()
     }
 
+    /// Synchronizes visual selection cursor with current window cursor.
+    pub fn sync_visual_cursor(&mut self, editor: &Editor) {
+        if let Mode::Visual(state) = &mut self.mode {
+            if let Some(window) = editor.current_window()
+                && let Ok(win) = editor.window(window)
+            {
+                sync_visual_state(state, win);
+            }
+        }
+    }
+
     /// `state.c:34-106`: checking consumes mappings and input but performs no buffer mutation.
     ///
     /// # Errors
@@ -724,6 +781,7 @@ impl ModeMachine {
     /// Returns an error when input decoding or mapping expansion fails, or when
     /// recursive mapping reaches `'maxmapdepth'`.
     pub fn check(&mut self, editor: &mut Editor) -> Result<Step, ModeError> {
+        self.sync_visual_cursor(editor);
         loop {
             let Some(flags) = editor.typeahead().front_flags() else {
                 self.map_pending = false;
@@ -750,6 +808,34 @@ impl ModeMachine {
                         let lhs = editor.typeahead().keylen(width).to_vec();
                         self.recordbuff.extend_from_slice(&lhs);
                     }
+                    self.publish_mapping_count(editor);
+                    if self.apply_mapping(editor, action, options, width)? {
+                        return Ok(Step::ProcessEvents);
+                    }
+                    continue;
+                }
+            } else if editor.typeahead().as_bytes().starts_with(b"<Plug>") {
+                // Upstream expands `<Plug>` mappings even through `:noremap`
+                // (`getchar.c` matches a leading `<Plug>` token against the
+                // mapping table regardless of the no-remap marks): a noremap
+                // right-hand side that names a `<Plug>` mapping still reaches
+                // it, which is how `vim.keymap.set` (noremap by default)
+                // drives `runtime/plugin/dir.lua`'s buffer maps.
+                let mode = map_mode(&self.mode);
+                let buffer = editor.current_buffer();
+                let plug = match editor
+                    .mappings()
+                    .lookup_typeahead(editor.typeahead(), mode, buffer)
+                {
+                    Lookup::Exact(mapping, width)
+                        if mapping.lhs.as_bytes().starts_with(b"<Plug>") =>
+                    {
+                        Some((mapping.action.clone(), mapping.options.clone(), width))
+                    }
+                    _ => None,
+                };
+                if let Some((action, options, width)) = plug {
+                    self.publish_mapping_count(editor);
                     if self.apply_mapping(editor, action, options, width)? {
                         return Ok(Step::ProcessEvents);
                     }
@@ -830,9 +916,7 @@ impl ModeMachine {
                 // An unmapped Alt/Meta-prefixed key is the terminal's
                 // `ESC`-prefix form (`getchar.c` `mod_mask`): deliver `ESC`
                 // now and let the queued key itself arrive next.
-                Key::Special(KS_MODIFIER, mask)
-                    if mask & (MOD_MASK_ALT | MOD_MASK_META) != 0 =>
-                {
+                Key::Special(KS_MODIFIER, mask) if mask & (MOD_MASK_ALT | MOD_MASK_META) != 0 => {
                     Ok(Step::Key('\u{1b}'))
                 }
                 Key::Special(second, third) => match Self::named_key(second, third) {
@@ -915,6 +999,28 @@ impl ModeMachine {
     ///
     /// Reports whether an action was parked, which is the caller's cue to
     /// leave the input loop so the host can run it.
+    /// Publishes the pending count for a triggered mapping (`v:count` is the
+    /// raw count, `v:count1` defaults it to 1; `getchar.c` sets both while a
+    /// mapping runs). Only normal mode accumulates a count; elsewhere the
+    /// defaults apply.
+    fn publish_mapping_count(&mut self, editor: &mut Editor) {
+        let (count, count1) = match &self.mode {
+            Mode::Normal(state) => {
+                let count = i64::try_from(state.count).unwrap_or(i64::MAX);
+                (count, count.max(1))
+            }
+            _ => (0, 1),
+        };
+        editor
+            .vvars_mut()
+            .insert(OxStr::from("count"), Object::Integer(count));
+        editor.vvars_mut().insert(
+            OxStr::from("count1"),
+            Object::Integer(count1),
+        );
+    }
+
+
     fn apply_mapping(
         &mut self,
         editor: &mut Editor,
@@ -1151,17 +1257,7 @@ impl ModeMachine {
     fn operand_prefix(prefix: &str) -> bool {
         matches!(
             prefix,
-            "register"
-                | "record"
-                | "exec"
-                | "r"
-                | "r\u{16}"
-                | "f"
-                | "F"
-                | "t"
-                | "T"
-                | "i"
-                | "a"
+            "register" | "record" | "exec" | "r" | "r\u{16}" | "f" | "F" | "t" | "T" | "i" | "a"
         )
     }
 
@@ -1300,7 +1396,9 @@ impl ModeMachine {
         let history = &self.cmdline_history;
         let start = state.history_index.unwrap_or(history.len());
         let found = if up {
-            (0..start).rev().find(|&index| history[index].starts_with(&lookfor))
+            (0..start)
+                .rev()
+                .find(|&index| history[index].starts_with(&lookfor))
         } else {
             (start + 1..history.len()).find(|&index| history[index].starts_with(&lookfor))
         };
@@ -1446,10 +1544,14 @@ impl ModeMachine {
                     i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX),
                     tabstop,
                 );
-                let cur_vcol = cur_vcol.saturating_add(usize::try_from(
-                    editor.window(ctx.window).map_or(0, |state| state.coladd.max(0)),
-                )
-                .unwrap_or(usize::MAX));
+                let cur_vcol = cur_vcol.saturating_add(
+                    usize::try_from(
+                        editor
+                            .window(ctx.window)
+                            .map_or(0, |state| state.coladd.max(0)),
+                    )
+                    .unwrap_or(usize::MAX),
+                );
                 let want = editor.window(ctx.window).ok().map_or(
                     i64::try_from(cur_vcol).unwrap_or(i64::MAX),
                     |state| {
@@ -1466,20 +1568,13 @@ impl ModeMachine {
                 // the covering cluster (the multi-byte snap is folded
                 // into the same translation).
                 let col = if want == i64::MAX
-                    || usize::try_from(want).unwrap_or(usize::MAX)
-                        >= display_len(&line, tabstop)
+                    || usize::try_from(want).unwrap_or(usize::MAX) >= display_len(&line, tabstop)
                 {
                     line.len()
                 } else {
                     vcol_to_byte(&line, usize::try_from(want).unwrap_or(0), tabstop)
                 };
-                editor.set_window_cursor(
-                    ctx.window,
-                    Position {
-                        lnum: target,
-                        col,
-                    },
-                )?;
+                editor.set_window_cursor(ctx.window, Position { lnum: target, col })?;
                 if let Ok(state) = editor.window_mut(ctx.window) {
                     state.curswant = want;
                     state.set_curswant = false;
@@ -1514,13 +1609,7 @@ impl ModeMachine {
             // not start a new undo block — return before `insert_moved`
             // is set.
             NamedKey::Del => {
-                insert::delete_forward(
-                    editor,
-                    ctx.buffer,
-                    ctx.window,
-                    ctx.cursor,
-                    self.timestamp,
-                )?;
+                insert::delete_forward(editor, ctx.buffer, ctx.window, ctx.cursor, self.timestamp)?;
                 return Ok(());
             }
             // `i_<C-Left>`/`i_<C-Right>` are the `ins_s_left`/`ins_s_right`
@@ -1531,13 +1620,8 @@ impl ModeMachine {
                 let lines = (1..=count)
                     .map(|n| ctx.line(editor, n))
                     .collect::<Result<Vec<_>, _>>()?;
-                let command = if key == NamedKey::CtrlLeft {
-                    "b"
-                } else {
-                    "w"
-                };
-                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1)
-                {
+                let command = if key == NamedKey::CtrlLeft { "b" } else { "w" };
+                if let Some(motion) = crate::motion::word_motion(&lines, ctx.cursor, command, 1) {
                     let mut target = motion.target;
                     // `ins_s_right` (`fwd_word`): the insert cursor may
                     // rest one past the line, so a `w` that lands inside
@@ -1609,6 +1693,93 @@ impl ModeMachine {
         Ok(())
     }
 
+    /// One expression-register input key while `"=` entry is active.
+    /// Returns `None` to stay in Normal state collecting, or the mode the
+    /// entry resolves to (only cancellation changes it).
+    fn expression_entry(
+        editor: &mut Editor,
+        state: &mut NormalState,
+        key: char,
+    ) -> Result<Option<Mode>, ModeError> {
+        if key == '\r' || key == '\n' {
+            let source = state.expression.take().map_or(String::new(), |text| text);
+            if !source.is_empty() {
+                if let Ok(content) = RegisterContent::characterwise(source.as_bytes()) {
+                    let _ = editor.registers_mut().set('=', content);
+                }
+                beep_flush(editor);
+            }
+            return Ok(None);
+        }
+        if key == '\u{1b}' || key == '\u{3}' {
+            state.expression = None;
+            state.register = None;
+            return Ok(Some(Mode::default()));
+        }
+        if let Some(expression) = state.expression.as_mut() {
+            expression.push(key);
+        }
+        Ok(None)
+    }
+
+    /// One normal-mode put (`p`/`P`/`gp`/`gP`/`[p`/`]p`).
+    ///
+    /// `forward` selects `p` over `P` placement, `cursend` is `gp`/`gP`,
+    /// and `fixindent` is `[p`/`]p`. Non-modifiable buffers fail with `E21`
+    /// before the register is even read, like upstream's `u_save`
+    /// (`register.c:do_put`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModeError`] when the buffer or register cannot be read, or
+    /// the put overflows (`E1240`) or targets a non-modifiable buffer
+    /// (`E21`).
+    fn normal_put(&mut self, editor: &mut Editor, put: NormalPut) -> Result<bool, ModeError> {
+        let ctx = cursor_context(editor)?;
+        if !editor.is_modifiable(ctx.buffer) {
+            return Err(ModeError::Vim(
+                "E21",
+                "Cannot make changes, 'modifiable' is off".to_owned(),
+            ));
+        }
+        // `do_put` refuses a count whose multiplication overflows before it
+        // allocates anything: characterwise text checks
+        // `count > INT_MAX / yanklen` (`register.c:1979`) and a block checks
+        // the same against its row width plus padding (`register.c:1854`).
+        // Without the guard `999999999p` builds a plan of a billion rows
+        // and never returns.
+        let width = editor
+            .registers()
+            .get(put.register)
+            .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
+            .map_or(0, |content| content.to_bytes().len());
+        if width > 0
+            && put.count
+                > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
+                    .unwrap_or(usize::MAX)
+        {
+            return Err(ModeError::Vim(
+                "E1240",
+                "Resulting text too long".to_owned(),
+            ));
+        }
+        editor
+            .put_register(RegisterPut {
+                window: ctx.window,
+                name: put.register,
+                direction: if put.forward {
+                    PutDirection::After
+                } else {
+                    PutDirection::Before
+                },
+                count: put.count,
+                cursend: put.cursend,
+                fixindent: put.fixindent,
+                timestamp: self.timestamp,
+            })
+            .map_err(ModeError::Editor)
+    }
+
     fn execute_key(
         &mut self,
         editor: &mut Editor,
@@ -1673,6 +1844,14 @@ impl ModeMachine {
         if state.count == 0 && state.prefix.is_empty() && state.register.is_none() {
             editor.set_v_register('"');
         }
+        // Expression-register entry (`"=` then text then `<CR>`): collect
+        // the source instead of executing it as commands. The mode machine
+        // has no general expression evaluator (only `indentexpr`), so a
+        // non-empty source is stored for `getreg('=')` and beeped — a later
+        // `p` cannot evaluate it and stays a silent no-op.
+        if state.expression.is_some() {
+            return Self::expression_entry(editor, state, key);
+        }
         if state.prefix == "register" {
             state.prefix.clear();
             // `op_reg_index` / `set_reg_may_clear` (`normal.c`): validate
@@ -1683,6 +1862,11 @@ impl ModeMachine {
             // invalid register survives to corrupt the following operation.
             if !is_valid_register_name(key) {
                 return Ok(None);
+            }
+            if key == '=' {
+                // Start expression entry; the register stays selected for
+                // the command after `<CR>` (`set_expr_line`, `ex_docmd.c`).
+                state.expression = Some(String::new());
             }
             // Retain the original case in `state.register` so uppercase
             // prefixes keep their append semantics (`A` appends to `a`).
@@ -1804,13 +1988,87 @@ impl ModeMachine {
                 Self::goto_tabpage(editor, key == 'T', state.count);
                 return Ok(Some(Mode::default()));
             }
+            // `gp`/`gP` put like `p`/`P` but leave the cursor after the
+            // inserted text (`PUT_CURSEND`, `nv_put`).
+            if matches!(key, 'p' | 'P') {
+                state.prefix.clear();
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: key == 'p',
+                    cursend: true,
+                    fixindent: false,
+                    count: state.count.max(1),
+                };
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
+                return Ok(Some(Mode::default()));
+            }
             let command = format!("g{key}");
             Self::move_command(editor, &command, state.count.max(1), false)?;
+            return Ok(Some(Mode::default()));
+        }
+        // `zo` opens one fold at the cursor like upstream (`nv_zet`); with
+        // no closed fold under the cursor it is a silent no-op, so a
+        // following motion (e.g. `Gkzo`) never leaks into Insert via `o`.
+        if state.prefix == "z" {
+            state.prefix.clear();
+            // `nv_zet`/`nv_zb`: place the cursor line at the top, middle or
+            // bottom of the window (`normal.c`). `zz` is the centre case;
+            // `zt` and `zb` differ only in where the first displayed line
+            // lands, clamped so the cursor stays visible.
+            if matches!(key, 'z' | 't' | 'b') {
+                let ctx = cursor_context(editor)?;
+                let height = editor
+                    .window_geometry(ctx.window)
+                    .map(|geometry| geometry.height.max(1))
+                    .unwrap_or(1);
+                let topline = match key {
+                    't' => ctx.cursor.lnum,
+                    'b' => ctx.cursor.lnum.saturating_sub(height.saturating_sub(1)).max(1),
+                    _ => ctx
+                        .cursor
+                        .lnum
+                        .saturating_sub(height.saturating_sub(1) / 2)
+                        .max(1),
+                };
+                editor.window_mut(ctx.window)?.topline = topline;
+                return Ok(Some(Mode::default()));
+            }
+            if matches!(key, 'o' | 'O' | 'c' | 'C') {
+                let ctx = cursor_context(editor)?;
+                let position = crate::fold::Position::new(
+                    ctx.cursor.lnum.saturating_sub(1),
+                    ctx.cursor.col,
+                );
+                if key == 'c' || key == 'C' {
+                    let _ = editor.fold_close(ctx.buffer, position);
+                } else {
+                    let _ = editor.fold_open(ctx.buffer, position);
+                }
+                return Ok(Some(Mode::default()));
+            }
+            beep_flush(editor);
             return Ok(Some(Mode::default()));
         }
         if state.prefix == "[" || state.prefix == "]" {
             let prefix = state.prefix.clone();
             state.prefix.clear();
+            // `[p`, `[P`, `]p`, `]P` put with indent adjustment
+            // (`PUT_FIXINDENT`, `nv_put_opt`): only `]p` moves forward.
+            if matches!(key, 'p' | 'P') {
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: prefix == "]" && key == 'p',
+                    cursend: false,
+                    fixindent: true,
+                    count: state.count.max(1),
+                };
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
+                return Ok(Some(Mode::default()));
+            }
             if matches!(key, 'i' | 'I' | '\t' | 'd' | 'D' | '\u{4}') {
                 Self::ident_search(editor, &prefix, key, state.count.max(1))?;
                 return Ok(Some(Mode::default()));
@@ -1866,7 +2124,7 @@ impl ModeMachine {
                     search: None,
                 })))
             }
-            'g' | '[' | ']' | '\u{17}' | 'f' | 'F' | 't' | 'T' => {
+            'g' | '[' | ']' | 'z' | '\u{17}' | 'f' | 'F' | 't' | 'T' => {
                 state.prefix = key.to_string();
                 Ok(None)
             }
@@ -1924,17 +2182,35 @@ impl ModeMachine {
                 Ok(Some(Mode::Insert(InsertState)))
             }
             'v' | 'V' | '\u{16}' | '\u{11}' => {
-                let cursor = cursor_context(editor)?.cursor;
-                Ok(Some(Mode::Visual(VisualState::new(
-                    cursor,
-                    if key == 'v' {
-                        VisualKind::Character
-                    } else if key == 'V' {
-                        VisualKind::Line
-                    } else {
-                        VisualKind::Block
-                    },
-                ))))
+                let ctx = cursor_context(editor)?;
+                let kind = if key == 'v' {
+                    VisualKind::Character
+                } else if key == 'V' {
+                    VisualKind::Line
+                } else {
+                    VisualKind::Block
+                };
+                let mut state = VisualState::new(ctx.cursor, kind);
+                // `V` on a closed fold selects the whole fold
+                // (`hasFolding` in `nv_visual`, `normal.c`).
+                if matches!(kind, VisualKind::Line)
+                    && let Ok(buffer) = editor.buffer(ctx.buffer)
+                    && let Ok(text) = buffer.text()
+                    && let Some((first, last)) =
+                        buffer.folds.closed_rows_at(ctx.cursor.lnum.saturating_sub(1))
+                {
+                    let line_count = text.line_count().max(1);
+                    state.anchor = Position {
+                        lnum: first.saturating_add(1).clamp(1, line_count),
+                        col: 0,
+                    };
+                    state.cursor = Position {
+                        lnum: last.saturating_add(1).clamp(1, line_count),
+                        col: 0,
+                    };
+                    editor.set_window_cursor(ctx.window, state.cursor)?;
+                }
+                Ok(Some(Mode::Visual(state)))
             }
             '/' | '?' => {
                 let ctx = cursor_context(editor)?;
@@ -1954,6 +2230,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             ':' => {
@@ -1982,6 +2259,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             'n' | 'N' => {
@@ -1993,14 +2271,16 @@ impl ModeMachine {
                 Ok(Some(Mode::default()))
             }
             'p' | 'P' => {
-                let ctx = cursor_context(editor)?;
-                let name = state.register.unwrap_or('"');
-                let direction = if key == 'p' {
-                    PutDirection::After
-                } else {
-                    PutDirection::Before
+                let put = NormalPut {
+                    register: state.register.unwrap_or('"'),
+                    forward: key == 'p',
+                    cursend: false,
+                    fixindent: false,
+                    count: state.count.max(1),
                 };
-                let _ = editor.put_register(ctx.window, name, direction, count, self.timestamp)?;
+                state.count = 0;
+                state.register = None;
+                self.normal_put(editor, put)?;
                 Ok(Some(Mode::default()))
             }
             'J' => {
@@ -2160,11 +2440,7 @@ impl ModeMachine {
                             start: ctx.cursor,
                             end: Position {
                                 lnum: ctx.cursor.lnum,
-                                col: ctx
-                                    .cursor
-                                    .col
-                                    .saturating_add(count - 1)
-                                    .min(line.len() - 1),
+                                col: ctx.cursor.col.saturating_add(count - 1).min(line.len() - 1),
                             },
                             kind: MotionKind::CharacterWise,
                             inclusive: true,
@@ -2235,8 +2511,12 @@ impl ModeMachine {
                     if self.recordbuff.last() == Some(&b'q') {
                         self.recordbuff.pop();
                     }
-                    let rows: Vec<Vec<u8>> = self
-                        .recordbuff
+                    // `do_record` (`register.c:488-494`): strip `K_SPECIAL`
+                    // quoting from the captured bytes before storing them,
+                    // so a recorded multi-byte character reads back as the
+                    // typed bytes; `exec_register` re-adds the quoting when
+                    // the macro plays back.
+                    let rows: Vec<Vec<u8>> = Keys::unescape_ks(&self.recordbuff)
                         .split(|byte| *byte == b'\n')
                         .map(<[u8]>::to_vec)
                         .collect();
@@ -2276,6 +2556,15 @@ impl ModeMachine {
             }
             '\u{1d}' => {
                 Self::jump_ident_tag(editor, count)?;
+                Ok(Some(Mode::default()))
+            }
+            '\u{1e}' => {
+                let target = if state.count != 0 {
+                    state.count.to_string()
+                } else {
+                    "#".to_owned()
+                };
+                self.completed_ex_command = Some(format!("buffer {target}"));
                 Ok(Some(Mode::default()))
             }
             '\u{14}' => {
@@ -2401,7 +2690,9 @@ impl ModeMachine {
                     beep_flush(editor);
                     return Ok(Some(Mode::default()));
                 };
-                push_jump(editor, ctx.buffer, ctx.cursor);
+                if result.target.lnum != ctx.cursor.lnum {
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                }
                 let range = EditRange::from_motion(
                     ctx.cursor,
                     crate::motion::Motion {
@@ -2641,7 +2932,7 @@ impl ModeMachine {
         };
         if let Some((motion, want)) = display {
             let change = state.operator == Operator::Change;
-            if motion.is_jump {
+            if motion.is_jump && motion.target.lnum != ctx.cursor.lnum {
                 push_jump(editor, ctx.buffer, ctx.cursor);
             }
             self.apply_operator(
@@ -2709,6 +3000,10 @@ impl ModeMachine {
         key: char,
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
+        let ctx = cursor_context(editor)?;
+        if let Ok(win) = editor.window(ctx.window) {
+            sync_visual_state(state, win);
+        }
         if key == '\u{1c}' {
             self.pending_ctrl_bslash = true;
             return Ok(None);
@@ -2716,7 +3011,7 @@ impl ModeMachine {
         if self.pending_ctrl_bslash {
             self.pending_ctrl_bslash = false;
             if key == '\u{0e}' {
-                // `v_CTRL-\_CTRL-N`: stop Visual mode without executing.
+                Self::save_visual_marks(editor, ctx.buffer, state);
                 self.last_visual = Some(state.clone());
                 return Ok(Some(Mode::default()));
             }
@@ -2738,8 +3033,54 @@ impl ModeMachine {
             self.visual_replace(editor, state, classify_replace_key(key, quoted))?;
             return Ok(Some(Mode::default()));
         }
+        // `"` in visual mode selects the register for a following `p`
+        // (`nv_put` reads `oap->regname` for the put after the delete).
+        if state.prefix == "register" {
+            state.prefix.clear();
+            if is_valid_register_name(key) {
+                state.register = Some(key);
+                return Ok(None);
+            }
+            state.register = None;
+            beep_flush(editor);
+            return Ok(None);
+        }
+        // `[p`/`]p` in visual mode puts with indent adjustment
+        // (`PUT_FIXINDENT`, `nv_put_opt`).
+        if state.prefix == "[" || state.prefix == "]" {
+            state.prefix.clear();
+            if matches!(key, 'p' | 'P') {
+                return self.visual_put(
+                    editor,
+                    state,
+                    VisualPutKind::Put {
+                        keep_registers: false,
+                        cursend: false,
+                        fixindent: true,
+                        forward: Self::visual_put_forward(state),
+                    },
+                    eval,
+                );
+            }
+            return Ok(None);
+        }
         if state.prefix == "g" {
             state.prefix.clear();
+            // `gp` in visual mode puts and lands after the text
+            // (`PUT_CURSEND`, `nv_put`).
+            if matches!(key, 'p' | 'P') {
+                return self.visual_put(
+                    editor,
+                    state,
+                    VisualPutKind::Put {
+                        keep_registers: key == 'P',
+                        cursend: true,
+                        fixindent: false,
+                        forward: Self::visual_put_forward(state),
+                    },
+                    eval,
+                );
+            }
             if matches!(key, 'u' | 'U' | '~') {
                 let operator = match key {
                     'u' => Operator::Lowercase,
@@ -2783,8 +3124,27 @@ impl ModeMachine {
         }
         match key {
             '\u{1b}' => {
+                Self::save_visual_marks(editor, ctx.buffer, state);
                 self.last_visual = Some(state.clone());
                 Ok(Some(Mode::default()))
+            }
+            'v' | 'V' | '\u{16}' | '\u{11}' => {
+                let target = match key {
+                    'v' => VisualKind::Character,
+                    'V' => VisualKind::Line,
+                    _ => VisualKind::Block,
+                };
+                if state.kind == target {
+                    Self::save_visual_marks(editor, ctx.buffer, state);
+                    self.last_visual = Some(state.clone());
+                    Ok(Some(Mode::default()))
+                } else {
+                    state.kind = target;
+                    if target == VisualKind::Block {
+                        state.wanted = Some(state.cursor.col);
+                    }
+                    Ok(None)
+                }
             }
             'o' | 'O' => {
                 if key == 'O' && state.kind == VisualKind::Block {
@@ -2792,8 +3152,25 @@ impl ModeMachine {
                 } else {
                     state.swap_ends();
                 }
-                let window = cursor_context(editor)?.window;
-                editor.set_window_cursor(window, state.cursor)?;
+                let target = if state.kind == VisualKind::Block {
+                    let max_col = ctx
+                        .line(editor, state.cursor.lnum)
+                        .ok()
+                        .map_or(0, |l| crate::motion::prev_char_boundary(&l, l.len()));
+                    Position {
+                        lnum: state.cursor.lnum,
+                        col: state.cursor.col.min(max_col),
+                    }
+                } else {
+                    state.cursor
+                };
+                editor.set_window_cursor(ctx.window, target)?;
+                if state.kind == VisualKind::Block
+                    && let Ok(win) = editor.window_mut(ctx.window)
+                {
+                    win.curswant = i64::try_from(state.cursor.col).unwrap_or(i64::MAX);
+                    win.set_curswant = false;
+                }
                 Ok(None)
             }
             'g' | 'f' | 'F' | 't' | 'T' | 'i' | 'a' => {
@@ -2822,6 +3199,7 @@ impl ModeMachine {
                     history_index: None,
                     history_saved: String::new(),
                     history_lookfor: String::new(),
+                    new_cmdpos: None,
                 })))
             }
             'J' => {
@@ -2834,6 +3212,28 @@ impl ModeMachine {
             'I' | 'A' if state.kind == VisualKind::Block => {
                 self.block_insert_begin(editor, state, key == 'A')
             }
+            '"' => {
+                state.prefix = "register".into();
+                Ok(None)
+            }
+            '[' | ']' => {
+                state.prefix = key.to_string();
+                Ok(None)
+            }
+            // Visual-mode put: the selection is deleted, then the register
+            // is put over it (`nv_put`, `normal.c:6630-6690`). `P` keeps
+            // registers (the selection goes to the black hole).
+            'p' | 'P' => self.visual_put(
+                editor,
+                state,
+                VisualPutKind::Put {
+                    keep_registers: key == 'P',
+                    cursend: false,
+                    fixindent: false,
+                    forward: Self::visual_put_forward(state),
+                },
+                eval,
+            ),
             'd' | 'x' | 'X' | 'c' | 'y' | '>' | '<' | '=' | 'u' | 'U' | '~' => self
                 .finish_visual_operator(
                     editor,
@@ -2875,13 +3275,43 @@ impl ModeMachine {
             )
             .map(|motion| (motion, None))
         };
-        if let Some((motion, want)) = display {
+        if let Some((mut motion, want)) = display {
+            let keep_curswant = if motion.keep_curswant {
+                if state.kind == VisualKind::Block && state.wanted.is_some() {
+                    state.wanted.map(|w| i64::try_from(w).unwrap_or(i64::MAX))
+                } else {
+                    editor.window(ctx.window).ok().map(|win| {
+                        if win.set_curswant {
+                            i64::try_from(ctx.cursor.col).unwrap_or(i64::MAX)
+                        } else {
+                            win.curswant
+                        }
+                    })
+                }
+            } else {
+                None
+            };
+            if let Some(curswant) = keep_curswant {
+                let lnum = motion.target.lnum;
+                let line = ctx.lines.get(lnum.saturating_sub(1));
+                let col = line.map_or(0, |line| {
+                    let want = usize::try_from(curswant).unwrap_or(0);
+                    want.min(crate::motion::prev_char_boundary(line, line.len()))
+                });
+                motion.target.col = col;
+            }
             editor.set_window_cursor(ctx.window, motion.target)?;
-            if let Some(want) = want
-                && let Ok(state) = editor.window_mut(ctx.window)
+            if let Some(curswant) = keep_curswant.or(want)
+                && let Ok(win) = editor.window_mut(ctx.window)
             {
-                state.curswant = want;
-                state.set_curswant = false;
+                win.curswant = curswant;
+                win.set_curswant = false;
+            }
+            if matches!(command, "$" | "g_")
+                && let Ok(win) = editor.window_mut(ctx.window)
+            {
+                win.curswant = i64::MAX;
+                win.set_curswant = false;
             }
             extend_visual(state, motion.target, ctx.cursor);
         }
@@ -3124,6 +3554,91 @@ impl ModeMachine {
         Ok(())
     }
 
+    /// Visual-mode put direction: linewise is always backward; otherwise
+    /// forward only when the active end sits before the selection start
+    /// (`nv_put`, `normal.c:6660-6668`).
+    fn visual_put_forward(state: &VisualState) -> bool {
+        if matches!(state.kind, VisualKind::Line) {
+            return false;
+        }
+        state.cursor.col < state.range().start.col
+    }
+
+    /// One visual-mode put (`p`/`P`/`gp`/`[p`/`]p`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModeError`] when the buffer or register cannot be read, the
+    /// put overflows (`E1240`), or the buffer is non-modifiable (`E21`).
+    fn visual_put(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut VisualState,
+        kind: VisualPutKind,
+        eval: &mut dyn ExprEval,
+    ) -> Result<Option<Mode>, ModeError> {
+        let VisualPutKind::Put {
+            keep_registers,
+            cursend,
+            fixindent,
+            forward,
+        } = kind;
+        let ctx = cursor_context(editor)?;
+        if !editor.is_modifiable(ctx.buffer) {
+            return Err(ModeError::Vim(
+                "E21",
+                "Cannot make changes, 'modifiable' is off".to_owned(),
+            ));
+        }
+        let count = state.count.max(1);
+        let name = state.register.unwrap_or('"');
+        let visual_kind = state.kind;
+        let range = state.range();
+        let direction = if forward {
+            PutDirection::After
+        } else {
+            PutDirection::Before
+        };
+        state.count = 0;
+        state.register = None;
+        state.prefix.clear();
+        self.last_visual = Some(state.clone());
+        // `do_put` overflow refusal mirrors the normal-mode guard.
+        let width = editor
+            .registers()
+            .get(name)
+            .map_err(|error| ModeError::Editor(EditorError::Register(error)))?
+            .map_or(0, |content| content.to_bytes().len());
+        if width > 0
+            && count
+                > usize::try_from(i32::MAX / i32::try_from(width).unwrap_or(i32::MAX))
+                    .unwrap_or(usize::MAX)
+        {
+            return Err(ModeError::Vim(
+                "E1240",
+                "Resulting text too long".to_owned(),
+            ));
+        }
+        editor
+            .put_visual(
+                VisualPut {
+                    window: ctx.window,
+                    range,
+                    kind: visual_kind,
+                    name,
+                    count,
+                    cursend,
+                    fixindent,
+                    keep_registers,
+                    direction,
+                    timestamp: self.timestamp,
+                },
+                eval,
+            )
+            .map_err(ModeError::Editor)?;
+        Ok(Some(Mode::default()))
+    }
+
     fn finish_visual_operator(
         &mut self,
         editor: &mut Editor,
@@ -3145,12 +3660,25 @@ impl ModeMachine {
                 eval,
             },
         )?;
+        // Visual operators record the selection in `'<'`/`'>`
+        // (`b_visual`); a linewise end reads as `MAXCOL`
+        // (`getpos("'>")`, `test_put.vim`).
+        Self::save_visual_marks(editor, ctx.buffer, state);
         Ok(Some(if result.enter_insert {
             Mode::Insert(InsertState)
         } else {
             Mode::default()
         }))
     }
+    fn save_visual_marks(editor: &mut Editor, buffer: BufHandle, state: &VisualState) {
+    let range = state.range();
+    let mut end = range.end;
+    if matches!(state.kind, VisualKind::Line) {
+        end.col = 0x7FFF_FFFF;
+    }
+    let _ = editor.set_local_mark(buffer, '<', range.start);
+    let _ = editor.set_local_mark(buffer, '>', end);
+}
     /// Shared `CTRL-\` second-key arm for Insert and Replace (`insert.c:640`).
     /// Pure state machine: no buffer writes. `Exit` ends the sequence with a
     /// mode change; `Consumed` ends it with nothing further; `Literal` means
@@ -3398,7 +3926,11 @@ impl ModeMachine {
             self.pending_insert_ctrl_r = false;
             return self.insert_register(editor, ctx, key, eval);
         }
-        match self.insert_literal.take().unwrap_or(InsertLiteral::Awaiting) {
+        match self
+            .insert_literal
+            .take()
+            .unwrap_or(InsertLiteral::Awaiting)
+        {
             InsertLiteral::Awaiting => {
                 let digits = match key {
                     'x' | 'X' => Some((16, 2)),
@@ -3451,11 +3983,7 @@ impl ModeMachine {
                     self.emit_literal_digits(editor, ctx, &digits, radix)?;
                     return self.insert(editor, state, key, eval);
                 } else {
-                    self.insert_literal = Some(InsertLiteral::Digits {
-                        radix,
-                        max,
-                        digits,
-                    });
+                    self.insert_literal = Some(InsertLiteral::Digits { radix, max, digits });
                 }
             }
         }
@@ -3480,8 +4008,59 @@ impl ModeMachine {
         if let Ok(value) = u32::from_str_radix(digits, radix)
             && let Some(ch) = char::from_u32(value).or_else(|| char::from_u32(value & 0xff))
         {
-            insert::insert_char(editor, ctx.buffer, ctx.window, ctx.cursor, ch, self.timestamp)?;
+            insert::insert_char(
+                editor,
+                ctx.buffer,
+                ctx.window,
+                ctx.cursor,
+                ch,
+                self.timestamp,
+            )?;
         }
+        Ok(())
+    }
+
+    /// `c_CTRL-R`: pastes a register into the command line (`ex_getln.c`
+    /// `command_line_insert_reg`). The text lands in [`CmdlineState::text`]
+    /// at the cursor — never through the buffer insert path — and a
+    /// position deferred by `setcmdpos()` is consumed here and cleared,
+    /// matching upstream's `new_cmdpos` slot. An empty register is a beep,
+    /// not an edit.
+    fn cmdline_paste_register(
+        &mut self,
+        editor: &mut Editor,
+        state: &mut CmdlineState,
+        name: char,
+    ) -> Result<(), ModeError> {
+        let Some(lines) = editor
+            .registers()
+            .get(name)
+            .ok()
+            .flatten()
+            .map(|content| content.getreg_lines())
+        else {
+            return Ok(());
+        };
+        let pasted = lines
+            .iter()
+            .map(|line| String::from_utf8_lossy(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let before = state.text[..state.cursor_byte].chars().count();
+        state.text.insert_str(state.cursor_byte, &pasted);
+        state.cursor_byte += pasted.len();
+        let end = before + pasted.chars().count();
+        let total = state.text.chars().count();
+        let target = state
+            .new_cmdpos
+            .take()
+            .map(|position| position.clamp(1, total + 1))
+            .unwrap_or(end + 1);
+        state.cursor_byte = state
+            .text
+            .char_indices()
+            .nth(target.saturating_sub(1))
+            .map_or(state.text.len(), |(byte, _)| byte);
         Ok(())
     }
 
@@ -3651,7 +4230,10 @@ impl ModeMachine {
         eval: &mut dyn ExprEval,
     ) -> Result<Option<Mode>, ModeError> {
         match key {
-            '\u{1b}' => {
+            // `i_CTRL-C` quits Replace like `<Esc>` (`edit.c`); without it
+            // a `:normal ...R...\<C-C>...` tail leaks Replace mode and every
+            // later `:normal` line types into the buffer instead of running.
+            '\u{1b}' | '\u{3}' => {
                 insert::normal_cursor(editor, ctx.window, ctx.cursor)?;
                 Ok(Some(Mode::default()))
             }
@@ -3687,7 +4269,10 @@ impl ModeMachine {
             beep_flush(editor);
             return Ok(());
         };
-        let keys = Keys::from_encoded(bytes)?;
+        // `put_in_typebuf` with escaping (`register.c:534-556`): the stored
+        // macro is raw bytes, so re-escape `K_SPECIAL` before the encoded
+        // validation the typeahead requires.
+        let keys = Keys::from_encoded(Keys::escape_ks(&bytes).as_bytes().to_vec())?;
         let flags = TypeaheadFlags {
             mapped: true,
             ..TypeaheadFlags::default()
@@ -3704,6 +4289,15 @@ impl ModeMachine {
         state: &mut CmdlineState,
         key: char,
     ) -> Result<Option<Mode>, ModeError> {
+        if self.pending_cmdline_ctrl_r && key != '\u{12}' {
+            self.pending_cmdline_ctrl_r = false;
+            // A cancel key aborts the pending paste and runs normally; any
+            // other key names the register to paste.
+            if !matches!(key, '\u{1b}' | '\u{3}' | '\n' | '\r') {
+                self.cmdline_paste_register(editor, state, key)?;
+                return Ok(None);
+            }
+        }
         if self.pending_cmdline_literal {
             self.pending_cmdline_literal = false;
             state.history_index = None;
@@ -3729,6 +4323,10 @@ impl ModeMachine {
         }
         if key == '\u{16}' {
             self.pending_cmdline_literal = true;
+            return Ok(None);
+        }
+        if key == '\u{12}' {
+            self.pending_cmdline_ctrl_r = true;
             return Ok(None);
         }
         if key == '\u{1c}' {
@@ -3774,7 +4372,9 @@ impl ModeMachine {
                             state.count.max(1),
                             option_bool(editor, "wrapscan", true),
                         )?;
-                        push_jump(editor, ctx.buffer, ctx.cursor);
+                        if result.target.lnum != ctx.cursor.lnum {
+                            push_jump(editor, ctx.buffer, ctx.cursor);
+                        }
                         editor.set_window_cursor(ctx.window, result.target)?;
                     }
                     CmdlineKind::Ex => {
@@ -3966,7 +4566,7 @@ impl ModeMachine {
             beep_flush(editor);
             return Ok(());
         };
-        if motion.is_jump && !visual {
+        if motion.is_jump && !visual && motion.target.lnum != ctx.cursor.lnum {
             push_jump(editor, ctx.buffer, ctx.cursor);
         }
         let keep_curswant = if motion.keep_curswant {
@@ -4307,7 +4907,9 @@ impl ModeMachine {
             count,
             option_bool(editor, "wrapscan", true),
         )?;
-        push_jump(editor, ctx.buffer, ctx.cursor);
+        if result.target.lnum != ctx.cursor.lnum {
+            push_jump(editor, ctx.buffer, ctx.cursor);
+        }
         editor.set_window_cursor(ctx.window, result.target)?;
         Ok(())
     }
@@ -4350,7 +4952,9 @@ impl ModeMachine {
             option_bool(editor, "wrapscan", true),
         ) {
             Ok(result) => {
-                push_jump(editor, ctx.buffer, ctx.cursor);
+                if result.target.lnum != ctx.cursor.lnum {
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                }
                 editor.set_window_cursor(ctx.window, result.target)?;
             }
             Err(_) => beep_flush(editor),
@@ -4382,7 +4986,15 @@ impl ModeMachine {
         };
         let containing = self
             .search
-            .preview(&ctx.lines, probe, "", SearchDirection::Backward, 1, false, None)
+            .preview(
+                &ctx.lines,
+                probe,
+                "",
+                SearchDirection::Backward,
+                1,
+                false,
+                None,
+            )
             .ok()
             .filter(|m| (m.match_end.lnum, m.match_end.col) > (ctx.cursor.lnum, ctx.cursor.col));
         if let Some(m) = containing {
@@ -4396,7 +5008,15 @@ impl ModeMachine {
             };
             return Ok(self
                 .search
-                .preview(&ctx.lines, m.match_start, "", direction, count - 1, wrapscan, None)
+                .preview(
+                    &ctx.lines,
+                    m.match_start,
+                    "",
+                    direction,
+                    count - 1,
+                    wrapscan,
+                    None,
+                )
                 .ok()
                 .map(|m| (m.match_start, m.match_end)));
         }
@@ -5040,6 +5660,23 @@ fn extend_visual(state: &mut VisualState, target: Position, from: Position) {
     }
 }
 
+/// Synchronizes a visual selection's active endpoint with the window cursor.
+/// For block visual mode, virtual edge columns (`wanted`) are preserved across
+/// vertical motions over ragged / shorter rows (`ops.c:2223-2231`, `normal.c:4670-4706`).
+fn sync_visual_state(state: &mut VisualState, win: &crate::WindowState) {
+    if state.kind == VisualKind::Block {
+        if win.set_curswant {
+            state.cursor = win.cursor;
+            state.wanted = Some(win.cursor.col);
+        } else {
+            state.cursor.lnum = win.cursor.lnum;
+            state.cursor.col = state.wanted.unwrap_or(win.cursor.col);
+        }
+    } else {
+        state.cursor = win.cursor;
+    }
+}
+
 /// Snapshots the editor state one mode operation reads.
 ///
 /// The window cursor is validated first, the way `check_cursor_lnum`
@@ -5271,7 +5908,9 @@ fn display_text_width(
     );
     let numbers = number_on || relative_on || statuscolumn_on;
     let (min_sc, max_sc) = signcolumn_bounds(signcolumn, numbers);
-    let sign_width = min_sc.max(max_sc.min(live_sign_slots(editor, buffer))).saturating_mul(2);
+    let sign_width = min_sc
+        .max(max_sc.min(live_sign_slots(editor, buffer)))
+        .saturating_mul(2);
     let number_width = if number_on || relative_on {
         let minimum = match editor.options().get_window(window, "numberwidth") {
             Ok(OptionValue::Number(value)) => usize::try_from((*value).clamp(1, 20)).unwrap_or(4),
@@ -5284,7 +5923,9 @@ fn display_text_width(
     } else {
         0
     };
-    width.saturating_sub(sign_width.saturating_add(number_width)).max(1)
+    width
+        .saturating_sub(sign_width.saturating_add(number_width))
+        .max(1)
 }
 
 /// `nv_screengo`/`nv_g_home_m_cmd`/`nv_g_dollar_cmd`: the screen-line
@@ -5360,13 +6001,13 @@ fn display_motion(
                     return Ok(None);
                 }
             }
-            let col = vcol_to_byte(
-                line_at(lnum),
-                usize::try_from(want).unwrap_or(0),
-                tabstop,
-            );
+            let col = vcol_to_byte(line_at(lnum), usize::try_from(want).unwrap_or(0), tabstop);
             let want = if curswant == i64::MAX { i64::MAX } else { want };
-            Ok(motion(Position { lnum, col }, curswant == i64::MAX, Some(want)))
+            Ok(motion(
+                Position { lnum, col },
+                curswant == i64::MAX,
+                Some(want),
+            ))
         }
         "g0" | "g^" | "gm" => {
             let col = display_row_home(
@@ -5377,7 +6018,14 @@ fn display_motion(
                 tabstop,
                 wrap,
             );
-            Ok(motion(Position { lnum: ctx.cursor.lnum, col }, false, None))
+            Ok(motion(
+                Position {
+                    lnum: ctx.cursor.lnum,
+                    col,
+                },
+                false,
+                None,
+            ))
         }
         _ => Ok(display_row_dollar(
             &ctx.lines,
@@ -5419,7 +6067,11 @@ fn display_row_home(
 ) -> usize {
     let row_start = cur_vcol / width * width;
     let i = if command == "gm" {
-        if wrap { row_start + width / 2 } else { width / 2 }
+        if wrap {
+            row_start + width / 2
+        } else {
+            width / 2
+        }
     } else if wrap {
         row_start
     } else {
@@ -5461,7 +6113,13 @@ fn display_row_dollar(
         for _ in 0..count - 1 {
             if wrap {
                 if !display_row_step(
-                    &mut lnum, &mut linelen, &mut want, lines, tabstop, width, true,
+                    &mut lnum,
+                    &mut linelen,
+                    &mut want,
+                    lines,
+                    tabstop,
+                    width,
+                    true,
                 ) {
                     return None;
                 }
@@ -5515,7 +6173,11 @@ fn seed_row_want(
     if curswant == i64::MAX {
         return vcol_as_i64(cur_vcol / width * width + width - 1);
     }
-    let want = if set_curswant { vcol_as_i64(cur_vcol) } else { curswant };
+    let want = if set_curswant {
+        vcol_as_i64(cur_vcol)
+    } else {
+        curswant
+    };
     want.clamp(0, vcol_as_i64(display_rows_of(linelen, width) * width) - 1)
 }
 
@@ -6005,9 +6667,7 @@ fn option_contains(editor: &Editor, name: &str, item: &str, fallback: bool) -> b
     }
 }
 fn push_jump(editor: &mut Editor, buffer: BufHandle, position: Position) {
-    editor
-        .jumplist_mut()
-        .push(MarkLocation::in_buffer(buffer, position));
+    editor.push_jump(buffer, position);
 }
 
 /// Whether `key` is a recognized Vim register name (`RegisterName::try_from`

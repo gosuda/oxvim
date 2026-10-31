@@ -17,6 +17,7 @@ pub mod extmark;
 pub mod fold;
 pub mod fs_builtins;
 pub mod highlight_init;
+pub mod history;
 pub mod include_search;
 pub mod indent;
 pub mod insert;
@@ -35,10 +36,13 @@ pub mod register;
 pub mod script;
 pub mod search;
 pub mod server;
+pub mod session;
 pub mod shada;
+pub mod syntax;
 pub mod tags;
 pub mod terminal_screen;
 pub mod textobject;
+pub(crate) mod timers;
 pub mod typeahead;
 pub mod userfunc;
 pub mod visual;
@@ -59,7 +63,7 @@ pub use decoration::Decorations;
 pub use editor::{
     BufferEditMode, BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError,
     HighlightDefinition, LineReplaceRequest, Message, MessageDestination, MessageKind,
-    MessageRouting, expand_buffer_name,
+    MessageRouting, OptionSetScope, OptionSetVars, expand_buffer_name,
 };
 #[cfg(any(test, feature = "testutils"))]
 pub use excmd_exec::TestEditorAccess;
@@ -76,7 +80,10 @@ pub use extmark::{
 };
 pub use fold::Folds;
 pub use indent::{ExprEval, IndentEvalContext, IndentExprError, NullExprEval};
-pub use job::{JobCallbacks, JobEvent, JobManager, JobStartOptions};
+pub use job::{
+    ChannelCloseError, ChannelPart, JobCallbacks, JobEvent, JobManager, JobStartOptions,
+    RpcCallError, SocketStream,
+};
 pub use layout::{
     Anchor, Border, BorderText, FloatingWindow, Frame, Geometry, Layout, LayoutError, LeafFrame,
     Margins, RelativeTo, TabpageState, TextAlignment, WinConfig, WindowApiState, WindowState,
@@ -97,7 +104,8 @@ pub use motion::{FindDirection, FindMotion, Motion, MotionKind};
 pub use ops::{EditRange, Operator, OperatorError, OperatorRequest, OperatorResult};
 pub use options::{
     OPTION_COUNT, OPTION_METADATA, OptionDefault, OptionDefaultValue, OptionError, OptionListKind,
-    OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue, option_metadata,
+    OptionLastSet, OptionMetadata, OptionScope, OptionStore, OptionType, OptionValue,
+    option_metadata, option_value_object,
 };
 pub use register::{
     ClipboardProvider, RegisterContent, RegisterError, RegisterKind, Registers, Selection,
@@ -108,10 +116,14 @@ pub use script::{
 };
 pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
 pub use server::{ServerHost, prepare_server_address, server_address_new};
+pub use session::{
+    EXRC_FILE, SESSION_FILE, SessionOptions, VIMRC_FILE, escape_fname, generate_session,
+    normalize_and_escape,
+};
 pub use typeahead::{
     K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Key,
     KeyDecodeError, Keys, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Remap,
-    Typeahead, TypeaheadError, TypeaheadFlags,
+    Typeahead, TypeaheadError, TypeaheadFlags, special_key_name, special_notation,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, MAX_FUNC_DEPTH, UserFunc, UserFuncError, UserFuncFlags,

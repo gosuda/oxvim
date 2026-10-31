@@ -704,22 +704,40 @@ pub(crate) fn build_runtimepath(
     data_dirs: &[String],
     vimruntime: &Path,
 ) -> String {
-    const APPNAME: &str = "nvim";
+    let app_name = appname();
+    build_runtimepath_for(
+        &app_name,
+        config_home,
+        config_dirs,
+        data_home,
+        data_dirs,
+        vimruntime,
+    )
+}
+
+pub(crate) fn build_runtimepath_for(
+    appname: &str,
+    config_home: Option<&str>,
+    config_dirs: &[String],
+    data_home: Option<&str>,
+    data_dirs: &[String],
+    vimruntime: &Path,
+) -> String {
     fn joined(base: &str, suffix: &str) -> String {
         format!("{}/{}", base.trim_end_matches('/'), suffix)
     }
     let mut entries = Vec::new();
     if let Some(home) = config_home {
-        entries.push(joined(home, APPNAME));
+        entries.push(joined(home, appname));
     }
     for dir in config_dirs {
-        entries.push(joined(dir, APPNAME));
+        entries.push(joined(dir, appname));
     }
     if let Some(home) = data_home {
-        entries.push(joined(home, &format!("{APPNAME}/site")));
+        entries.push(joined(home, &format!("{appname}/site")));
     }
     for dir in data_dirs {
-        entries.push(joined(dir, &format!("{APPNAME}/site")));
+        entries.push(joined(dir, &format!("{appname}/site")));
     }
     // An unresolved runtime tree contributes no entry (an empty path
     // would render as an empty comma-list item, which the option setter
@@ -734,16 +752,16 @@ pub(crate) fn build_runtimepath(
         entries.push("/".to_owned());
     }
     for dir in data_dirs.iter().rev() {
-        entries.push(joined(dir, &format!("{APPNAME}/site/after")));
+        entries.push(joined(dir, &format!("{appname}/site/after")));
     }
     if let Some(home) = data_home {
-        entries.push(joined(home, &format!("{APPNAME}/site/after")));
+        entries.push(joined(home, &format!("{appname}/site/after")));
     }
     for dir in config_dirs.iter().rev() {
-        entries.push(joined(dir, &format!("{APPNAME}/after")));
+        entries.push(joined(dir, &format!("{appname}/after")));
     }
     if let Some(home) = config_home {
-        entries.push(joined(home, &format!("{APPNAME}/after")));
+        entries.push(joined(home, &format!("{appname}/after")));
     }
     entries.join(",")
 }
@@ -756,6 +774,23 @@ fn to_slash(path: String) -> String {
     } else {
         path
     }
+}
+
+/// Resolves the application name, honouring `$NVIM_APPNAME` with fallback to `"nvim"`.
+/// Upstream `get_appname` (`os/stdpaths.c:70-87`).
+#[must_use]
+pub(crate) fn appname() -> String {
+    resolve_appname(std::env::var_os("NVIM_APPNAME").as_deref())
+}
+
+#[must_use]
+pub(crate) fn resolve_appname(env_val: Option<&std::ffi::OsStr>) -> String {
+    env_val
+        .and_then(|val| {
+            let s = val.to_string_lossy().into_owned();
+            (!s.is_empty()).then_some(to_slash(s))
+        })
+        .unwrap_or_else(|| "nvim".to_string())
 }
 
 /// Resolves one single-directory XDG variable, falling back to the
@@ -904,20 +939,25 @@ impl StdPath {
 /// cannot disagree.
 #[must_use]
 pub fn stdpath(what: StdPath) -> Vec<String> {
-    const APPNAME: &str = "nvim";
+    let app_name = appname();
+    stdpath_for(&app_name, what)
+}
+
+#[must_use]
+pub(crate) fn stdpath_for(appname: &str, what: StdPath) -> Vec<String> {
     fn under(base: Option<String>, suffix: &str) -> Vec<String> {
         base.into_iter()
             .map(|dir| format!("{}/{suffix}", dir.trim_end_matches('/')))
             .collect()
     }
     match what {
-        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), APPNAME),
-        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), APPNAME),
-        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), APPNAME),
-        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), APPNAME),
+        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), appname),
+        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), appname),
+        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), appname),
+        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), appname),
         StdPath::Log => under(
             xdg_home_dir("XDG_STATE_HOME", "~/.local/state"),
-            &format!("{APPNAME}/logs"),
+            &format!("{appname}/logs"),
         ),
         // `stdpaths_get_xdg_var` has no fallback for the runtime dir and no
         // `get_xdg_home` wrapper, so this is the variable verbatim
@@ -934,11 +974,11 @@ pub fn stdpath(what: StdPath) -> Vec<String> {
         ],
         StdPath::ConfigDirs => xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg")
             .into_iter()
-            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .map(|dir| format!("{}/{appname}", dir.trim_end_matches('/')))
             .collect(),
         StdPath::DataDirs => xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
             .into_iter()
-            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .map(|dir| format!("{}/{appname}", dir.trim_end_matches('/')))
             .collect(),
     }
 }
@@ -1055,14 +1095,7 @@ impl<F: FileIO> ScriptCtx<F> {
     /// `current_context()` all observe that script while it executes. A
     /// user command passes the caller's `seq` to keep `sc_seq` unchanged,
     /// while a function call passes the function's own `seq`.
-    pub fn push_alias_source(
-        &mut self,
-        sid: Sid,
-        seq: u64,
-        lnum: usize,
-        name: String,
-        order: u64,
-    ) {
+    pub fn push_alias_source(&mut self, sid: Sid, seq: u64, lnum: usize, name: String, order: u64) {
         self.source_stack.push(SourceFrame {
             sid,
             seq,
@@ -1074,12 +1107,14 @@ impl<F: FileIO> ScriptCtx<F> {
         });
     }
 
-    /// The SID a previous sourcing of `name` already owns, when `name` is a
-    /// file rather than an anonymous context.
+    /// The SID a previous sourcing of `name` already owns.
+    ///
+    /// A string source has no file of its own, so the reference gives it one
+    /// pseudo id for the session: `do_source_ext` takes `SID_STR` when `str` is
+    /// given (`runtime.c:2226`), and the item materialises once
+    /// (`globals.h:298`). Two anonymous sources in one session therefore share
+    /// an id.
     fn reusable_sid(&self, name: &str) -> Option<Sid> {
-        if name.starts_with('<') {
-            return None;
-        }
         self.scripts
             .iter()
             .rev()
@@ -1098,6 +1133,31 @@ impl<F: FileIO> ScriptCtx<F> {
     #[must_use]
     pub fn current_sid(&self) -> Option<Sid> {
         self.source_stack.last().map(|frame| frame.sid)
+    }
+
+    /// Runs the next body under script `sid` without a real `:source`
+    /// (`current_sctx = autocmd->sc_sctx`, `autocmd.c`). An alias frame
+    /// observes the defining script's `s:` and `<SNR>`, does not appear in
+    /// `v:throwpoint`, and lets a `:source` inside the body stack its own
+    /// frame on top, so the sourced script wins for the duration of the
+    /// source.
+    ///
+    /// Returns whether the frame was pushed; an unknown `sid` has no scope to
+    /// restore and reports false.
+    pub fn push_autocmd_script(&mut self, sid: Sid) -> bool {
+        if self.current_sid() == Some(sid) {
+            return false;
+        }
+        let Some(name) = self.script_name(sid).map(str::to_owned) else {
+            return false;
+        };
+        self.push_alias_source(sid, 0, 0, name, 0);
+        true
+    }
+
+    /// Undoes [`Self::push_autocmd_script`].
+    pub fn pop_autocmd_script(&mut self) {
+        self.source_stack.pop();
     }
 
     /// The sequence number of the sourcing event currently running, or `0`
@@ -1346,6 +1406,28 @@ impl<F: FileIO> ScriptCtx<F> {
         }
     }
 
+    /// Switches the visible `s:` scope from one script to another, keeping
+    /// the per-SID registry live at every hop.
+    ///
+    /// The plain load/store pair only reconciles the registry when a sourced
+    /// script starts and finishes, so a script that is still executing keeps
+    /// its only copy of `s:` in `scope.script`. Entering a function whose
+    /// defining script differs — while the defining script is mid-execution
+    /// further down the stack — must not overwrite that live map with the
+    /// registry's stale copy (`:h E121` on `s:` reads such as
+    /// `runtest.vim`'s `s:has_ffi`). Flushing the outgoing frame first and
+    /// reading the incoming frame back from the registry keeps every SID's
+    /// stored map current, exactly like upstream's per-script `svars` dict,
+    /// which reads and writes mutate in place.
+    pub fn switch_script_scope(&mut self, from: Option<Sid>, to: Sid, scope: &mut Scope) {
+        if from != Some(to) {
+            if let Some(from) = from {
+                self.store_script_scope(from, scope);
+            }
+            self.load_script_scope(to, scope);
+        }
+    }
+
     /// Joins `\`-continuation lines, dropping comment lines, per the sourcing
     /// getline rules in `src/nvim/ex_docmd.c:1330-1430`:
     ///
@@ -1589,7 +1671,14 @@ fn next_quote_event(rest: &str, quoting: Quoting) -> Option<(usize, QuoteEvent)>
         };
         return Some((quote, event));
     }
-    let marker = rest.find(SNR_MARKER);
+    // A double-quoted run is a string literal, and upstream only rewrites a
+    // function name (`trans_function_name`, `eval/userfunc.c:1967`), so a
+    // `<SNR>` inside one stays as typed.
+    let marker = if quoting == Quoting::Double {
+        None
+    } else {
+        rest.find(SNR_MARKER)
+    };
     let quote = rest.find(['\'', '"']);
     let Some(at) = quote.filter(|at| marker.is_none_or(|marker| *at < marker)) else {
         return marker.map(|at| (at, QuoteEvent::Marker));
@@ -1790,5 +1879,39 @@ mod tests {
 
         exec.execute_line(&editor, "echo 1foo#bar()").unwrap_err();
         assert_eq!(global_number(&exec, "onefoo_loaded"), None);
+    }
+
+    #[test]
+    fn nvim_appname_honoured_in_runtimepath_and_stdpath() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            super::resolve_appname(Some(OsStr::new("custom_app"))),
+            "custom_app"
+        );
+        assert_eq!(super::resolve_appname(None), "nvim");
+        assert_eq!(super::resolve_appname(Some(OsStr::new(""))), "nvim");
+
+        let config_dirs = vec!["/etc/one".to_owned()];
+        let data_dirs = vec!["/d/one".to_owned()];
+        let rtp = super::build_runtimepath_for(
+            "custom_app",
+            Some("/cfg"),
+            &config_dirs,
+            Some("/dat"),
+            &data_dirs,
+            Path::new("/rt"),
+        );
+        assert!(rtp.contains("/cfg/custom_app"));
+        assert!(rtp.contains("/etc/one/custom_app"));
+        assert!(rtp.contains("/dat/custom_app/site"));
+        assert!(rtp.contains("/etc/one/custom_app/after"));
+        assert!(rtp.contains("/cfg/custom_app/after"));
+
+        let paths = super::stdpath_for("custom_app", super::StdPath::Config);
+        assert!(paths.iter().all(|path| path.ends_with("/custom_app")));
+
+        let log_paths = super::stdpath_for("custom_app", super::StdPath::Log);
+        assert!(log_paths.iter().all(|path| path.ends_with("/custom_app/logs")));
     }
 }

@@ -565,6 +565,35 @@ fn let_assigns_register_through_at() {
     assert_eq!(content.to_bytes(), b"text");
 }
 
+#[test]
+fn let_assigns_unnamed_register_through_at_at() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, r#"let @@ = "text""#).unwrap();
+    {
+        let ed = editor.editor();
+        let content = ed.registers().get('"').unwrap().unwrap();
+        assert_eq!(content.to_bytes(), b"text");
+    }
+    exec.execute_line(&editor, r#"let @@= "nospace""#).unwrap();
+    {
+        let ed = editor.editor();
+        let content = ed.registers().get('"').unwrap().unwrap();
+        assert_eq!(content.to_bytes(), b"nospace");
+    }
+    exec.execute_line(&editor, r#"let ykeep = @@"#).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"ykeep", 0),
+        Ok(&Typval::String(OxStr::from("nospace")))
+    );
+    exec.execute_line(&editor, r#"let @" = "other""#).unwrap();
+    exec.execute_line(&editor, r#"let roundtrip = @@"#).unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"roundtrip", 0),
+        Ok(&Typval::String(OxStr::from("other")))
+    );
+}
+
 // ex_docmd.c:ex_let with `$VAR` target — `:let $VAR = "value"` stores
 // into the scope's env map (eval.c:env_setvar).
 #[test]
@@ -1065,10 +1094,10 @@ fn global_menu_cleanup_succeeds_for_empty_menu_state() {
 
     exec.execute_line(&editor, "aunmenu *").unwrap();
     exec.execute_line(&editor, "tlunmenu *").unwrap();
-    assert!(matches!(
-        exec.execute_line(&editor, "aunmenu File.Open"),
-        Err(crate::ExecError::NotImplemented(command)) if command == "aunmenu"
-    ));
+    // A builtin without a handler arm reports the standard unknown-command
+    // error rather than a function-call error.
+    let result = exec.execute_line(&editor, "aunmenu File.Open");
+    assert_vim_error(result, "E492");
 }
 
 // ex_docmd.c:ex_echo — `:echo "hello"` produces an Echo message without
@@ -1118,8 +1147,84 @@ fn echon_joins_without_space_separator() {
     // echon separator is "" → "abcdef".
     assert_eq!(message_text(&msgs[0]), "abcdef");
 }
+#[test]
+fn echo_self_referencing_container_prints_dots_and_string_raises_e724() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    // 1. :echo of a self-referential list prints dots without error:
+    exec.execute_script(
+        &editor,
+        "<test_list>",
+        "function! TestList()\n\
+           let l = [1]\n\
+           call add(l, l)\n\
+           echo l\n\
+         endfunction\n\
+         call TestList()",
+    )
+    .unwrap();
+    let ed = editor.editor();
+    assert_eq!(message_text(ed.messages().last().unwrap()), "[1, [...@0]]");
+    drop(ed);
 
-// ── execute ────────────────────────────────────────────────────────────
+    // string(l) raises E724:
+    let res_str = exec.execute_script(
+        &editor,
+        "<test_string_l>",
+        "function! TestStringL()\n\
+           let l = [1]\n\
+           call add(l, l)\n\
+           let s = string(l)\n\
+         endfunction\n\
+         call TestStringL()",
+    );
+    let ExecError::Vim(err) = res_str.unwrap_err() else {
+        panic!("expected Vim exception for string(l) on list cycle");
+    };
+    assert_eq!(
+        err.emsg_text(),
+        "E724: unable to correctly dump variable with self-referencing container"
+    );
+
+    // 2. :echo of a self-referential dict prints dots without error:
+    exec.execute_script(
+        &editor,
+        "<test_dict>",
+        "function! TestDict()\n\
+           let d = {'a': 1}\n\
+           let d['self'] = d\n\
+           echo d\n\
+         endfunction\n\
+         call TestDict()",
+    )
+    .unwrap();
+    let ed_d = editor.editor();
+    assert_eq!(
+        message_text(ed_d.messages().last().unwrap()),
+        "{'a': 1, 'self': {...@0}}"
+    );
+    drop(ed_d);
+
+    // string(d) raises E724:
+    let res_str_d = exec.execute_script(
+        &editor,
+        "<test_string_d>",
+        "function! TestStringD()\n\
+           let d = {'a': 1}\n\
+           let d['self'] = d\n\
+           let s = string(d)\n\
+         endfunction\n\
+         call TestStringD()",
+    );
+    let ExecError::Vim(err_d) = res_str_d.unwrap_err() else {
+        panic!("expected Vim exception for string(d) on dict cycle");
+    };
+    assert_eq!(
+        err_d.emsg_text(),
+        "E724: unable to correctly dump variable with self-referencing container"
+    );
+}
+
 
 #[test]
 fn set_minus_equal_removes_complete_comma_list_item() {
@@ -1543,6 +1648,96 @@ fn cd_minus_toggles_and_returns_previous_directory() {
     );
     std::fs::remove_dir(&target).unwrap();
 }
+#[test]
+fn bcd_buffer_local_directory_survives_edit_bang_on_new_file() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("bcd-edit-bang");
+    let bufdir = fixture.child("bufdir");
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+
+    let nonexistent = fixture.directory.join("nonexistent_test_file");
+    exec.execute_line(&editor, &format!("edit {}", nonexistent.display()))
+        .unwrap();
+    exec.execute_line(&editor, &format!("bcd {}", bufdir.display()))
+        .unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), bufdir);
+
+    // Re-editing a buffer whose file does not exist on disk must not raise E484
+    // and must preserve the buffer-local directory.
+    exec.execute_line(&editor, "let b:kept = 1").unwrap();
+    exec.execute_line(&editor, "edit!").unwrap();
+    let curbuf = editor.editor().current_buffer().unwrap();
+    assert_eq!(
+        editor.editor().buffer_local_directory(curbuf).unwrap(),
+        Some(bufdir.clone())
+    );
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Buffer, b"kept", 0),
+        Ok(&Typval::Number(1))
+    );
+}
+
+#[test]
+fn hidden_buffer_call_lcd_does_not_pollute_caller_window_directory() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("hidden-buffer-lcd");
+    let windir = fixture.child("windir");
+    let (mut editor, _, caller_window) = editor_with_window();
+    let hidden = editor.create_buffer(true).unwrap();
+
+    let result = editor.with_buffer_context(hidden, |ed| {
+        let editor_access = TestEditorAccess::new(std::mem::take(ed));
+        let mut exec = ExExecutor::new();
+        let res = exec.execute_line(&editor_access, &format!("lcd {}", windir.display()));
+        *ed = editor_access.into_inner();
+        res
+    });
+    result.unwrap().unwrap();
+
+    // :lcd targeted the temporary context and must not leak into caller window
+    assert_eq!(
+        editor.window_local_directory(caller_window).unwrap(),
+        None
+    );
+    assert_eq!(std::env::current_dir().unwrap(), fixture.original);
+}
+
+#[test]
+fn autochdir_switches_directory_on_edit_and_preserves_window_local_dir() {
+    let _guard = crate::lock_process_state();
+    let fixture = CwdFixture::new("autochdir-edit");
+    let sub = fixture.child("sub");
+    let (editor, _, window) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&editor, "set autochdir").unwrap();
+    let file_in_sub = sub.join("testfile.txt");
+    exec.execute_line(&editor, &format!("edit {}", file_in_sub.display()))
+        .unwrap();
+    // Autochdir moved the process cwd to sub
+    assert_eq!(std::env::current_dir().unwrap(), sub);
+    // Window-local directory was not set by autochdir
+    assert_eq!(editor.editor().window_local_directory(window).unwrap(), None);
+
+    // Setting lcd sets window-local directory
+    exec.execute_line(&editor, &format!("lcd {}", fixture.directory.display()))
+        .unwrap();
+    assert_eq!(
+        editor.editor().window_local_directory(window).unwrap(),
+        Some(fixture.directory.clone())
+    );
+
+    // Re-editing runs autochdir to sub, while window-local directory is preserved
+    exec.execute_line(&editor, "edit").unwrap();
+    assert_eq!(std::env::current_dir().unwrap(), sub);
+    assert_eq!(
+        editor.editor().window_local_directory(window).unwrap(),
+        Some(fixture.directory.clone())
+    );
+}
 
 /// `:cd` back out of a working directory that has been deleted underneath the
 /// process still works, and the directory it left behind is reported as empty.
@@ -1648,6 +1843,30 @@ fn execute_builtin_captures_nested_command_output() {
     assert_eq!(
         exec.scope().get_scoped(ScopeKind::Global, b"swap", 0),
         Ok(&Typval::String(OxStr::from("\nNo swap file"))),
+    );
+    assert!(editor.editor().messages().is_empty());
+}
+
+// `execute('echon "ab"')` captures `"ab"` with no leading newline, while
+// `execute('echo "a"')` captures `"\na"`: `:echon` continues the current
+// line, `:echo` starts a new one (echo_spec `StringN` vs `String`).
+#[test]
+fn execute_builtin_capture_distinguishes_echon_continuation() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+
+    exec.execute_line(&editor, "let g:echon_cap = execute('echon \"ab\"')")
+        .unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"echon_cap", 0),
+        Ok(&Typval::String(OxStr::from("ab"))),
+    );
+
+    exec.execute_line(&editor, "let g:echo_cap = execute('echo \"a\"')")
+        .unwrap();
+    assert_eq!(
+        exec.scope().get_scoped(ScopeKind::Global, b"echo_cap", 0),
+        Ok(&Typval::String(OxStr::from("\na"))),
     );
     assert!(editor.editor().messages().is_empty());
 }
@@ -1882,17 +2101,23 @@ fn highlight_default_and_link_forms_retain_definitions() {
 // ── unsupported-command NotImplemented identity ────────────────────────
 
 // ex_docmd.c:do_one_cmd dispatch — a builtin command not in the handler
-// table returns NotImplemented(name) rather than a silent no-op.
+// table reports the standard unknown-command error rather than a silent
+// no-op or a function-call error.
+// ":sort" used to stand in here; it is dispatched now, so the probe moved
+// on. `:move` grew a handler and `:mkspell` carries `NEEDARG` (bare use is
+// `E471`), so the probe is now `:breakadd`, which parses cleanly and still
+// has no handler arm.
 #[test]
-fn unimplemented_builtin_returns_not_implemented() {
+fn unimplemented_builtin_reports_unknown_command_error() {
     let editor = TestEditorAccess::new(Editor::new());
     let mut exec = ExExecutor::new();
-    // ":sort" used to stand in here; it is dispatched now, so the probe
-    // moved to ":move", which the handler table still does not carry.
-    let err = exec.execute_line(&editor, "move").unwrap_err();
+    let err = exec.execute_line(&editor, "breakadd").unwrap_err();
     match err {
-        ExecError::NotImplemented(name) => assert_eq!(name, "move"),
-        other => panic!("expected NotImplemented, got {other:?}"),
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E492".to_owned()));
+            assert_eq!(exception.emsg_text(), "E492: Not an editor command: breakadd");
+        }
+        other => panic!("expected E492, got {other:?}"),
     }
 }
 
@@ -2303,6 +2528,130 @@ fn put_expression_evaluates_and_inserts_expression_register() {
     assert_eq!(text.line(2).unwrap(), b"screen too small");
 }
 
+/// `:put ={expr}` keeps the expression register form anywhere on the line:
+/// an indented command and one following a bar both parse the `=` rest as
+/// the expression instead of raising `E488: Trailing characters`.
+#[test]
+fn put_expression_parses_with_indent_and_after_bar() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['do'])")
+        .unwrap();
+    exec.execute_line(&editor, "  put =1+1").unwrap();
+    exec.execute_line(&editor, "echo 1 | put =2+2").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    // The cursor moves onto the line a put inserted (`do_put`'s
+    // `curwin->w_cursor.lnum` update), so the second put lands below the
+    // first. The oracle answers `do,2,4` for exactly this script.
+    assert_eq!(text.line(1).unwrap(), b"do");
+    assert_eq!(text.line(2).unwrap(), b"2");
+    assert_eq!(text.line(3).unwrap(), b"4");
+}
+
+/// A bare `:put =` evaluates the previously stored expression if there is
+/// one, and is a silent no-op otherwise (upstream `get_spec_reg` returns
+/// NULL instead of raising E353).
+#[test]
+fn put_empty_expression_reuses_stored_expression() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['do'])")
+        .unwrap();
+    exec.execute_line(&editor, "put =").unwrap();
+    exec.execute_line(&editor, "put =40+2").unwrap();
+    exec.execute_line(&editor, "put =").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.line(2).unwrap(), b"42");
+    assert_eq!(text.line(3).unwrap(), b"42");
+    assert_eq!(text.line_count(), 3);
+}
+
+/// `parse_register` only takes a digit as a register when the command has
+/// no count (`ex_docmd.c:1352`): `:delete 2` deletes two lines instead of
+/// yanking one line into register `2`.
+#[test]
+fn delete_leading_digit_is_count_not_register() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['a', 'b', 'c', 'd'])")
+        .unwrap();
+    exec.execute_line(&editor, "delete 2").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    assert_eq!(text.line_count(), 2);
+    assert_eq!(text.line(1).unwrap(), b"c");
+}
+
+/// `:tabdo` runs its nested command once per tabpage and leaves the cursor
+/// on the last tabpage visited.
+#[test]
+fn tabdo_runs_nested_command_in_each_tabpage() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(
+        &editor,
+        "tabdo let g:seen = get(g:, 'seen', []) + [tabpagenr()]",
+    )
+    .unwrap();
+
+    let seen = exec.scope().get_scoped(ScopeKind::Global, b"seen", 0);
+    let seen = match seen {
+        Ok(Typval::List(reference)) => reference
+            .borrow()
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Typval::Number(number) => Some(*number),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("expected g:seen list, got {other:?}"),
+    };
+    assert_eq!(seen, vec![1, 2, 3]);
+}
+
+/// `:vimgrep` collects one entry per matching line and jumps to the first
+/// match; without `!` a 'winfixbuf' window refuses with E1513.
+#[test]
+fn vimgrep_builds_list_and_jumps_to_first_match() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(root.join("b.txt"), "three\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let pattern = format!("vimgrep /t/ {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let ed = editor.editor();
+    let stack = ed.quickfix();
+    let list = stack.current().expect("quickfix list");
+    assert_eq!(list.items().len(), 2);
+    assert_eq!(list.items()[0].lnum, 2);
+    assert_eq!(list.items()[1].lnum, 1);
+    assert_eq!(
+        ed.current_buffer()
+            .and_then(|buffer| ed.buffer(buffer).ok())
+            .map(|state| state.name().to_string_lossy().into_owned()),
+        Some(root.join("a.txt").to_string_lossy().into_owned())
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn writable_vim_variables_match_upstream_table() {
     for name in [
@@ -2400,6 +2749,65 @@ fn luaeval_rejects_wrong_argument_counts() {
         .execute_line(&editor, "echo luaeval('1', 2, 3)")
         .unwrap_err();
     assert!(error.to_string().contains("E118"), "{}", error);
+}
+
+/// `function('g:Name')` accepts a `g:`-prefixed global function name the way
+/// upstream's `common_function` does (`eval/userfunc.c:1732-1735`, `1856`):
+/// the existence check runs on the stripped name while the reference keeps
+/// the written spelling, so the resulting Funcref calls the global function.
+/// `function('g:Nope')` is still `E700`, and a `g:`-prefixed builtin stays
+/// `E117` at call time because `call_func` consults the internal table with
+/// the original name.
+#[test]
+fn function_accepts_global_prefixed_function_name() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "global.vim",
+        "func GlobalFn(nr)\nreturn a:nr + 1\nendfunc\nlet g:made = function('g:GlobalFn')\nlet g:called = g:made(41)",
+    )
+    .unwrap();
+    assert_eq!(
+        exec.scope()
+            .get_scoped(ScopeKind::Global, b"called", 0)
+            .unwrap(),
+        &Typval::Number(42),
+    );
+    let made = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"made", 0)
+        .unwrap();
+    let ox_types::Typval::Funcref(made) = made else {
+        panic!("expected function('g:GlobalFn') to build a Funcref, got {made:?}");
+    };
+    assert_eq!(made.name.as_bytes(), b"g:GlobalFn");
+    assert!(made.args.is_empty());
+    assert!(made.dict.is_none());
+    assert!(made.registry.is_none());
+    let error = exec
+        .execute_line(&editor, "echo function('g:Nope')")
+        .unwrap_err();
+    assert!(error.to_string().contains("E700"), "{error}");
+    assert!(
+        error.to_string().contains("Unknown function: g:Nope"),
+        "{error}"
+    );
+}
+
+/// A `g:`-prefixed builtin name passes the `function()` existence check but
+/// stays uncallable: upstream reports `E117` with the written name, since the
+/// internal dispatch never sees the stripped spelling.
+#[test]
+fn function_of_global_prefixed_builtin_stays_uncallable() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "global.vim",
+        "let g:made = function('g:printf')\nlet g:called = g:made('%d', 1)",
+    )
+    .unwrap_err();
 }
 
 #[test]
@@ -3185,7 +3593,7 @@ fn top_level_same_value_writes_fire_twice_and_once_consumes_one() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3195,7 +3603,7 @@ fn top_level_same_value_writes_fire_twice_and_once_consumes_one() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:onces = exists('g:onces') ? g:onces + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:onces = exists('g:onces') ? g:onces + 1 : 1".to_owned(), script: None },
             &AutocmdOptions {
                 once: true,
                 ..AutocmdOptions::default()
@@ -3222,7 +3630,7 @@ fn same_value_filetype_inside_a_nested_handler_does_not_recurse() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = exists('g:hits') ? g:hits + 1 : 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3232,7 +3640,7 @@ fn same_value_filetype_inside_a_nested_handler_does_not_recurse() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("set filetype=python".to_owned()),
+            &AutocmdKind::ExString { source: "set filetype=python".to_owned(), script: None },
             &AutocmdOptions {
                 nested: true,
                 ..AutocmdOptions::default()
@@ -3258,7 +3666,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("set filetype=lua".to_owned()),
+            &AutocmdKind::ExString { source: "set filetype=lua".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3268,7 +3676,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "python",
-            &AutocmdKind::ExString("let g:outer_match = expand('<amatch>')".to_owned()),
+            &AutocmdKind::ExString { source: "let g:outer_match = expand('<amatch>')".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3278,7 +3686,7 @@ fn changed_filetype_recursion_fires_once_and_restores_the_outer_match() {
         .register_legacy(
             &[Event::FileType],
             "lua",
-            &AutocmdKind::ExString("let g:inner_match = expand('<amatch>')".to_owned()),
+            &AutocmdKind::ExString { source: "let g:inner_match = expand('<amatch>')".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3307,7 +3715,7 @@ fn query_display_and_failed_writes_never_fire_filetype() {
         .register_legacy(
             &[Event::FileType],
             "*",
-            &AutocmdKind::ExString("let g:hits = 1".to_owned()),
+            &AutocmdKind::ExString { source: "let g:hits = 1".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3647,15 +4055,11 @@ fn recursive_containers_have_finite_display_text() {
     };
     reference
         .borrow_mut()
-        .entries
-        .push(ox_types::DictEntry::new(
-            OxStr::from("self"),
-            dictionary.clone(),
-        ));
+        .insert(OxStr::from("self"), dictionary.clone());
 
     assert_eq!(
         crate::excmd_exec::typval_to_text(&dictionary),
-        "{'self': {...}}"
+        "{'self': {...@0}}"
     );
 
     let reversed = Typval::dict(vec![
@@ -3664,7 +4068,7 @@ fn recursive_containers_have_finite_display_text() {
     ]);
     assert_eq!(
         crate::excmd_exec::typval_to_text(&reversed),
-        "{'two': 2, 'one': 1}"
+        "{'one': 1, 'two': 2}"
     );
     assert_eq!(
         crate::excmd_exec::typval_to_text(&Typval::Float(5.0)),
@@ -3683,4 +4087,35 @@ fn stopinsert_requests_a_host_mode_transition() {
         exec.take_pending_edit_mode(),
         Some(crate::PendingEditMode::StopInsert)
     );
+}
+
+/// `find_buffer` (`eval/buffer.c:49-71`) maps number `0` to the window's
+/// alternate buffer, and a string argument only ever matches a buffer name, so
+/// `""` and `"%"` miss. `buflisted`, `bufexists`, and `bufloaded` all share it.
+#[test]
+fn buffer_predicates_resolve_zero_to_the_alternate() {
+    let editor = TestEditorAccess::new(Editor::new());
+    let mut exec = ExExecutor::new();
+    exec.execute_script(
+        &editor,
+        "predicates.vim",
+        "edit /tmp/oxvim-pred-a.txt\nedit /tmp/oxvim-pred-b.txt\n\
+         let g:listed0 = buflisted(0)\nlet g:exists0 = bufexists(0)\n\
+         let g:loaded0 = bufloaded(0)\nlet g:exists_percent = bufexists('%')\n\
+         let g:exists_empty = bufexists('')\n",
+    )
+    .unwrap();
+    let number = |name: &[u8]| match exec
+        .scope()
+        .get_scoped(ScopeKind::Global, name, 0)
+        .ok()
+    {
+        Some(Typval::Number(value)) => Some(*value),
+        _ => None,
+    };
+    assert_eq!(number(b"listed0"), Some(1));
+    assert_eq!(number(b"exists0"), Some(1));
+    assert_eq!(number(b"loaded0"), Some(1));
+    assert_eq!(number(b"exists_percent"), Some(0));
+    assert_eq!(number(b"exists_empty"), Some(0));
 }

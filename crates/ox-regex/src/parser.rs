@@ -134,6 +134,11 @@ pub(crate) struct Parser<'a> {
     pattern: &'a str,
     pos: usize,
     mode: Magic,
+    /// Mirror of upstream `RE_STRICT`: an unclosed `[` collection is an
+    /// error instead of a literal `[`. Only strict consumers (`vim.regex()`,
+    /// spell files, `'indentexpr'`) set this; the editor compiles
+    /// non-strict and treats `[` without a matching `]` as plain text.
+    strict: bool,
     captures: usize,
     closed_captures: usize,
     ignore_case: bool,
@@ -146,11 +151,21 @@ impl<'a> Parser<'a> {
             pattern,
             pos: 0,
             mode,
+            strict: false,
             captures: 0,
             closed_captures: 0,
             ignore_case: false,
             features: Features::default(),
         }
+    }
+
+    /// Non-strict [`Parser::new`] plus upstream `RE_STRICT` handling: an
+    /// unclosed `[` collection fails to compile with `E769` instead of
+    /// becoming a literal `[`.
+    pub(crate) fn new_strict(pattern: &'a str, mode: Magic) -> Self {
+        let mut parser = Self::new(pattern, mode);
+        parser.strict = true;
+        parser
     }
 
     pub(crate) fn parse(mut self) -> Result<Parsed, CompileError> {
@@ -297,7 +312,14 @@ impl<'a> Parser<'a> {
             }
             let index = self.captures;
             let expr = self.parse_pattern(Some(Terminator::Group))?;
-            self.expect_group_close("unclosed capture group")?;
+            // regexp.c `e_unmatched_str_open` interpolates the opener: `\(` in
+            // magic modes, bare `(` in very magic mode.
+            let unmatched = if self.mode == Magic::VeryMagic {
+                "Unmatched ("
+            } else {
+                "Unmatched \\("
+            };
+            self.expect_group_close(unmatched)?;
             self.closed_captures = self.closed_captures.max(index);
             return Ok(Expr::Group {
                 index: Some(index),
@@ -354,8 +376,8 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Any { newline: true });
         }
         if self.starts_with("\\_[") {
-            self.pos += 2;
-            return self.parse_collection(true);
+            self.pos += 3;
+            return self.parse_multiline_collection();
         }
         if self.starts_with("\\_") {
             self.pos += 2;
@@ -374,7 +396,7 @@ impl<'a> Parser<'a> {
         }
         if self.at_collection_open() {
             self.consume_collection_open();
-            return self.parse_collection(false);
+            return self.parse_collection();
         }
         if self.at_dot() {
             self.consume_dot();
@@ -496,43 +518,76 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| self.error("numeric character atom is not a Unicode scalar"))
     }
 
-    fn parse_collection(&mut self, include_newline: bool) -> Result<Expr, CompileError> {
-        let negated = self.consume_str("^");
+    /// Parses a `[...]` collection (regexp.c `nfa_regatom` `collection:`).
+    fn parse_collection(&mut self) -> Result<Expr, CompileError> {
+        self.parse_collection_impl(false)
+    }
+
+    /// Parses a `\_[...]` collection, which additionally matches a line break.
+    /// An unclosed `\_[` stays a literal `[` with no newline attached.
+    fn parse_multiline_collection(&mut self) -> Result<Expr, CompileError> {
+        self.parse_collection_impl(true)
+    }
+
+    fn parse_collection_impl(&mut self, include_newline: bool) -> Result<Expr, CompileError> {
+        let Some(end) = self.skip_collection_end(self.pos) else {
+            if self.strict {
+                return Err(CompileError::MissingBracket);
+            }
+            return Ok(Expr::Literal('['));
+        };
         let mut items = Vec::new();
+        let negated = self.consume_str("^");
         if self.consume_str("]") {
             items.push(ClassItem::Char(']'));
         }
-        while !self.at_end() && !self.starts_with("]") {
-            if self.starts_with("[:") {
-                let class_start = self.pos + 2;
-                if let Some(relative_end) = self.pattern[class_start..].find(":]") {
-                    let name = &self.pattern[class_start..class_start + relative_end];
-                    let kind = posix_class(name)
-                        .ok_or_else(|| self.error("unknown POSIX character class"))?;
-                    self.pos = class_start + relative_end + 2;
-                    items.push(ClassItem::Kind(kind));
-                    continue;
-                }
+        while self.pos < end {
+            if let Some(kind) = self.take_posix_kind(end)? {
+                items.push(ClassItem::Kind(kind));
+                continue;
             }
             let first = self.parse_collection_char()?;
-            if self.consume_str("-") && !self.starts_with("]") {
-                let last = self.parse_collection_char()?;
-                if first > last {
-                    return Err(self.error("reversed character range"));
+            if self.consume_str("-") {
+                if self.starts_with("]") {
+                    items.push(ClassItem::Char(first));
+                    items.push(ClassItem::Char('-'));
+                } else {
+                    let last = self.parse_collection_char()?;
+                    if first > last {
+                        return Err(CompileError::ReversedRange);
+                    }
+                    items.push(ClassItem::Range(first, last));
                 }
-                items.push(ClassItem::Range(first, last));
             } else {
                 items.push(ClassItem::Char(first));
             }
         }
-        if !self.consume_str("]") {
-            return Err(self.error("unclosed character collection"));
-        }
+        self.pos = end + 1;
         Ok(Expr::Class(CharClass {
             negated,
             include_newline,
             items,
         }))
+    }
+
+    /// Parses a `[:name:]` item when the body starts with one before `end`.
+    fn take_posix_kind(&mut self, end: usize) -> Result<Option<ClassKind>, CompileError> {
+        if !self.starts_with("[:") {
+            return Ok(None);
+        }
+        let class_start = self.pos + 2;
+        if class_start > end {
+            return Ok(None);
+        }
+        let search_end = (end + 1).min(self.pattern.len());
+        let Some(relative_end) = self.pattern[class_start..search_end].find(":]") else {
+            return Ok(None);
+        };
+        let name = &self.pattern[class_start..class_start + relative_end];
+        let kind =
+            posix_class(name).ok_or_else(|| self.error("unknown POSIX character class"))?;
+        self.pos = class_start + relative_end + 2;
+        Ok(Some(kind))
     }
 
     fn parse_collection_char(&mut self) -> Result<char, CompileError> {
@@ -551,6 +606,97 @@ impl<'a> Parser<'a> {
         }
         self.next_char()
             .ok_or_else(|| self.error("missing collection character"))
+    }
+
+    /// Ports `skip_anyof()` (regexp.c:710).
+    fn skip_collection_end(&self, mut pos: usize) -> Option<usize> {
+        let bytes = self.pattern.as_bytes();
+        if bytes.get(pos) == Some(&b'^') {
+            pos += 1;
+        }
+        if matches!(bytes.get(pos), Some(b']' | b'-')) {
+            pos += 1;
+        }
+        while pos < bytes.len() && bytes[pos] != b']' {
+            let Some(ch) = self.pattern.get(pos..).and_then(|rest| rest.chars().next()) else {
+                break;
+            };
+            if ch.len_utf8() > 1 {
+                pos += ch.len_utf8();
+                continue;
+            }
+            match ch {
+                '-' => {
+                    pos += 1;
+                    if pos < bytes.len() && bytes[pos] != b']' {
+                        pos += self
+                            .pattern
+                            .get(pos..)
+                            .and_then(|rest| rest.chars().next())
+                            .map_or(1, char::len_utf8);
+                    }
+                }
+                '\\' => {
+                    let skips_two = matches!(
+                        bytes.get(pos + 1),
+                        Some(b']' | b'^' | b'-' | b'n' | b'\\' | b'r' | b't' | b'e' | b'b' | b'd'
+                        | b'o' | b'x' | b'u' | b'U')
+                    );
+                    pos += if skips_two { 2 } else { 1 };
+                }
+                '[' => {
+                    let next = self
+                        .class_name_end(pos)
+                        .or_else(|| self.bracketed_class_end(pos, b'='))
+                        .or_else(|| self.bracketed_class_end(pos, b'.'));
+                    if let Some(next) = next {
+                        pos = next;
+                    } else if pos + 1 < bytes.len() {
+                        pos += 1;
+                    } else {
+                        break;
+                    }
+                }
+                _ => {
+                    pos += 1;
+                }
+            }
+        }
+        (pos < bytes.len() && bytes[pos] == b']').then_some(pos)
+    }
+
+    /// End offset of the `[:name:]` class itself (regexp.c:459 scan rule).
+    fn class_name_end(&self, pos: usize) -> Option<usize> {
+        let body = self.pattern.get(pos..)?.strip_prefix("[:")?;
+        POSIX_CLASS_NAMES
+            .iter()
+            .find(|name| {
+                body.strip_prefix(**name)
+                    .is_some_and(|tail| tail.starts_with(":]"))
+            })
+            .map(|name| pos + "[:".len() + name.len() + ":]".len())
+    }
+
+    /// Ports `get_equi_class()` / `get_coll_element()` (regexp.c:662,683):
+    /// recognizes `[=c=]` / `[.c.]` at `pos`, returning the single character
+    /// and the index just past the closing `]`.
+    fn take_bracketed_class(&self, pos: usize, delimiter: u8) -> Option<(char, usize)> {
+        let rest = self.pattern.get(pos..)?;
+        let prefix = if delimiter == b'=' { "[=" } else { "[." };
+        let rest = rest.strip_prefix(prefix)?;
+        let ch = rest.chars().next()?;
+        let after = pos + prefix.len() + ch.len_utf8();
+        let tail = self.pattern.get(after..)?;
+        let closing = if delimiter == b'=' { "=]" } else { ".]" };
+        tail.starts_with(closing)
+            .then(|| (ch, after + closing.len()))
+    }
+
+    /// End offset of a `[[=c=]]` / `[[.c.]]` opener for the scan, mirroring
+    /// the shared `posix` advance rule in `skip_anyof`.
+    fn bracketed_class_end(&self, pos: usize, delimiter: u8) -> Option<usize> {
+        self.take_bracketed_class(pos, delimiter)
+            .map(|(_, next)| next)
     }
 
     fn parse_multiplier(&mut self) -> Result<Option<(usize, Option<usize>, bool)>, CompileError> {
@@ -897,6 +1043,11 @@ fn class_escape(code: char) -> Option<(ClassKind, bool)> {
     };
     Some((kind, negated))
 }
+
+const POSIX_CLASS_NAMES: &[&str] = &[
+    "alnum", "alpha", "backspace", "blank", "cntrl", "digit", "escape", "fname", "graph", "ident",
+    "keyword", "lower", "print", "punct", "return", "space", "tab", "upper", "xdigit",
+];
 
 fn posix_class(name: &str) -> Option<ClassKind> {
     Some(match name {

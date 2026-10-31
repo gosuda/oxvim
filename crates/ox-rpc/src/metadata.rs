@@ -378,7 +378,7 @@ mod tests {
         let Object::Array(functions) = functions else {
             unreachable!()
         };
-        assert_eq!(functions.len(), 263);
+        assert_eq!(functions.len(), 262);
         let parameters = get(&functions[0], "parameters").unwrap();
         assert!(
             matches!(parameters, Object::Array(_)),

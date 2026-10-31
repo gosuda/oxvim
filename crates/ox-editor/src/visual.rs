@@ -26,6 +26,8 @@ pub struct VisualState {
     pub kind: VisualKind,
     /// Count accumulated before a visual motion.
     pub count: usize,
+    /// Explicit register selected with `"` (`nv_put` reads it for `p`).
+    pub register: Option<char>,
     /// Incomplete `g`, find, or text-object prefix.
     pub prefix: String,
     /// Virtual column the active endpoint holds during vertical block motions,
@@ -44,6 +46,7 @@ impl VisualState {
             cursor: anchor,
             kind,
             count: 0,
+            register: None,
             prefix: String::new(),
             wanted: (kind == VisualKind::Block).then_some(anchor.col),
         }

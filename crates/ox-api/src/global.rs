@@ -4,8 +4,8 @@ use ox_editor::{
     AutocmdContext, BufferRelease, Editor, EditorError, Event, FocusContainer, K_SPECIAL,
     KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Keys, MOD_MASK_ALT, MOD_MASK_CTRL,
     MOD_MASK_META, MOD_MASK_SHIFT, Message, MessageKind, OptionError, OptionListKind,
-    OptionMetadata, OptionScope, OptionType, OptionValue, TypeaheadFlags, UserCommand,
-    focus_transition,
+    OptionMetadata, OptionScope, OptionSetScope, OptionType, OptionValue, TypeaheadFlags,
+    UserCommand, focus_transition,
 };
 use ox_excmd::ExCommand;
 use ox_types::{Special, Typval};
@@ -135,6 +135,263 @@ pub trait CommandExecutor {
         args: Vec<Typval>,
     ) -> Result<Typval, ApiError>;
 
+    /// Writes one `g:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `g:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Global)` event and drain it after the editor
+    /// borrow is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_global_var(
+        &mut self,
+        session: &ApiSession,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor.gvars_mut().insert(name, value);
+        });
+        Ok(())
+    }
+
+    /// Deletes one `g:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `g:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Global)` event and drain it after the editor
+    /// borrow is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor.gvars_mut();
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+    /// Writes one `b:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `b:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Buffer)` event and drain it after the editor
+    /// borrow is released. `buffer` is already resolved to a live buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key is read-only or locked, or the host
+    /// cannot perform the write.
+    fn set_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            if name.as_bytes() == b"changedtick" {
+                return Err(ApiError::validation(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            if state.is_var_locked(&name) {
+                return Err(ApiError::validation(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            state.variables_mut().insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `b:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `b:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Buffer)` event and drain it after the editor
+    /// borrow is released. `buffer` is already resolved to a live buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_buffer_var(
+        &mut self,
+        session: &ApiSession,
+        buffer: BufHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            if name.as_bytes() == b"changedtick" {
+                return Err(ApiError::validation(format!(
+                    "Key is read-only: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let state = editor
+                .buffer_mut(buffer)
+                .map_err(|error| ApiError::validation(error.to_string()))?;
+            if state.is_var_locked(&name) {
+                return Err(ApiError::validation(format!(
+                    "Key is locked: {}",
+                    name.to_string_lossy()
+                )));
+            }
+            let variables = state.variables_mut();
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Writes one `w:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `w:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Window)` event and drain it after the editor
+    /// borrow is released. `win` is already resolved to a live window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_window_var(
+        &mut self,
+        session: &ApiSession,
+        win: WinHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor
+                .window_variables_mut(win)
+                .map_err(|error| ApiError::exception(error.to_string()))?
+                .insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `w:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `w:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Window)` event and drain it after the editor
+    /// borrow is released. `win` is already resolved to a live window.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_window_var(
+        &mut self,
+        session: &ApiSession,
+        win: WinHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor
+                .window_variables_mut(win)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            let Some(index) = variables
+                .iter()
+                .position(|(candidate, _)| candidate == &name)
+            else {
+                return Err(ApiError::exception(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Writes one `t:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `t:` fires with the change.
+    ///
+    /// The default keeps the legacy silent editor-map write for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Tab)` event and drain it after the editor
+    /// borrow is released. `tabpage` is already resolved to a live tabpage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the host cannot perform the write.
+    fn set_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+        value: Object,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ApiError::exception(error.to_string()))?
+                .insert(name, value);
+            Ok(())
+        })
+    }
+
+    /// Deletes one `t:` variable through the live Ex evaluator, so a scope
+    /// watcher registered on `t:` fires with the removed value.
+    ///
+    /// The default keeps the legacy silent editor-map removal for hosts
+    /// without Ex semantics; Ex-backed hosts override this to record a
+    /// `WatchTarget::Scope(Tab)` event and drain it after the editor
+    /// borrow is released. `tabpage` is already resolved to a live tabpage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an API error when the key does not exist or the host cannot
+    /// perform the removal.
+    fn del_tabpage_var(
+        &mut self,
+        session: &ApiSession,
+        tabpage: TabHandle,
+        name: OxStr,
+    ) -> Result<(), ApiError> {
+        session.with_editor_mut(|editor| {
+            let variables = editor
+                .tabpage_variables_mut(tabpage)
+                .map_err(|error| ApiError::exception(error.to_string()))?;
+            let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
+                return Err(ApiError::validation(format!(
+                    "Key not found: {}",
+                    name.to_string_lossy()
+                )));
+            };
+            variables.0.remove(index);
+            Ok(())
+        })
+    }
+
     /// Changes the process working directory globally.
     ///
     /// `path` is valid UTF-8. The host retains the previous directory for
@@ -210,7 +467,12 @@ pub fn execute_nvim_cmd(
 ) -> Result<OxStr, ApiError> {
     let (command, output) = build_nvim_cmd(cmd, opts)?;
     let message_start = session.with_editor(|editor| editor.messages().len());
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
     let result = execute_command(session, &OxStr(command.into_bytes()), executor);
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev));
     if !output {
         result?;
         return Ok(OxStr::from(""));
@@ -301,6 +563,7 @@ fn build_nvim_cmd(cmd: &Dict, opts: &Dict) -> Result<(String, bool), ApiError> {
                     ));
                 }
             };
+            let text = text.replace('\n', "\0");
             line.push(' ');
             if magic_bar {
                 line.push_str(&text);
@@ -1036,6 +1299,15 @@ pub fn nvim_set_vvar(session: &ApiSession, name: OxStr, value: Object) -> Result
     Ok(())
 }
 
+/// Whether an Ex-command host is installed (or forkable from the prototype),
+/// so `g:` writes go through the evaluator and notify scope watchers instead
+/// of mutating the editor map silently.
+pub(crate) fn host_present(session: &ApiSession) -> bool {
+    session.with_state(|state| {
+        state.command_depth < state.command_pool.len() || state.command_prototype.is_some()
+    })
+}
+
 #[api(since = 1)]
 #[expect(
     clippy::needless_pass_by_value,
@@ -1049,10 +1321,15 @@ pub fn nvim_get_var(session: &ApiSession, name: OxStr) -> Result<Object, ApiErro
 
 #[api(since = 1)]
 #[expect(
-    clippy::unnecessary_wraps,
-    reason = "`#[api]` handlers must return `Result` for the generated dispatcher"
+    clippy::needless_pass_by_value,
+    reason = "the generated dispatcher binds and moves owned RPC arguments"
 )]
 pub fn nvim_set_var(session: &ApiSession, name: OxStr, value: Object) -> Result<(), ApiError> {
+    if host_present(session) {
+        return with_command_executor(session, |session, executor| {
+            executor.set_global_var(session, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         editor.gvars_mut().insert(name, value);
     });
@@ -1065,6 +1342,11 @@ pub fn nvim_set_var(session: &ApiSession, name: OxStr, value: Object) -> Result<
     reason = "the generated dispatcher binds and moves owned RPC arguments"
 )]
 pub fn nvim_del_var(session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+    if host_present(session) {
+        return with_command_executor(session, |session, executor| {
+            executor.del_global_var(session, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         let variables = editor.gvars_mut();
         let Some(index) = variables.iter().position(|(key, _)| key == &name) else {
@@ -1104,9 +1386,39 @@ pub fn nvim_set_option(session: &ApiSession, name: OxStr, value: Object) -> Resu
     let name = option_name(&name)?;
     let metadata = ox_editor::OptionStore::metadata(name).map_err(exception)?;
     let value = object_to_legacy_option_value(metadata, name, value)?;
-    session
-        .with_editor_mut(|editor| editor.options_mut().set_global(name, value))
-        .map_err(exception)
+    let target = if metadata.scopes.contains(&OptionScope::Global) {
+        OptionTarget::Global
+    } else if metadata.scopes.contains(&OptionScope::Window) {
+        OptionTarget::Window(current_window(session)?)
+    } else if metadata.scopes.contains(&OptionScope::Buffer) {
+        OptionTarget::Buffer(current_buffer(session)?)
+    } else {
+        OptionTarget::Global
+    };
+    let previous = current_option_value(session, name, target)?;
+    let previous_object = structured_option_value(metadata, &previous);
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev_sctx = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
+    let set_result = set_option_at(session, name, value.clone(), target);
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev_sctx));
+    set_result?;
+    let assigned = structured_option_value(metadata, &value);
+    let opt_scope = match target {
+        OptionTarget::Global => OptionSetScope::Global,
+        _ => OptionSetScope::Local,
+    };
+    crate::autocmd::fire_option_set(
+        session,
+        metadata.name,
+        opt_scope,
+        &previous_object,
+        None,
+        Some(&previous_object),
+        &assigned,
+    )?;
+    Ok(())
 }
 
 #[api(since = 9)]
@@ -1157,18 +1469,57 @@ pub fn nvim_set_option_value(
         )),
         other => other,
     };
-    let value = crate::option_merge::merge(
-        metadata,
-        &current_option_value(session, name, target)?,
-        value,
-        operation,
-    )?;
+    let previous = current_option_value(session, name, target)?;
+    let previous_object = structured_option_value(metadata, &previous);
+    let value = crate::option_merge::merge(metadata, &previous, value, operation)?;
     if dict_bool(&opts, "dry_run")? == Some(true) {
         validate_option_at(session, name, &value, target)?;
         return Ok(structured_option_value(metadata, &value));
     }
     let assigned = structured_option_value(metadata, &value);
-    set_option_at(session, name, value, target)?;
+    set_option_at(session, name, value.clone(), target)?;
+    // `apply_optionset_autocmd_now` (option.c:2099) reports the flags the
+    // *request* carried, not the value target: `opt_flags` starts at zero and
+    // only a `scope` key, a `buf`, or a `win` sets it (`api/options.c:62-95`).
+    // Zero flags is upstream's plain `set`, which publishes both old values.
+    let requested = match dict_string(&opts, "scope")? {
+        Some(text) if text.as_bytes() == b"global" => OptionSetScope::Global,
+        Some(_) => OptionSetScope::Local,
+        None => {
+            if opts.get(&OxStr::from("buf")).is_some() || opts.get(&OxStr::from("win")).is_some() {
+                OptionSetScope::Local
+            } else {
+                OptionSetScope::Set
+            }
+        }
+    };
+    let (old_local, old_global) = match requested {
+        OptionSetScope::Set => {
+            // A buffer-only option has no global value to read; upstream's
+            // `oldval_g` is then the value the write replaced.
+            let global = if metadata.scopes.contains(&OptionScope::Global) {
+                structured_option_value(
+                    metadata,
+                    &current_option_value(session, name, OptionTarget::Global)?,
+                )
+            } else {
+                previous_object.clone()
+            };
+            (Some(previous_object.clone()), Some(global))
+        }
+        OptionSetScope::Global => (None, Some(previous_object.clone())),
+        OptionSetScope::Local | OptionSetScope::Modeline => (None, None),
+    };
+    let scope = requested;
+    crate::autocmd::fire_option_set(
+        session,
+        metadata.name,
+        scope,
+        &previous_object,
+        old_local.as_ref(),
+        old_global.as_ref(),
+        &assigned,
+    )?;
     if metadata.name == "modified"
         && let OptionTarget::Buffer(buffer) | OptionTarget::GlobalAndBuffer(buffer) = target
         && let Object::Boolean(modified) = &assigned
@@ -1863,7 +2214,11 @@ fn set_option_at(
     let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
     let buffer_only = metadata.scopes.contains(&OptionScope::Buffer)
         && !metadata.scopes.contains(&OptionScope::Global);
-    session.with_editor_mut(|editor| match target {
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
+    let result = session.with_editor_mut(|editor| match target {
         OptionTarget::Global => {
             if buffer_only {
                 editor
@@ -1912,7 +2267,9 @@ fn set_option_at(
                 .set_window(window, name, value)
                 .map_err(option_value_error)
         }
-    })
+    });
+    session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev));
+    result
 }
 
 fn resolve_buffer(session: &ApiSession, buffer: BufHandle) -> Result<BufHandle, ApiError> {
@@ -2208,11 +2565,7 @@ pub(crate) fn structured_option_value(
 }
 
 fn option_value_to_object(value: &OptionValue) -> Object {
-    match value {
-        OptionValue::Boolean(value) => Object::Boolean(*value),
-        OptionValue::Number(value) => Object::Integer(*value),
-        OptionValue::String(value) => Object::String(OxStr::from(value.as_str())),
-    }
+    ox_editor::option_value_object(value)
 }
 
 fn comma_items(text: &str) -> impl Iterator<Item = &str> {
@@ -2311,7 +2664,6 @@ fn typval_to_object_inner(
             let result = values
                 .try_borrow()
                 .map_err(|_| ApiError::exception("Cannot convert mutably borrowed Dictionary"))?
-                .entries
                 .iter()
                 .map(|entry| {
                     Ok((
@@ -2392,7 +2744,6 @@ const SPECIAL_KEY_PAIRS: &[(&[u8], (u8, u8))] = &[
     (b"delete", (b'k', b'D')),
     (b"bs", (b'k', b'b')),
     (b"backspace", (b'k', b'b')),
-    (b"tab", (KS_EXTRA, 54)),    // KE_TAB
     (b"ignore", (KS_EXTRA, 53)), // KE_IGNORE
     (b"nop", (KS_EXTRA, 97)),    // KE_NOP
     (b"insert", (b'k', b'I')),
@@ -2555,6 +2906,11 @@ fn simple_termcode(notation: &[u8], do_lt: bool) -> Option<u8> {
         return do_lt.then_some(b'<');
     }
     let named = [
+        // Upstream's `string_escape` table maps these to their control bytes
+        // (`<Tab>` is Ctrl-I, `<NL>` is Ctrl-J), not to `K_SPECIAL` keys.
+        (&b"tab"[..], b'\t'),
+        (&b"nl"[..], b'\n'),
+        (&b"newline"[..], b'\n'),
         (&b"cr"[..], b'\r'),
         (&b"enter"[..], b'\r'),
         (&b"esc"[..], 0x1b),
@@ -2837,7 +3193,7 @@ pub fn nvim_call_dict_function(
 }
 
 // option.c:7180-7233 is the return schema; metadata comes from options.lua.
-fn option_info(metadata: &OptionMetadata) -> Dict {
+fn option_info(metadata: &OptionMetadata, last_set: Option<&ox_editor::OptionLastSet>) -> Dict {
     let scope = if metadata.scopes.contains(&OptionScope::Buffer) {
         "buf"
     } else if metadata.scopes.contains(&OptionScope::Window) {
@@ -2849,6 +3205,15 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
         .default
         .value
         .map_or(Object::Nil, |value| option_value_to_object(&value.into()));
+    let (was_set, sid, lnum, chan) = match last_set {
+        Some(ls) => (
+            true,
+            ls.sid,
+            i64::try_from(ls.line).unwrap_or(0),
+            i64::try_from(ls.channel_id).unwrap_or(0),
+        ),
+        None => (false, 0, 0, 0),
+    };
     Dict(vec![
         (
             OxStr::from("name"),
@@ -2887,10 +3252,10 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
             OxStr::from("allows_duplicates"),
             Object::Boolean(!metadata.deny_duplicates),
         ),
-        (OxStr::from("was_set"), Object::Boolean(false)),
-        (OxStr::from("last_set_sid"), Object::Integer(0)),
-        (OxStr::from("last_set_linenr"), Object::Integer(0)),
-        (OxStr::from("last_set_chan"), Object::Integer(0)),
+        (OxStr::from("was_set"), Object::Boolean(was_set)),
+        (OxStr::from("last_set_sid"), Object::Integer(sid)),
+        (OxStr::from("last_set_linenr"), Object::Integer(lnum)),
+        (OxStr::from("last_set_chan"), Object::Integer(chan)),
     ])
 }
 
@@ -2899,14 +3264,17 @@ fn option_info(metadata: &OptionMetadata) -> Dict {
     clippy::unnecessary_wraps,
     reason = "`#[api]` requires owned arguments and a `Result` return"
 )]
-pub fn nvim_get_all_options_info(_session: &ApiSession) -> Result<Dict, ApiError> {
+pub fn nvim_get_all_options_info(session: &ApiSession) -> Result<Dict, ApiError> {
     Ok(Dict(
         ox_editor::OPTION_METADATA
             .iter()
             .map(|metadata| {
+                let last_set = session.with_editor(|editor| {
+                    editor.options().get_last_set_global(metadata.name).cloned()
+                });
                 (
                     OxStr::from(metadata.name),
-                    Object::Dict(option_info(metadata)),
+                    Object::Dict(option_info(metadata, last_set.as_ref())),
                 )
             })
             .collect::<Vec<_>>(),
@@ -2927,7 +3295,17 @@ pub fn nvim_get_option_info2(
     let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
     let target = option_target(session, name, &opts)?;
     get_option_at(session, name, target)?;
-    Ok(option_info(metadata))
+    let last_set = session.with_editor(|editor| {
+        let (buf, win, local_only) = match target {
+            OptionTarget::Global => (None, None, false),
+            OptionTarget::Buffer(b) => (Some(b), None, true),
+            OptionTarget::Window(w) => (None, Some(w), true),
+            OptionTarget::GlobalAndBuffer(b) => (Some(b), None, false),
+            OptionTarget::GlobalAndWindow(w) => (None, Some(w), false),
+        };
+        editor.options().get_last_set(metadata.name, buf, win, local_only).cloned()
+    });
+    Ok(option_info(metadata, last_set.as_ref()))
 }
 
 // api/vimscript.c:360-499. This parses syntax; no evaluator is invoked.
@@ -3259,6 +3637,23 @@ fn check_stl_option(statusline: &[u8]) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn eval_statusline_expression(
+    session: &ApiSession,
+    source: &str,
+) -> Result<Typval, ApiError> {
+    if let Some(lua_source) = source.strip_prefix("v:lua.") {
+        let code = format!("return {lua_source}");
+        let value = with_lua_executor(session, |session, lua| {
+            lua.exec(session, &code, Vec::new())
+                .map_err(ApiError::exception)
+        })?;
+        return object_to_typval(&value, 0);
+    }
+    with_command_executor(session, |session, executor| {
+        executor.evaluate(session, source)
+    })
+}
+
 fn cell_width(text: &[u8]) -> usize {
     String::from_utf8_lossy(text).width()
 }
@@ -3394,8 +3789,17 @@ pub fn nvim_eval_statusline(
         };
         let modified = buffer.flags.contains(ox_editor::BufferFlags::MODIFIED);
         let modifiable = !buffer.flags.contains(ox_editor::BufferFlags::READONLY);
+        let readonly = buffer.flags.contains(ox_editor::BufferFlags::READONLY);
         let name = buffer.name().clone();
         let handle = state.buffer;
+        let help = matches!(
+            editor.options().get_buffer(handle, "buftype"),
+            Ok(OptionValue::String(value)) if value == "help"
+        );
+        let preview = matches!(
+            editor.options().get_window(window, "previewwindow"),
+            Ok(OptionValue::Boolean(true))
+        );
         Ok(StatuslineContext {
             cursor,
             line_count,
@@ -3404,7 +3808,9 @@ pub fn nvim_eval_statusline(
             modifiable,
             name,
             handle,
-            readonly: false,
+            help,
+            preview,
+            readonly,
             filetype: String::new(),
             arglist: (0, 0),
         })
@@ -3476,9 +3882,7 @@ pub fn nvim_eval_statusline(
                 }
                 let source = std::str::from_utf8(format.get(offset..end).unwrap_or_default())
                     .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
-                let value = with_command_executor(session, |_, executor| {
-                    executor.evaluate(session, source)
-                })?;
+                let value = eval_statusline_expression(session, source)?;
                 let rendered = match &value {
                     Typval::Number(number) => number.to_string().into_bytes(),
                     Typval::String(text) => text.as_bytes().to_vec(),
@@ -3499,9 +3903,7 @@ pub fn nvim_eval_statusline(
             b'!' => {
                 let source = std::str::from_utf8(format.get(offset..).unwrap_or_default())
                     .map_err(|_| ApiError::validation("Expression must be valid UTF-8"))?;
-                let value = with_command_executor(session, |_, executor| {
-                    executor.evaluate(session, source)
-                })?;
+                let value = eval_statusline_expression(session, source)?;
                 let rendered = match &value {
                     Typval::Number(number) => number.to_string().into_bytes(),
                     Typval::String(text) => text.as_bytes().to_vec(),
@@ -3667,6 +4069,26 @@ pub fn nvim_eval_statusline(
                                 b",RO".to_vec()
                             } else {
                                 b"[RO]".to_vec()
+                            };
+                        }
+                    }
+                    b'h' | b'H' => {
+                        fillable = false;
+                        if context.help {
+                            piece = if target == b'H' {
+                                b",HLP".to_vec()
+                            } else {
+                                b"[Help]".to_vec()
+                            };
+                        }
+                    }
+                    b'w' | b'W' => {
+                        fillable = false;
+                        if context.preview {
+                            piece = if target == b'W' {
+                                b",PRV".to_vec()
+                            } else {
+                                b"[Preview]".to_vec()
                             };
                         }
                     }
@@ -3859,8 +4281,9 @@ fn highlight_entry(start: usize, groups: &[OxStr]) -> Object {
 fn fillchar_width(fillchar: &[u8]) -> usize {
     String::from_utf8_lossy(fillchar)
         .chars()
-        .map(char::width_usize)
-        .sum()
+        .next()
+        .map(CharWidth::width_usize)
+        .unwrap_or(1)
 }
 
 fn truncate_cells(text: &mut Vec<u8>, max_cells: usize) {
@@ -3896,6 +4319,8 @@ struct StatuslineContext {
     modifiable: bool,
     name: OxStr,
     handle: BufHandle,
+    help: bool,
+    preview: bool,
     readonly: bool,
     filetype: String,
     arglist: (usize, usize),
@@ -3951,61 +4376,6 @@ impl StlBuilder {
     }
 }
 
-/// Adds a multicursor in the given buffer (`nvim_mcursor`,
-/// src/nvim/api/vim.c:1462): the `[row, col]` position is (1,0)-indexed,
-/// the column clamps to the line length like `nvim_win_set_cursor`, and the
-/// reply is the total extra-cursor count (`mc_count`).
-#[api(since = 15)]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "the generated dispatcher binds and moves owned RPC arguments"
-)]
-pub fn nvim_mcursor(session: &ApiSession, buf: BufHandle, pos: Vec<i64>) -> Result<i64, ApiError> {
-    let buffer = crate::buffer::resolve_buffer(session, buf)?;
-    if pos.len() != 2 {
-        return Err(ApiError::validation(
-            "Invalid 'pos': expected [row, col] array",
-        ));
-    }
-    let position = session.with_editor(|editor| {
-        let text = editor
-            .buffer(buffer)
-            .map_err(exception)?
-            .text()
-            .map_err(exception)?;
-        let row = usize::try_from(pos[0])
-            .ok()
-            .filter(|row| (1..=text.line_count()).contains(row))
-            .ok_or_else(|| ApiError::validation("Invalid cursor line: out of range"))?;
-        // VALIDATE_RANGE's column bound precedes the silent end-of-line
-        // clamp (api/vim.c:1477-1482; check_cursor_col).
-        if pos[1] < 0 || pos[1] > MAXCOL {
-            return Err(ApiError::validation("Invalid cursor column: out of range"));
-        }
-        let col = usize::try_from(pos[1])
-            .map_err(|_| ApiError::exception("Cursor column exceeds addressable range"))?
-            .min(text.line(row).map_err(exception)?.len());
-        Ok::<_, ApiError>(ox_text::Position { lnum: row, col })
-    })?;
-    // `mc_ns` (mcursor.c:137): one lazily allocated global namespace shared
-    // by every buffer, surfaced in `nvim_get_namespaces` by its upstream
-    // name.
-    let namespace =
-        crate::extmark::nvim_create_namespace(session, OxStr::from("nvim.multicursor"))?;
-    let namespace = ox_editor::NamespaceId::new(
-        u32::try_from(namespace)
-            .map_err(|_| ApiError::exception("mcursor namespace id out of range"))?,
-    )
-    .map_err(|error| ApiError::exception(error.to_string()))?;
-    let count = session.with_editor_mut(|editor| {
-        editor
-            .add_mcursor(buffer, position, namespace)
-            .map_err(exception)?;
-        Ok::<_, ApiError>(editor.mcursor_count(namespace))
-    })?;
-    i64::try_from(count).map_err(|_| ApiError::exception("mcursor count exceeds API integer range"))
-}
-
 pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     registry.register(
         nvim_get_current_buf__API_META(),
@@ -4015,7 +4385,6 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
         nvim_set_current_buf__API_META(),
         nvim_set_current_buf__API_DISPATCH,
     )?;
-    registry.register(nvim_mcursor__API_META(), nvim_mcursor__API_DISPATCH)?;
     registry.register(
         nvim_get_current_win__API_META(),
         nvim_get_current_win__API_DISPATCH,
@@ -4106,4 +4475,519 @@ pub(crate) fn register(registry: &mut Registry) -> Result<(), RegistryError> {
     )?;
     registry.register(nvim_input_mouse__API_META(), nvim_input_mouse__API_DISPATCH)?;
     Ok(())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test scaffolding unwraps proven setup values"
+)]
+mod api_scope_watch_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Test host delegating every exercised entry point to the live
+    /// [`ox_editor::ExExecutor`], the same owner the production hosts wrap.
+    /// Only the `g:` write pair matters here; unrelated trait methods report
+    /// themselves as unimplemented.
+    struct LiveHost {
+        executor: Rc<RefCell<ox_editor::ExExecutor>>,
+    }
+
+    impl LiveHost {
+        fn api_error(error: ox_editor::ExecError) -> ApiError {
+            ApiError::exception(error.to_string())
+        }
+    }
+
+    fn dict(entries: &[(&str, Object)]) -> Dict {
+        Dict(
+            entries
+                .iter()
+                .map(|(key, value)| (OxStr::from(*key), value.clone()))
+                .collect(),
+        )
+    }
+
+    impl CommandExecutor for LiveHost {
+        fn execute(
+            &mut self,
+            session: &ApiSession,
+            commands: &[ExCommand],
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .execute_commands(session, commands)
+                .map(|_| ())
+                .map_err(Self::api_error)
+        }
+
+        fn define_user_command(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+            _command: UserCommand,
+            _force: bool,
+        ) -> Result<(), ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn delete_user_command(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+            _name: &str,
+        ) -> Result<(), ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn list_user_commands(
+            &mut self,
+            _session: &ApiSession,
+            _buffer: Option<BufHandle>,
+        ) -> Result<Vec<UserCommand>, ApiError> {
+            Err(ApiError::exception("not implemented in test host"))
+        }
+
+        fn parse_cmdline(
+            &mut self,
+            session: &ApiSession,
+            line: &str,
+        ) -> Result<Vec<ExCommand>, ApiError> {
+            let executor = self.executor.borrow();
+            session
+                .with_editor(|editor| executor.parse_commands(editor, line))
+                .map_err(Self::api_error)
+        }
+
+        fn remove_buffer(&mut self, buffer: BufHandle) -> Result<(), ApiError> {
+            self.executor.borrow_mut().remove_buffer(buffer);
+            Ok(())
+        }
+
+        fn evaluate(&mut self, session: &ApiSession, expression: &str) -> Result<Typval, ApiError> {
+            self.executor
+                .borrow_mut()
+                .evaluate_expression(session, expression)
+                .map_err(Self::api_error)
+        }
+
+        fn call_builtin(
+            &mut self,
+            session: &ApiSession,
+            name: &OxStr,
+            args: Vec<Typval>,
+        ) -> Result<Typval, ApiError> {
+            self.executor
+                .borrow_mut()
+                .call_builtin(session, name, args)
+                .map_err(Self::api_error)
+        }
+
+        fn change_directory(&mut self, session: &ApiSession, path: &str) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .change_directory(session, path)
+                .map_err(Self::api_error)
+        }
+
+        fn set_global_var(
+            &mut self,
+            session: &ApiSession,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_global_var(session, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_global_var(&mut self, session: &ApiSession, name: OxStr) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_global_var(session, &name)
+                .map_err(Self::api_error)
+        }
+
+        fn set_buffer_var(
+            &mut self,
+            session: &ApiSession,
+            buffer: BufHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_buffer_var(session, buffer, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_buffer_var(
+            &mut self,
+            session: &ApiSession,
+            buffer: BufHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_buffer_var(session, buffer, &name)
+                .map_err(Self::api_error)
+        }
+
+        fn set_window_var(
+            &mut self,
+            session: &ApiSession,
+            window: WinHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_window_var(session, window, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_window_var(
+            &mut self,
+            session: &ApiSession,
+            window: WinHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_window_var(session, window, &name)
+                .map_err(Self::api_error)
+        }
+
+        fn set_tabpage_var(
+            &mut self,
+            session: &ApiSession,
+            tabpage: TabHandle,
+            name: OxStr,
+            value: Object,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .set_tabpage_var(session, tabpage, &name, value)
+                .map_err(Self::api_error)
+        }
+
+        fn del_tabpage_var(
+            &mut self,
+            session: &ApiSession,
+            tabpage: TabHandle,
+            name: OxStr,
+        ) -> Result<(), ApiError> {
+            self.executor
+                .borrow_mut()
+                .remove_tabpage_var(session, tabpage, &name)
+                .map_err(Self::api_error)
+        }
+    }
+
+    fn session_with_live_buffer_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>, BufHandle)
+    {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        let executor = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        crate::set_command_executor(
+            &session,
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+        );
+        (session, executor, buffer)
+    }
+
+    fn session_with_live_host() -> (ApiSession, Rc<RefCell<ox_editor::ExExecutor>>) {
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, ox_editor::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let session = ApiSession::new(Rc::new(RefCell::new(editor)));
+        let executor = Rc::new(RefCell::new(ox_editor::ExExecutor::new()));
+        crate::set_command_executor(
+            &session,
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+            Box::new(LiveHost {
+                executor: Rc::clone(&executor),
+            }),
+        );
+        (session, executor)
+    }
+
+    fn install_scope_watcher(session: &ApiSession, executor: &RefCell<ox_editor::ExExecutor>) {
+        // The callback records `[key, has_new, has_old]` per notification, the
+        // same shape the scope-`remove()` tests assert on the Ex side.
+        executor
+            .borrow_mut()
+            .execute_script(
+                session,
+                "watch_setup.vim",
+                "function! Changed(d, k, c)\n  call add(g:seen, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:seen = []\ncall dictwatcheradd(g:, 'watched', 'Changed')",
+            )
+            .unwrap();
+    }
+
+    fn seen(session: &ApiSession) -> Object {
+        nvim_get_var(session, OxStr::from("seen")).unwrap()
+    }
+
+    fn row(key: &str, has_new: i64, has_old: i64) -> Object {
+        Object::Array(vec![
+            Object::String(OxStr::from(key)),
+            Object::Integer(has_new),
+            Object::Integer(has_old),
+        ])
+    }
+
+    #[test]
+    fn nvim_set_var_fires_scope_watcher_with_new() {
+        let (session, executor) = session_with_live_host();
+        install_scope_watcher(&session, &executor);
+        nvim_set_var(
+            &session,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        // The write itself lands where `nvim_get_var` reads it.
+        assert_eq!(
+            nvim_get_var(&session, OxStr::from("watched")).unwrap(),
+            Object::String(OxStr::from("test"))
+        );
+        // The API write notifies with `new` and no `old`, exactly like the
+        // `:let` write the reference reports.
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 1, 0)]));
+        // A later `remove()` on the same key then reports the API-written
+        // value as `old`: this is the `remove() when updated with
+        // nvim_*_var` reference sequence.
+        executor
+            .borrow_mut()
+            .execute_line(&session, "call remove(g:, 'watched')")
+            .unwrap();
+        assert_eq!(
+            seen(&session),
+            Object::Array(vec![row("watched", 1, 0), row("watched", 0, 1)])
+        );
+    }
+
+    #[test]
+    fn nvim_del_var_fires_scope_watcher_with_old() {
+        let (session, executor) = session_with_live_host();
+        install_scope_watcher(&session, &executor);
+        nvim_set_var(
+            &session,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        executor
+            .borrow_mut()
+            .execute_line(&session, "let g:seen = []")
+            .unwrap();
+        nvim_del_var(&session, OxStr::from("watched")).unwrap();
+        // The API removal drops the variable and notifies with `old` and no
+        // `new`, the same change shape as `unlet`.
+        assert!(nvim_get_var(&session, OxStr::from("watched")).is_err());
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 0, 1)]));
+        // Deleting a missing key keeps the `Key not found` error.
+        let error = nvim_del_var(&session, OxStr::from("watched")).unwrap_err();
+        assert!(
+            error.to_string().contains("Key not found"),
+            "missing key keeps its error: {error:?}"
+        );
+    }
+
+    fn install_buffer_watcher(
+        session: &ApiSession,
+        executor: &RefCell<ox_editor::ExExecutor>,
+        pattern: &str,
+    ) {
+        // Same recording callback as the `g:` watcher, but registered on the
+        // `b:` namespace the API writes below target.
+        executor
+            .borrow_mut()
+            .execute_script(
+                session,
+                "buffer_watch_setup.vim",
+                &format!(
+                    "function! Changed(d, k, c)\n  call add(g:seen, [a:k, has_key(a:c, 'new'), has_key(a:c, 'old')])\nendfunction\nlet g:seen = []\ncall dictwatcheradd(b:, '{pattern}', 'Changed')"
+                ),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn nvim_buf_set_var_fires_buffer_scope_watcher_with_new() {
+        let (session, executor, buffer) = session_with_live_buffer_host();
+        install_buffer_watcher(&session, &executor, "watched");
+        crate::buffer::nvim_buf_set_var(
+            &session,
+            buffer,
+            OxStr::from("watched"),
+            Object::String(OxStr::from("test")),
+        )
+        .unwrap();
+        // The write itself lands where `nvim_buf_get_var` reads it.
+        assert_eq!(
+            crate::buffer::nvim_buf_get_var(&session, buffer, OxStr::from("watched")).unwrap(),
+            Object::String(OxStr::from("test"))
+        );
+        // The API write notifies with `new` and no `old`, exactly like the
+        // `:let b:` write the reference reports.
+        assert_eq!(seen(&session), Object::Array(vec![row("watched", 1, 0)]));
+        // Deleting the same key then reports the API-written value as `old`.
+        crate::buffer::nvim_buf_del_var(&session, buffer, OxStr::from("watched")).unwrap();
+        assert!(crate::buffer::nvim_buf_get_var(&session, buffer, OxStr::from("watched")).is_err());
+        assert_eq!(
+            seen(&session),
+            Object::Array(vec![row("watched", 1, 0), row("watched", 0, 1)])
+        );
+    }
+
+    #[test]
+    fn nvim_buf_failed_writes_record_nothing() {
+        let (session, executor, buffer) = session_with_live_buffer_host();
+        install_buffer_watcher(&session, &executor, "*");
+        // Deleting a missing key keeps the `Key not found` error and fires no
+        // watcher round.
+        let error =
+            crate::buffer::nvim_buf_del_var(&session, buffer, OxStr::from("watched")).unwrap_err();
+        assert!(
+            error.to_string().contains("Key not found"),
+            "missing key keeps its error: {error:?}"
+        );
+        // A read-only key refuses the write the same silent way.
+        let error = crate::buffer::nvim_buf_set_var(
+            &session,
+            buffer,
+            OxStr::from("changedtick"),
+            Object::Integer(1),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("read-only"),
+            "read-only key keeps its error: {error:?}"
+        );
+        assert_eq!(seen(&session), Object::Array(vec![]));
+    }
+    #[test]
+    fn nvim_cmd_set_records_channel_provenance_and_verbose_set_reports_it() {
+        let (session, _executor) = session_with_live_host();
+        let _caller = session.enter_rpc_call(ox_rpc::ChannelId::new(3));
+        let cmd = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline"))]),
+            ),
+        ]);
+        crate::global::nvim_cmd(&session, cmd, Dict(Vec::new())).unwrap();
+
+        let info = crate::global::nvim_get_option_info2(
+            &session,
+            OxStr::from("cursorline"),
+            Dict(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            info.get(&OxStr::from("was_set")),
+            Some(&Object::Boolean(true))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_sid")),
+            Some(&Object::Integer(-9))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_chan")),
+            Some(&Object::Integer(3))
+        );
+
+        let query = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline?"))]),
+            ),
+            (
+                "mods",
+                Object::Dict(dict(&[("verbose", Object::Integer(1))])),
+            ),
+        ]);
+        let output = crate::global::nvim_cmd(
+            &session,
+            query,
+            dict(&[("output", Object::Boolean(true))]),
+        )
+        .unwrap();
+        let out_str = output.to_string_lossy();
+        assert!(
+            out_str.contains("cursorline\n\tLast set from API client (channel id 3)"),
+            "expected API client Last set text in output, got: {out_str}"
+        );
+    }
+
+    #[test]
+    fn nvim_set_option_records_channel_provenance_and_verbose_reports_it() {
+        let (session, _executor) = session_with_live_host();
+        let _caller = session.enter_rpc_call(ox_rpc::ChannelId::new(7));
+        crate::global::nvim_set_option(
+            &session,
+            OxStr::from("cursorline"),
+            Object::Boolean(true),
+        )
+        .unwrap();
+
+        let info = crate::global::nvim_get_option_info2(
+            &session,
+            OxStr::from("cursorline"),
+            Dict(Vec::new()),
+        )
+        .unwrap();
+        assert_eq!(
+            info.get(&OxStr::from("was_set")),
+            Some(&Object::Boolean(true))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_sid")),
+            Some(&Object::Integer(-9))
+        );
+        assert_eq!(
+            info.get(&OxStr::from("last_set_chan")),
+            Some(&Object::Integer(7))
+        );
+
+        let query = dict(&[
+            ("cmd", Object::String(OxStr::from("set"))),
+            (
+                "args",
+                Object::Array(vec![Object::String(OxStr::from("cursorline?"))]),
+            ),
+            (
+                "mods",
+                Object::Dict(dict(&[("verbose", Object::Integer(1))])),
+            ),
+        ]);
+        let output = crate::global::nvim_cmd(
+            &session,
+            query,
+            dict(&[("output", Object::Boolean(true))]),
+        )
+        .unwrap();
+        let out_str = output.to_string_lossy();
+        assert!(
+            out_str.contains("cursorline\n\tLast set from API client (channel id 7)"),
+            "expected channel 7 in output, got: {out_str}"
+        );
+    }
 }

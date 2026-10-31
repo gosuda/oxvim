@@ -1241,6 +1241,27 @@ fn exec_file_error_contains_message() {
 }
 
 #[test]
+fn exec_file_error_text_strips_mlua_runtime_error_prefix() {
+    let (mut host, _, _) = host();
+    let path = std::env::temp_dir().join("ox-lua-exec-file-runtime-error.lua");
+    std::fs::write(&path, "error('chunk failure')").unwrap();
+    let _guard = TempFile(path.clone());
+    let error = host.exec_file(&path).unwrap_err();
+    let ExecError::Load(inner) = &error else {
+        panic!("expected ExecError::Load, got {error:?}");
+    };
+    assert!(!inner.starts_with("runtime error: "), "inner: {inner}");
+    assert!(inner.contains("chunk failure"), "inner: {inner}");
+
+    let exec_err = host.exec("error('chunk failure')", vec![]).unwrap_err();
+    let ExecError::Runtime(exec_inner) = &exec_err else {
+        panic!("expected ExecError::Runtime, got {exec_err:?}");
+    };
+    assert!(!exec_inner.starts_with("runtime error: "), "exec_inner: {exec_inner}");
+    assert!(exec_inner.contains("chunk failure"), "exec_inner: {exec_inner}");
+}
+
+#[test]
 #[expect(
     clippy::panic,
     reason = "shape failures must fail the test with the observed value"

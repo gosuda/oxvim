@@ -8,7 +8,9 @@
 
 pub(crate) mod assert;
 pub(crate) mod buffer;
+pub(crate) mod cmdline;
 pub(crate) mod completion;
+pub(crate) mod datetime;
 pub(crate) mod environment;
 pub(crate) mod eval;
 pub(crate) mod filesystem;
@@ -68,6 +70,8 @@ pub(crate) enum Family {
     Completion,
     /// Match highlighting, served by [`matches`].
     Match,
+    /// Command-line introspection, served by [`cmdline`].
+    Cmdline,
     /// Tags-file queries, served by [`tag`].
     Tag,
     /// The listening-RPC server, served by [`server`].
@@ -83,37 +87,42 @@ pub(crate) fn route(name: &str) -> Option<Family> {
         | "assert_match" | "assert_notequal" | "assert_notmatch" | "assert_report"
         | "assert_true" => Family::Assert,
         "append" | "appendbufline" | "bufadd" | "bufexists" | "bufload" | "bufname" | "bufnr"
-        | "changenr" | "deletebufline" | "getbufinfo" | "getbufline" | "getbufvar"
-        | "getchangelist" | "last_buffer_nr" | "prompt_getprompt" | "prompt_setprompt"
-        | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
-        "api_info" | "chdir" | "defer" | "eventhandler" | "highlight_exists" | "hlID"
+        | "changenr" | "deletebufline" | "did_filetype" | "getbufinfo" | "getbufline"
+        | "getbufvar" | "getchangelist" | "last_buffer_nr" | "prompt_getprompt"
+        | "prompt_setprompt" | "setbufline" | "setbufvar" | "undotree" => Family::Buffer,
+        "api_info" | "chdir" | "defer" | "eventhandler" | "getcwd" | "highlight_exists" | "hlID"
         | "hlexists" | "shellescape" | "stdpath" | "strdisplaywidth" | "strftime" | "mode"
-        | "swapname" => Family::Environment,
-        "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand" | "funcref"
-        | "function" | "luaeval" | "submatch" => Family::Eval,
+        | "state" | "swapname" | "shiftwidth" | "haslocaldir" | "bufloaded" | "buflisted" | "dictwatcheradd"
+        | "dictwatcherdel" | "getscriptinfo" => Family::Environment,
+        "call" | "eval" | "execute" | "exists" | "expand" | "feedkeys" | "fullcommand"
+        | "funcref" | "function" | "luaeval" | "submatch" | "uniq" => Family::Eval,
         "swapfilelist" => Family::FileSystem,
-        "foldclosed" | "foldclosedend" | "foldlevel" => Family::Fold,
+        "foldclosed" | "foldclosedend" | "foldlevel" | "diff_filler" => Family::Fold,
         "confirm" | "getchar" | "getcharstr" | "input" | "inputdialog" | "inputlist" => {
             Family::Input
         }
-        "maparg" | "mapcheck" | "hasmapto" => Family::Mapping,
+        "maparg" | "mapcheck" | "hasmapto" | "mapset" => Family::Mapping,
         "charcol" | "col" | "cursor" | "getcharpos" | "getcurpos" | "getcursorcharpos"
         | "getpos" | "getregion" | "getregionpos" | "line" | "line2byte" | "setcharpos"
         | "setcursorcharpos" | "setpos" | "virtcol" => Family::Position,
         "chansend" | "jobpid" | "jobsend" | "jobstart" | "jobstop" | "jobwait" | "system"
-        | "systemlist" => Family::Process,
+        | "systemlist" | "jobclose" | "chanclose" | "rpcnotify" | "rpcrequest" | "sockconnect"
+        | "termopen" | "timer_info" | "timer_pause" | "timer_start" | "timer_stop"
+        | "timer_stopall" => Family::Process,
         "search" | "searchpair" | "searchpairpos" | "searchcount" => Family::Search,
         "getqflist" | "setqflist" | "getloclist" | "setloclist" => Family::Quickfix,
         "screenattr" | "screenchar" | "screenchars" | "screenstring" | "screencol" | "bufwinid"
         | "bufwinnr" | "screenrow" | "tabpagenr" | "tabpagewinnr" | "win_getid" | "win_gotoid"
-        | "win_gettype" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
+        | "win_gettype" | "win_findbuf" | "winbufnr" | "winheight" | "winnr" | "winwidth" | "winsaveview"
         | "winrestview" | "winline" | "wincol" | "getwinvar" | "setwinvar" | "winlayout"
-        | "getwininfo" => Family::Window,
+        | "getwininfo" | "win_execute" | "win_screenpos" | "screenpos" | "getjumplist" => Family::Window,
 
         "getreg" | "getregtype" | "setreg" | "getreginfo" => Family::Register,
-        "complete" | "complete_info" | "getcompletion" => Family::Completion,
+        "complete" | "complete_check" | "complete_info" | "getcompletion" => Family::Completion,
         "matchadd" | "matchaddpos" | "matchdelete" | "clearmatches" | "getmatches"
         | "setmatches" | "matcharg" => Family::Match,
+        "getcmdline" | "getcmdpos" | "setcmdpos" | "getcmdtype" | "getcmdwintype" | "getcmdprompt" | "pumvisible"
+        | "wildmenumode" | "histadd" | "histdel" | "histget" | "histnr" => Family::Cmdline,
         "taglist" | "gettagstack" | "settagstack" => Family::Tag,
         "serverstart" | "serverstop" | "serverlist" => Family::Server,
         _ => return predicate_family(name),
@@ -162,15 +171,35 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             .access
             .with_ex_editor(|editor| crate::quickfix::call(editor, name, args)),
         Family::Register => register::call(host, name, args, scope),
-        Family::Completion => host
-            .access
-            .with_ex_editor(|editor| completion::call(editor, name, args)),
+        Family::Completion => completion::call_host(host, name, args, scope),
         Family::Server => server::call(host, name, args, scope),
         Family::Match => host
             .access
             .with_ex_editor(|editor| matches::call(editor, name, args)),
+        Family::Cmdline => cmdline::call(host, name, args),
         Family::Tag => tag::call(host, name, args),
-        Family::Window => window::call(host, name, args),
+        Family::Window => window::call(host, name, args, scope),
+    }
+}
+
+/// Serves `name` with per-argument call-site identities.
+///
+/// Only the environment family resolves scope-namespace arguments; every
+/// other family runs through [`call`] with plain values (a `g:` snapshot
+/// that merely flows through a value is a Dict, not a Scope).
+pub(crate) fn call_with_identities<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    family: Family,
+    name: &str,
+    args: Vec<ox_eval::eval::CallArg>,
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    match family {
+        Family::Environment => environment::call_with_identities(host, name, args, scope),
+        _ => {
+            let values = args.into_iter().map(|arg| arg.value).collect::<Vec<_>>();
+            call(host, family, name, &values, scope)
+        }
     }
 }
 

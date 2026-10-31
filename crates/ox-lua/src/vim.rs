@@ -306,11 +306,262 @@ pub fn install_vim_core(
         lua.create_function(move |_, ()| Ok(state_for_lua.in_fast_callback()))?,
     )?;
 
+    install_utf_functions(lua, &vim)?;
     install_builtin_functions(lua, &vim, builtins, state.clone())?;
     install_schedule(lua, &vim, scheduler)?;
     vim.set("api", lua.create_table()?)?;
     lua.globals().set("vim", vim)?;
     Ok(state)
+}
+
+/// A Lua index as a slice offset. `vim._maxint` reaches the host as a double
+/// past `i64`, so the range check compares in the float the caller used and
+/// every accepted value is then narrowed with a checked conversion.
+fn lua_index(index: f64, length: usize) -> Option<usize> {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "length is compared with a Lua double the caller already passed as one"
+    )]
+    let bound = length as f64;
+    if index < 0.0 || index > bound {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the float is non-negative and not past `length`, checked just above"
+    )]
+    let value = index as usize;
+    Some(value)
+}
+
+/// Registers the UTF-8 helpers the Lua prelude builds `vim.str_utfindex` and
+/// `vim.str_byteindex` on, plus the three the prelude calls directly
+/// (`nlua_str_utfindex` and friends, `lua/stdlib.c:174-320`).
+///
+/// The byte walkers count the whole slice, so an embedded NUL is one one-byte
+/// character (`mb_utflen`, `mb_utf_index_to_bytes`, `mbyte.c`); only
+/// `str_utf_pos` stops there, as upstream does.
+fn install_utf_functions(lua: &Lua, vim: &Table) -> mlua::Result<()> {
+    vim.set(
+        "_str_utfindex",
+        lua.create_function(|_, (text, index): (mlua::LuaString, Option<f64>)| {
+            let bytes = text.as_bytes();
+            // `vim._maxint` arrives as a double that is already past `i64`,
+            // so the bound is compared as a float: anything from the length up
+            // is out of range and the wrapper falls back to the totals.
+            let limit = match index {
+                Some(index) => match lua_index(index, bytes.len()) {
+                    Some(position) => position,
+                    None => return Ok((None, None)),
+                },
+                None => bytes.len(),
+            };
+            let (codepoints, codeunits) = utf_lengths(&bytes, limit);
+            Ok((
+                Some(i64::try_from(codepoints).unwrap_or(i64::MAX)),
+                Some(i64::try_from(codeunits).unwrap_or(i64::MAX)),
+            ))
+        })?,
+    )?;
+    vim.set(
+        "_str_byteindex",
+        lua.create_function(|_, (text, index, utf16): (mlua::LuaString, i64, Option<bool>)| {
+            let bytes = text.as_bytes();
+            if index < 0 {
+                return Ok(None);
+            }
+            let index = usize::try_from(index).unwrap_or(usize::MAX);
+            Ok(utf_index_to_bytes(&bytes, index, utf16.unwrap_or(false)))
+        })?,
+    )?;
+    vim.set(
+        "str_utf_pos",
+        lua.create_function(|lua, text: mlua::LuaString| {
+            let bytes = text.as_bytes();
+            let positions = lua.create_table()?;
+            let mut offset = 0usize;
+            let mut slot = 1;
+            while offset < bytes.len() && bytes[offset] != 0 {
+                positions.set(slot, offset + 1)?;
+                slot += 1;
+                offset += utf_sequence_len(&bytes[offset..]);
+            }
+            Ok(positions)
+        })?,
+    )?;
+    vim.set(
+        "str_utf_start",
+        lua.create_function(|_, (text, index): (mlua::LuaString, i64)| {
+            let bytes = text.as_bytes();
+            let position = checked_position(&bytes, index)?;
+            Ok(utf_bounds(&bytes, position).0)
+        })?,
+    )?;
+    vim.set(
+        "str_utf_end",
+        lua.create_function(|_, (text, index): (mlua::LuaString, i64)| {
+            let bytes = text.as_bytes();
+            let position = checked_position(&bytes, index)?;
+            Ok(utf_bounds(&bytes, position).1 - 1)
+        })?,
+    )?;
+    Ok(())
+}
+
+/// The 1-based index as a slice offset, refusing what upstream refuses with
+/// `index out of range` (`lua/stdlib.c:238-241`).
+fn checked_position(bytes: &[u8], index: i64) -> mlua::Result<usize> {
+    if index <= 0 || usize::try_from(index).map_or(true, |index| index > bytes.len()) {
+        return Err(mlua::Error::runtime("index out of range"));
+    }
+    Ok(usize::try_from(index).unwrap_or(1) - 1)
+}
+
+/// `mb_utflen` (`mbyte.c`): code points and UTF-16 code units in `bytes`, with
+/// an invalid byte counting as one of each.
+fn utf_lengths(bytes: &[u8], limit: usize) -> (usize, usize) {
+    let mut codepoints = 0usize;
+    let mut codeunits = 0usize;
+    let mut offset = 0usize;
+    while offset < limit {
+        let length = utf_sequence_len(&bytes[offset..limit]);
+        let sequence_length = utf_sequence_len(&bytes[offset..]);
+        let end = (offset + sequence_length).min(bytes.len());
+        let value = utf_character_value(&bytes[offset..end]);
+        codepoints += 1;
+        codeunits += if value > 0xffff { 2 } else { 1 };
+        offset += length;
+    }
+    (codepoints, codeunits)
+}
+
+/// `mb_utf_index_to_bytes` (`mbyte.c`): the byte offset after `index` code
+/// points, or `None` when the string is shorter.
+fn utf_index_to_bytes(bytes: &[u8], index: usize, utf16: bool) -> Option<i64> {
+    if index == 0 {
+        return Some(0);
+    }
+    let mut count = 0usize;
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let length = utf_sequence_len(&bytes[offset..]);
+        let end = (offset + length).min(bytes.len());
+        let value = utf_character_value(&bytes[offset..end]);
+        count += 1;
+        if utf16 && value > 0xffff {
+            count += 1;
+        }
+        if count >= index {
+            return Some(i64::try_from((offset + length).min(bytes.len())).unwrap_or(i64::MAX));
+        }
+        offset += length;
+    }
+    None
+}
+
+/// Length of the codepoint starting at `bytes[0]`, clamped to the slice — the
+/// Rust translation of `utf_ptr2len_len` (`mbyte.c`).
+fn utf_sequence_len(bytes: &[u8]) -> usize {
+    let Some(&first) = bytes.first() else {
+        return 1;
+    };
+    if first < 0x80 {
+        return 1;
+    }
+    // `utf8len_tab` (`mbyte.c:99-117`) maps every lead byte, including the
+    // illegal ones: 0xC0 and 0xC1 promise two bytes, 0xF5 to 0xFD promise four
+    // to six, and only 0xFE and 0xFF fall back to a single byte.
+    let expected = match first {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        0xf8..=0xfb => 5,
+        0xfc..=0xfd => 6,
+        _ => return 1,
+    };
+    // `utf_ptr2len_len` (`mbyte.c:852-872`): the *expected* length comes back
+    // even when the slice ends inside the sequence, and the caller's index
+    // walk overshoots and stops. Only a trail byte that is present and wrong
+    // collapses the whole thing to one byte.
+    let available = expected.min(bytes.len());
+    if bytes[1..available].iter().all(|byte| byte & 0xc0 == 0x80) {
+        expected
+    } else {
+        1
+    }
+}
+
+/// Base codepoint of a full sequence, or the raw byte for an invalid one --
+/// upstream's `utf_ptr2char` fallback.
+fn utf_character_value(bytes: &[u8]) -> u32 {
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
+    let length = utf_sequence_len(bytes);
+    if length == 1 || bytes.len() < length {
+        return u32::from(first);
+    }
+    if bytes[1..length].iter().any(|byte| byte & 0xc0 != 0x80) {
+        return u32::from(first);
+    }
+    // `utf_ptr2char` (`mbyte.c:642-700`) assembles the value from the bit
+    // layout and validates only the trail bytes, so a lead such as 0xF5 yields
+    // an out-of-range scalar rather than a fallback byte.
+    let lead_mask = 0xffu32 >> (length + 1);
+    let mut value = u32::from(first) & lead_mask;
+    for byte in &bytes[1..length] {
+        value = (value << 6) | (u32::from(*byte) & 0x3f);
+    }
+    value
+}
+
+/// `position` shifted by `delta`, when it stays inside the slice.
+fn shifted(position: usize, delta: i64, length: usize) -> Option<usize> {
+    usize::try_from(i64::try_from(position).ok()?.checked_add(delta)?)
+        .ok()
+        .filter(|at| *at < length)
+}
+
+/// `utf_cp_bounds_len` (`mbyte.c`): offset from `position` back to the
+/// character's first byte, and forward to one past its last byte.
+fn utf_bounds(bytes: &[u8], position: usize) -> (i64, i64) {
+    if bytes[position] < 0x80 {
+        return (0, 1);
+    }
+    let mut first_off = 0i64;
+    while shifted(position, first_off, bytes.len())
+        .is_some_and(|at| bytes[at] & 0xc0 == 0x80)
+    {
+        first_off -= 1;
+        if first_off < -3 {
+            return (0, 1);
+        }
+    }
+    let Ok(start) = usize::try_from(i64::try_from(position).unwrap_or(i64::MAX) + first_off) else {
+        return (0, 1);
+    };
+    // `utf_cp_bounds_len` needs the *complete* sequence: a truncation at the end
+    // of the slice falls back to a single byte.
+    let length = match bytes[start] {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        0xf8..=0xfb => 5,
+        0xfc..=0xfd => 6,
+        _ => return (0, 1),
+    };
+    if start + length > bytes.len() || !bytes[start + 1..start + length]
+        .iter()
+        .all(|byte| byte & 0xc0 == 0x80)
+    {
+        return (0, 1);
+    }
+    let end_off = first_off + i64::try_from(length).unwrap_or(1);
+    if end_off <= 0 {
+        return (0, 1);
+    }
+    (first_off, end_off)
 }
 
 /// Lua wrapper factory for Rust natives that signal failure as
@@ -558,6 +809,18 @@ pub fn bind_variables(lua: &Lua, host: Rc<dyn VariableHost>) -> mlua::Result<()>
                     .map_err(mlua::Error::runtime)?
                 {
                     Some(value) => object_to_lua(lua, &value).map_err(mlua::Error::external),
+                    // `v:exiting` exists and is NIL until the editor starts
+                    // exiting (`vv_exiting`, eval/vars.c), and Lua sees the
+                    // `vim.NIL` sentinel, not `nil`. The distinction is load
+                    // bearing: `runtime/lua/vim/_core/editor.lua:141-146`
+                    // closes the `vim.wait` wake timer when
+                    // `vim.v.exiting ~= vim.NIL`, so a Lua `nil` here stops
+                    // every wait from waking on its interval.
+                    None if scope == VariableScope::Vim && name.as_bytes() == b"exiting" => Ok(
+                        lua.globals()
+                            .get::<Table>("vim")?
+                            .get::<Value>("NIL")?,
+                    ),
                     None => Ok(Value::Nil),
                 }
             },
