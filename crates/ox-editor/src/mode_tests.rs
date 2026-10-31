@@ -2836,6 +2836,21 @@ fn jump_motions_record_only_jump_origins() {
     assert_eq!(editor.jumplist().len(), 1);
     assert_eq!(editor.jumplist().entries()[0].position, position(3, 0));
 }
+
+#[test]
+fn jump_motions_dedupe_repeated_goto_and_skip_same_line() {
+    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(1, 0), "GG");
+    assert_eq!(editor.jumplist().len(), 1);
+    assert_eq!(editor.jumplist().entries()[0].position, position(1, 0));
+
+    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(1, 0), "GGgg");
+    assert_eq!(editor.jumplist().len(), 2);
+    assert_eq!(editor.jumplist().entries()[0].position, position(1, 0));
+    assert_eq!(editor.jumplist().entries()[1].position, position(3, 0));
+
+    let (_, _, _, editor, _) = run("single line", position(1, 0), "G");
+    assert_eq!(editor.jumplist().len(), 0);
+}
 // Real behavior matrix (replaces earlier padded A/x/l/dd repetition).  Each
 // family cites the upstream function or oldtest that defines it.
 

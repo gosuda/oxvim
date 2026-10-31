@@ -9589,6 +9589,14 @@ fn set_current_buffer_for_edit(
     keepalt: bool,
 ) -> Result<(), EditorError> {
     let window = editor.current_window();
+    let current_state = window
+        .and_then(|window| editor.window(window).ok())
+        .map(|w| (w.buffer, w.cursor));
+    if let Some((old_buffer, cursor)) = current_state
+        && old_buffer != buffer
+    {
+        editor.push_jump(old_buffer, cursor);
+    }
     let alternate = keepalt
         .then(|| window.and_then(|window| editor.window(window).ok()))
         .flatten()
@@ -12418,9 +12426,7 @@ fn command_terminal<F: FileIO, E: ExEditorAccess>(
                 .map(|state| (state.buffer, state.cursor))
         });
         if let Some((buffer, position)) = origin {
-            editor
-                .jumplist_mut()
-                .push(crate::marks::MarkLocation::in_buffer(buffer, position));
+            editor.push_jump(buffer, position);
         }
     });
     let mut fresh = command.clone();
@@ -17333,6 +17339,12 @@ fn switch_current_buffer<F: FileIO, E: ExEditorAccess>(
         LoadSwitchFocus::Revalidate,
         |_runtime, _scope, _lua| {
             access.with_ex_editor(|editor| {
+                if let Some(window) = editor.current_window()
+                    && let Ok(state) = editor.window(window)
+                    && state.buffer != target
+                {
+                    editor.push_jump(state.buffer, state.cursor);
+                }
                 editor
                     .set_current_buffer(target, BufferRelease::KeepLoaded)
                     .map_err(LoadSwitchError::Editor)

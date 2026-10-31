@@ -24,7 +24,7 @@ use crate::layout::{
     WindowState,
 };
 use crate::mapping::Mappings;
-use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError};
+use crate::marks::{Changelists, GlobalMarks, Jumplist, MarkError, MarkLocation, MarkTarget};
 use crate::ops::{self, EditRange, Operator, OperatorRequest};
 use crate::options::{OptionStore, OptionValue};
 use crate::put::{PutDirection, PutEdit, PutPlan, PutRequest, plan_put, put_origin};
@@ -449,6 +449,16 @@ struct ContextDirsSnapshot {
     tab_local_dir: Option<PathBuf>,
     global_dir: Option<PathBuf>,
     cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BufferSwitchView {
+    cursor: Position,
+    topline: usize,
+    skiprows: usize,
+    curswant: i64,
+    set_curswant: bool,
+    coladd: i64,
 }
 /// All mutable editor state under a single `&mut self` discipline.
 ///
@@ -2207,18 +2217,21 @@ impl Editor {
             .get(&window)
             .copied()
             .ok_or(EditorError::UnknownWindow(window))?;
+        let view = self.initial_window_view_for_buffer(window, tab, buffer);
         let tabpage = self
             .tabpages
             .get_mut(&tab)
             .ok_or(EditorError::UnknownTabpage(tab))?;
         if let Err(error) = tabpage.window_mut(window).map(|state| {
             state.alternate_buffer = Some(old_buffer);
-            // Upstream's `w_llist_ref` is meaningful only while the window
-            // displays a quickfix buffer (`IS_LL_WINDOW`, quickfix.c:274-276).
-            // Replacing that buffer ends the display, so the reference must
-            // not follow the window into its next buffer.
             state.loclist_ref = None;
             state.buffer = buffer;
+            state.cursor = view.cursor;
+            state.topline = view.topline;
+            state.skiprows = view.skiprows;
+            state.curswant = view.curswant;
+            state.set_curswant = view.set_curswant;
+            state.coladd = view.coladd;
         }) {
             if let Some(state) = self.buffers.get_mut(&buffer) {
                 state.detach(true);
@@ -2254,6 +2267,91 @@ impl Editor {
         }
         Ok(())
     }
+    fn window_showing_buffer(
+        &self,
+        buffer: BufHandle,
+        exclude: WinHandle,
+        preferred_tab: TabHandle,
+    ) -> Option<&WindowState> {
+        self.windows
+            .iter()
+            .filter(|&(w, t)| *w != exclude && *t == preferred_tab)
+            .find_map(|(&w, _)| {
+                let state = self.window(w).ok()?;
+                (state.buffer == buffer).then_some(state)
+            })
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .filter(|&(w, t)| *w != exclude && *t != preferred_tab)
+                    .find_map(|(&w, _)| {
+                        let state = self.window(w).ok()?;
+                        (state.buffer == buffer).then_some(state)
+                    })
+            })
+    }
+
+    fn initial_window_view_for_buffer(
+        &self,
+        window: WinHandle,
+        tab: TabHandle,
+        buffer: BufHandle,
+    ) -> BufferSwitchView {
+        let existing = self.window_showing_buffer(buffer, window, tab);
+        let startofline = matches!(
+            self.options.get_global("startofline"),
+            Ok(OptionValue::Boolean(true))
+        );
+        let (mut cursor, raw_topline, skiprows, curswant, set_curswant, coladd) = match existing {
+            Some(state) if startofline => (
+                Position {
+                    lnum: state.cursor.lnum,
+                    col: 0,
+                },
+                state.topline,
+                state.skiprows,
+                0,
+                true,
+                0,
+            ),
+            Some(state) => (
+                state.cursor,
+                state.topline,
+                state.skiprows,
+                state.curswant,
+                state.set_curswant,
+                state.coladd,
+            ),
+            None => (Position { lnum: 1, col: 0 }, 1, 0, 0, true, 0),
+        };
+        if let Some(buf_state) = self.buffers.get(&buffer)
+            && let Ok(text) = buf_state.text()
+        {
+            let line_count = text.line_count().max(1);
+            cursor.lnum = cursor.lnum.clamp(1, line_count);
+            let line_len = text.line(cursor.lnum).map_or(0, |line| line.len());
+            let max_col = if line_len == 0 {
+                0
+            } else {
+                line_len.saturating_sub(1)
+            };
+            cursor.col = cursor.col.min(max_col);
+        }
+        let height = self
+            .tabpages
+            .get(&tab)
+            .map_or(1, |page| viewport_height(page, window, self.laststatus()));
+        let topline = cursor_visible_topline(raw_topline, cursor.lnum, height);
+        BufferSwitchView {
+            cursor,
+            topline,
+            skiprows,
+            curswant,
+            set_curswant,
+            coladd,
+        }
+    }
+
 
     /// Enters a buffer for a silent context switch without opening its file.
     ///
@@ -2322,6 +2420,10 @@ impl Editor {
         let Some(caller) = self.current_window() else {
             return Err(EditorError::NoCurrentTabpage);
         };
+        let caller_cursor = self
+            .window(caller)
+            .ok()
+            .map(|state| (state.cursor, state.topline, state.skiprows));
         let caller_buffer = self.window(caller).ok().map(|state| state.buffer);
         let visible: Vec<_> = self
             .windows()
@@ -2367,6 +2469,13 @@ impl Editor {
             && self.buffer(original).is_ok()
         {
             let _ = self.set_window_buffer(window, original, BufferRelease::KeepLoaded);
+            if let Some((cursor, topline, skiprows)) = caller_cursor
+                && let Ok(state) = self.window_mut(window)
+            {
+                state.cursor = cursor;
+                state.topline = topline;
+                state.skiprows = skiprows;
+            }
         }
         if self.current_window() != Some(caller) && self.window(caller).is_ok() {
             let _ = self.set_current_window(caller);
@@ -2397,6 +2506,10 @@ impl Editor {
         let Some(caller) = self.current_window() else {
             return Err(EditorError::NoCurrentTabpage);
         };
+        let caller_cursor = self
+            .window(caller)
+            .ok()
+            .map(|state| (state.cursor, state.topline, state.skiprows));
         let caller_buffer = self.window(caller).ok().map(|state| state.buffer);
         let previous_before = self.previous_window;
         // The window this call took over and the buffer it showed before, so
@@ -2431,6 +2544,13 @@ impl Editor {
             && self.buffer(expected).is_ok()
         {
             let _ = self.set_window_buffer(window, expected, BufferRelease::KeepLoaded);
+            if let Some((cursor, topline, skiprows)) = caller_cursor
+                && let Ok(state) = self.window_mut(window)
+            {
+                state.cursor = cursor;
+                state.topline = topline;
+                state.skiprows = skiprows;
+            }
         }
         let prior_previous = self.previous_window;
         if self.current_window() != Some(caller) && self.window(caller).is_ok() {
@@ -2742,6 +2862,36 @@ impl Editor {
     /// the entries and the navigation index reset together.
     pub fn clear_jumplist(&mut self) {
         self.jumplist = Jumplist::new();
+    }
+
+    /// Records a jump destination in the jumplist (`setpcmark`, `mark.c:259`).
+    ///
+    /// Skips when the previous entry matches `buffer` and `position` (lnum and col).
+    pub fn push_jump(&mut self, buffer: BufHandle, position: Position) {
+        let prev = if self.jumplist.index() < self.jumplist.entries().len() {
+            self.jumplist.entries().get(self.jumplist.index())
+        } else {
+            self.jumplist.entries().last()
+        };
+        if let Some(prev) = prev {
+            let is_same_target = match &prev.target {
+                MarkTarget::Buffer(b) => *b == buffer,
+                MarkTarget::File(path) => {
+                    self.buffer(buffer)
+                        .ok()
+                        .and_then(|buf| buf.file_path.as_ref())
+                        == Some(path)
+                }
+            };
+            if is_same_target
+                && prev.position.lnum == position.lnum
+                && prev.position.col == position.col
+            {
+                return;
+            }
+        }
+        self.jumplist
+            .push(MarkLocation::in_buffer(buffer, position));
     }
 
     /// Returns registered autocmd and augroup state.

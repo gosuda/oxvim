@@ -380,6 +380,41 @@ fn edit_updates_alternate_buffer_without_keepalt() {
     );
 }
 
+#[test]
+fn edit_switches_buffer_pushes_jumplist() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("first.txt", "line1\nline2\nline3\n");
+    executor.scripts().io().insert("second.txt", "hello\n");
+    executor.scripts().io().insert("third.txt", "world\n");
+    let start = editor.editor().current_buffer().unwrap();
+    executor.execute_line(&editor, "edit first.txt").unwrap();
+    let first = editor.editor().current_buffer().unwrap();
+    let win = editor.editor().current_window().unwrap();
+    editor.editor_mut().set_window_cursor(win, ox_text::Position { lnum: 3, col: 0 }).unwrap();
+
+    executor.execute_line(&editor, "edit second.txt").unwrap();
+    let second = editor.editor().current_buffer().unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 2);
+    assert_eq!(
+        editor.editor().jumplist().entries()[0],
+        crate::marks::MarkLocation::in_buffer(start, ox_text::Position { lnum: 1, col: 0 })
+    );
+    assert_eq!(
+        editor.editor().jumplist().entries()[1],
+        crate::marks::MarkLocation::in_buffer(first, ox_text::Position { lnum: 3, col: 0 })
+    );
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 3);
+    assert_eq!(
+        editor.editor().jumplist().entries()[2],
+        crate::marks::MarkLocation::in_buffer(second, ox_text::Position { lnum: 1, col: 0 })
+    );
+
+    executor.execute_line(&editor, "edit third.txt").unwrap();
+    assert_eq!(editor.editor().jumplist().len(), 3);
+}
+
 /// Abandoning a buffer during `:edit` respects `'hidden'` and `'bufhidden'`
 /// (`do_ecmd` -> `close_buffer`, `buffer.c:4120-4133`).
 #[test]

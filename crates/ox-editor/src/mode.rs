@@ -20,7 +20,7 @@ use crate::typeahead::{
 };
 use crate::{
     BufferRelease, BufferStateError, BufferTextEditRequest, Editor, EditorError, ExtmarkId,
-    ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MarkLocation, MotionKind,
+    ExtmarkPlacement, ExtmarkPosition, Key, KeyDecodeError, MotionKind,
     OperatorRequest, OptionValue, SearchError, VisualKind, VisualState,
 };
 use crate::{
@@ -2678,7 +2678,9 @@ impl ModeMachine {
                     beep_flush(editor);
                     return Ok(Some(Mode::default()));
                 };
-                push_jump(editor, ctx.buffer, ctx.cursor);
+                if result.target.lnum != ctx.cursor.lnum {
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                }
                 let range = EditRange::from_motion(
                     ctx.cursor,
                     crate::motion::Motion {
@@ -2918,7 +2920,7 @@ impl ModeMachine {
         };
         if let Some((motion, want)) = display {
             let change = state.operator == Operator::Change;
-            if motion.is_jump {
+            if motion.is_jump && motion.target.lnum != ctx.cursor.lnum {
                 push_jump(editor, ctx.buffer, ctx.cursor);
             }
             self.apply_operator(
@@ -4285,7 +4287,9 @@ impl ModeMachine {
                             state.count.max(1),
                             option_bool(editor, "wrapscan", true),
                         )?;
-                        push_jump(editor, ctx.buffer, ctx.cursor);
+                        if result.target.lnum != ctx.cursor.lnum {
+                            push_jump(editor, ctx.buffer, ctx.cursor);
+                        }
                         editor.set_window_cursor(ctx.window, result.target)?;
                     }
                     CmdlineKind::Ex => {
@@ -4477,7 +4481,7 @@ impl ModeMachine {
             beep_flush(editor);
             return Ok(());
         };
-        if motion.is_jump && !visual {
+        if motion.is_jump && !visual && motion.target.lnum != ctx.cursor.lnum {
             push_jump(editor, ctx.buffer, ctx.cursor);
         }
         let keep_curswant = if motion.keep_curswant {
@@ -4818,7 +4822,9 @@ impl ModeMachine {
             count,
             option_bool(editor, "wrapscan", true),
         )?;
-        push_jump(editor, ctx.buffer, ctx.cursor);
+        if result.target.lnum != ctx.cursor.lnum {
+            push_jump(editor, ctx.buffer, ctx.cursor);
+        }
         editor.set_window_cursor(ctx.window, result.target)?;
         Ok(())
     }
@@ -4861,7 +4867,9 @@ impl ModeMachine {
             option_bool(editor, "wrapscan", true),
         ) {
             Ok(result) => {
-                push_jump(editor, ctx.buffer, ctx.cursor);
+                if result.target.lnum != ctx.cursor.lnum {
+                    push_jump(editor, ctx.buffer, ctx.cursor);
+                }
                 editor.set_window_cursor(ctx.window, result.target)?;
             }
             Err(_) => beep_flush(editor),
@@ -6557,9 +6565,7 @@ fn option_contains(editor: &Editor, name: &str, item: &str, fallback: bool) -> b
     }
 }
 fn push_jump(editor: &mut Editor, buffer: BufHandle, position: Position) {
-    editor
-        .jumplist_mut()
-        .push(MarkLocation::in_buffer(buffer, position));
+    editor.push_jump(buffer, position);
 }
 
 /// Whether `key` is a recognized Vim register name (`RegisterName::try_from`
