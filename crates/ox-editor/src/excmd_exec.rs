@@ -48,9 +48,7 @@ use crate::lvalue::{
     assign_lvalue, assign_vim_variable, expand_curly_target, names_read_only_entry,
     parse_and_bind_lvalue, read_lvalue, remove_lvalue, vim_variable_type,
 };
-use crate::mapping::{
-    MapFlags, MapMode, MapModes, MapScope, Mapping, MappingAction, MappingOptions,
-};
+use crate::mapping::{MapFlags, MapMode, MapModes, MapScope, MappingAction, MappingOptions};
 use crate::options::{
     CommaItems, OPTION_METADATA, OptionListKind, OptionScope, OptionType, OptionValue,
     find_unescaped,
@@ -59,7 +57,7 @@ use crate::quickfix::QuickfixMove;
 use crate::register::RegisterContent;
 use crate::script::{FileIO, LogicalLine, RealFileIO, ScriptCtx, Sid, SourceContext, SourceFormat};
 use crate::search::{SearchDirection, SearchError, SearchState, pattern_with_case};
-use crate::typeahead::{Keys, Remap, TypeaheadFlags, special_notation};
+use crate::typeahead::{Keys, Remap, TypeaheadFlags};
 use crate::userfunc::{UserFuncError, UserFunctions, WatchCallback, WatchTarget};
 use crate::{
     BufferRelease, ChannelIds, DirectoryError, DirectoryScope, Editor, EditorError, Geometry,
@@ -24761,7 +24759,7 @@ fn list_mappings(editor: &mut Editor, lhs: &Keys, modes: MapModes, buffer_only: 
         .filter(|(mapping, local)| {
             !buffer_only || (*local && matches!(mapping.options.scope, MapScope::Buffer(_)))
         })
-        .map(|(mapping, local)| showmap_row(mapping, local))
+        .map(|(mapping, local)| mapping.listing_row(local))
         .collect();
     push_info_text_message(editor, String::new());
     if rows.is_empty() {
@@ -24815,48 +24813,6 @@ pub fn lua_reference(event: &crate::job::JobEvent) -> Option<usize> {
             .and_then(|reference| reference.parse::<usize>().ok()),
         _ => None,
     }
-}
-/// One `showmap` row (`mapping.c:220-266`): the mode characters padded to
-/// three columns, the lhs padded to at least twelve with one trailing blank
-/// guaranteed, the `*`/`&`/blank remapker, the `@`/blank buffer-local
-///ker, then the right-hand side.
-fn showmap_row(mapping: &Mapping, local: bool) -> String {
-    let mut row = mapping.options.modes.to_chars();
-    while row.len() < 3 {
-        row.push(' ');
-    }
-    let shown = special_notation(mapping.lhs.as_bytes(), true, false);
-    let mut width = shown.chars().count();
-    row.push_str(&shown);
-    loop {
-        row.push(' ');
-        width += 1;
-        if width >= 12 {
-            break;
-        }
-    }
-    row.push(if mapping.options.flags.contains(MapFlags::SCRIPT) {
-        '&'
-    } else if mapping.options.flags.contains(MapFlags::REMAP) {
-        ' '
-    } else {
-        '*'
-    });
-    row.push(if local { '@' } else { ' ' });
-    match mapping.action {
-        MappingAction::Callback(id) => {
-            let _ = write!(row, "<Callback {id}>");
-        }
-        ref action => match action.replaced_keys().unwrap_or_default() {
-            [] => row.push_str("<Nop>"),
-            keys => row.push_str(&special_notation(keys, false, false)),
-        },
-    }
-    if let Some(description) = &mapping.options.description {
-        row.push_str("\n                 ");
-        row.push_str(description);
-    }
-    row
 }
 
 /// Rebuilds or refreshes the `b:` mirror. Gated on buffer identity AND the

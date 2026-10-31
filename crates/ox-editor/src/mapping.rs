@@ -14,6 +14,7 @@
 //! [`Mappings::lookup_abbreviation_in_mode`]; the engine only stores the
 //! mode-filtered table and the word-boundary rules here.
 
+use std::fmt::Write as _;
 use std::ops::{BitOr, BitOrAssign};
 
 use ox_excmd::{ExCommand, ParseError, Parser};
@@ -265,12 +266,11 @@ impl MappingAction {
         if rhs.eq_ignore_ascii_case("<nop>") {
             return Ok(Self::Nop);
         }
-        let command = rhs
-            .strip_prefix("<Cmd>")
-            .and_then(|body| body.strip_suffix("<CR>"))
+        let command = Self::strip_case_prefix(rhs, "<Cmd>")
+            .and_then(|body| Self::strip_case_suffix(body, "<CR>"))
             .or_else(|| {
                 rhs.strip_prefix(':')
-                    .and_then(|body| body.strip_suffix("<CR>"))
+                    .and_then(|body| Self::strip_case_suffix(body, "<CR>"))
             });
         // A `:…<CR>` right-hand side runs as typed keys: `:` opens the
         // cmdline, `<C-U>` clears it, the text types itself. The pre-parsed
@@ -287,6 +287,21 @@ impl MappingAction {
             });
         }
         Ok(Self::Keys(Keys::parse_notation(rhs, leader, local_leader)))
+    }
+    fn strip_case_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            Some(&s[prefix.len()..])
+        } else {
+            None
+        }
+    }
+
+    fn strip_case_suffix<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+        if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
+            Some(&s[..s.len() - suffix.len()])
+        } else {
+            None
+        }
     }
 
     /// The right-hand side after `replace_termcodes`, upstream's
@@ -1107,6 +1122,81 @@ impl Mappings {
             .filter(|entry| abbreviation_boundary(before_cursor, &entry.lhs))
             .max_by_key(|entry| (entry.lhs.len(), entry.sequence))
     }
+
+    /// Formats matching mappings as `showmap` listing rows (`mapping.c:698-793`).
+    #[must_use]
+    pub fn format_listing(
+        &self,
+        lhs: &[u8],
+        modes: MapModes,
+        buffer: Option<BufHandle>,
+    ) -> Vec<String> {
+        self.matching(lhs, modes, buffer)
+            .into_iter()
+            .map(|(mapping, local)| mapping.listing_row(local))
+            .collect()
+    }
+
+    /// Formats matching buffer-local mappings as `showmap` listing rows.
+    #[must_use]
+    pub fn format_buffer_listing(
+        &self,
+        lhs: &[u8],
+        modes: MapModes,
+        buffer: BufHandle,
+    ) -> Vec<String> {
+        self.matching(lhs, modes, Some(buffer))
+            .into_iter()
+            .filter(|(mapping, local)| *local && matches!(mapping.options.scope, MapScope::Buffer(_)))
+            .map(|(mapping, local)| mapping.listing_row(local))
+            .collect()
+    }
+}
+
+impl Mapping {
+    /// One `showmap` row for a mapping (`mapping.c:240-304`): mode characters
+    /// padded to three columns, the LHS padded to at least twelve with one
+    /// trailing blank guaranteed, the `*`/`&`/blank remap marker, the
+    /// `@`/blank buffer-local marker, then the right-hand side.
+    #[must_use]
+    pub fn listing_row(&self, local: bool) -> String {
+        let mut row = self.options.modes.to_chars();
+        while row.len() < 3 {
+            row.push(' ');
+        }
+        let shown = special_notation(self.lhs.as_bytes(), true, false);
+        let mut width = shown.chars().count();
+        row.push_str(&shown);
+        loop {
+            row.push(' ');
+            width += 1;
+            if width >= 12 {
+                break;
+            }
+        }
+        row.push(if self.options.flags.contains(MapFlags::SCRIPT) {
+            '&'
+        } else if self.options.flags.contains(MapFlags::REMAP) {
+            ' '
+        } else {
+            '*'
+        });
+        row.push(if local { '@' } else { ' ' });
+        match self.action {
+            MappingAction::Callback(id) => {
+                let _ = write!(row, "<Callback {id}>");
+            }
+            ref action => match action.replaced_keys().unwrap_or_default() {
+                [] => row.push_str("<Nop>"),
+                keys => row.push_str(&special_notation(keys, false, false)),
+            },
+        }
+        if let Some(description) = &self.options.description {
+            row.push_str("\n                 ");
+            row.push_str(description);
+        }
+        row
+    }
 }
 
 impl Abbreviation {
@@ -1464,5 +1554,43 @@ mod tests {
             mappings.abbreviate(&long, MappingAction::Nop, MapScope::Global, true,),
             Err(MappingError::InvalidAbbreviation(_))
         ));
+    }
+
+    #[test]
+    fn mapping_listing_row_formats_special_keys_and_columns_matching_reference() {
+        let mut mappings = Mappings::new();
+        let lhs = Keys::parse_notation("<F3>", "\\", "\\");
+        let rhs = MappingAction::parse_rhs("<Cmd>let m = mode(1)<cr>", "\\", "\\").unwrap();
+        let options = MappingOptions {
+            modes: MapModes::MAP,
+            ..MappingOptions::default()
+        };
+        mappings.noremap(lhs.clone(), rhs.clone(), options.clone()).unwrap();
+
+        let rows = mappings.format_listing(lhs.as_bytes(), MapModes::MAP, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], "   <F3>        * <Cmd>let m = mode(1)<CR>");
+
+        let n_options = MappingOptions {
+            modes: MapModes::one(MapMode::Normal),
+            ..MappingOptions::default()
+        };
+        let n_lhs = Keys::parse_notation("<C-F3>", "\\", "\\");
+        mappings.map(n_lhs.clone(), rhs.clone(), n_options).unwrap();
+        let n_rows = mappings.format_listing(n_lhs.as_bytes(), MapModes::one(MapMode::Normal), None);
+        assert_eq!(n_rows.len(), 1);
+        assert_eq!(n_rows[0], "n  <C-F3>        <Cmd>let m = mode(1)<CR>");
+
+        let buf_handle = BufHandle::try_from(1i64).unwrap();
+        let buf_options = MappingOptions {
+            modes: MapModes::MAP,
+            scope: MapScope::Buffer(buf_handle),
+            ..MappingOptions::default()
+        };
+        let b_lhs = Keys::parse_notation("<F4>", "\\", "\\");
+        mappings.noremap(b_lhs.clone(), rhs, buf_options).unwrap();
+        let buf_rows = mappings.format_buffer_listing(b_lhs.as_bytes(), MapModes::MAP, buf_handle);
+        assert_eq!(buf_rows.len(), 1);
+        assert_eq!(buf_rows[0], "   <F4>        *@<Cmd>let m = mode(1)<CR>");
     }
 }

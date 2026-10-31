@@ -1568,6 +1568,18 @@ fn mapping_rhs_parses_cmd_form_with_ex_parser() {
 }
 
 #[test]
+fn mapping_rhs_parses_case_insensitive_cmd_and_cr() {
+    for rhs in ["<Cmd>echo hi<cr>", "<cmd>echo hi<CR>", "<CMD>echo hi<cr>"] {
+        let MappingAction::ExCommands { commands, .. } =
+            MappingAction::parse_rhs(rhs, "\\", "\\").unwrap()
+        else {
+            panic!("expected parsed Ex commands for {rhs}");
+        };
+        assert_eq!(commands.len(), 1);
+    }
+}
+
+#[test]
 fn mapping_rhs_parses_colon_command_form() {
     let MappingAction::ExCommands {
         keys: rhs,
