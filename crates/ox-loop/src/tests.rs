@@ -517,3 +517,65 @@ fn stop_before_run_makes_run_return_immediately() {
         "run should return immediately when stopped before entry"
     );
 }
+
+#[test]
+fn timer_panic_preserves_sibling_one_shot_timers() {
+    let mut timers = TimerHeap::new();
+    let now = Instant::now();
+    let sibling_fired = Arc::new(AtomicBool::new(false));
+    let sibling_flag = Arc::clone(&sibling_fired);
+
+    timers.insert(
+        now,
+        TimerEntry::once(|| {
+            panic!("first timer panics");
+        }),
+    );
+    timers.insert(
+        now,
+        TimerEntry::once(move || {
+            sibling_flag.store(true, Ordering::SeqCst);
+        }),
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timers.fire_expired(now);
+    }));
+
+    assert!(result.is_err(), "expected first timer panic to propagate");
+    assert!(
+        sibling_fired.load(Ordering::SeqCst),
+        "sibling one-shot timer must fire even if earlier timer panics"
+    );
+}
+
+#[test]
+fn loop_timer_panic_preserves_sibling_timers() {
+    let mut event_loop = Loop::new().unwrap();
+    let now = Instant::now();
+    let sibling_fired = Arc::new(AtomicBool::new(false));
+    let sibling_flag = Arc::clone(&sibling_fired);
+
+    event_loop.timers().insert(
+        now,
+        TimerEntry::once(|| {
+            panic!("loop timer panics");
+        }),
+    );
+    event_loop.timers().insert(
+        now,
+        TimerEntry::once(move || {
+            sibling_flag.store(true, Ordering::SeqCst);
+        }),
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = event_loop.run_once(Some(Duration::ZERO));
+    }));
+
+    assert!(result.is_err(), "expected timer panic to propagate");
+    assert!(
+        sibling_fired.load(Ordering::SeqCst),
+        "sibling timer must fire and not be dropped"
+    );
+}
