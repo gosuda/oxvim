@@ -402,86 +402,160 @@ fn call_luaeval_builtin<F: FileIO, E: ExEditorAccess>(
 /// longest-first so a later `<argname>`-style addition cannot be shadowed.
 const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%", "#"];
 
-/// Looks up a buffer's name by handle, returning an empty [`OxStr`] if the
-/// handle is absent, invalid, or belongs to an unnamed buffer.
-fn buffer_name_by_handle(editor: &crate::Editor, handle: Option<BufHandle>) -> OxStr {
-    handle
-        .and_then(|h| editor.buffer(h).ok())
-        .map_or_else(
-            || OxStr(Vec::new()),
-            |buffer| {
-                let name = buffer.name().to_string_lossy();
-                OxStr::from(name.as_ref())
-            },
-        )
+const VALID_PATH: u32 = 1;
+const VALID_HEAD: u32 = 2;
+
+fn skip_substitution(bytes: &[u8]) -> usize {
+    let offset = if bytes.starts_with(b":gs") {
+        3
+    } else if bytes.starts_with(b":s") {
+        2
+    } else {
+        return 0;
+    };
+    let Some(&sep) = bytes.get(offset) else {
+        return 0;
+    };
+    let rest = &bytes[offset + 1..];
+    let Some(first) = rest.iter().position(|&b| b == sep) else {
+        return 0;
+    };
+    let after_pat = &rest[first + 1..];
+    let Some(second) = after_pat.iter().position(|&b| b == sep) else {
+        return 0;
+    };
+    offset + 1 + first + 1 + second + 1
 }
-fn resolve_buffer_token(editor: &crate::Editor, token: &str) -> OxStr {
+
+fn modifier_validity(modifiers: &[u8]) -> u32 {
+    let mut valid = 0;
+    let mut cursor = 0;
+    let mut can_accept_p = true;
+
+    while cursor < modifiers.len() {
+        let rest = &modifiers[cursor..];
+        if rest.starts_with(b":p") {
+            if !can_accept_p {
+                break;
+            }
+            valid |= VALID_PATH;
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        if rest.starts_with(b":h") {
+            valid |= VALID_HEAD;
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        if rest.starts_with(b":.")
+            || rest.starts_with(b":~")
+            || rest.starts_with(b":8")
+            || rest.starts_with(b":t")
+            || rest.starts_with(b":e")
+            || rest.starts_with(b":r")
+            || rest.starts_with(b":S")
+        {
+            can_accept_p = false;
+            cursor += 2;
+            continue;
+        }
+        let sub_len = skip_substitution(rest);
+        if sub_len > 0 {
+            can_accept_p = true;
+            cursor += sub_len;
+            continue;
+        }
+        break;
+    }
+
+    valid
+}
+
+enum ExpandTarget {
+    Absent,
+    UnnamedBuffer,
+    Named(OxStr),
+}
+
+fn alternate_window_buffer(editor: &crate::Editor) -> Option<&crate::BufferState> {
+    let window = editor.current_window()?;
+    let alternate = editor.window(window).ok()?.alternate_buffer?;
+    editor.buffer(alternate).ok()
+}
+
+fn classify_buffer(buffer: Option<&crate::BufferState>) -> ExpandTarget {
+    match buffer {
+        None => ExpandTarget::Absent,
+        Some(buffer) if buffer.name().as_bytes().is_empty() => ExpandTarget::UnnamedBuffer,
+        Some(buffer) => {
+            let name = buffer.name().to_string_lossy();
+            ExpandTarget::Named(OxStr::from(name.as_ref()))
+        }
+    }
+}
+
+fn resolve_buffer_target(editor: &crate::Editor, token: &str) -> ExpandTarget {
     let digits = token.strip_prefix('#').unwrap_or_default();
     let number = if digits.is_empty() {
         0
     } else {
         digits.parse::<i64>().unwrap_or(-1)
     };
-    if number == 0 {
-        let alternate = editor
-            .current_window()
-            .and_then(|window| editor.window(window).ok())
-            .and_then(|window| window.alternate_buffer);
-        buffer_name_by_handle(editor, alternate)
+    let buffer = if number == 0 {
+        alternate_window_buffer(editor)
     } else if number > 0 {
-        let handle = BufHandle::try_from(number).ok();
-        buffer_name_by_handle(editor, handle)
+        BufHandle::try_from(number)
+            .ok()
+            .and_then(|handle| editor.buffer(handle).ok())
     } else {
-        OxStr(Vec::new())
+        None
+    };
+    classify_buffer(buffer)
+}
+
+fn autocmd_text_target(value: &OxStr) -> ExpandTarget {
+    if value.as_bytes().is_empty() {
+        ExpandTarget::Absent
+    } else {
+        ExpandTarget::Named(value.clone())
     }
 }
 
-/// The `eval_vars` (`ex_docmd.c:7551`) bases behind `expand()`'s special
-/// tokens. A token this port does not know yields an empty base.
-fn expand_special_base<F: FileIO, E: ExEditorAccess>(
+fn expand_special_target<F: FileIO, E: ExEditorAccess>(
     runtime: &ExRuntime<F>,
     access: &E,
     token: &str,
-) -> OxStr {
+) -> ExpandTarget {
     match token {
         "%" => access.with_ex_editor(|editor| {
-            editor
-                .current_buffer()
-                .and_then(|buffer| editor.buffer(buffer).ok())
-                .map_or_else(
-                    || OxStr(Vec::new()),
-                    |buffer| {
-                        let name = buffer.name().to_string_lossy();
-                        OxStr::from(name.as_ref())
-                    },
-                )
+            let current = editor.current_buffer().and_then(|h| editor.buffer(h).ok());
+            classify_buffer(current)
         }),
-        "<SID>" => runtime.scripts.current_sid().map_or_else(
-            || OxStr(Vec::new()),
+        "<SID>" => runtime.scripts.current_sid().map_or(
+            ExpandTarget::Absent,
             |sid| {
                 let name = format!("<SNR>{sid}_");
-                OxStr::from(name.as_str())
+                ExpandTarget::Named(OxStr::from(name.as_str()))
             },
         ),
-        "<amatch>" => runtime.active_autocmd.matched.clone(),
-        "<afile>" => runtime.active_autocmd.file.clone(),
-        "<abuf>" => runtime.active_autocmd.buffer.map_or_else(
-            || OxStr(Vec::new()),
+        "<amatch>" => autocmd_text_target(&runtime.active_autocmd.matched),
+        "<afile>" => autocmd_text_target(&runtime.active_autocmd.file),
+        "<abuf>" => runtime.active_autocmd.buffer.map_or(
+            ExpandTarget::Absent,
             |buffer| {
                 let number = i64::from(buffer).to_string();
-                OxStr::from(number.as_str())
+                ExpandTarget::Named(OxStr::from(number.as_str()))
             },
         ),
         token if token.starts_with('#') => {
-            access.with_ex_editor(|editor| resolve_buffer_token(editor, token))
+            access.with_ex_editor(|editor| resolve_buffer_target(editor, token))
         }
-        _ => OxStr(Vec::new()),
+        _ => ExpandTarget::Absent,
     }
 }
 
-/// Splits a leading special token and its trailing remainder for `expand()`.
-///
-/// Handles `<...>` tokens, `%`, `#` (alternate buffer), and `#N` (buffer number N).
 fn find_expand_special<'a>(text: &'a str) -> Option<(&'a str, &'a str)> {
     if let Some(rest) = text.strip_prefix('#') {
         let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -493,6 +567,43 @@ fn find_expand_special<'a>(text: &'a str) -> Option<(&'a str, &'a str)> {
         .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)))
 }
 
+fn apply_unnamed_modifiers(rest: &str) -> ox_eval::Result<OxStr> {
+    if rest.is_empty() {
+        return Ok(OxStr(Vec::new()));
+    }
+    let modified = ox_eval::apply_filename_modifiers(Some(&VimRegex), "", rest.as_bytes())?;
+    let valid = modifier_validity(rest.as_bytes());
+    if modified.is_empty() || valid != (VALID_HEAD | VALID_PATH) {
+        Ok(OxStr(Vec::new()))
+    } else {
+        Ok(OxStr::from(modified.as_str()))
+    }
+}
+
+fn apply_named_modifiers(name: OxStr, rest: &str) -> ox_eval::Result<OxStr> {
+    if rest.is_empty() {
+        return Ok(name);
+    }
+    let base_text = name.to_string_lossy();
+    let modified = ox_eval::apply_filename_modifiers(
+        Some(&VimRegex),
+        base_text.as_ref(),
+        rest.as_bytes(),
+    )?;
+    if modified.is_empty() {
+        Ok(OxStr(Vec::new()))
+    } else {
+        Ok(OxStr::from(modified.as_str()))
+    }
+}
+
+fn apply_expand_target(target: ExpandTarget, rest: &str) -> ox_eval::Result<OxStr> {
+    match target {
+        ExpandTarget::Absent => Ok(OxStr(Vec::new())),
+        ExpandTarget::UnnamedBuffer => apply_unnamed_modifiers(rest),
+        ExpandTarget::Named(name) => apply_named_modifiers(name, rest),
+    }
+}
 /// `expand()` (`f_expand`).
 ///
 /// `%`, `#`, `#N` and a `<...>` keyword go to `eval_vars`; this port resolves
@@ -527,20 +638,8 @@ fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
         // Exact token or token-plus-`:`-modifier chain (`eval_vars` +
         // `modify_fname`).
         Some((token, rest)) if rest.is_empty() || rest.starts_with(':') => {
-            let base = expand_special_base(runtime, access, token);
-            // `expand()` on an unnamed source yields "" (upstream f_expand:
-            // eval_vars marks the result invalid and f_expand returns "").
-            if rest.is_empty() || base.as_bytes().is_empty() {
-                base
-            } else {
-                let base_text = base.to_string_lossy();
-                let modified = ox_eval::apply_filename_modifiers(
-                    Some(&VimRegex),
-                    base_text.as_ref(),
-                    rest.as_bytes(),
-                )?;
-                OxStr::from(modified.as_str())
-            }
+            let target = expand_special_target(runtime, access, token);
+            apply_expand_target(target, rest)?
         }
         _ => {
             let expanded = expand_env_esc(text);
@@ -1248,7 +1347,12 @@ mod tests {
 
         assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('#99:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:p:h')"), text(""));
 
         let win = editor.editor().current_window().unwrap();
         editor.editor_mut().window_mut(win).unwrap().buffer = buf2;
@@ -1256,13 +1360,25 @@ mod tests {
 
         assert_eq!(eval(&mut exec, &editor, "expand('#')"), text("foo.txt"));
         assert_eq!(eval(&mut exec, &editor, "expand('#2')"), text("bar.txt"));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2:h')"), text("."));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2:gs?a?b?')"), text("bbr.txt"));
 
         let bar_p = eval(&mut exec, &editor, "expand('#2:p')");
         let Typval::String(bar_str) = &bar_p else { panic!("expected string") };
         assert!(bar_str.to_string_lossy().ends_with("bar.txt"));
 
+        let bar_p_h = eval(&mut exec, &editor, "expand('#2:p:h')");
+        let Typval::String(bar_dir) = &bar_p_h else { panic!("expected string") };
+        assert!(!bar_dir.to_string_lossy().is_empty());
+
         assert_eq!(eval(&mut exec, &editor, "expand('#3')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('#3:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:gs?a?b?')"), text(""));
+
+        let unnamed_p_h = eval(&mut exec, &editor, "expand('#3:p:h')");
+        let Typval::String(unnamed_dir) = &unnamed_p_h else { panic!("expected string") };
+        assert_eq!(unnamed_dir, bar_dir);
 
         let foo_p_gs = eval(&mut exec, &editor, "expand('#1:p:gs?\\?/?')");
         let Typval::String(foo_str) = &foo_p_gs else { panic!("expected string") };
@@ -1275,5 +1391,13 @@ mod tests {
         editor.editor_mut().window_mut(win).unwrap().alternate_buffer = Some(buf3);
         assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p:h')"), Typval::String(unnamed_dir.clone()));
+
+        editor.editor_mut().window_mut(win).unwrap().buffer = buf3;
+        assert_eq!(eval(&mut exec, &editor, "expand('%')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:h')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('%:p:h')"), Typval::String(unnamed_dir.clone()));
     }
 }
