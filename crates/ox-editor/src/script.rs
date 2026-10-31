@@ -704,22 +704,40 @@ pub(crate) fn build_runtimepath(
     data_dirs: &[String],
     vimruntime: &Path,
 ) -> String {
-    const APPNAME: &str = "nvim";
+    let app_name = appname();
+    build_runtimepath_for(
+        &app_name,
+        config_home,
+        config_dirs,
+        data_home,
+        data_dirs,
+        vimruntime,
+    )
+}
+
+pub(crate) fn build_runtimepath_for(
+    appname: &str,
+    config_home: Option<&str>,
+    config_dirs: &[String],
+    data_home: Option<&str>,
+    data_dirs: &[String],
+    vimruntime: &Path,
+) -> String {
     fn joined(base: &str, suffix: &str) -> String {
         format!("{}/{}", base.trim_end_matches('/'), suffix)
     }
     let mut entries = Vec::new();
     if let Some(home) = config_home {
-        entries.push(joined(home, APPNAME));
+        entries.push(joined(home, appname));
     }
     for dir in config_dirs {
-        entries.push(joined(dir, APPNAME));
+        entries.push(joined(dir, appname));
     }
     if let Some(home) = data_home {
-        entries.push(joined(home, &format!("{APPNAME}/site")));
+        entries.push(joined(home, &format!("{appname}/site")));
     }
     for dir in data_dirs {
-        entries.push(joined(dir, &format!("{APPNAME}/site")));
+        entries.push(joined(dir, &format!("{appname}/site")));
     }
     // An unresolved runtime tree contributes no entry (an empty path
     // would render as an empty comma-list item, which the option setter
@@ -734,16 +752,16 @@ pub(crate) fn build_runtimepath(
         entries.push("/".to_owned());
     }
     for dir in data_dirs.iter().rev() {
-        entries.push(joined(dir, &format!("{APPNAME}/site/after")));
+        entries.push(joined(dir, &format!("{appname}/site/after")));
     }
     if let Some(home) = data_home {
-        entries.push(joined(home, &format!("{APPNAME}/site/after")));
+        entries.push(joined(home, &format!("{appname}/site/after")));
     }
     for dir in config_dirs.iter().rev() {
-        entries.push(joined(dir, &format!("{APPNAME}/after")));
+        entries.push(joined(dir, &format!("{appname}/after")));
     }
     if let Some(home) = config_home {
-        entries.push(joined(home, &format!("{APPNAME}/after")));
+        entries.push(joined(home, &format!("{appname}/after")));
     }
     entries.join(",")
 }
@@ -756,6 +774,23 @@ fn to_slash(path: String) -> String {
     } else {
         path
     }
+}
+
+/// Resolves the application name, honouring `$NVIM_APPNAME` with fallback to `"nvim"`.
+/// Upstream `get_appname` (`os/stdpaths.c:70-87`).
+#[must_use]
+pub(crate) fn appname() -> String {
+    resolve_appname(std::env::var_os("NVIM_APPNAME").as_deref())
+}
+
+#[must_use]
+pub(crate) fn resolve_appname(env_val: Option<&std::ffi::OsStr>) -> String {
+    env_val
+        .and_then(|val| {
+            let s = val.to_string_lossy().into_owned();
+            (!s.is_empty()).then_some(to_slash(s))
+        })
+        .unwrap_or_else(|| "nvim".to_string())
 }
 
 /// Resolves one single-directory XDG variable, falling back to the
@@ -904,20 +939,25 @@ impl StdPath {
 /// cannot disagree.
 #[must_use]
 pub fn stdpath(what: StdPath) -> Vec<String> {
-    const APPNAME: &str = "nvim";
+    let app_name = appname();
+    stdpath_for(&app_name, what)
+}
+
+#[must_use]
+pub(crate) fn stdpath_for(appname: &str, what: StdPath) -> Vec<String> {
     fn under(base: Option<String>, suffix: &str) -> Vec<String> {
         base.into_iter()
             .map(|dir| format!("{}/{suffix}", dir.trim_end_matches('/')))
             .collect()
     }
     match what {
-        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), APPNAME),
-        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), APPNAME),
-        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), APPNAME),
-        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), APPNAME),
+        StdPath::Cache => under(xdg_home_dir("XDG_CACHE_HOME", "~/.cache"), appname),
+        StdPath::Config => under(xdg_home_dir("XDG_CONFIG_HOME", "~/.config"), appname),
+        StdPath::Data => under(xdg_home_dir("XDG_DATA_HOME", "~/.local/share"), appname),
+        StdPath::State => under(xdg_home_dir("XDG_STATE_HOME", "~/.local/state"), appname),
         StdPath::Log => under(
             xdg_home_dir("XDG_STATE_HOME", "~/.local/state"),
-            &format!("{APPNAME}/logs"),
+            &format!("{appname}/logs"),
         ),
         // `stdpaths_get_xdg_var` has no fallback for the runtime dir and no
         // `get_xdg_home` wrapper, so this is the variable verbatim
@@ -934,11 +974,11 @@ pub fn stdpath(what: StdPath) -> Vec<String> {
         ],
         StdPath::ConfigDirs => xdg_dir_list("XDG_CONFIG_DIRS", "/etc/xdg")
             .into_iter()
-            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .map(|dir| format!("{}/{appname}", dir.trim_end_matches('/')))
             .collect(),
         StdPath::DataDirs => xdg_dir_list("XDG_DATA_DIRS", "/usr/local/share:/usr/share")
             .into_iter()
-            .map(|dir| format!("{}/{APPNAME}", dir.trim_end_matches('/')))
+            .map(|dir| format!("{}/{appname}", dir.trim_end_matches('/')))
             .collect(),
     }
 }
@@ -1839,5 +1879,39 @@ mod tests {
 
         exec.execute_line(&editor, "echo 1foo#bar()").unwrap_err();
         assert_eq!(global_number(&exec, "onefoo_loaded"), None);
+    }
+
+    #[test]
+    fn nvim_appname_honoured_in_runtimepath_and_stdpath() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            super::resolve_appname(Some(OsStr::new("custom_app"))),
+            "custom_app"
+        );
+        assert_eq!(super::resolve_appname(None), "nvim");
+        assert_eq!(super::resolve_appname(Some(OsStr::new(""))), "nvim");
+
+        let config_dirs = vec!["/etc/one".to_owned()];
+        let data_dirs = vec!["/d/one".to_owned()];
+        let rtp = super::build_runtimepath_for(
+            "custom_app",
+            Some("/cfg"),
+            &config_dirs,
+            Some("/dat"),
+            &data_dirs,
+            Path::new("/rt"),
+        );
+        assert!(rtp.contains("/cfg/custom_app"));
+        assert!(rtp.contains("/etc/one/custom_app"));
+        assert!(rtp.contains("/dat/custom_app/site"));
+        assert!(rtp.contains("/etc/one/custom_app/after"));
+        assert!(rtp.contains("/cfg/custom_app/after"));
+
+        let paths = super::stdpath_for("custom_app", super::StdPath::Config);
+        assert!(paths.iter().all(|path| path.ends_with("/custom_app")));
+
+        let log_paths = super::stdpath_for("custom_app", super::StdPath::Log);
+        assert!(log_paths.iter().all(|path| path.ends_with("/custom_app/logs")));
     }
 }
