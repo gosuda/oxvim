@@ -4432,6 +4432,9 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "runtime" => command_runtime(runtime, access, scope, lua, command),
         "preserve" => command_preserve(runtime, access),
         "recover" => command_recover(runtime, access, command),
+        "mksession" | "mkvimrc" | "mkexrc" | "mkview" => {
+            crate::session::command_session(runtime, access, scope, lua, command)
+        }
         "wshada" | "wviminfo" => command_wshada(runtime, access, command),
         "rshada" | "rviminfo" => command_rshada(runtime, access, command),
         "iabbrev" | "abclear" => {
@@ -4578,6 +4581,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             BufferRemoveKind::Unload,
         ),
         "args" => command_args(runtime, access, scope, lua, command),
+        "argglobal" => command_argglobal(runtime, access, scope, lua, command),
         "next" => command_next(runtime, access, scope, lua, command),
         "first" | "rewind" => command_argument_absolute(runtime, access, scope, lua, command, 0),
         "last" => command_argument_absolute(runtime, access, scope, lua, command, i64::MAX),
@@ -4710,7 +4714,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "sign" => access.with_ex_editor(|editor| command_sign(runtime, editor, command)),
         "augroup" => access.with_ex_editor(|editor| command_augroup(runtime, editor, command)),
         "autocmd" => command_autocmd(runtime, access, lua, command),
-        "doautocmd" => command_doautocmd(runtime, access, scope, lua, command),
+        "doautocmd" | "doautoall" => command_doautocmd(runtime, access, scope, lua, command),
         "command" => access.with_ex_editor(|editor| command_user_command(runtime, editor, command)),
         "comclear" => {
             runtime.user_commands.borrow_mut().commands.clear();
@@ -5424,6 +5428,8 @@ fn command_wincmd<F: FileIO>(
             Some(window) => Some(window),
             None => return error_flow(runtime, "E441", "There is no preview window"),
         },
+        't' => windows.first().copied(),
+        'b' => windows.last().copied(),
         'h' | 'j' | 'k' | 'l' => directional_window(editor, current, &windows, key),
         _ => return error_flow(runtime, "E474", format!("Invalid argument: {key}")),
     };
@@ -9066,6 +9072,49 @@ fn buffer_from_file<F: FileIO, E: ExEditorAccess>(
     ))
 }
 
+/// Return true if the buffer is empty, unnamed, unmodified and used in
+/// at most one window, matching Neovim `curbuf_reusable()` (`src/nvim/buffer.c:2161`).
+fn is_buffer_reusable(editor: &Editor, buffer: BufHandle) -> bool {
+    let Ok(state) = editor.buffer(buffer) else {
+        return false;
+    };
+    if !state.name().as_bytes().is_empty() || state.file_path.is_some() {
+        return false;
+    }
+    if state.flags.contains(crate::BufferFlags::MODIFIED) {
+        return false;
+    }
+    if editor.is_terminal_buffer(buffer) {
+        return false;
+    }
+    if state.attachments > 1 {
+        return false;
+    }
+    let buftype = editor
+        .options()
+        .get_buffer(buffer, "buftype")
+        .ok()
+        .and_then(|v| match v {
+            OptionValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !buftype.is_empty() {
+        return false;
+    }
+    if !editor
+        .mappings()
+        .format_buffer_listing(&[], crate::MapModes::ALL, buffer)
+        .is_empty()
+    {
+        return false;
+    }
+    let Ok(text) = state.text() else {
+        return true;
+    };
+    text.line_count() <= 1 && text.line(1).map_or(true, |l| l.is_empty())
+}
+
 fn stage_buffer_from_file<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
@@ -9090,7 +9139,10 @@ fn stage_buffer_from_file<F: FileIO>(
         buffer.file_path = Some(abs_path);
         buffer.set_name(OxStr::from(path.to_string_lossy().as_ref()));
         buffer.mark_saved();
-        buffer.unload().map_err(EditorError::from)
+        buffer.undo = ox_text::UndoTree::new();
+        buffer.extmarks = crate::Extmarks::new();
+        buffer.residency = crate::buffer::BufferResidency::Unloaded;
+        Ok(())
     });
     if let Err(error) = result {
         return Err(error_flow(runtime, "E948", error.to_string()));
@@ -17567,15 +17619,21 @@ fn command_argument<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let count = command
-        .count
-        .and_then(|count| i64::try_from(count).ok())
-        .or_else(|| command.args.trim().parse::<i64>().ok())
-        .unwrap_or_else(|| {
-            access.with_ex_editor(|editor| {
-                i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
-            })
-        });
+    let count = if command.range.is_some() {
+        match access.with_ex_editor(|editor| resolve_range_raw(editor, command)) {
+            Ok((_, end)) => i64::try_from(end).ok(),
+            Err(message) => return error_flow(runtime, "E16", message),
+        }
+    } else {
+        None
+    }
+    .or_else(|| command.count.and_then(|count| i64::try_from(count).ok()))
+    .or_else(|| command.args.trim().parse::<i64>().ok())
+    .unwrap_or_else(|| {
+        access.with_ex_editor(|editor| {
+            i64::try_from(editor.arglist().index()).map_or(1, |index| index.saturating_add(1))
+        })
+    });
     do_argfile(
         runtime,
         access,
@@ -17796,6 +17854,22 @@ fn buffer_name_matches(name: &OxStr, needle: &str) -> bool {
         || Path::new(name.as_ref())
             .file_name()
             .is_some_and(|file_name| file_name == needle)
+}
+
+/// `:argglobal` (`ex_args`, arglist.c:502).
+/// Redefines the argument list if files are given (like `:next`);
+/// otherwise makes the global argument list active in the current window.
+fn command_argglobal<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    if !command.args.trim().is_empty() {
+        return command_next(runtime, access, scope, lua, command);
+    }
+    Flow::Normal
 }
 
 /// `:args` (`ex_args`, arglist.c 502): with file arguments the list is
@@ -18024,6 +18098,14 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
         .with_ex_editor(|editor| editor.current_window())
         .is_some()
     {
+        let reusable = if is_directory_path(runtime, Path::new(name)) {
+            None
+        } else {
+            access.with_ex_editor(|editor| current.filter(|&cur| is_buffer_reusable(editor, cur)))
+        };
+        if let Some(handle) = reusable {
+            return fill_reusable_argument_buffer(runtime, access, scope, lua, handle, name);
+        }
         let handle = match access.with_ex_editor(|editor| -> Result<BufHandle, EditorError> {
             let handle = editor.create_buffer(true)?;
             {
@@ -18096,6 +18178,41 @@ fn edit_argument_file<F: FileIO, E: ExEditorAccess>(
         Ok(_) => Flow::Normal,
         Err(error) => error_flow(runtime, "E948", error.to_string()),
     }
+}
+
+/// Gives the reusable current buffer `name` and reads it in place: the
+/// `BLN_CURBUF` branch of `buflist_new` (`buffer.c:2029-2046`) that `:args`
+/// and the other argument-list commands take from an empty unnamed buffer,
+/// followed by `do_ecmd`'s read and `do_autochdir` (`ex_cmds.c:2790-2791`).
+fn fill_reusable_argument_buffer<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    name: &str,
+) -> Flow {
+    if let Err(error) = access.with_ex_editor(|editor| -> Result<(), EditorError> {
+        let state = editor.buffer_mut(buffer)?;
+        state.set_name(OxStr::from(name));
+        state.mark_saved();
+        Ok(())
+    }) {
+        return error_flow(runtime, "E948", error.to_string());
+    }
+    let flow = fire_buffer_lifecycle(
+        runtime,
+        access,
+        scope,
+        lua,
+        &[Event::BufNew, Event::BufAdd],
+        buffer,
+    );
+    if !matches!(flow, Flow::Normal) || !access.with_ex_editor(|editor| editor.buffer(buffer).is_ok())
+    {
+        return flow;
+    }
+    edit_reload_current(runtime, access, scope, lua, Path::new(name))
 }
 
 /// `:argdo` (`ex_listdo` `CMD_argdo`, `ex_cmds2.c` 461): for every entry in

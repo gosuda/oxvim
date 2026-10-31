@@ -36,6 +36,7 @@ pub mod register;
 pub mod script;
 pub mod search;
 pub mod server;
+pub mod session;
 pub mod shada;
 pub mod syntax;
 pub mod tags;
@@ -115,10 +116,14 @@ pub use script::{
 };
 pub use search::{SearchDirection, SearchError, SearchOffset, SearchResult, SearchState};
 pub use server::{ServerHost, prepare_server_address, server_address_new};
+pub use session::{
+    EXRC_FILE, SESSION_FILE, SessionOptions, VIMRC_FILE, escape_fname, generate_session,
+    normalize_and_escape,
+};
 pub use typeahead::{
     K_SPECIAL, KE_EVENT, KE_FILLER, KS_EXTRA, KS_MODIFIER, KS_SPECIAL, KS_ZERO, Key,
     KeyDecodeError, Keys, MOD_MASK_ALT, MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Remap,
-    Typeahead, TypeaheadError, TypeaheadFlags,
+    Typeahead, TypeaheadError, TypeaheadFlags, special_key_name, special_notation,
 };
 pub use userfunc::{
     CallFrame, FunctionSignature, MAX_FUNC_DEPTH, UserFunc, UserFuncError, UserFuncFlags,

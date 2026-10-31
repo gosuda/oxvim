@@ -327,8 +327,8 @@ fn edit_keepalt_preserves_alternate_buffer() {
     let (editor, mut executor) = setup();
     executor.scripts().io().insert("first.txt", "first");
     executor.scripts().io().insert("second.txt", "second");
+    executor.execute_line(&editor, "file initial.txt").unwrap();
     let initial = editor.editor().current_buffer().unwrap();
-
     executor.execute_line(&editor, "edit first.txt").unwrap();
     let first = editor.editor().current_buffer().unwrap();
     assert_eq!(
@@ -386,6 +386,7 @@ fn edit_switches_buffer_pushes_jumplist() {
     executor.scripts().io().insert("first.txt", "line1\nline2\nline3\n");
     executor.scripts().io().insert("second.txt", "hello\n");
     executor.scripts().io().insert("third.txt", "world\n");
+    executor.execute_line(&editor, "file start.txt").unwrap();
     let start = editor.editor().current_buffer().unwrap();
     executor.execute_line(&editor, "edit first.txt").unwrap();
     let first = editor.editor().current_buffer().unwrap();
@@ -2948,6 +2949,7 @@ fn autocmd_buffer_switch_read_hook_sets_target_buffer_local_option() {
     executor
         .execute_line(&editor, "setlocal shiftwidth=8")
         .unwrap();
+    executor.execute_line(&editor, "file source.txt").unwrap();
     let source = editor.editor().current_buffer().unwrap();
     executor
         .execute_line(&editor, "edit read-hook.txt")
@@ -6986,6 +6988,29 @@ fn argdelete_rejects_an_address_with_an_argument() {
     executor.execute_line(&editor, "args a.txt b.txt").unwrap();
     assert_vim_error(executor.execute_line(&editor, "1argdelete a.txt"), "E475");
     assert_eq!(arglist_names(&editor), vec!["a.txt", "b.txt"]);
+}
+#[test]
+fn argglobal_bare_succeeds_and_with_files_redefines_list() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("x.txt", "x\n");
+    executor.scripts().io().insert("y.txt", "y\n");
+    executor.execute_line(&editor, "argglobal").unwrap();
+    executor.execute_line(&editor, "argglobal x.txt y.txt").unwrap();
+    assert_eq!(arglist_names(&editor), vec!["x.txt", "y.txt"]);
+    assert_eq!(editor.editor().arglist().index(), 0);
+}
+
+#[test]
+fn argument_with_range_count_selects_argument() {
+    let (editor, mut executor) = setup_with_content(&[b"a".to_vec()]);
+    executor.scripts().io().insert("first.txt", "1\n");
+    executor.scripts().io().insert("second.txt", "2\n");
+    executor.execute_line(&editor, "args first.txt second.txt").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 0);
+    executor.execute_line(&editor, "2argu").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 1);
+    executor.execute_line(&editor, "1argu").unwrap();
+    assert_eq!(editor.editor().arglist().index(), 0);
 }
 
 fn arglist_names(editor: &TestEditorAccess) -> Vec<String> {
