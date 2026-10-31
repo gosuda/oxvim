@@ -467,9 +467,10 @@ pub fn execute_nvim_cmd(
 ) -> Result<OxStr, ApiError> {
     let (command, output) = build_nvim_cmd(cmd, opts)?;
     let message_start = session.with_editor(|editor| editor.messages().len());
-    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
-    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
-    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
     let result = execute_command(session, &OxStr(command.into_bytes()), executor);
     session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev));
     if !output {
@@ -1396,9 +1397,10 @@ pub fn nvim_set_option(session: &ApiSession, name: OxStr, value: Object) -> Resu
     };
     let previous = current_option_value(session, name, target)?;
     let previous_object = structured_option_value(metadata, &previous);
-    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
-    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
-    let prev_sctx = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev_sctx = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
     let set_result = set_option_at(session, name, value.clone(), target);
     session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(prev_sctx));
     set_result?;
@@ -2212,9 +2214,10 @@ fn set_option_at(
     let metadata = ox_editor::OptionStore::metadata(name).map_err(option_value_error)?;
     let buffer_only = metadata.scopes.contains(&OptionScope::Buffer)
         && !metadata.scopes.contains(&OptionScope::Global);
-    let channel_id = session.requesting_channel().map_or(1, |c| c.get());
-    let sctx = ox_editor::OptionLastSet::api_client(channel_id);
-    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(Some(sctx)));
+    let sctx = session
+        .requesting_channel()
+        .map(|c| ox_editor::OptionLastSet::api_client(c.get()));
+    let prev = session.with_editor_mut(|editor| editor.options_mut().set_current_sctx(sctx));
     let result = session.with_editor_mut(|editor| match target {
         OptionTarget::Global => {
             if buffer_only {
