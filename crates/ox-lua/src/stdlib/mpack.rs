@@ -2,7 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, ErrorKind};
 
 use mlua::{
-    AnyUserData, Function, Lua, LuaString, MetaMethod, Table, UserData, UserDataMethods, Value,
+    AnyUserData, Function, Lua, LuaString, MetaMethod, MultiValue, Table, UserData,
+    UserDataMethods, Value,
 };
 use rmpv::Value as MpackValue;
 
@@ -63,45 +64,57 @@ impl Unpacker {
         input: &[u8],
         start: usize,
     ) -> mlua::Result<(Option<MpackValue>, usize)> {
-        if start == 0 || start > input.len() {
-            return Err(mlua::Error::runtime(
-                "start position must be between 1 and the input string length",
-            ));
+        decode_value(&mut self.pending, input, start)
+    }
+}
+
+/// Decodes the next msgpack value, carrying partially received input across
+/// calls in `pending`.
+fn decode_value(
+    pending: &mut Vec<u8>,
+    input: &[u8],
+    start: usize,
+) -> mlua::Result<(Option<MpackValue>, usize)> {
+    if start == 0 || start > input.len() {
+        return Err(mlua::Error::runtime(
+            "start position must be between 1 and the input string length",
+        ));
+    }
+    let chunk = &input[start - 1..];
+    let previous_len = pending.len();
+    let mut scratch = Vec::new();
+    let bytes = concat_chunks(pending, chunk, &mut scratch);
+    let mut cursor = Cursor::new(bytes);
+    match rmpv::decode::read_value(&mut cursor) {
+        Ok(value) => {
+            let consumed = usize::try_from(cursor.position())
+                .map_err(mlua::Error::external)?
+                .saturating_sub(previous_len);
+            pending.clear();
+            Ok((Some(value), start + consumed))
         }
-        let chunk = &input[start - 1..];
-        let previous_len = self.pending.len();
-        let mut combined = Vec::new();
-        let bytes = if previous_len == 0 {
-            chunk
-        } else {
-            combined.reserve(previous_len + chunk.len());
-            combined.extend_from_slice(&self.pending);
-            combined.extend_from_slice(chunk);
-            combined.as_slice()
-        };
-        let mut cursor = Cursor::new(bytes);
-        match rmpv::decode::read_value(&mut cursor) {
-            Ok(value) => {
-                let consumed = usize::try_from(cursor.position())
-                    .map_err(mlua::Error::external)?
-                    .saturating_sub(previous_len);
-                self.pending.clear();
-                Ok((Some(value), start + consumed))
-            }
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                if previous_len == 0 {
-                    self.pending.extend_from_slice(chunk);
-                } else {
-                    self.pending = combined;
-                }
-                Ok((None, input.len() + 1))
-            }
-            Err(error) => {
-                self.pending.clear();
-                Err(mlua::Error::runtime(format!("invalid msgpack: {error}")))
-            }
+        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+            pending.clear();
+            pending.extend_from_slice(bytes);
+            Ok((None, input.len() + 1))
+        }
+        Err(error) => {
+            pending.clear();
+            Err(mlua::Error::runtime(format!("invalid msgpack: {error}")))
         }
     }
+}
+
+/// Returns `pending` followed by `chunk`, using `scratch` when both are
+/// present.
+fn concat_chunks<'a>(pending: &[u8], chunk: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if pending.is_empty() {
+        return chunk;
+    }
+    scratch.reserve(pending.len() + chunk.len());
+    scratch.extend_from_slice(pending);
+    scratch.extend_from_slice(chunk);
+    scratch.as_slice()
 }
 
 impl UserData for Unpacker {
@@ -125,7 +138,8 @@ impl UserData for Unpacker {
 
 #[derive(Debug)]
 struct Session {
-    unpacker: AnyUserData,
+    unpacker: Option<AnyUserData>,
+    buffer: Vec<u8>,
     pending: HashMap<u32, Value>,
     next_id: u32,
 }
@@ -154,65 +168,7 @@ impl UserData for Session {
         methods.add_method_mut(
             "receive",
             |lua, this, (input, start): (LuaString, Option<usize>)| {
-                let input = input.as_bytes();
-                let mut unpacker = this.unpacker.borrow_mut::<Unpacker>()?;
-                let (value, next) = unpacker.decode_next(&input, start.unwrap_or(1))?;
-                let Some(MpackValue::Array(mut fields)) = value else {
-                    if value.is_none() {
-                        return Ok((Value::Nil, Value::Nil, Value::Nil, Value::Nil, next));
-                    }
-                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
-                };
-                if fields.is_empty() {
-                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
-                }
-                let kind = rpc_u32(&fields[0])?;
-                let expected = if kind == 2 { 3 } else { 4 };
-                if fields.len() != expected {
-                    return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
-                }
-                let ext = Some(&unpacker.ext);
-                match kind {
-                    0 => {
-                        let id = rpc_u32(&fields[1])?;
-                        let method = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        let args = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        Ok((
-                            Value::String(lua.create_string("request")?),
-                            Value::Integer(i64::from(id)),
-                            method,
-                            args,
-                            next,
-                        ))
-                    }
-                    1 => {
-                        let id = rpc_u32(&fields[1])?;
-                        let callback = this.pending.remove(&id).ok_or_else(|| {
-                            mlua::Error::runtime("invalid msgpack-rpc response id")
-                        })?;
-                        let error = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        let result = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
-                        Ok((
-                            Value::String(lua.create_string("response")?),
-                            callback,
-                            error,
-                            result,
-                            next,
-                        ))
-                    }
-                    2 => {
-                        let method = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
-                        let args = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
-                        Ok((
-                            Value::String(lua.create_string("notification")?),
-                            Value::Nil,
-                            method,
-                            args,
-                            next,
-                        ))
-                    }
-                    _ => Err(mlua::Error::runtime("invalid msgpack-rpc string")),
-                }
+                session_receive(lua, this, &input.as_bytes(), start.unwrap_or(1))
             },
         );
     }
@@ -274,22 +230,44 @@ pub(super) fn install(lua: &Lua, vim: &Table) -> mlua::Result<()> {
             mpack_to_lua(lua, value, 0)
         })?,
     )?;
-    module.set(
-        "Session",
-        lua.create_function(|lua, options: Option<Table>| {
-            let unpacker: AnyUserData = options
-                .ok_or_else(|| mlua::Error::runtime("expecting a table argument"))?
-                .get("unpack")?;
-            unpacker.borrow::<Unpacker>().map_err(|_| {
-                mlua::Error::runtime("\"unpack\" option must be a mpack.Unpacker instance")
-            })?;
-            lua.create_userdata(Session {
-                unpacker,
-                pending: HashMap::new(),
-                next_id: 0,
-            })
-        })?,
-    )?;
+    let session_native = lua.create_function(|lua, options: Option<Value>| {
+        // Upstream lmpack only treats a table first argument as options;
+        // nil and non-table arguments create a session without unpacker.
+        let unpacker = match options {
+            Some(Value::Table(options)) => {
+                let unpacker = match options.get::<Value>("unpack") {
+                    Ok(Value::UserData(unpacker)) => unpacker,
+                    _ => {
+                        return Ok((
+                            false,
+                            Value::String(lua.create_string(
+                                "\"unpack\" option must be a mpack.Unpacker instance",
+                            )?),
+                        ));
+                    }
+                };
+                if unpacker.borrow::<Unpacker>().is_err() {
+                    return Ok((
+                        false,
+                        Value::String(lua.create_string(
+                            "\"unpack\" option must be a mpack.Unpacker instance",
+                        )?),
+                    ));
+                }
+                Some(unpacker)
+            }
+            _ => None,
+        };
+        let session = lua.create_userdata(Session {
+            unpacker,
+            buffer: Vec::new(),
+            pending: HashMap::new(),
+            next_id: 0,
+        })?;
+        Ok((true, Value::UserData(session)))
+    })?;
+    let session: Function = crate::vim::error_shim(lua)?.call(session_native)?;
+    module.set("Session", session)?;
     module.set("NIL", vim.get::<Value>("NIL")?)?;
     vim.set("mpack", module.clone())?;
     let package: Table = lua.globals().get("package")?;
@@ -311,6 +289,325 @@ fn rpc_prefix(len: u32, kind: u32, id: Option<u32>) -> mlua::Result<Vec<u8>> {
 
 fn next_request_id(id: u32) -> u32 {
     if id == u32::MAX - 1 { 0 } else { id + 1 }
+}
+
+enum Step<T> {
+    Ready(T),
+    Incomplete,
+    Invalid,
+}
+
+enum RpcFrame {
+    Request(u32),
+    Response(u32),
+    Notification,
+}
+
+/// Implements `Session:receive` following lmpack.c: without an unpacker only
+/// the msgpack-rpc header is consumed and three values are returned; with one
+/// the unpacker also consumes method and arguments, returning five values.
+fn session_receive(
+    lua: &Lua,
+    session: &mut Session,
+    input: &[u8],
+    start: usize,
+) -> mlua::Result<MultiValue> {
+    let Session {
+        unpacker,
+        buffer,
+        pending,
+        ..
+    } = session;
+    let Some(unpacker) = unpacker.as_ref() else {
+        return receive_frame(lua, buffer, pending, input, start);
+    };
+    if start == 0 || start > input.len() {
+        return Err(mlua::Error::runtime(
+            "start position must be between 1 and the input string length",
+        ));
+    }
+    let mut unpacker = unpacker.borrow_mut::<Unpacker>()?;
+    let step = {
+        let chunk = &input[start - 1..];
+        let mut scratch = Vec::new();
+        let bytes = concat_chunks(&unpacker.pending, chunk, &mut scratch);
+        parse_rpc_frame(bytes)
+    };
+    match step {
+        Step::Invalid => {
+            unpacker.pending.clear();
+            return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+        }
+        Step::Incomplete | Step::Ready(_) => {}
+    }
+    let (value, next) = unpacker.decode_next(input, start)?;
+    let Some(MpackValue::Array(mut fields)) = value else {
+        if value.is_none() {
+            return Ok(MultiValue::from_iter([
+                Value::Nil,
+                Value::Nil,
+                Value::Nil,
+                Value::Nil,
+                position_value(next)?,
+            ]));
+        }
+        return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+    };
+    if fields.is_empty() {
+        return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+    }
+    let kind = rpc_u32(&fields[0])?;
+    let expected = if kind == 2 { 3 } else { 4 };
+    if fields.len() != expected {
+        return Err(mlua::Error::runtime("invalid msgpack-rpc string"));
+    }
+    let ext = Some(&unpacker.ext);
+    let position = position_value(next)?;
+    match kind {
+        0 => {
+            let id = rpc_u32(&fields[1])?;
+            let method = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+            let args = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+            Ok(MultiValue::from_iter([
+                Value::String(lua.create_string("request")?),
+                Value::Integer(i64::from(id)),
+                method,
+                args,
+                position,
+            ]))
+        }
+        1 => {
+            let id = rpc_u32(&fields[1])?;
+            let callback = remove_pending_callback(pending, id)?;
+            let error = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+            let result = mpack_to_lua_with_ext(lua, fields.remove(2), 0, ext)?;
+            Ok(MultiValue::from_iter([
+                Value::String(lua.create_string("response")?),
+                callback,
+                error,
+                result,
+                position,
+            ]))
+        }
+        2 => {
+            let method = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
+            let args = mpack_to_lua_with_ext(lua, fields.remove(1), 0, ext)?;
+            Ok(MultiValue::from_iter([
+                Value::String(lua.create_string("notification")?),
+                Value::Nil,
+                method,
+                args,
+                position,
+            ]))
+        }
+        _ => Err(mlua::Error::runtime("invalid msgpack-rpc string")),
+    }
+}
+
+fn remove_pending_callback(pending: &mut HashMap<u32, Value>, id: u32) -> mlua::Result<Value> {
+    pending
+        .remove(&id)
+        .ok_or_else(|| mlua::Error::runtime("invalid msgpack-rpc string"))
+}
+
+/// Header-only receive used by sessions without an unpacker, mirroring
+/// `mpack_rpc_receive`: the payload stays in the caller's string.
+fn receive_frame(
+    lua: &Lua,
+    buffer: &mut Vec<u8>,
+    pending: &mut HashMap<u32, Value>,
+    input: &[u8],
+    start: usize,
+) -> mlua::Result<MultiValue> {
+    let (frame, next) = decode_rpc_header(buffer, input, start)?;
+    let position = position_value(next)?;
+    let Some(frame) = frame else {
+        return Ok(MultiValue::from_iter([Value::Nil, Value::Nil, position]));
+    };
+    let mut values = MultiValue::new();
+    match frame {
+        RpcFrame::Request(id) => {
+            values.push_back(Value::String(lua.create_string("request")?));
+            values.push_back(Value::Integer(i64::from(id)));
+        }
+        RpcFrame::Response(id) => {
+            let callback = remove_pending_callback(pending, id)?;
+            values.push_back(Value::String(lua.create_string("response")?));
+            values.push_back(callback);
+        }
+        RpcFrame::Notification => {
+            values.push_back(Value::String(lua.create_string("notification")?));
+            values.push_back(Value::Nil);
+        }
+    }
+    values.push_back(position);
+    Ok(values)
+}
+
+/// Parses the msgpack-rpc frame header, buffering incomplete input in
+/// `buffer` across calls exactly like `mpack_rpc_session_t.reader`.
+fn decode_rpc_header(
+    buffer: &mut Vec<u8>,
+    input: &[u8],
+    start: usize,
+) -> mlua::Result<(Option<RpcFrame>, usize)> {
+    if start == 0 || start > input.len() {
+        return Err(mlua::Error::runtime(
+            "start position must be between 1 and the input string length",
+        ));
+    }
+    let chunk = &input[start - 1..];
+    let previous_len = buffer.len();
+    let mut scratch = Vec::new();
+    let bytes = concat_chunks(buffer, chunk, &mut scratch);
+    match parse_rpc_frame(bytes) {
+        Step::Ready((frame, header_len)) => {
+            let consumed = header_len.saturating_sub(previous_len);
+            buffer.clear();
+            Ok((Some(frame), start + consumed))
+        }
+        Step::Incomplete => {
+            buffer.clear();
+            buffer.extend_from_slice(bytes);
+            Ok((None, input.len() + 1))
+        }
+        Step::Invalid => {
+            buffer.clear();
+            Err(mlua::Error::runtime("invalid msgpack-rpc string"))
+        }
+    }
+}
+
+/// Mirrors `mpack_rpc_receive_tok`: array of length 3 or 4, a type uint of at
+/// most one byte holding at most 2, and for request/response a request id
+/// uint of at most four bytes.
+fn parse_rpc_frame(bytes: &[u8]) -> Step<(RpcFrame, usize)> {
+    let (mut offset, length) = match read_array_header(bytes) {
+        Step::Ready(header) => header,
+        Step::Incomplete => return Step::Incomplete,
+        Step::Invalid => return Step::Invalid,
+    };
+    if length != 3 && length != 4 {
+        return Step::Invalid;
+    }
+    let (used, kind) = match read_uint(&bytes[offset..], 1) {
+        Step::Ready(uint) => uint,
+        Step::Incomplete => return Step::Incomplete,
+        Step::Invalid => return Step::Invalid,
+    };
+    offset += used;
+    if kind > 2 {
+        return Step::Invalid;
+    }
+    if kind == 2 {
+        return if length == 3 {
+            Step::Ready((RpcFrame::Notification, offset))
+        } else {
+            Step::Invalid
+        };
+    }
+    if length != 4 {
+        return Step::Invalid;
+    }
+    let (used, id) = match read_uint(&bytes[offset..], 4) {
+        Step::Ready(uint) => uint,
+        Step::Incomplete => return Step::Incomplete,
+        Step::Invalid => return Step::Invalid,
+    };
+    offset += used;
+    let Ok(id) = u32::try_from(id) else {
+        return Step::Invalid;
+    };
+    Step::Ready((
+        if kind == 0 {
+            RpcFrame::Request(id)
+        } else {
+            RpcFrame::Response(id)
+        },
+        offset,
+    ))
+}
+
+fn read_array_header(bytes: &[u8]) -> Step<(usize, u32)> {
+    let Some(&first) = bytes.first() else {
+        return Step::Incomplete;
+    };
+    match first {
+        0x90..=0x9f => Step::Ready((1, u32::from(first & 0x0f))),
+        0xdc => {
+            let Some(rest) = bytes.get(1..3) else {
+                return Step::Incomplete;
+            };
+            Step::Ready((3, u32::from(u16::from_be_bytes([rest[0], rest[1]]))))
+        }
+        0xdd => {
+            let Some(rest) = bytes.get(1..5) else {
+                return Step::Incomplete;
+            };
+            Step::Ready((
+                5,
+                u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]),
+            ))
+        }
+        _ => Step::Invalid,
+    }
+}
+
+/// Reads a msgpack uint token, returning the total consumed byte count and
+/// value; `max_length` is the largest accepted token payload width in bytes.
+fn read_uint(bytes: &[u8], max_length: usize) -> Step<(usize, u64)> {
+    let Some(&first) = bytes.first() else {
+        return Step::Incomplete;
+    };
+    let (consumed, length, value) = match first {
+        0x00..=0x7f => (1usize, 1usize, u64::from(first)),
+        0xcc => {
+            let Some(rest) = bytes.get(1) else {
+                return Step::Incomplete;
+            };
+            (2, 1, u64::from(*rest))
+        }
+        0xcd => {
+            let Some(rest) = bytes.get(1..3) else {
+                return Step::Incomplete;
+            };
+            (3, 2, u64::from(u16::from_be_bytes([rest[0], rest[1]])))
+        }
+        0xce => {
+            let Some(rest) = bytes.get(1..5) else {
+                return Step::Incomplete;
+            };
+            (
+                5,
+                4,
+                u64::from(u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]])),
+            )
+        }
+        0xcf => {
+            let Some(rest) = bytes.get(1..9) else {
+                return Step::Incomplete;
+            };
+            (
+                9,
+                8,
+                u64::from_be_bytes([
+                    rest[0], rest[1], rest[2], rest[3], rest[4], rest[5], rest[6], rest[7],
+                ]),
+            )
+        }
+        _ => return Step::Invalid,
+    };
+    if length > max_length {
+        Step::Invalid
+    } else {
+        Step::Ready((consumed, value))
+    }
+}
+
+fn position_value(next: usize) -> mlua::Result<Value> {
+    let position = i64::try_from(next)
+        .map_err(|_| mlua::Error::runtime("msgpack position exceeds platform limits"))?;
+    Ok(Value::Integer(position))
 }
 
 fn rpc_u32(value: &MpackValue) -> mlua::Result<u32> {
@@ -345,8 +642,17 @@ fn lua_to_mpack(
         Value::Nil => MpackValue::Nil,
         Value::Boolean(value) => MpackValue::Boolean(*value),
         Value::Integer(value) => MpackValue::Integer((*value).into()),
-        Value::Number(value) if value.is_finite() => MpackValue::F64(*value),
-        Value::Number(_) => return Err(mlua::Error::runtime("cannot encode non-finite number")),
+        Value::Number(value) if value.is_infinite() => {
+            // conv.c's mpack_fits_single() compares (float)v == v, which is
+            // true for infinities, so both signs use a 32-bit float.
+            MpackValue::F32(if value.is_sign_negative() {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            })
+        }
+        // NaN fails mpack_fits_single() and stays a 64-bit float.
+        Value::Number(value) => MpackValue::F64(*value),
         Value::String(value) => {
             let bytes = value.as_bytes();
             let is_bin = match packer.and_then(|packer| packer.is_bin.as_ref()) {

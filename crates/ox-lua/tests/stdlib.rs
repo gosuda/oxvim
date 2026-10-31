@@ -169,6 +169,114 @@ fn mpack_session_frames_rpc_messages_and_correlates_responses() {
 }
 
 #[test]
+fn mpack_encodes_nonfinite_numbers_with_upstream_float_widths() {
+    let host = host();
+    let encoded: (mlua::LuaString, mlua::LuaString, mlua::LuaString) = eval(
+        &host,
+        "return vim.mpack.encode(math.huge), vim.mpack.encode(-math.huge), \
+                vim.mpack.encode(0 / 0)",
+    );
+    // conv.c's mpack_fits_single() keeps infinities in a 4-byte float because
+    // (float)v == v holds, while NaN fails the check and takes 8 bytes.
+    assert_eq!(
+        encoded.0.as_bytes().as_ref(),
+        [0xca, 0x7f, 0x80, 0x00, 0x00]
+    );
+    assert_eq!(
+        encoded.1.as_bytes().as_ref(),
+        [0xca, 0xff, 0x80, 0x00, 0x00]
+    );
+    let nan = encoded.2.as_bytes();
+    assert_eq!(nan.len(), 9);
+    assert_eq!(nan[0], 0xcb);
+
+    let decoded: (bool, bool, bool, bool, bool) = eval(
+        &host,
+        "local inf = vim.mpack.decode(vim.mpack.encode(math.huge)); \
+         local ninf = vim.mpack.decode(vim.mpack.encode(-math.huge)); \
+         local nan = vim.mpack.decode(vim.mpack.encode(0 / 0)); \
+         local f32 = vim.mpack.decode(string.char(0xca, 0x7f, 0x80, 0, 0)); \
+         local f64 = vim.mpack.decode(string.char(0xcb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0)); \
+         return inf == math.huge, ninf == -math.huge, nan ~= nan, \
+           f32 == math.huge, f64 ~= f64",
+    );
+    assert_eq!(decoded, (true, true, true, true, true));
+}
+
+#[test]
+fn mpack_sessions_accept_optional_options_and_expose_header_only_receive() {
+    let host = host();
+    let result: (bool, bool, bool, bool, bool, bool, bool) = eval(
+        &host,
+        "local pack = vim.mpack.Packer(); \
+         local ok_no_args = pcall(vim.mpack.Session); \
+         local ok_nil = pcall(vim.mpack.Session, nil); \
+         local ok_non_table = pcall(vim.mpack.Session, 'ignored'); \
+         local ok_empty, empty_err = pcall(vim.mpack.Session, {}); \
+         local ok_bad, bad_err = pcall(vim.mpack.Session, { unpack = 'nope' }); \
+         local session = vim.mpack.Session('ignored'); \
+         local callback = function() end; \
+         local request = session:request(callback) .. pack('method') .. pack({3}); \
+         local kind, id, request_pos = session:receive(request); \
+         local request_ok = kind == 'request' and id == 0 and request_pos == 4; \
+         local ok_payload = pcall(session.receive, session, request:sub(request_pos)); \
+         local response = session:reply(id) .. pack(vim.NIL) .. pack(7); \
+         local rkind, registered, response_pos = session:receive(response); \
+         local response_ok = rkind == 'response' and registered == callback \
+           and response_pos == 4; \
+         local notification = session:notify() .. pack('event') .. pack({4}); \
+         local nkind, none, notification_pos = session:receive(notification); \
+         local notification_ok = nkind == 'notification' and none == nil \
+           and notification_pos == 3; \
+         local fresh = vim.mpack.Session(nil); \
+         local first, second, fragment_pos = fresh:receive(request:sub(1, 2)); \
+         local fkind, fid, resumed_pos = fresh:receive(request:sub(3)); \
+         local fragment_ok = first == nil and second == nil and fragment_pos == 3 \
+           and fkind == 'request' and fid == 0 and resumed_pos == 2; \
+         return ok_no_args, ok_nil, ok_non_table, \
+           not ok_empty and empty_err:find('unpack', 1, true) ~= nil, \
+           not ok_bad and bad_err:find('unpack', 1, true) ~= nil, \
+           request_ok, \
+           not ok_payload and response_ok and notification_ok and fragment_ok",
+    );
+    assert_eq!(result, (true, true, true, true, true, true, true));
+}
+
+#[test]
+fn mpack_session_receive_enforces_rpc_header_widths_in_both_modes() {
+    let host = host();
+    let result: (bool, bool, bool, bool, bool, bool) = eval(
+        &host,
+        "local pack = vim.mpack.Packer(); \
+         local payload = pack('method') .. pack({3}); \
+         local wide_kind = string.char(0x94, 0xcd, 0x00, 0x00, 0x00) .. payload; \
+         local wide_id = string.char(0x94, 0x00, 0xcf, 0, 0, 0, 0, 0, 0, 0, 1) .. payload; \
+         local u8_kind = string.char(0x94, 0xcc, 0x00, 0x00) .. payload; \
+         local u32_id = string.char(0x94, 0x00, 0xce, 0, 0, 0, 5) .. payload; \
+         local hdr_session = vim.mpack.Session(); \
+         local unp_session = vim.mpack.Session({ unpack = vim.mpack.Unpacker() }); \
+         local ok_hdr_wide_kind = pcall(hdr_session.receive, hdr_session, wide_kind); \
+         local ok_unp_wide_kind = pcall(unp_session.receive, unp_session, wide_kind); \
+         local ok_hdr_wide_id = pcall(hdr_session.receive, hdr_session, wide_id); \
+         local ok_unp_wide_id = pcall(unp_session.receive, unp_session, wide_id); \
+         local hk, hid, hpos = hdr_session:receive(u8_kind); \
+         local uk, uid, umethod, uargs, upos = unp_session:receive(u8_kind); \
+         local u8_ok = hk == 'request' and hid == 0 and hpos == 5 \
+           and uk == 'request' and uid == 0 and umethod == 'method' and uargs[1] == 3 \
+           and upos == #u8_kind + 1; \
+         local hk32, hid32, hpos32 = hdr_session:receive(u32_id); \
+         local uk32, uid32, umethod32, uargs32, upos32 = unp_session:receive(u32_id); \
+         local u32_ok = hk32 == 'request' and hid32 == 5 and hpos32 == 8 \
+           and uk32 == 'request' and uid32 == 5 and umethod32 == 'method' and uargs32[1] == 3 \
+           and upos32 == #u32_id + 1; \
+         return not ok_hdr_wide_kind, not ok_unp_wide_kind, \
+           not ok_hdr_wide_id, not ok_unp_wide_id, \
+           u8_ok, u32_ok",
+    );
+    assert_eq!(result, (true, true, true, true, true, true));
+}
+
+#[test]
 fn json_encode_covers_shape_formatting_and_scalar_boundaries() {
     let host = host();
     let encoded: (String, String, String, String) = eval(
