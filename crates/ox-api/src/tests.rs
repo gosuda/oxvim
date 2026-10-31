@@ -4642,6 +4642,59 @@ fn context_display_cells_matches_mb_string2cells_len() {
 }
 
 #[test]
+fn context_get_jump_entries_resolves_named_buffers_and_skips_unnamed() {
+    let (mut editor, buf1, _, _) = editor_with_lines(&["one"]);
+    let buf2 = editor
+        .create_buffer_with(ox_text::Buffer::new(), true)
+        .unwrap();
+    editor.rename_buffer(buf2, OxStr::from("BUF1")).unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(
+            buf1,
+            ox_text::Position { lnum: 2, col: 0 },
+        ));
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(
+            buf2,
+            ox_text::Position { lnum: 5, col: 0 },
+        ));
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("jumps"))]))]),
+    )
+    .unwrap();
+    session.with_editor_mut(|editor| {
+        *editor.jumplist_mut() = ox_editor::Jumplist::new();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    let cwd = std::env::current_dir().unwrap();
+    let expected_buf2_path = cwd.join("BUF1");
+    assert!(entries.iter().any(|e| e.file() == Some(&expected_buf2_path) && e.position.lnum == 5));
+    assert!(!entries.iter().any(|e| e.position.lnum == 2));
+}
+
+#[test]
+fn context_load_does_not_impute_ru_flag_when_unset() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor.registers_mut().delete(
+        ox_editor::RegisterContent::linewise(vec![b"del".to_vec()]).unwrap(),
+    );
+    assert_eq!(editor.registers().unnamed_target_name(), '1');
+    let session = session_with(editor);
+    let context = dict(&[(
+        "regs",
+        Object::Array(vec![Object::String(OxStr::from("line"))]),
+    )]);
+    let _ = crate::context::nvim_load_context(&session, context);
+    let after_unnamed = session.with_editor(|editor| editor.registers().unnamed_target_name());
+    assert_eq!(after_unnamed, '"');
+}
+
+#[test]
 fn client_info_round_trip_reports_registered_channel() {
     let (editor, _, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);
@@ -10471,3 +10524,4 @@ fn set_hl_namespace_zero_link_global_reprojects() {
     });
     assert_eq!(painted, Some(Some(0x00_ccdd)));
 }
+

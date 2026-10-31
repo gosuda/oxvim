@@ -499,16 +499,33 @@ fn global_mark_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
         .collect()
 }
 
+fn is_register_empty(content: &RegisterContent) -> bool {
+    content.lines().is_empty()
+        || (content.lines().len() == 1
+            && matches!(content.kind(), RegisterKind::CharacterWise)
+            && content.lines()[0].is_empty())
+}
+
 /// Builds `Register` entries for `-`, `0-9`, and `a-z`, skipping registers
 /// longer than `cap` lines (negative: no cap).
 pub fn register_entries(editor: &Editor, cap: i64, timestamp: u64) -> Vec<StreamEntry> {
-    let unnamed = editor.registers().unnamed_target_name();
+    let unnamed = editor
+        .registers()
+        .get('"')
+        .ok()
+        .flatten()
+        .filter(|content| !is_register_empty(content))
+        .map(|_| editor.registers().unnamed_target_name())
+        .unwrap_or('"');
     let names = std::iter::once('-').chain('0'..='9').chain('a'..='z');
     let mut entries = Vec::new();
     for name in names {
         let Ok(Some(content)) = editor.registers().get(name) else {
             continue;
         };
+        if is_register_empty(content) {
+            continue;
+        }
         if cap >= 0 && i64::try_from(content.lines().len()).unwrap_or(i64::MAX) > cap {
             continue;
         }
@@ -570,20 +587,65 @@ fn register_value(name: char, content: &RegisterContent, is_unnamed: bool) -> Va
     Value::Map(map)
 }
 
-/// Builds `Jump` entries for the file-backed part of the jump list, oldest
-/// first (`shada_init_jumps`).
+/// Builds `Jump` entries for the jump list, oldest first (`shada_init_jumps`,
+/// `shada.c:3575-3616`).
 pub fn jump_entries(editor: &Editor, timestamp: u64) -> Vec<StreamEntry> {
-    editor
-        .jumplist()
-        .entries()
-        .iter()
-        .filter_map(|location| {
-            let file = location.file()?;
-            Some(StreamEntry::new(
+    let current = editor.current_window().and_then(|win| {
+        let win_state = editor.window(win).ok()?;
+        Some(crate::marks::MarkLocation::in_buffer(
+            win_state.buffer,
+            win_state.cursor,
+        ))
+    });
+
+    let mut raw_jumps = Vec::new();
+    for location in editor.jumplist().entries().iter().chain(current.as_ref()) {
+        if location.position.lnum == 0 {
+            continue;
+        }
+        let resolved_path = match &location.target {
+            crate::marks::MarkTarget::File(path) => {
+                let name = OxStr::from(path.to_string_lossy().as_ref());
+                let expanded = crate::editor::expand_buffer_name(&name);
+                PathBuf::from(expanded.to_string_lossy().as_ref())
+            }
+            crate::marks::MarkTarget::Buffer(handle) => {
+                let Ok(state) = editor.buffer(*handle) else {
+                    continue;
+                };
+                let name = state.name();
+                if name.as_bytes().is_empty() {
+                    continue;
+                }
+                let expanded = crate::editor::expand_buffer_name(name);
+                PathBuf::from(expanded.to_string_lossy().as_ref())
+            }
+        };
+        raw_jumps.push((resolved_path, location.position));
+    }
+
+    let mut deduped = Vec::with_capacity(raw_jumps.len().min(100));
+    for (i, (path, pos)) in raw_jumps.iter().enumerate() {
+        let is_dup = raw_jumps[i + 1..]
+            .iter()
+            .any(|(later_path, later_pos)| later_path == path && later_pos.lnum == pos.lnum);
+        if !is_dup {
+            deduped.push((path.clone(), *pos));
+        }
+    }
+    if deduped.len() > 100 {
+        let skip = deduped.len() - 100;
+        deduped.drain(..skip);
+    }
+
+    deduped
+        .into_iter()
+        .map(|(path, position)| {
+            StreamEntry::new(
                 EntryType::Jump,
                 timestamp,
-                filemark_value(None, file, location.position),
-            ))
+                filemark_value(None, &path, position),
+            )
         })
         .collect()
 }

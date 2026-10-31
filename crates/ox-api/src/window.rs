@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use ox_editor::{
     Anchor, AutocmdContext, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor,
     Event, Extmark, ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition,
-    FileIO, Margins, OptionStore, OptionValue, RealFileIO, RelativeTo, TextAlignment,
-    VirtualTextChunk, WinConfig,
+    FileIO, Margins, MarkLocation, MarkTarget, OptionStore, OptionValue, RealFileIO, RelativeTo,
+    TextAlignment, VirtualTextChunk, WinConfig,
 };
 use ox_text::{Buffer, Position};
 use unicode_width::UnicodeWidthChar;

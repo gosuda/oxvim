@@ -105,6 +105,7 @@ pub(crate) fn display_cells(line: &[u8]) -> usize {
     cells
 }
 
+
 #[api(since = 6)]
 #[expect(
     clippy::needless_pass_by_value,
@@ -197,10 +198,7 @@ pub fn nvim_load_context(session: &ApiSession, dict: Dict) -> Result<Object, Api
     }
 
     session.with_editor_mut(|editor| {
-        let registers = editor.registers_mut();
-        for name in std::iter::once('-').chain('0'..='9').chain('a'..='z') {
-            let _ = registers.clear_for_setreg(name);
-        }
+        *editor.registers_mut() = ox_editor::Registers::new();
     });
 
     for (bytes, type_id) in [
