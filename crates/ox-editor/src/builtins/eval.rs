@@ -18,7 +18,7 @@ use ox_eval::builtins::string_arg;
 use ox_eval::closure_index;
 use ox_eval::exists as exists_in_scope;
 use ox_excmd::{ResolveError, ResolvedCommand, resolve_command};
-use ox_types::{Funcref, Object, OxStr, Special, Typval};
+use ox_types::{BufHandle, Funcref, Object, OxStr, Special, Typval};
 use std::rc::Rc;
 
 use super::input_string_arg;
@@ -400,7 +400,41 @@ fn call_luaeval_builtin<F: FileIO, E: ExEditorAccess>(
 /// Leading cmdline `sp_token` table for `expand()` (`find_cmdline_var`,
 /// `ex_docmd.c:7488`), limited to the tokens this port resolves. Ordered
 /// longest-first so a later `<argname>`-style addition cannot be shadowed.
-const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%"];
+const EXPAND_SPECIAL_TOKENS: &[&str] = &["<amatch>", "<afile>", "<abuf>", "<SID>", "%", "#"];
+
+/// Looks up a buffer's name by handle, returning an empty [`OxStr`] if the
+/// handle is absent, invalid, or belongs to an unnamed buffer.
+fn buffer_name_by_handle(editor: &crate::Editor, handle: Option<BufHandle>) -> OxStr {
+    handle
+        .and_then(|h| editor.buffer(h).ok())
+        .map_or_else(
+            || OxStr(Vec::new()),
+            |buffer| {
+                let name = buffer.name().to_string_lossy();
+                OxStr::from(name.as_ref())
+            },
+        )
+}
+fn resolve_buffer_token(editor: &crate::Editor, token: &str) -> OxStr {
+    let digits = token.strip_prefix('#').unwrap_or_default();
+    let number = if digits.is_empty() {
+        0
+    } else {
+        digits.parse::<i64>().unwrap_or(-1)
+    };
+    if number == 0 {
+        let alternate = editor
+            .current_window()
+            .and_then(|window| editor.window(window).ok())
+            .and_then(|window| window.alternate_buffer);
+        buffer_name_by_handle(editor, alternate)
+    } else if number > 0 {
+        let handle = BufHandle::try_from(number).ok();
+        buffer_name_by_handle(editor, handle)
+    } else {
+        OxStr(Vec::new())
+    }
+}
 
 /// The `eval_vars` (`ex_docmd.c:7551`) bases behind `expand()`'s special
 /// tokens. A token this port does not know yields an empty base.
@@ -438,17 +472,35 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
                 OxStr::from(number.as_str())
             },
         ),
+        token if token.starts_with('#') => {
+            access.with_ex_editor(|editor| resolve_buffer_token(editor, token))
+        }
         _ => OxStr(Vec::new()),
     }
 }
 
+/// Splits a leading special token and its trailing remainder for `expand()`.
+///
+/// Handles `<...>` tokens, `%`, `#` (alternate buffer), and `#N` (buffer number N).
+fn find_expand_special<'a>(text: &'a str) -> Option<(&'a str, &'a str)> {
+    if let Some(rest) = text.strip_prefix('#') {
+        let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+        let (token, remaining) = text.split_at(1 + digits);
+        return Some((token, remaining));
+    }
+    EXPAND_SPECIAL_TOKENS
+        .iter()
+        .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)))
+}
+
 /// `expand()` (`f_expand`).
 ///
-/// `%`, `#` and a `<...>` keyword go to `eval_vars`; this port resolves
-/// `%`, `<SID>`, `<amatch>`, `<afile>` and `<abuf>` as leading tokens with
-/// an optional trailing `:`-modifier chain applied through
+/// `%`, `#`, `#N` and a `<...>` keyword go to `eval_vars`; this port resolves
+/// `%`, `#`, `#N`, `<SID>`, `<amatch>`, `<afile>` and `<abuf>` as leading tokens
+/// with an optional trailing `:`-modifier chain applied through
 /// `ox_eval::apply_filename_modifiers` (`modify_fname` parity), so
-/// `expand('%:p')` is the absolute current-buffer name. Anything else is a
+/// `expand('%:p')` is the absolute current-buffer name and `expand('#:p')`
+/// is the absolute alternate-buffer name. Anything else is a
 /// file pattern handed to `ExpandOne`, which resolves `~` and `$NAME`
 /// through `expand_env_esc` before matching. Returning such a pattern
 /// verbatim leaves `expand('~')` as the literal `~`, and callers that hand
@@ -457,7 +509,7 @@ fn expand_special_base<F: FileIO, E: ExEditorAccess>(
 ///
 /// Named gap: the wildcard half of `ExpandOne` is not here, so a pattern
 /// with `*` or `?` still comes back as itself; `glob()` is where this port
-/// matches files. `#` and `<cword>`/`<sfile>`-style tokens are likewise
+/// matches files. `<cword>`/`<sfile>`-style tokens are likewise
 /// not recognized and pass through verbatim, and the `%<` extension-strip
 /// form is not implemented.
 fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
@@ -470,9 +522,7 @@ fn call_expand_builtin<F: FileIO, E: ExEditorAccess>(
     };
     let text = value.to_string_lossy();
     let text: &str = text.as_ref();
-    let special = EXPAND_SPECIAL_TOKENS
-        .iter()
-        .find_map(|token| text.strip_prefix(token).map(|rest| (*token, rest)));
+    let special = find_expand_special(text);
     let expanded = match special {
         // Exact token or token-plus-`:`-modifier chain (`eval_vars` +
         // `modify_fname`).
@@ -1169,5 +1219,61 @@ mod tests {
         let editor = TestEditorAccess::new(Editor::new());
         let mut exec = executor();
         assert!(failure(&mut exec, &editor, "uniq(1)").contains("E686"));
+    }
+
+    #[test]
+    fn expand_resolves_alternate_and_numbered_buffers_with_modifiers() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let buf1 = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buf1)
+            .unwrap()
+            .set_name(OxStr::from("foo.txt"));
+        editor
+            .editor_mut()
+            .create_tabpage(buf1, crate::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+
+        let buf2 = editor.editor_mut().create_buffer(true).unwrap();
+        editor
+            .editor_mut()
+            .buffer_mut(buf2)
+            .unwrap()
+            .set_name(OxStr::from("bar.txt"));
+
+        let buf3 = editor.editor_mut().create_buffer(true).unwrap();
+
+        let mut exec = executor();
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#99:p')"), text(""));
+
+        let win = editor.editor().current_window().unwrap();
+        editor.editor_mut().window_mut(win).unwrap().buffer = buf2;
+        editor.editor_mut().window_mut(win).unwrap().alternate_buffer = Some(buf1);
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text("foo.txt"));
+        assert_eq!(eval(&mut exec, &editor, "expand('#2')"), text("bar.txt"));
+
+        let bar_p = eval(&mut exec, &editor, "expand('#2:p')");
+        let Typval::String(bar_str) = &bar_p else { panic!("expected string") };
+        assert!(bar_str.to_string_lossy().ends_with("bar.txt"));
+
+        assert_eq!(eval(&mut exec, &editor, "expand('#3')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#3:p')"), text(""));
+
+        let foo_p_gs = eval(&mut exec, &editor, "expand('#1:p:gs?\\?/?')");
+        let Typval::String(foo_str) = &foo_p_gs else { panic!("expected string") };
+        let foo_path = foo_str.to_string_lossy();
+        assert!(foo_path.ends_with("foo.txt"));
+        assert!(!foo_path.contains('\\'));
+
+        assert_eq!(eval(&mut exec, &editor, "expand('1#')"), text("1#"));
+
+        editor.editor_mut().window_mut(win).unwrap().alternate_buffer = Some(buf3);
+        assert_eq!(eval(&mut exec, &editor, "expand('#')"), text(""));
+        assert_eq!(eval(&mut exec, &editor, "expand('#:p')"), text(""));
     }
 }
