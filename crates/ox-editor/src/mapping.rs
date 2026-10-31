@@ -14,7 +14,6 @@
 //! [`Mappings::lookup_abbreviation_in_mode`]; the engine only stores the
 //! mode-filtered table and the word-boundary rules here.
 
-use std::fmt::Write as _;
 use std::ops::{BitOr, BitOrAssign};
 
 use ox_excmd::{ExCommand, ParseError, Parser};
@@ -22,7 +21,10 @@ use ox_types::BufHandle;
 use thiserror::Error;
 
 use crate::script::SourceContext;
-use crate::typeahead::{Keys, Typeahead, special_notation};
+use crate::typeahead::{
+    KE_FILLER, KS_MODIFIER, KS_SPECIAL, KS_ZERO, K_SPECIAL, Keys, MOD_MASK_ALT, MOD_MASK_CMD,
+    MOD_MASK_CTRL, MOD_MASK_META, MOD_MASK_SHIFT, Typeahead, special_key_name,
+};
 
 /// One mapping mode accepted by the `:map` family.
 ///
@@ -1151,90 +1153,163 @@ impl Mappings {
             .map(|(mapping, local)| mapping.listing_row(local))
             .collect()
     }
+    /// Formats matching mappings as attributed `showmap` chunks.
+    #[must_use]
+    pub fn format_chunks_listing(
+        &self,
+        lhs: &[u8],
+        modes: MapModes,
+        buffer: Option<BufHandle>,
+    ) -> Vec<Vec<(String, Option<&'static str>)>> {
+        self.matching(lhs, modes, buffer)
+            .into_iter()
+            .map(|(mapping, local)| mapping.listing_chunks(local))
+            .collect()
+    }
 }
 
 impl Mapping {
     /// One `showmap` row for a mapping (`mapping.c:240-304`): mode characters
     /// padded to three columns, the LHS padded to at least twelve with one
     /// trailing blank guaranteed, the `*`/`&`/blank remap marker, the
-    /// `@`/blank buffer-local marker, then the right-hand side.
+    /// `@`/blank buffer-local marker, then the right-hand side, broken into
+    /// `(text, highlight_group)` pieces under `SpecialKey`.
     #[must_use]
-    pub fn listing_row(&self, local: bool) -> String {
-        let mut row = self.options.modes.to_chars();
-        while row.len() < 3 {
-            row.push(' ');
+    pub fn listing_chunks(&self, local: bool) -> Vec<(String, Option<&'static str>)> {
+        let mut chunks = Vec::new();
+        let mut mode_str = self.options.modes.to_chars();
+        while mode_str.len() < 3 {
+            mode_str.push(' ');
         }
-        let shown = special_notation(self.lhs.as_bytes(), true, false);
-        let mut width = shown.chars().count();
-        row.push_str(&shown);
+        chunks.push((mode_str, None));
+
+        let lhs_chunks = special_notation_chunks(self.lhs.as_bytes(), true, false);
+        let mut width = 0;
+        for (text, is_special) in lhs_chunks {
+            width += text.chars().count();
+            chunks.push((text, is_special.then_some("SpecialKey")));
+        }
+
+        let mut pad = String::new();
         loop {
-            row.push(' ');
+            pad.push(' ');
             width += 1;
             if width >= 12 {
                 break;
             }
         }
-        row.push(if self.options.flags.contains(MapFlags::SCRIPT) {
-            '&'
+        chunks.push((pad, None));
+
+        let remap_char = if self.options.flags.contains(MapFlags::SCRIPT) {
+            "&"
         } else if self.options.flags.contains(MapFlags::REMAP) {
-            ' '
+            " "
         } else {
-            '*'
-        });
-        row.push(if local { '@' } else { ' ' });
+            "*"
+        };
+        let remap_hl = (remap_char != " ").then_some("SpecialKey");
+        chunks.push((remap_char.to_owned(), remap_hl));
+
+        let local_char = if local { "@" } else { " " };
+        chunks.push((local_char.to_owned(), None));
+
         match self.action {
             MappingAction::Callback(id) => {
-                let _ = write!(row, "<Callback {id}>");
+                chunks.push((format!("<Callback {id}>"), Some("SpecialKey")));
             }
             ref action => match action.replaced_keys().unwrap_or_default() {
-                [] => row.push_str("<Nop>"),
-                keys => row.push_str(&special_notation(keys, false, false)),
+                [] => chunks.push(("<Nop>".to_owned(), Some("SpecialKey"))),
+                keys => {
+                    let rhs_chunks = special_notation_chunks(keys, false, false);
+                    for (text, is_special) in rhs_chunks {
+                        chunks.push((text, is_special.then_some("SpecialKey")));
+                    }
+                }
             },
         }
+
         if let Some(description) = &self.options.description {
-            row.push_str("\n                 ");
-            row.push_str(description);
+            chunks.push(("\n                 ".to_owned(), None));
+            chunks.push((description.clone(), None));
         }
-        row
+
+        chunks
+    }
+
+    /// One `showmap` row for a mapping (`mapping.c:240-304`), rendered as a
+    /// flat text string by concatenating the styled fragments.
+    #[must_use]
+    pub fn listing_row(&self, local: bool) -> String {
+        self.listing_chunks(local)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
     }
 }
 
 impl Abbreviation {
-    /// One `showmap` row for an abbreviation (`mapping.c:220-266`), the same
-    /// shape mappings print: mode characters padded to three columns, the
-    /// trigger padded to twelve with one trailing blank guaranteed, the
-    /// `*`/`&`/blank remap marker, the `@`/blank buffer-local marker, then
-    /// the right-hand side (`<Nop>` for an empty one).
+    /// One `showmap` row for an abbreviation (`mapping.c:220-266`), broken into
+    /// `(text, highlight_group)` pieces under `SpecialKey`.
     #[must_use]
-    pub fn listing_row(&self, local: bool) -> String {
-        let mut row = self.modes.to_chars();
-        while row.len() < 3 {
-            row.push(' ');
+    pub fn listing_chunks(&self, local: bool) -> Vec<(String, Option<&'static str>)> {
+        let mut chunks = Vec::new();
+        let mut mode_str = self.modes.to_chars();
+        while mode_str.len() < 3 {
+            mode_str.push(' ');
         }
-        let shown = special_notation(self.lhs.as_bytes(), true, false);
-        let mut width = shown.chars().count();
-        row.push_str(&shown);
+        chunks.push((mode_str, None));
+
+        let trigger_chunks = special_notation_chunks(self.lhs.as_bytes(), true, false);
+        let mut width = 0;
+        for (text, is_special) in trigger_chunks {
+            width += text.chars().count();
+            chunks.push((text, is_special.then_some("SpecialKey")));
+        }
+
+        let mut pad = String::new();
         loop {
-            row.push(' ');
+            pad.push(' ');
             width += 1;
             if width >= 12 {
                 break;
             }
         }
-        row.push(if self.flags.contains(MapFlags::SCRIPT) {
-            '&'
+        chunks.push((pad, None));
+
+        let remap_char = if self.flags.contains(MapFlags::SCRIPT) {
+            "&"
         } else if self.flags.contains(MapFlags::REMAP) {
-            ' '
+            " "
         } else {
-            '*'
-        });
-        row.push(if local { '@' } else { ' ' });
+            "*"
+        };
+        let remap_hl = (remap_char != " ").then_some("SpecialKey");
+        chunks.push((remap_char.to_owned(), remap_hl));
+
+        let local_char = if local { "@" } else { " " };
+        chunks.push((local_char.to_owned(), None));
+
         match self.action.replaced_keys() {
-            Some([]) => row.push_str("<Nop>"),
-            Some(keys) => row.push_str(&special_notation(keys, false, false)),
-            None => row.push_str("<Nop>"),
+            Some([]) | None => chunks.push(("<Nop>".to_owned(), Some("SpecialKey"))),
+            Some(keys) => {
+                let rhs_chunks = special_notation_chunks(keys, false, false);
+                for (text, is_special) in rhs_chunks {
+                    chunks.push((text, is_special.then_some("SpecialKey")));
+                }
+            }
         }
-        row
+
+        chunks
+    }
+
+    /// One `showmap` row for an abbreviation (`mapping.c:220-266`), rendered
+    /// as a flat text string by concatenating the styled fragments.
+    #[must_use]
+    pub fn listing_row(&self, local: bool) -> String {
+        self.listing_chunks(local)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
     }
 }
 
@@ -1245,6 +1320,160 @@ impl Abbreviation {
 fn abbrev_lhs_matches(trigger: &str, lhs: &str) -> bool {
     lhs.strip_prefix(trigger)
         .is_some_and(|rest| rest.chars().all(char::is_whitespace))
+}
+
+/// Formats internal key sequence bytes into human-readable notation fragments
+/// tagged with whether each fragment represents a special key.
+#[must_use]
+pub fn special_notation_chunks(
+    bytes: &[u8],
+    replace_spaces: bool,
+    replace_lt: bool,
+) -> Vec<(String, bool)> {
+    let mut chunks: Vec<(String, bool)> = Vec::new();
+    let mut plain_bytes: Vec<u8> = Vec::new();
+
+
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if let Some(prefix) = ["<cmd>", "<cr>", "<nop>"].iter().find(|kw| {
+            bytes[offset..].len() >= kw.len()
+                && bytes[offset..offset + kw.len()].eq_ignore_ascii_case(kw.as_bytes())
+        }) {
+            flush_plain(&mut plain_bytes, &mut chunks);
+            let canonical = match *prefix {
+                "<cmd>" => "<Cmd>",
+                "<cr>" => "<CR>",
+                "<nop>" => "<Nop>",
+                _ => unreachable!(),
+            };
+            chunks.push((canonical.to_owned(), true));
+            offset += prefix.len();
+            continue;
+        }
+        if let [K_SPECIAL, KS_MODIFIER, modifiers, K_SPECIAL, second, third, ..] = bytes[offset..] {
+            flush_plain(&mut plain_bytes, &mut chunks);
+            let mut out = Vec::new();
+            out.push(b'<');
+            push_modifiers_bytes(&mut out, modifiers);
+            if let Some(name) = special_key_name(second, third) {
+                out.extend_from_slice(name.as_bytes());
+            } else {
+                out.extend_from_slice(b"t_");
+                out.push(second);
+                out.push(third);
+            }
+            out.push(b'>');
+            chunks.push((String::from_utf8_lossy(&out).into_owned(), true));
+            offset += 6;
+            continue;
+        }
+        if let [K_SPECIAL, KS_MODIFIER, modifiers, raw_byte, ..] = bytes[offset..] {
+            flush_plain(&mut plain_bytes, &mut chunks);
+            let mut out = Vec::new();
+            out.push(b'<');
+            push_modifiers_bytes(&mut out, modifiers);
+            if raw_byte == b' ' {
+                out.extend_from_slice(b"Space");
+            } else if raw_byte < 0x20 {
+                out.push(raw_byte | 0x40);
+            } else {
+                out.push(raw_byte);
+            }
+            out.push(b'>');
+            chunks.push((String::from_utf8_lossy(&out).into_owned(), true));
+            offset += 4;
+            continue;
+        }
+        let (byte, width) = match bytes[offset..] {
+            [K_SPECIAL, KS_ZERO, KE_FILLER, ..] => (0u8, 3),
+            [K_SPECIAL, KS_SPECIAL, KE_FILLER, ..] => (K_SPECIAL, 3),
+            [K_SPECIAL, second, third, ..] => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                let mut out = Vec::new();
+                if let Some(name) = special_key_name(second, third) {
+                    out.push(b'<');
+                    out.extend_from_slice(name.as_bytes());
+                    out.push(b'>');
+                } else {
+                    out.extend_from_slice(b"<t_");
+                    out.extend_from_slice(&[second, third, b'>']);
+                }
+                chunks.push((String::from_utf8_lossy(&out).into_owned(), true));
+                offset += 3;
+                continue;
+            }
+            [byte, ..] => (byte, 1),
+            [] => break,
+        };
+        offset += width;
+        match byte {
+            b' ' if replace_spaces => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<Space>".to_owned(), true));
+            }
+            b'<' if replace_lt => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<lt>".to_owned(), true));
+            }
+            0x00 => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<Nul>".to_owned(), true));
+            }
+            0x09 => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<Tab>".to_owned(), true));
+            }
+            0x0a => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<NL>".to_owned(), true));
+            }
+            0x0d => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<CR>".to_owned(), true));
+            }
+            0x1b => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                chunks.push(("<Esc>".to_owned(), true));
+            }
+            0x01..=0x1f => {
+                flush_plain(&mut plain_bytes, &mut chunks);
+                let mut out = Vec::new();
+                out.extend_from_slice(b"<C-");
+                out.extend_from_slice(&[byte | 0x40, b'>']);
+                chunks.push((String::from_utf8_lossy(&out).into_owned(), true));
+            }
+            other => plain_bytes.push(other),
+        }
+    }
+    flush_plain(&mut plain_bytes, &mut chunks);
+    chunks
+}
+
+fn flush_plain(plain: &mut Vec<u8>, chunks: &mut Vec<(String, bool)>) {
+    if !plain.is_empty() {
+        let s = String::from_utf8_lossy(plain).into_owned();
+        chunks.push((s, false));
+        plain.clear();
+    }
+}
+
+fn push_modifiers_bytes(out: &mut Vec<u8>, modifiers: u8) {
+    if modifiers & MOD_MASK_ALT != 0 {
+        out.extend_from_slice(b"M-");
+    }
+    if modifiers & MOD_MASK_META != 0 {
+        out.extend_from_slice(b"T-");
+    }
+    if modifiers & MOD_MASK_CTRL != 0 {
+        out.extend_from_slice(b"C-");
+    }
+    if modifiers & MOD_MASK_SHIFT != 0 {
+        out.extend_from_slice(b"S-");
+    }
+    if modifiers & MOD_MASK_CMD != 0 {
+        out.extend_from_slice(b"D-");
+    }
 }
 
 fn valid_abbreviation(lhs: &str) -> bool {
@@ -1592,5 +1821,33 @@ mod tests {
         let buf_rows = mappings.format_buffer_listing(b_lhs.as_bytes(), MapModes::MAP, buf_handle);
         assert_eq!(buf_rows.len(), 1);
         assert_eq!(buf_rows[0], "   <F4>        *@<Cmd>let m = mode(1)<CR>");
+    }
+
+    #[test]
+    fn mapping_listing_chunks_emits_special_key_attributes() {
+        let mut mappings = Mappings::new();
+        let lhs = Keys::parse_notation("<F3>", "\\", "\\");
+        let rhs = MappingAction::parse_rhs("<Cmd>let m = mode(1)<cr>", "\\", "\\").unwrap();
+        let options = MappingOptions {
+            modes: MapModes::MAP,
+            ..MappingOptions::default()
+        };
+        mappings.noremap(lhs.clone(), rhs, options).unwrap();
+
+        let chunk_rows = mappings.format_chunks_listing(lhs.as_bytes(), MapModes::MAP, None);
+        assert_eq!(chunk_rows.len(), 1);
+        assert_eq!(
+            &chunk_rows[0],
+            &[
+                ("   ".to_owned(), None),
+                ("<F3>".to_owned(), Some("SpecialKey")),
+                ("        ".to_owned(), None),
+                ("*".to_owned(), Some("SpecialKey")),
+                (" ".to_owned(), None),
+                ("<Cmd>".to_owned(), Some("SpecialKey")),
+                ("let m = mode(1)".to_owned(), None),
+                ("<CR>".to_owned(), Some("SpecialKey")),
+            ]
+        );
     }
 }

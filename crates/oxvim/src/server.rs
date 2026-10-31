@@ -2916,10 +2916,6 @@ fn show_message_in_chrome(
     message: &ox_editor::Message,
     identity: &MessageIdentity,
 ) {
-    let text = match &message.content {
-        Object::String(text) => text.clone(),
-        value => OxStr::from(format!("{value:?}").as_bytes()),
-    };
     if identity.history_show {
         // `:messages`: the sentinel identity swaps the wire event to
         // `msg_history_show`, built from every history-retained entry. A
@@ -2931,21 +2927,25 @@ fn show_message_in_chrome(
                 .iter()
                 .zip(editor.message_identities().iter())
                 .filter(|(entry, _)| entry.history)
-                .filter_map(|(entry, identity)| match &entry.content {
-                    Object::String(text) => Some((
+                .map(|(entry, identity)| {
+                    (
                         identity.kind.clone(),
-                        vec![ContentChunk::new(0, text.clone())],
-                    )),
-                    _ => None,
+                        entry.content.clone(),
+                    )
                 })
                 .collect::<Vec<_>>()
         });
-        session.with_render_state(|_, _, chrome| {
+        session.with_render_state(|_, highlights, chrome| {
+            let resolved_entries: Vec<(OxStr, Vec<ContentChunk>)> = entries
+                .into_iter()
+                .map(|(kind, content)| (kind, resolve_content_chunks(&content, highlights)))
+                .collect();
+            let content = resolve_content_chunks(&message.content, highlights);
             chrome.history_show(
-                &entries,
+                &resolved_entries,
                 MessageState {
                     kind: OxStr::from("echo"),
-                    content: vec![ContentChunk::new(0, text)],
+                    content,
                     replace_last: false,
                     history: false,
                     append: false,
@@ -2956,10 +2956,11 @@ fn show_message_in_chrome(
         });
         return;
     }
-    session.with_render_state(|_, _, chrome| {
+    session.with_render_state(|_, highlights, chrome| {
+        let content = resolve_content_chunks(&message.content, highlights);
         chrome.show_message(MessageState {
             kind: identity.kind.clone(),
-            content: vec![ContentChunk::new(0, text)],
+            content,
             replace_last: false,
             history: message.history,
             append: false,
@@ -2967,6 +2968,69 @@ fn show_message_in_chrome(
             trigger: OxStr::from(""),
         });
     });
+}
+
+fn resolve_content_chunks(content: &Object, highlights: &mut ox_ui::HlState) -> Vec<ContentChunk> {
+    match content {
+        Object::String(text) => vec![ContentChunk::new(0, text.clone())],
+        Object::Array(chunks) => {
+            let mut result = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                match chunk {
+                    Object::Array(pair) => {
+                        let text = match pair.first() {
+                            Some(Object::String(text)) => text.clone(),
+                            _ => continue,
+                        };
+                        let hl_id = match pair.get(1) {
+                            Some(Object::Integer(id)) => u64::try_from(*id).unwrap_or(0),
+                            Some(Object::String(group)) => match highlights.group_id(group) {
+                                Some(id) => id,
+                                None => {
+                                    if group.as_bytes() == b"SpecialKey" {
+                                        highlights
+                                            .define_group(
+                                                "SpecialKey",
+                                                Highlight {
+                                                    rgb: HlAttrs {
+                                                        foreground: Some(0x00_00_ff),
+                                                        ..HlAttrs::default()
+                                                    },
+                                                    cterm: HlAttrs {
+                                                        foreground: Some(6),
+                                                        fg_indexed: true,
+                                                        ..HlAttrs::default()
+                                                    },
+                                                    ..Highlight::default()
+                                                },
+                                            )
+                                            .unwrap_or(0)
+                                    } else {
+                                        0
+                                    }
+                                }
+                            },
+                            _ => 0,
+                        };
+                        result.push(ContentChunk::new(hl_id, text));
+                    }
+                    Object::String(text) => {
+                        result.push(ContentChunk::new(0, text.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            if result.is_empty() {
+                vec![ContentChunk::new(0, OxStr::from(""))]
+            } else {
+                result
+            }
+        }
+        value => vec![ContentChunk::new(
+            0,
+            OxStr::from(format!("{value:?}").as_bytes()),
+        )],
+    }
 }
 
 /// Returns a caller-supplied `nvim_echo` id. Automatic ids are deliberately

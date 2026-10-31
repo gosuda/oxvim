@@ -694,6 +694,7 @@ fn ensure_chrome_highlights(highlights: &mut HlState) -> Result<(), HlError> {
     define_group_if_missing(highlights, "ErrorMsg", error_msg_highlight())?;
     define_group_if_missing(highlights, "MsgArea", Highlight::default())?;
     define_group_if_missing(highlights, "MoreMsg", more_msg_highlight())?;
+    define_group_if_missing(highlights, "SpecialKey", special_key_highlight())?;
     Ok(())
 }
 
@@ -835,6 +836,22 @@ fn more_msg_highlight() -> Highlight {
         true,
     )
 }
+
+fn special_key_highlight() -> Highlight {
+    named_highlight(
+        "SpecialKey",
+        HlAttrs {
+            foreground: Some(0x00_00_ff),
+            ..HlAttrs::default()
+        },
+        HlAttrs {
+            foreground: Some(6),
+            fg_indexed: true,
+            ..HlAttrs::default()
+        },
+        true,
+    )
+}
 fn apply_message_fallback(
     grid: &mut Grid,
     highlights: &HlState,
@@ -916,13 +933,7 @@ fn paint_message_line(
     if grid.width() == 0 {
         return Ok(());
     }
-    let fill_id = line.last().map_or(
-        msg_area_id,
-        |(_, hl_id)| {
-            if *hl_id == 0 { msg_area_id } else { *hl_id }
-        },
-    );
-    grid.write_text(row, 0, &" ".repeat(grid.width()), fill_id)?;
+    grid.write_text(row, 0, &" ".repeat(grid.width()), msg_area_id)?;
     let mut col = 0;
     for (text, hl_id) in line {
         if !text.is_empty() {

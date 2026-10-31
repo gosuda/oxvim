@@ -652,6 +652,79 @@ fn showmode_fallback_renders_on_last_row_without_regular_message() -> Result<(),
 }
 
 #[test]
+fn message_fallback_paints_per_chunk_highlights_and_default_fill() {
+    let compositor = Compositor::new(20, 5);
+    let mut channels = UiChannels::new();
+    channels
+        .attach(
+            1,
+            20,
+            5,
+            UiOptions {
+                ext_linegrid: true,
+                ..UiOptions::default()
+            },
+        )
+        .unwrap();
+    let mut chrome = ChromeState::new();
+    chrome.show_message(MessageState {
+        kind: OxStr::from("echo"),
+        content: vec![
+            ContentChunk::new(0, "   "),
+            ContentChunk::new(6, "<F3>"),
+            ContentChunk::new(0, " * "),
+            ContentChunk::new(6, "<Cmd>"),
+        ],
+        replace_last: false,
+        history: false,
+        append: false,
+        id: Object::Nil,
+        trigger: OxStr::from(""),
+    });
+    let mut emitter = Emitter::new();
+    let frame = emitter
+        .redraw(&mut channels, &compositor, &mut HlState::new(), &mut chrome)
+        .unwrap()
+        .0;
+    let decoded = decode(&frame[&1]).unwrap();
+    let Object::Array(frame_arr) = &decoded else {
+        panic!("decoded frame is not an array");
+    };
+    let Some(Object::Array(events)) = frame_arr.get(2) else {
+        panic!("no events array in frame");
+    };
+    let mut last_row_cells = Vec::new();
+    for event in events {
+        let Object::Array(parts) = event else { continue };
+        let Some(Object::String(name)) = parts.first() else { continue };
+        if name.as_bytes() != b"grid_line" { continue };
+        for argset in parts.iter().skip(1) {
+            let Object::Array(args) = argset else { continue };
+            if args.get(1) == Some(&Object::Integer(4)) {
+                if let Some(Object::Array(cells)) = args.get(3) {
+                    last_row_cells = cells.clone();
+                }
+            }
+        }
+    }
+    assert!(!last_row_cells.is_empty(), "expected grid_line on row 4");
+    let mut cells_with_hl = Vec::new();
+    let mut current_hl = 0i64;
+    for cell in last_row_cells {
+        let Object::Array(parts) = cell else { continue };
+        let text = match parts.first() {
+            Some(Object::String(s)) => s.to_string_lossy().into_owned(),
+            _ => continue,
+        };
+        if let Some(Object::Integer(hl)) = parts.get(1) {
+            current_hl = *hl;
+        }
+        cells_with_hl.push((text, current_hl));
+    }
+    assert!(cells_with_hl.iter().any(|(t, hl)| t == "<" && *hl == 6));
+}
+
+#[test]
 fn showmode_emits_msg_showmode_event_with_ext_messages() {
     // With ext_messages enabled, showmode is routed as a msg_showmode event
     // rather than rendered into the grid.
