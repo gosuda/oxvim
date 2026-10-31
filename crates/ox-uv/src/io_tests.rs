@@ -2,11 +2,12 @@
 // a failed expect here is a test failure, not a recoverable error.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs as std_fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,7 +18,7 @@ use crate::UvLoop;
 use crate::dns::{self, AddrInfoHints};
 use crate::fs::{self, OpenFlags};
 use crate::net::{NetEvent, Tcp, Udp};
-use crate::pool::{LoopPoster, Pool};
+use crate::pool::{LoopCompletion, LoopPoster, Pool, PostError};
 #[cfg(unix)]
 use crate::process::StdioConfig;
 use crate::process::{self, SpawnOptions};
@@ -182,6 +183,192 @@ fn fixed_pool_drains_thirty_two_jobs_without_deadlock() {
     let mut expected: Vec<_> = (0_u32..32).map(|value| value * value).collect();
     expected.sort_unstable();
     assert_eq!(results, expected);
+}
+
+#[test]
+fn dropping_loop_releases_queued_completions_that_own_its_queue() {
+    let uv_loop = UvLoop::new().expect("create loop");
+    let poster = uv_loop.completion_poster();
+    let queued_work = Arc::new(());
+    let queued_handle = Arc::clone(&queued_work);
+    let queued_poster = poster.clone();
+    poster
+        .post(Box::new(move |_| drop((queued_handle, queued_poster))))
+        .expect("queue completion");
+    assert_eq!(Arc::strong_count(&queued_work), 2);
+
+    drop(uv_loop);
+    assert_eq!(
+        Arc::strong_count(&queued_work),
+        1,
+        "a pending completion kept its own loop queue reachable"
+    );
+
+    let rejected_work = Arc::new(());
+    let rejected_handle = Arc::clone(&rejected_work);
+    assert!(
+        poster
+            .post(Box::new(move |_| drop(rejected_handle)))
+            .is_err(),
+        "closed queue still accepted a completion"
+    );
+    assert_eq!(
+        Arc::strong_count(&rejected_work),
+        1,
+        "a rejected completion stayed queued"
+    );
+    assert!(
+        poster.begin().is_err(),
+        "closed queue still began a request"
+    );
+}
+
+#[test]
+fn pool_submit_ends_exactly_once_on_post_wake_failure_and_retains_queue_order() {
+    #[derive(Clone)]
+    struct FailingPoster {
+        begun: Arc<AtomicUsize>,
+        ended: Arc<AtomicUsize>,
+        pending: Arc<Mutex<VecDeque<LoopCompletion>>>,
+        fail_wake: Arc<AtomicBool>,
+    }
+
+    impl LoopPoster for FailingPoster {
+        fn begin(&self) -> Result<(), PostError> {
+            self.begun.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn end(&self) {
+            self.ended.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn post(&self, completion: LoopCompletion) -> Result<(), PostError> {
+            let mut pending = self.pending.lock().map_err(|_| PostError)?;
+            pending.push_back(completion);
+            if self.fail_wake.load(Ordering::SeqCst) {
+                let rejected = pending.pop_back();
+                drop(pending);
+                drop(rejected);
+                return Err(PostError);
+            }
+            drop(pending);
+            Ok(())
+        }
+    }
+
+    let poster = FailingPoster {
+        begun: Arc::new(AtomicUsize::new(0)),
+        ended: Arc::new(AtomicUsize::new(0)),
+        pending: Arc::new(Mutex::new(VecDeque::new())),
+        fail_wake: Arc::new(AtomicBool::new(true)),
+    };
+
+    // Pre-populate queue with a prior marker completion to verify queue ordering and that
+    // events are not lost on rollback.
+    let marker_executed = Arc::new(AtomicBool::new(false));
+    let marker_executed_clone = Arc::clone(&marker_executed);
+    poster.pending.lock().unwrap().push_back(Box::new(move |_| {
+        marker_executed_clone.store(true, Ordering::SeqCst);
+    }));
+
+    let pool = Pool::with_size(1);
+    let (work_done_tx, work_done_rx) = mpsc::channel();
+    let callback_invoked = Arc::new(AtomicBool::new(false));
+    let callback_invoked_clone = Arc::clone(&callback_invoked);
+
+    pool.submit(
+        poster.clone(),
+        move || {
+            work_done_tx.send(()).expect("send work done");
+            123_u32
+        },
+        move |_, _| {
+            callback_invoked_clone.store(true, Ordering::SeqCst);
+        },
+    )
+    .expect("submit work");
+
+    work_done_rx.recv_timeout(TIMEOUT).expect("work executed");
+
+    let start = Instant::now();
+    while poster.ended.load(Ordering::SeqCst) == 0 && start.elapsed() < TIMEOUT {
+        thread::yield_now();
+    }
+
+    // Must be ended exactly once:
+    assert_eq!(poster.begun.load(Ordering::SeqCst), 1);
+    assert_eq!(poster.ended.load(Ordering::SeqCst), 1);
+
+    // The callback must not have been executed:
+    assert!(
+        !callback_invoked.load(Ordering::SeqCst),
+        "callback must not run when post fails"
+    );
+
+    // Queue ordering retained: the prior marker completion is still in the queue,
+    // and the failed completion was removed.
+    let mut pending = poster.pending.lock().unwrap();
+    assert_eq!(pending.len(), 1, "prior event retained without loss");
+    let mut dummy_loop = UvLoop::new().expect("create loop");
+    let marker = pending.pop_front().expect("pop marker");
+    drop(pending);
+    marker(&mut dummy_loop);
+    assert!(
+        marker_executed.load(Ordering::SeqCst),
+        "marker was preserved and executed"
+    );
+}
+
+#[test]
+fn pool_submit_ends_exactly_once_when_loop_closes_before_dispatch() {
+    let pool = Pool::with_size(1);
+    let uv_loop = UvLoop::new().expect("create loop");
+    let poster = uv_loop.completion_poster();
+
+    let (work_started_tx, work_started_rx) = mpsc::channel();
+    let (block_tx, block_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    pool.submit(
+        poster.clone(),
+        move || {
+            work_started_tx.send(()).expect("signal work started");
+            block_rx.recv().expect("unblock worker");
+            42_u32
+        },
+        move |_, _| {
+            done_tx.send(()).expect("send done");
+        },
+    )
+    .expect("submit work");
+
+    work_started_rx
+        .recv_timeout(TIMEOUT)
+        .expect("work started on pool worker");
+    assert!(
+        poster.has_outstanding(),
+        "in-flight pool work must be accounted for"
+    );
+
+    // Unblock the worker so it finishes work and posts the completion.
+    block_tx.send(()).expect("unblock worker");
+
+    // Close and drop the loop before running it: close() drains and drops pending completions.
+    drop(uv_loop);
+
+    let start = Instant::now();
+    while poster.has_outstanding() && start.elapsed() < TIMEOUT {
+        thread::yield_now();
+    }
+    assert!(
+        !poster.has_outstanding(),
+        "closing loop must drop queued completion and decrement outstanding count to zero"
+    );
+    assert!(
+        done_rx.try_recv().is_err(),
+        "completion callback must not run after loop is closed"
+    );
 }
 
 #[test]
