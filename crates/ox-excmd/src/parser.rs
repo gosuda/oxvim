@@ -1267,7 +1267,7 @@ fn shell_arg_family(name: &str, flags: CommandFlags, usefilter: bool) -> bool {
 /// the text just past the previous `|`/`\n` separator — or the start of the
 /// input — through the first non-blank byte (eval/vars.c:772-776). A `|` or
 /// `\n` earlier than the separator cannot precede a parsed command: anything
-/// that swallows it (`:normal`, user commands, quoted arguments) also
+/// that swallows it (user commands, quoted arguments) also
 /// swallows the text this command was read from, so the last separator
 /// before `before` is always the real chunk boundary.
 fn chunk_ws(input: &str, before: usize) -> &str {
@@ -1360,17 +1360,10 @@ fn command_end(
     if name == "wincmd" {
         return wincmd_command_end(input, args_start);
     }
-    // Commands whose argument is the whole remainder of the cmdline: script
-    // source a language handler evaluates, a `:command`/`:autocmd` body that
-    // keeps following lines as its definition, `:normal` keys, a nested
-    // cmdline the handler re-executes (`:windo let a\nlet b` runs both per
-    // window), and user commands (`:Mc a\nlet x` puts the newline in
-    // `<args>`). A newline is content here, never a separator.
     if matches!(command, ResolvedCommand::User(_))
         || matches!(
             name,
-            "normal"
-                | "command"
+            "command"
                 | "autocmd"
                 | "debug"
                 | "lua"

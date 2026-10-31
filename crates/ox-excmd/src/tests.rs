@@ -812,6 +812,66 @@ fn normal_consumes_bar() {
 }
 
 #[test]
+fn normal_followed_by_more_lines_ends_at_newline() {
+    let input = "normal! ihello\nfunction! F()\ncall F()\nendfunction";
+    let commands = Parser::new().parse(input).unwrap_or_default();
+    assert_eq!(commands.len(), 4);
+    assert_eq!(commands[0].command.name(), "normal");
+    assert!(commands[0].bang);
+    assert_eq!(commands[0].args, "ihello");
+    assert_eq!(commands[1].command.name(), "function");
+    assert!(commands[1].bang);
+    assert_eq!(commands[1].args, "F()");
+    assert_eq!(commands[2].command.name(), "call");
+    assert_eq!(commands[2].args, "F()");
+    assert_eq!(commands[3].command.name(), "endfunction");
+    assert_eq!(commands[3].args, "");
+}
+
+#[test]
+fn normal_consumes_bar_but_ends_at_newline() {
+    let input = "normal! ihello|foo\nlet g:x = 1";
+    let commands = Parser::new().parse(input).unwrap_or_default();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].command.name(), "normal");
+    assert!(commands[0].bang);
+    assert_eq!(commands[0].args, "ihello|foo");
+    assert_eq!(commands[1].command.name(), "let");
+    assert_eq!(commands[1].args, "g:x = 1");
+}
+
+#[test]
+fn cmd_map_spec_function_with_normal_parses() {
+    let input = "\
+        function! TextObj()\n\
+            if mode() !=# \"v\"\n\
+                normal! v\n\
+            end\n\
+            call cursor(1,3)\n\
+            normal! o\n\
+            call cursor(2,4)\n\
+        endfunction";
+    let commands = Parser::new().parse(input).unwrap_or_default();
+    assert_eq!(commands.len(), 8);
+    let names: Vec<_> = commands.iter().map(|c| c.command.name()).collect();
+    assert_eq!(
+        names,
+        &[
+            "function",
+            "if",
+            "normal",
+            "endif",
+            "call",
+            "normal",
+            "call",
+            "endfunction",
+        ]
+    );
+    assert_eq!(commands[2].args, "v");
+    assert_eq!(commands[5].args, "o");
+}
+
+#[test]
 fn global_consumes_bar() {
     let command = parse_one("global/foo/print | echo later");
     assert_eq!(command.args, "/foo/print | echo later");
