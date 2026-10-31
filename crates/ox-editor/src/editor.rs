@@ -789,6 +789,7 @@ impl Editor {
                 ("_null_list".into(), Object::Array(Vec::new())),
                 ("_null_dict".into(), Object::Dict(Dict(Vec::new()))),
                 ("register".into(), Object::String(OxStr::from("\""))),
+                ("vim_did_init".into(), Object::Integer(1)),
                 // `v:vim_did_enter` is 0 through startup and 1 from the
                 // moment VimEnter is fired (`eval.c` `set_vim_var_nr`, main.c),
                 // so a runtime plugin that branches on it during startup sees

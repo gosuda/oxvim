@@ -837,6 +837,11 @@ impl AppState {
         // (main.c:1193-1197), so a later `-u <file>` on the same command line
         // overwrites it and is honoured. Gating this on `!cli.clean` made
         // `--clean -u file` ignore the file, which the oracle sources.
+        self.session.with_editor_mut(|editor| {
+            editor
+                .vvars_mut()
+                .insert(ox_types::OxStr::from("vim_did_init"), ox_types::Object::Integer(0));
+        });
         match &cli.user_config {
             UserConfig::File(path) => self.source_config_file(Path::new(path)),
             UserConfig::None | UserConfig::NoRc => {}
@@ -850,6 +855,11 @@ impl AppState {
         if self.exiting {
             return Ok(());
         }
+        self.session.with_editor_mut(|editor| {
+            editor
+                .vvars_mut()
+                .insert(ox_types::OxStr::from("vim_did_init"), ox_types::Object::Integer(1));
+        });
 
         // main.c:489 `load_plugins`, after the user config and before the
         // window layout. 'loadplugins' already carries the `--noplugin` and
@@ -1053,24 +1063,39 @@ impl AppState {
         else {
             return;
         };
-        let (after, plain): (Vec<&str>, Vec<&str>) = value
+        let is_after = |entry: &str| {
+            Path::new(entry)
+                .file_name()
+                .is_some_and(|name| name == "after")
+        };
+        let plain: Vec<String> = value
             .split(',')
             .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .partition(|entry| {
-                Path::new(entry)
-                    .file_name()
-                    .is_some_and(|name| name == "after")
-            });
-        for entry in plain.into_iter().chain(after) {
+            .filter(|entry| !entry.is_empty() && !is_after(entry))
+            .map(str::to_owned)
+            .collect();
+        for entry in &plain {
             for script in plugin_scripts(Path::new(entry)) {
-                // `source_callback_vim_lua` (runtime.c:371-396) discards
-                // `do_source`'s result and sources the next file, so an error
-                // inside one plugin ends that plugin and nothing else. One
-                // broken plugin must not be able to stop startup -- with the
-                // error propagated instead, `runtime/plugin/gzip.vim` took the
-                // whole editor down on every plain startup. Config errors
-                // display inside `source_config_file`, never as `Err` here.
+                self.source_config_file(&script);
+                if self.exiting {
+                    return;
+                }
+            }
+        }
+        let Ok(OptionValue::String(value)) = self
+            .session
+            .with_editor(|editor| editor.options().get_global("runtimepath").cloned())
+        else {
+            return;
+        };
+        let after: Vec<String> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty() && is_after(entry))
+            .map(str::to_owned)
+            .collect();
+        for entry in &after {
+            for script in plugin_scripts(Path::new(entry)) {
                 self.source_config_file(&script);
                 if self.exiting {
                     return;

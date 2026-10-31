@@ -150,11 +150,43 @@ fn call_getcompletion(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typva
         "highlight" => complete_highlights(editor, &pat),
         "messages" => complete_messages(&pat),
         "filetypecmd" => complete_filetypecmd(&pat),
+        "help" => complete_help(editor, &pat),
         _ => Vec::new(),
     };
     Ok(Typval::list(
         matches.into_iter().map(Typval::String).collect(),
     ))
+}
+fn complete_help(editor: &Editor, pat: &str) -> Vec<OxStr> {
+    let Ok(crate::options::OptionValue::String(rtp)) =
+        editor.options().get_global("runtimepath")
+    else {
+        return Vec::new();
+    };
+    let mut tags = Vec::new();
+    for dir in crate::fs_builtins::split_path_list(&rtp) {
+        let tags_path = std::path::Path::new(&dir).join("doc").join("tags");
+        collect_tags_from_file(&tags_path, &mut tags);
+    }
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let mut results = prefix_filter(&tag_refs, pat);
+    results.sort();
+    results.dedup();
+    results
+}
+
+fn collect_tags_from_file(tags_path: &std::path::Path, tags: &mut Vec<String>) {
+    let Ok(content) = std::fs::read_to_string(tags_path) else {
+        return;
+    };
+    for line in content.lines() {
+        let Some(tag) = line.split('\t').next() else {
+            continue;
+        };
+        if !tag.is_empty() && !tag.starts_with('!') {
+            tags.push(tag.to_owned());
+        }
+    }
 }
 
 fn prefix_filter(candidates: &[&str], pat: &str) -> Vec<OxStr> {

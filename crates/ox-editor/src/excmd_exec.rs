@@ -4558,6 +4558,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "bfirst" | "brewind" => command_buffer_absolute(runtime, access, scope, lua, command, 0),
         "blast" => command_buffer_absolute(runtime, access, scope, lua, command, isize::MAX),
         "buffer" | "b" => command_buffer(runtime, access, scope, lua, command),
+        "sbuffer" | "sb" => command_sbuffer(runtime, access, scope, lua, command),
         "ls" | "buffers" | "files" => {
             access.with_ex_editor(|editor| command_buffer_list(runtime, editor, command))
         }
@@ -6231,7 +6232,6 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
                 ),
             )
         })?;
-    let lines = join_source_lines(runtime, access, &text, cfg!(windows))?;
     let name = runtime
         .scripts
         .io()
@@ -6241,9 +6241,6 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let caller_script = scope.script.clone();
     let caller_augroup = runtime.current_augroup;
     let caller_sid = runtime.scripts.current_sid();
-    // `save_funccal` (`runtime.c:2337`): the file body is not the caller's
-    // function body, so its unscoped names are global, not that function's
-    // locals.
     let caller_bar = runtime.source_bar;
     runtime.source_bar = runtime.functions.call_stack().len();
     if let Some(from) = caller_sid {
@@ -6252,17 +6249,22 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     let sid = runtime
         .scripts
         .push_source(name, runtime.next_frame_order());
-    let lines = expand_script_lines(&runtime.scripts, lines, sid);
     runtime.scripts.load_script_scope(sid, scope);
     if load_once {
         runtime.scripts.mark_sourced_once(path);
     }
-    let program = parse_program(
-        &runtime.user_commands,
-        access.with_ex_editor(|editor| editor.current_buffer()),
-        &lines,
-    );
-    let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
+    let flow = if path.extension().is_some_and(|ext| ext == "lua") {
+        source_lua_file(runtime, access, scope, lua, path)
+    } else {
+        let lines = join_source_lines(runtime, access, &text, cfg!(windows))?;
+        let lines = expand_script_lines(&runtime.scripts, lines, sid);
+        let program = parse_program(
+            &runtime.user_commands,
+            access.with_ex_editor(|editor| editor.current_buffer()),
+            &lines,
+        );
+        Ok(run_program(runtime, access, scope, lua, &program, 0, program.len()))
+    };
     runtime.scripts.store_script_scope(sid, scope);
     runtime.scripts.pop_source();
     match caller_sid {
@@ -6271,7 +6273,27 @@ fn source_path<F: FileIO, E: ExEditorAccess>(
     }
     runtime.current_augroup = caller_augroup;
     runtime.source_bar = caller_bar;
-    Ok(flow)
+    flow
+}
+
+fn source_lua_file<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    path: &Path,
+) -> Result<Flow, ExecError> {
+    let Some(lua) = lua else {
+        return Ok(Flow::Normal);
+    };
+    access.with_ex_editor(|editor| sync_scope_into_editor(editor, scope))?;
+    let result = lua.execute_file(path);
+    let sync = access.with_ex_editor(|editor| sync_editor_into_scope(editor, scope));
+    match (result, sync) {
+        (Err(error), _) => Ok(lua_error_flow(runtime, error, "E5112", "E5113")),
+        (Ok(()), Err(error)) => Ok(exec_error_flow(runtime, error)),
+        (Ok(()), Ok(())) => Ok(Flow::Normal),
+    }
 }
 /// `call_user_func` cleanup (userfunc.c:1272, 3487-3524): pops the frame's
 /// one `fc_defer` list and runs it last-registered-first while the callee
@@ -9285,10 +9307,12 @@ fn command_packadd<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let name = command.args.trim();
-    if name.is_empty() {
+    let raw_name = command.args.trim();
+    if raw_name.is_empty() {
         return error_flow(runtime, "E471", "Argument required");
     }
+    let unescaped_name = raw_name.replace("\\ ", " ");
+    let name = unescaped_name.as_str();
     let packpath = access.with_ex_editor(|editor| match editor.options().get_global("packpath") {
         Ok(OptionValue::String(text)) => text.clone(),
         _ => "./".to_owned(),
@@ -17833,6 +17857,198 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
         return flow;
     }
     switch_current_buffer(runtime, access, scope, lua, current, handle)
+}
+fn command_sbuffer<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    if runtime.textlock > 0 {
+        return error_flow(
+            runtime,
+            "E565",
+            format!(
+                "Not allowed to change text or change window: {}",
+                command.command.name()
+            ),
+        );
+    }
+    let target = match resolve_sbuffer_target(access, command, runtime) {
+        Ok(handle) => handle,
+        Err(flow) => return flow,
+    };
+    if let Some(tab_mod) = command
+        .modifiers
+        .iter()
+        .find(|m| m.kind == ModifierKind::Tab)
+    {
+        return open_sbuffer_tab(runtime, access, scope, lua, target, tab_mod);
+    }
+    open_sbuffer_split(runtime, access, scope, lua, command, target)
+}
+
+fn resolve_sbuffer_target<F: FileIO, E: ExEditorAccess>(
+    editor_access: &E,
+    command: &ExCommand,
+    runtime: &ExRuntime<F>,
+) -> Result<BufHandle, Flow> {
+    let raw_arg = command.args.trim();
+    let unescaped_arg = crate::session::unescape_fname(raw_arg);
+    let unescaped_arg = if let Some(rest) = unescaped_arg.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        unescaped_arg
+    };
+    let resolved_arg = if let Some(rest) = unescaped_arg.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(rest).to_string_lossy().into_owned()
+        } else {
+            unescaped_arg.clone()
+        }
+    } else {
+        unescaped_arg.clone()
+    };
+    let arg = raw_arg;
+    let requested = command
+        .count
+        .and_then(|value| i64::try_from(value).ok())
+        .or_else(|| arg.parse::<i64>().ok());
+    if let Some(requested_val) = requested {
+        if let Ok(handle) = BufHandle::try_from(requested_val) {
+            if editor_access.with_ex_editor(|editor| editor.buffer(handle).is_ok()) {
+                return Ok(handle);
+            }
+        }
+        return Err(error_flow(
+            runtime,
+            "E86",
+            format!("Buffer {requested_val} does not exist"),
+        ));
+    }
+    if arg.is_empty() {
+        return editor_access
+            .with_ex_editor(|editor| editor.current_buffer())
+            .ok_or_else(|| error_flow(runtime, "E749", "Empty buffer"));
+    }
+    if arg == "#" {
+        return editor_access.with_ex_editor(|editor| {
+            editor
+                .current_window()
+                .and_then(|window| editor.window(window).ok())
+                .and_then(|window| window.alternate_buffer)
+                .filter(|buffer| editor.buffer(*buffer).is_ok())
+                .ok_or_else(|| error_flow(runtime, "E94", "No matching buffer for #"))
+        });
+    }
+    editor_access.with_ex_editor(|editor| {
+        let matches: Vec<BufHandle> = editor
+            .buffers()
+            .into_iter()
+            .filter(|handle| {
+                editor
+                    .buffer(*handle)
+                    .is_ok_and(|buffer| {
+                        buffer_name_matches(buffer.name(), arg)
+                            || buffer_name_matches(buffer.name(), &unescaped_arg)
+                            || buffer_name_matches(buffer.name(), &resolved_arg)
+                            || buffer.file_path.as_ref().is_some_and(|p| {
+                                let p_str = p.to_string_lossy();
+                                p_str == arg || p_str == unescaped_arg || p_str == resolved_arg
+                            })
+                    })
+            })
+            .collect();
+        match matches.as_slice() {
+            [handle] => Ok(*handle),
+            [] => Err(error_flow(
+                runtime,
+                "E94",
+                format!("No matching buffer for {arg}"),
+            )),
+            _ => Err(error_flow(
+                runtime,
+                "E93",
+                format!("More than one match for {arg}"),
+            )),
+        }
+    })
+}
+
+fn open_sbuffer_tab<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    target: BufHandle,
+    modifier: &CommandModifier,
+) -> Flow {
+    let after = modifier
+        .count
+        .and_then(|count| usize::try_from(count).ok())
+        .map(|count| count.max(1))
+        .unwrap_or(0);
+    let outcome = access.with_ex_editor(|editor| {
+        editor.create_tabpage_at(target, DEFAULT_TABPAGE_GEOMETRY, after)
+    });
+    if let Err(error) = outcome {
+        return error_flow(runtime, "E948", error.to_string());
+    }
+    fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], target)
+}
+
+fn open_sbuffer_split<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+    target: BufHandle,
+) -> Flow {
+    let vertical = command
+        .modifiers
+        .iter()
+        .any(|modifier| modifier.kind == ModifierKind::Vertical);
+    let below_right = command.modifiers.iter().any(|modifier| {
+        matches!(
+            modifier.kind,
+            ModifierKind::BelowRight | ModifierKind::BotRight | ModifierKind::RightBelow
+        )
+    });
+    let Some(tab) = access.with_ex_editor(|editor| editor.current_tabpage()) else {
+        return error_flow(runtime, "E749", "No current tabpage");
+    };
+    let Some(window) = access.with_ex_editor(|editor| editor.current_window()) else {
+        return error_flow(runtime, "E749", "No current window");
+    };
+    let origin_cursor =
+        access.with_ex_editor(|editor| editor.window(window).ok().map(|state| state.cursor));
+    let created = if vertical && !below_right {
+        access.with_ex_editor(|editor| editor.split_left(tab, window, target, true))
+    } else if vertical {
+        access.with_ex_editor(|editor| editor.split_vertical(tab, window, target, true))
+    } else if below_right {
+        access.with_ex_editor(|editor| editor.split_horizontal(tab, window, target, true))
+    } else {
+        access.with_ex_editor(|editor| editor.split_above(tab, window, target, true))
+    };
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => return error_flow(runtime, "E36", error.to_string()),
+    };
+    if let Err(error) = access.with_ex_editor(|editor| editor.set_current_window(created)) {
+        let _ = access.with_ex_editor(|editor| editor.close_window(tab, created, true));
+        return error_flow(runtime, "E36", error.to_string());
+    }
+    if access.with_ex_editor(|editor| editor.current_buffer()) == Some(target)
+        && let Some(cursor) = origin_cursor
+        && let Err(error) =
+            access.with_ex_editor(|editor| editor.set_window_cursor(created, cursor))
+    {
+        return error_flow(runtime, "E16", error.to_string());
+    }
+    fire_buffer_lifecycle(runtime, access, scope, lua, &[Event::BufEnter], target)
 }
 
 #[derive(Clone, Copy)]
