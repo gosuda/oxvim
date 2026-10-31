@@ -8330,9 +8330,10 @@ fn a_map_keeps_trailing_spaces_and_edit_does_not() {
 fn listing_rows(editor: &TestEditorAccess, from: usize) -> Vec<String> {
     editor.editor().messages()[from..]
         .iter()
-        .map(|message| match &message.content {
-            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
-            other => panic!("expected a string message, got {other:?}"),
+        .map(|message| {
+            message
+                .text_lossy()
+                .unwrap_or_else(|| panic!("expected a text message, got {:?}", message.content))
         })
         .collect()
 }

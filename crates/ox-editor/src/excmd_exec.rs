@@ -4714,7 +4714,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "sign" => access.with_ex_editor(|editor| command_sign(runtime, editor, command)),
         "augroup" => access.with_ex_editor(|editor| command_augroup(runtime, editor, command)),
         "autocmd" => command_autocmd(runtime, access, lua, command),
-        "doautocmd" | "doautoall" => command_doautocmd(runtime, access, scope, lua, command),
+        "doautocmd" => command_doautocmd(runtime, access, scope, lua, command),
+        "doautoall" => command_doautoall(runtime, access, scope, lua, command),
         "command" => access.with_ex_editor(|editor| command_user_command(runtime, editor, command)),
         "comclear" => {
             runtime.user_commands.borrow_mut().commands.clear();
@@ -5651,7 +5652,18 @@ fn argument_path(editor: &Editor, argument: &str) -> PathBuf {
             .current_window()
             .and_then(|window| editor.window(window).ok())
             .and_then(|window| window.alternate_buffer),
-        _ => return PathBuf::from(argument),
+        _ => {
+            if let Some(rest) = argument.strip_prefix("~/") {
+                if let Ok(home) = std::env::var("HOME") {
+                    return PathBuf::from(home).join(rest);
+                }
+            } else if argument == "~" {
+                if let Ok(home) = std::env::var("HOME") {
+                    return PathBuf::from(home);
+                }
+            }
+            return PathBuf::from(argument);
+        }
     };
     buffer
         .and_then(|buffer| editor.buffer(buffer).ok())
@@ -5715,7 +5727,10 @@ pub(crate) fn resolve_buffer_argument(
         Some(Typval::String(name)) => editor.buffers().into_iter().find(|buffer| {
             editor
                 .buffer(*buffer)
-                .is_ok_and(|state| state.name() == name)
+                .is_ok_and(|state| {
+                    state.name() == name
+                        || buffer_name_matches(state.name(), &name.to_string_lossy())
+                })
         }),
         _ => None,
     }
@@ -8399,9 +8414,24 @@ fn directory_target(
             .previous_directory(scope)
             .ok_or_else(|| EvalError::new("E186", 0, "No previous directory"));
     }
-    let direct = PathBuf::from(path);
-    if direct.is_absolute() || direct.is_dir() {
-        return Ok(direct);
+    let unescaped = crate::session::unescape_fname(path);
+    let resolved = if let Some(rest) = unescaped.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(rest)
+        } else {
+            PathBuf::from(&unescaped)
+        }
+    } else if unescaped == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+        } else {
+            PathBuf::from(&unescaped)
+        }
+    } else {
+        PathBuf::from(&unescaped)
+    };
+    if resolved.is_absolute() || resolved.is_dir() {
+        return Ok(resolved);
     }
     if let Ok(OptionValue::String(cdpath)) = editor.options().get_global("cdpath") {
         for entry in cdpath.split(',') {
@@ -8410,13 +8440,13 @@ fn directory_target(
             } else {
                 Path::new(entry)
             };
-            let candidate = base.join(path);
+            let candidate = base.join(&unescaped);
             if candidate.is_dir() {
                 return Ok(candidate);
             }
         }
     }
-    Ok(direct)
+    Ok(resolved)
 }
 
 /// `:cd`/`:lcd` and `chdir()`/`haslocaldir()`'s shared move
@@ -9151,9 +9181,19 @@ fn stage_buffer_from_file<F: FileIO>(
 }
 fn existing_buffer_for_path(editor: &Editor, path: &std::path::Path) -> Option<BufHandle> {
     let wanted = path.to_string_lossy();
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(path)
+    } else {
+        path.to_path_buf()
+    };
     let wanted_canon = std::fs::canonicalize(path).ok();
     editor.buffers().into_iter().find(|handle| {
         editor.buffer(*handle).is_ok_and(|state| {
+            if state.file_path.as_deref() == Some(&abs_path) {
+                return true;
+            }
             let name = state.name().to_string_lossy();
             if name == wanted {
                 return true;
@@ -9595,7 +9635,7 @@ fn edit_winfixbuf_guard<F: FileIO, E: ExEditorAccess>(
 /// Displays a sourced-script path the way `:scriptnames` lists it:
 /// `home_replace` (`path.c`) swaps a `$HOME` prefix for `~`, so a script
 /// under the home directory lists as `~/home_script.vim`.
-fn home_replaced_name(name: &str) -> String {
+pub(crate) fn home_replaced_name(name: &str) -> String {
     let Some(home) = std::env::var_os("HOME") else {
         return name.to_owned();
     };
@@ -9823,7 +9863,17 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
                 .unwrap_or_default()
         })
     } else {
-        PathBuf::from(command.args.replace('\0', "\n"))
+        let unescaped = crate::session::unescape_fname(&command.args.replace('\0', "\n"));
+        let resolved = if let Some(rest) = unescaped.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                PathBuf::from(home).join(rest).to_string_lossy().into_owned()
+            } else {
+                unescaped
+            }
+        } else {
+            unescaped
+        };
+        PathBuf::from(resolved)
     };
     if path.as_os_str().is_empty() {
         return error_flow(runtime, "E32", "No file name");
@@ -9865,6 +9915,14 @@ fn command_edit<F: FileIO, E: ExEditorAccess>(
         Ok((handle, origin)) => (handle, origin),
         Err(flow) => return flow,
     };
+    if path.is_absolute() {
+        let _ = access.with_ex_editor(|editor| {
+            if let Ok(state) = editor.buffer_mut(handle) {
+                state.set_name(OxStr::from(path.to_string_lossy().as_ref()));
+                state.file_path = Some(path.to_path_buf());
+            }
+        });
+    }
     if access.with_ex_editor(|editor| editor.current_buffer()) == Some(handle)
         && is_directory_path(runtime, &path)
     {
@@ -12534,12 +12592,19 @@ fn command_terminal<F: FileIO, E: ExEditorAccess>(
             editor.push_jump(buffer, position);
         }
     });
-    let mut fresh = command.clone();
-    fresh.args.clear();
-    fresh.usefilter = false;
-    let flow = command_enew(runtime, access, scope, lua, &fresh);
-    if !matches!(flow, Flow::Normal) {
-        return flow;
+    let reusable = access.with_ex_editor(|editor| {
+        editor
+            .current_buffer()
+            .filter(|&buf| is_buffer_reusable(editor, buf))
+    });
+    if reusable.is_none() {
+        let mut fresh = command.clone();
+        fresh.args.clear();
+        fresh.usefilter = false;
+        let flow = command_enew(runtime, access, scope, lua, &fresh);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
     }
     let (_, buffer) = match crate::builtins::process::start_terminal(
         runtime,
@@ -12591,8 +12656,6 @@ fn command_enew<F: FileIO, E: ExEditorAccess>(
         Ok(handle) => handle,
         Err(error) => return error_flow(runtime, "E948", error.to_string()),
     };
-    // `buf_alloc` (`buffer.c:2115-2135`): the new listed buffer fires `BufNew`
-    // then `BufAdd` before it is entered.
     let flow = fire_buffer_lifecycle(
         runtime,
         access,
@@ -13525,7 +13588,7 @@ fn read_file_format(bytes: &[u8], formats: &str, fallback: &str, binary: bool) -
 /// 'mac' with CR, 'unix' with LF; the trailing EOL is written whenever
 /// 'endofline' is set or 'fixeol' fixes it, but never under 'binary'
 /// without 'endofline'.
-fn buffer_file_bytes(editor: &Editor, buffer: BufHandle, bytes: &[u8]) -> Vec<u8> {
+fn buffer_file_bytes(editor: &Editor, buffer: BufHandle, text: &ox_text::Buffer) -> Vec<u8> {
     let bool_option = |name: &str, default: bool| match editor.options().get_buffer(buffer, name) {
         Ok(OptionValue::Boolean(value)) => *value,
         _ => default,
@@ -13537,36 +13600,23 @@ fn buffer_file_bytes(editor: &Editor, buffer: BufHandle, bytes: &[u8]) -> Vec<u8
     let binary = bool_option("binary", false);
     let eol = bool_option("endofline", true);
     let fixeol = bool_option("fixeol", true);
-    // `to_bytes` marks a terminated last line with one trailing `\n`; strip
-    // it so the separator join doesn't double it with the EOL write below.
-    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
-    let mut out = Vec::with_capacity(bytes.len() + 8);
-    if fileformat == "mac" {
-        for byte in body {
-            out.push(match byte {
-                b'\n' => b'\r',
-                _ => *byte,
-            });
-        }
-        if eol || (fixeol && !binary) {
-            out.push(b'\r');
-        }
-    } else {
-        let separator = if fileformat == "dos" {
-            b"\r\n".as_slice()
-        } else {
-            b"\n".as_slice()
-        };
-        let mut parts = body.split(|byte| *byte == b'\n').peekable();
-        while let Some(part) = parts.next() {
-            out.extend_from_slice(part);
-            if parts.peek().is_some() {
+    let line_count = text.line_count();
+    let separator = match fileformat.as_str() {
+        "mac" => b"\r".as_slice(),
+        "dos" => b"\r\n".as_slice(),
+        _ => b"\n".as_slice(),
+    };
+    let mut out = Vec::new();
+    for lnum in 1..=line_count {
+        if let Ok(line) = text.line(lnum) {
+            out.extend_from_slice(&line);
+            if lnum < line_count {
                 out.extend_from_slice(separator);
             }
         }
-        if eol || (fixeol && !binary) {
-            out.extend_from_slice(separator);
-        }
+    }
+    if eol || (fixeol && !binary) {
+        out.extend_from_slice(separator);
     }
     out
 }
@@ -13920,7 +13970,7 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
         editor
             .buffer(buffer)
             .and_then(|state| state.text().map_err(Into::into))
-            .map(|text| buffer_file_bytes(editor, buffer, &text.to_bytes()))
+            .map(|text| buffer_file_bytes(editor, buffer, text))
     }) {
         Ok(bytes) => bytes,
         Err(error) => return error_flow(runtime, "E749", error.to_string()),
@@ -14576,6 +14626,17 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
                     created_window.set(None);
                     return Err(LoadSwitchError::Editor(error));
                 }
+                let requested_size = command
+                    .count
+                    .and_then(|c| usize::try_from(c).ok())
+                    .or_else(|| wincmd_range_count(command));
+                if let Some(count) = requested_size {
+                    if vertical {
+                        let _ = access.with_ex_editor(|editor| editor.set_window_width(created, count));
+                    } else {
+                        let _ = access.with_ex_editor(|editor| editor.set_window_height(created, count));
+                    }
+                }
                 // `:split {file}` initialises its window with `win_init`, not
                 // `win_init_some`, so it inherits nothing from the window the
                 // command started in; only a bare `:split` copies options.
@@ -14662,6 +14723,17 @@ fn command_split<F: FileIO, E: ExEditorAccess>(
         }
         return error_flow(runtime, "E36", error.to_string());
     }
+    let requested_size = command
+        .count
+        .and_then(|c| usize::try_from(c).ok())
+        .or_else(|| wincmd_range_count(command));
+    if let Some(count) = requested_size {
+        if vertical {
+            let _ = access.with_ex_editor(|editor| editor.set_window_width(created, count));
+        } else {
+            let _ = access.with_ex_editor(|editor| editor.set_window_height(created, count));
+        }
+    }
     // `:new`, `:vnew`, and `:split {file}` create their window with
     // `win_init`, so nothing is inherited; only a bare `:split` copies.
     if new_buffer != buffer {
@@ -14715,7 +14787,13 @@ fn command_tabnew<F: FileIO, E: ExEditorAccess>(
         Ok(after) => after,
         Err(message) => return error_flow(runtime, "E16", message),
     };
-    let name = command.args.trim();
+    let mut name = command.args.trim();
+    if let Some(stripped) = name.strip_prefix('+') {
+        let end = stripped
+            .find(|character: char| character == ' ' || character == '\t')
+            .map_or(stripped.len(), |index| index);
+        name = stripped[end..].trim();
+    }
     let has_file = !name.is_empty();
     let (buffer, origin) = if has_file {
         let path = access.with_ex_editor(|editor| argument_path(editor, name));
@@ -17651,7 +17729,23 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let arg = command.args.trim();
+    let raw_arg = command.args.trim();
+    let unescaped_arg = crate::session::unescape_fname(raw_arg);
+    let unescaped_arg = if let Some(rest) = unescaped_arg.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        unescaped_arg
+    };
+    let resolved_arg = if let Some(rest) = unescaped_arg.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(rest).to_string_lossy().into_owned()
+        } else {
+            unescaped_arg.clone()
+        }
+    } else {
+        unescaped_arg.clone()
+    };
+    let arg = raw_arg;
     let requested = command
         .count
         .and_then(|value| i64::try_from(value).ok())
@@ -17666,11 +17760,7 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
                 .and_then(|window| window.alternate_buffer)
                 .filter(|buffer| editor.buffer(*buffer).is_ok())
             {
-                Some(alternate) => {
-                    // `:b#` edits the alternate buffer (`do_buffer`'s `#`
-                    // expansion, `buffer.c`).
-                    Ok(alternate)
-                }
+                Some(alternate) => Ok(alternate),
                 None => Err(error_flow(
                     runtime,
                     "E94",
@@ -17684,7 +17774,15 @@ fn command_buffer<F: FileIO, E: ExEditorAccess>(
                 .filter(|handle| {
                     editor
                         .buffer(*handle)
-                        .is_ok_and(|buffer| buffer_name_matches(buffer.name(), arg))
+                        .is_ok_and(|buffer| {
+                            buffer_name_matches(buffer.name(), arg)
+                                || buffer_name_matches(buffer.name(), &unescaped_arg)
+                                || buffer_name_matches(buffer.name(), &resolved_arg)
+                                || buffer.file_path.as_ref().is_some_and(|p| {
+                                    let p_str = p.to_string_lossy();
+                                    p_str == arg || p_str == unescaped_arg || p_str == resolved_arg
+                                })
+                        })
                 })
                 .collect();
             match matches.as_slice() {
@@ -17849,11 +17947,40 @@ fn format_buffer_list_row(
 }
 
 fn buffer_name_matches(name: &OxStr, needle: &str) -> bool {
-    let name = name.to_string_lossy();
-    name == needle
-        || Path::new(name.as_ref())
-            .file_name()
-            .is_some_and(|file_name| file_name == needle)
+    let name_str = name.to_string_lossy();
+    let name_norm = if let Some(rest) = name_str.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        name_str.into_owned()
+    };
+    let needle_norm = if let Some(rest) = needle.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        needle.to_owned()
+    };
+    if name_norm == needle_norm {
+        return true;
+    }
+    if Path::new(name_norm.as_str())
+        .file_name()
+        .is_some_and(|file_name| file_name == needle_norm.as_str())
+    {
+        return true;
+    }
+    if name_norm.ends_with(needle_norm.as_str()) {
+        return true;
+    }
+    if let Some(tail) = needle_norm.strip_prefix('/') {
+        if name_norm == tail
+            || Path::new(name_norm.as_str())
+                .file_name()
+                .is_some_and(|file_name| file_name == tail)
+            || name_norm.ends_with(tail)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// `:argglobal` (`ex_args`, arglist.c:502).
@@ -20130,27 +20257,52 @@ fn command_badd<F: FileIO>(
             return error_flow(runtime, "E471", "Argument required");
         }
     }
+    let unescaped = crate::session::unescape_fname(name);
+    let normalized = if let Some(rest) = unescaped.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        unescaped
+    };
+    let resolved = if let Some(rest) = normalized.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join(rest).to_string_lossy().into_owned()
+        } else {
+            normalized
+        }
+    } else {
+        normalized
+    };
+    let name = &resolved;
+    let abs_path = if Path::new(name).is_absolute() {
+        PathBuf::from(name)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(name)
+    } else {
+        PathBuf::from(name)
+    };
     for handle in editor.buffers() {
         let Ok(state) = editor.buffer(handle) else {
             continue;
         };
-        if state.name().as_bytes() != name.as_bytes() {
-            continue;
-        }
-        // `buflist_new` returns the existing entry (marking it listed) when
-        // the name is already known.
-        if !state.flags.contains(crate::BufferFlags::LISTED) {
-            if let Ok(state) = editor.buffer_mut(handle) {
-                state.flags.set(crate::BufferFlags::LISTED, true);
+        if state.name().as_bytes() == name.as_bytes()
+            || state.file_path.as_deref() == Some(&abs_path)
+        {
+            // `buflist_new` returns the existing entry (marking it listed) when
+            // the name is already known.
+            if !state.flags.contains(crate::BufferFlags::LISTED) {
+                if let Ok(state) = editor.buffer_mut(handle) {
+                    state.flags.set(crate::BufferFlags::LISTED, true);
+                }
             }
+            return Flow::Normal;
         }
-        return Flow::Normal;
     }
     let handle = match editor.create_buffer(true) {
         Ok(handle) => handle,
         Err(error) => return error_flow(runtime, "E86", error.to_string()),
     };
     if let Ok(state) = editor.buffer_mut(handle) {
+        state.file_path = Some(abs_path);
         state.set_name(OxStr::from(name.as_bytes()));
         // `buflist_new` with `BLN_LISTED` never reads the file: the buffer
         // stays unloaded until first use.
@@ -20683,7 +20835,7 @@ fn command_checktime<F: FileIO, E: ExEditorAccess>(
                 .buffer(buffer)
                 .ok()
                 .and_then(|state| state.text().ok())
-                .map(|text| buffer_file_bytes(editor, buffer, &text.to_bytes()))
+                .map(|text| buffer_file_bytes(editor, buffer, text))
         });
         let Some(current) = current else {
             continue;
@@ -23513,6 +23665,43 @@ fn command_autocmd<F: FileIO, E: ExEditorAccess>(
 /// `do_msg = false` (`ex_docmd.c:4527`), so the "No matching autocommands"
 /// message belongs to the `do_msg` callers alone. `<nomodeline>` is accepted
 /// and dropped; this port does not run modelines at all.
+fn parse_doautocmd_args<E: ExEditorAccess>(
+    access: &E,
+    args: &str,
+) -> Result<(Option<crate::autocmd::AugroupId>, Vec<Event>, Option<String>), (&'static str, String)> {
+    let args = args
+        .strip_prefix("<nomodeline>")
+        .map_or(args, |rest| rest.trim_start());
+    let (first, tail) = args
+        .split_once(char::is_whitespace)
+        .map_or((args, ""), |(first, tail)| {
+            (first, tail.trim_start())
+        });
+    let named_group = access.with_ex_editor(|editor| editor.autocmds().group(first));
+    let (group, rest) = named_group.map_or((None, args), |group| (Some(group), tail));
+    if rest.starts_with('*') {
+        return Err(("E217", "Can't execute autocommands for ALL events".to_owned()));
+    }
+    let mut words = rest.splitn(2, char::is_whitespace);
+    let Some(event_names) = words.next().filter(|names| !names.is_empty()) else {
+        return Ok((group, Vec::new(), None));
+    };
+    let file_name = words.next().map(|name| name.trim_start().to_owned());
+    let mut events = Vec::new();
+    for event_name in event_names.split(',').filter(|name| !name.is_empty()) {
+        match Event::from_name(event_name) {
+            Some(event) => events.push(event),
+            None if group.is_some() => {
+                return Err(("E216", format!("No such event: {event_name}")));
+            }
+            None => {
+                return Err(("E216", format!("No such group or event: {event_name}")));
+            }
+        }
+    }
+    Ok((group, events, file_name))
+}
+
 fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
@@ -23520,44 +23709,12 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
     lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let args = command.args.trim();
-    // `check_nomodeline` (autocmd.c:1244) tests the *start* of the argument.
-    let args = args
-        .strip_prefix("<nomodeline>")
-        .map_or(args, |rest| rest.trim_start())
-        .to_owned();
-    let (first, tail) = args
-        .split_once(char::is_whitespace)
-        .map_or((args.as_str(), ""), |(first, tail)| {
-            (first, tail.trim_start())
-        });
-    let named_group = access.with_ex_editor(|editor| editor.autocmds().group(first));
-    let (group, rest) = named_group.map_or((None, args.as_str()), |group| (Some(group), tail));
-    if rest.starts_with('*') {
-        return error_flow(runtime, "E217", "Can't execute autocommands for ALL events");
-    }
-    let mut words = rest.splitn(2, char::is_whitespace);
-    let Some(event_names) = words.next().filter(|names| !names.is_empty()) else {
-        return Flow::Normal;
+    let (group, events, file_name) = match parse_doautocmd_args(access, command.args.trim()) {
+        Ok(parsed) => parsed,
+        Err((code, message)) => return error_flow(runtime, code, message),
     };
-    let file_name = words.next().map(|name| name.trim_start().to_owned());
-    let mut events = Vec::new();
-    for event_name in event_names.split(',').filter(|name| !name.is_empty()) {
-        match Event::from_name(event_name) {
-            Some(event) => events.push(event),
-            // `arg_event_skip` (autocmd.c:2467) names the group only when one
-            // was given, so `:doautocmd BadEvent` reports the combined form.
-            None if group.is_some() => {
-                return error_flow(runtime, "E216", format!("No such event: {event_name}"));
-            }
-            None => {
-                return error_flow(
-                    runtime,
-                    "E216",
-                    format!("No such group or event: {event_name}"),
-                );
-            }
-        }
+    if events.is_empty() {
+        return Flow::Normal;
     }
     let buffer = access.with_ex_editor(|editor| editor.current_buffer());
     let file_name = file_name.or_else(|| {
@@ -23599,6 +23756,180 @@ fn command_doautocmd<F: FileIO, E: ExEditorAccess>(
             return flow;
         }
     }
+    Flow::Normal
+}
+
+fn command_doautoall<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    command: &ExCommand,
+) -> Flow {
+    let (group, events, explicit_file_name) =
+        match parse_doautocmd_args(access, command.args.trim()) {
+            Ok(parsed) => parsed,
+            Err((code, message)) => return error_flow(runtime, code, message),
+        };
+    if events.is_empty() {
+        return Flow::Normal;
+    }
+
+    let curbuf = access.with_ex_editor(|editor| editor.current_buffer());
+    let all_buffers = access.with_ex_editor(|editor| editor.buffers());
+    let loaded_buffers: Vec<BufHandle> = all_buffers
+        .into_iter()
+        .filter(|&buf| {
+            access.with_ex_editor(|editor| {
+                editor
+                    .buffer(buf)
+                    .is_ok_and(|state| state.residency.is_loaded())
+            })
+        })
+        .collect();
+
+    let mut target_buffers: Vec<BufHandle> = loaded_buffers
+        .iter()
+        .copied()
+        .filter(|buf| Some(*buf) != curbuf)
+        .collect();
+    if let Some(cur) = curbuf
+        && loaded_buffers.contains(&cur)
+    {
+        target_buffers.push(cur);
+    } else if target_buffers.is_empty()
+        && let Some(cur) = curbuf
+    {
+        target_buffers.push(cur);
+    }
+
+    let caller_win = access.with_ex_editor(|editor| editor.current_window());
+
+    for buf in target_buffers {
+        let is_current = Some(buf) == curbuf;
+        let mut changed_ctx = None;
+        if !is_current && let Some(caller) = caller_win {
+            let caller_buf = access.with_ex_editor(|editor| {
+                editor.window(caller).ok().map(|state| state.buffer)
+            });
+            let caller_view = access.with_ex_editor(|editor| {
+                editor
+                    .window(caller)
+                    .ok()
+                    .map(|state| (state.cursor, state.topline, state.skiprows))
+            });
+            let visible_win = access.with_ex_editor(|editor| {
+                editor
+                    .windows()
+                    .into_iter()
+                    .find(|&w| editor.window(w).is_ok_and(|st| st.buffer == buf))
+            });
+            match visible_win {
+                Some(w) if w == caller => {}
+                Some(w) => {
+                    if access
+                        .with_ex_editor(|editor| editor.set_current_window(w))
+                        .is_ok()
+                    {
+                        changed_ctx = Some((w, buf, None, None));
+                    }
+                }
+                None => {
+                    let orig_buf = caller_buf.unwrap_or(buf);
+                    if access
+                        .with_ex_editor(|editor| editor.enter_buffer_context(buf))
+                        .is_ok()
+                    {
+                        changed_ctx = Some((caller, orig_buf, caller_view, Some(buf)));
+                    }
+                }
+            }
+        }
+
+        let file_name = explicit_file_name.clone().or_else(|| {
+            access.with_ex_editor(|editor| {
+                editor
+                    .buffer(buf)
+                    .ok()
+                    .map(|state| state.name().to_string_lossy().into_owned())
+            })
+        });
+
+        for &event in &events {
+            let plan = access.with_ex_editor(|editor| match group {
+                Some(group) => editor.autocmds_mut().plan_in_group(
+                    event,
+                    group,
+                    AutocmdContext {
+                        buffer: Some(buf),
+                        file_name: file_name.as_deref().map(str::as_bytes),
+                        match_name: None,
+                        nested: true,
+                        data: None,
+                    },
+                ),
+                None => editor.autocmds_mut().plan(
+                    event,
+                    AutocmdContext {
+                        buffer: Some(buf),
+                        file_name: file_name.as_deref().map(str::as_bytes),
+                        match_name: None,
+                        nested: true,
+                        data: None,
+                    },
+                ),
+            });
+            if plan.ready.is_empty() {
+                continue;
+            }
+            let flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+            if !matches!(flow, Flow::Normal) {
+                if let Some((win, orig, view, temp_buf)) = changed_ctx {
+                    access.with_ex_editor(|editor| {
+                        if temp_buf.is_some() && editor.buffer(orig).is_ok() {
+                            let _ = editor.set_window_buffer(win, orig, BufferRelease::KeepLoaded);
+                            if let Some((cursor, topline, skiprows)) = view
+                                && let Ok(st) = editor.window_mut(win)
+                            {
+                                st.cursor = cursor;
+                                st.topline = topline;
+                                st.skiprows = skiprows;
+                            }
+                        }
+                        if editor.current_window() != caller_win
+                            && let Some(cw) = caller_win
+                            && editor.window(cw).is_ok()
+                        {
+                            let _ = editor.set_current_window(cw);
+                        }
+                    });
+                }
+                return flow;
+            }
+        }
+
+        if let Some((win, orig, view, temp_buf)) = changed_ctx {
+            access.with_ex_editor(|editor| {
+                if temp_buf.is_some() && editor.buffer(orig).is_ok() {
+                    let _ = editor.set_window_buffer(win, orig, BufferRelease::KeepLoaded);
+                    if let Some((cursor, topline, skiprows)) = view
+                        && let Ok(st) = editor.window_mut(win)
+                    {
+                        st.cursor = cursor;
+                        st.topline = topline;
+                        st.skiprows = skiprows;
+                    }
+                }
+                if editor.current_window() != caller_win
+                    && let Some(cw) = caller_win
+                    && editor.window(cw).is_ok()
+                {
+                    let _ = editor.set_current_window(cw);
+                }
+            });
+        }
+    }
+
     Flow::Normal
 }
 
@@ -24869,14 +25200,14 @@ fn command_map<F: FileIO>(
 /// supplies another.
 fn list_mappings(editor: &mut Editor, lhs: &Keys, modes: MapModes, buffer_only: bool) -> Flow {
     let buffer = editor.current_buffer();
-    let rows: Vec<String> = editor
+    let rows: Vec<Vec<(String, Option<&'static str>)>> = editor
         .mappings()
         .matching(lhs.as_bytes(), modes, buffer)
         .into_iter()
         .filter(|(mapping, local)| {
             !buffer_only || (*local && matches!(mapping.options.scope, MapScope::Buffer(_)))
         })
-        .map(|(mapping, local)| mapping.listing_row(local))
+        .map(|(mapping, local)| mapping.listing_chunks(local))
         .collect();
     push_info_text_message(editor, String::new());
     if rows.is_empty() {
@@ -24885,7 +25216,7 @@ fn list_mappings(editor: &mut Editor, lhs: &Keys, modes: MapModes, buffer_only: 
         return Flow::Normal;
     }
     for row in rows {
-        push_info_text_message(editor, row);
+        push_info_chunks_message(editor, row);
     }
     Flow::Normal
 }
@@ -27978,6 +28309,16 @@ pub(crate) fn push_info_text_message(editor: &mut Editor, text: String) {
         history: false,
         leading_newline: true,
     });
+}
+
+/// Output of an informative listing command broken into attributed chunks.
+pub(crate) fn push_info_chunks_message<I, T, H>(editor: &mut Editor, chunks: I)
+where
+    I: IntoIterator<Item = (T, Option<H>)>,
+    T: Into<String>,
+    H: Into<String>,
+{
+    editor.push_info_message(Message::from_chunks(chunks, false, true));
 }
 
 /// E1513 for buffer switches out of a 'winfixbuf' window unless the

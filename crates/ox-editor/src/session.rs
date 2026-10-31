@@ -10,7 +10,7 @@ use ox_types::{BufHandle, Object, OxStr, Typval, WinHandle};
 use crate::autocmd::Event;
 use crate::editor::Editor;
 use crate::excmd_exec::{
-    ExEditorAccess, ExRuntime, Flow, LuaExec, fire_buffer_lifecycle,
+    ExEditorAccess, ExRuntime, Flow, LuaExec, fire_buffer_lifecycle, home_replaced_name,
 };
 use crate::layout::{Frame, Layout, TabpageState};
 use crate::options::OptionValue;
@@ -41,10 +41,38 @@ pub fn escape_fname(name: &str) -> String {
     String::from_utf8(escaped).unwrap_or_else(|_| name.to_owned())
 }
 
-/// Normalizes backslashes to forward slashes and escapes special characters.
+/// Unescapes backslashes in a file name that was escaped with `escape_fname`.
+#[must_use]
+pub fn unescape_fname(name: &str) -> String {
+    let mut unescaped = Vec::with_capacity(name.len());
+    let mut chars = name.as_bytes().iter().copied();
+    while let Some(b) = chars.next() {
+        if b == b'\\' {
+            if let Some(next) = chars.next() {
+                unescaped.push(next);
+            } else {
+                unescaped.push(b'\\');
+            }
+        } else {
+            unescaped.push(b);
+        }
+    }
+    String::from_utf8(unescaped).unwrap_or_else(|_| name.to_owned())
+}
+
+/// Normalizes backslashes to forward slashes, replaces `$HOME` with `~`, and escapes special characters.
 #[must_use]
 pub fn normalize_and_escape(path: &str) -> String {
-    escape_fname(&path.replace('\\', "/"))
+    let sname = home_replaced_name(path);
+    escape_fname(&sname.replace('\\', "/"))
+}
+
+fn normalize_term_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("term://///") {
+        format!("term:///.//{rest}")
+    } else {
+        name.to_owned()
+    }
 }
 fn resolve_absolute_cwd(cwd_path: &Path) -> PathBuf {
     let cwd_str = cwd_path.to_string_lossy();
@@ -171,6 +199,7 @@ struct SessionWriter<'a> {
     options_raw: &'a str,
     cwd: &'a str,
     did_lcd: bool,
+    restore_height_width: bool,
     output: String,
 }
 
@@ -195,6 +224,7 @@ impl<'a> SessionWriter<'a> {
             options_raw,
             cwd,
             did_lcd: false,
+            restore_height_width: false,
             output: String::new(),
         }
     }
@@ -303,6 +333,7 @@ impl<'a> SessionWriter<'a> {
         );
         self.output
             .push_str("let v:this_session=expand(\"<sfile>:p\")\n");
+        self.output.push_str("doautoall SessionLoadPre\n");
         self.output.push_str("silent only\n");
         if self.options.tabpages {
             self.output.push_str("silent tabonly\n");
@@ -349,7 +380,15 @@ impl<'a> SessionWriter<'a> {
             if !self.should_save_buffer(buf, state) {
                 continue;
             }
-            let name = state.name().to_string_lossy();
+            let raw_name = normalize_term_name(&state.name().to_string_lossy());
+            let name = if self.did_lcd && !Path::new(&raw_name).is_absolute() {
+                Path::new(self.cwd)
+                    .join(&raw_name)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                raw_name
+            };
             let escaped = normalize_and_escape(&name);
             self.output.push_str(&format!("badd +0 {escaped}\n"));
         }
@@ -371,7 +410,7 @@ impl<'a> SessionWriter<'a> {
             if !self.should_save_buffer(buf, state) {
                 continue;
             }
-            let name = state.name().to_string_lossy();
+            let name = normalize_term_name(&state.name().to_string_lossy());
             let abs_local_dir = if local_dir.is_absolute() {
                 local_dir.clone()
             } else {
@@ -385,35 +424,52 @@ impl<'a> SessionWriter<'a> {
         }
     }
 
-    fn write_frame(&mut self, frame: &Frame) {
+    fn ses_do_frame(&self, tabpage: &TabpageState, frame: &Frame) -> bool {
+        match frame {
+            Frame::Leaf(leaf) => self.ses_do_win(tabpage, leaf.window),
+            Frame::Column { children, .. } | Frame::Row { children, .. } => {
+                children.iter().any(|child| self.ses_do_frame(tabpage, child))
+            }
+        }
+    }
+
+    fn write_frame(&mut self, tabpage: &TabpageState, frame: &Frame) {
         match frame {
             Frame::Leaf(_) => {}
             Frame::Column { children, .. } => {
-                let count = children.len().saturating_sub(1);
+                let valid_children: Vec<&Frame> = children
+                    .iter()
+                    .filter(|c| self.ses_do_frame(tabpage, c))
+                    .collect();
+                let count = valid_children.len().saturating_sub(1);
                 for _ in 0..count {
                     self.output.push_str("wincmd _ | wincmd |\nsplit\n");
                 }
                 if count > 0 {
                     self.output.push_str(&format!("{count}wincmd k\n"));
                 }
-                for (idx, child) in children.iter().enumerate() {
-                    self.write_frame(child);
-                    if idx + 1 < children.len() {
+                for (idx, child) in valid_children.iter().enumerate() {
+                    self.write_frame(tabpage, child);
+                    if idx + 1 < valid_children.len() {
                         self.output.push_str("wincmd w\n");
                     }
                 }
             }
             Frame::Row { children, .. } => {
-                let count = children.len().saturating_sub(1);
+                let valid_children: Vec<&Frame> = children
+                    .iter()
+                    .filter(|c| self.ses_do_frame(tabpage, c))
+                    .collect();
+                let count = valid_children.len().saturating_sub(1);
                 for _ in 0..count {
                     self.output.push_str("wincmd _ | wincmd |\nvsplit\n");
                 }
                 if count > 0 {
                     self.output.push_str(&format!("{count}wincmd h\n"));
                 }
-                for (idx, child) in children.iter().enumerate() {
-                    self.write_frame(child);
-                    if idx + 1 < children.len() {
+                for (idx, child) in valid_children.iter().enumerate() {
+                    self.write_frame(tabpage, child);
+                    if idx + 1 < valid_children.len() {
                         self.output.push_str("wincmd w\n");
                     }
                 }
@@ -421,31 +477,35 @@ impl<'a> SessionWriter<'a> {
         }
     }
 
-    fn write_window_resizes(&mut self, layout: &Layout, root: &Frame, win: WinHandle, index: usize) {
-        if !self.options.winsize {
+    fn write_winsizes(&mut self, tabpage: &TabpageState, windows: &[WinHandle]) {
+        if !self.options.winsize || windows.len() <= 1 {
             return;
         }
-        let Ok(geom) = layout.window_geometry(win) else {
-            return;
-        };
+        let layout = tabpage.layout();
+        let root = layout.root();
         let total_h = root.geometry().height;
         let total_w = root.geometry().width;
-        if total_h > 0 {
-            let half = total_h / 2;
-            let h = geom.height;
-            self.output.push_str(&format!(
-                "exe '{index}resize ' . ((&lines * {h} + {half}) / {total_h})\n"
-            ));
-        }
-        if total_w > 0 {
-            let half = total_w / 2;
-            let w = geom.width;
-            self.output.push_str(&format!(
-                "exe 'vertical {index}resize ' . ((&columns * {w} + {half}) / {total_w})\n"
-            ));
+        let half_lines = total_h / 2;
+        let half_cols = total_w / 2;
+        for (idx, &win) in windows.iter().enumerate() {
+            let Ok(geom) = layout.window_geometry(win) else {
+                continue;
+            };
+            let nr = idx + 1;
+            if geom.height < total_h && total_h > 0 {
+                self.output.push_str(&format!(
+                    "exe '{nr}resize ' . ((&lines * {} + {half_lines}) / {total_h})\n",
+                    geom.height
+                ));
+            }
+            if geom.width < total_w && total_w > 0 {
+                self.output.push_str(&format!(
+                    "exe 'vert {nr}resize ' . ((&columns * {} + {half_cols}) / {total_w})\n",
+                    geom.width
+                ));
+            }
         }
     }
-
     fn write_window_buffer_load(&mut self, layout: &Layout, win: WinHandle) {
         let Ok(win_state) = layout.window(win) else {
             return;
@@ -456,17 +516,23 @@ impl<'a> SessionWriter<'a> {
         let name = self
             .editor
             .buffer(buf)
-            .map(|st| st.name().to_string_lossy().into_owned())
+            .map(|st| normalize_term_name(&st.name().to_string_lossy()))
             .unwrap_or_default();
 
         if !name.is_empty()
             && (!matches!(buftype.as_str(), "nofile" | "quickfix" | "prompt") || is_terminal)
         {
             let edit_name = if self.did_lcd && !Path::new(&name).is_absolute() {
-                Path::new(self.cwd)
-                    .join(&name)
-                    .to_string_lossy()
-                    .into_owned()
+                if let Ok(state) = self.editor.buffer(buf)
+                    && let Some(file_path) = &state.file_path
+                {
+                    file_path.to_string_lossy().into_owned()
+                } else {
+                    Path::new(self.cwd)
+                        .join(&name)
+                        .to_string_lossy()
+                        .into_owned()
+                }
             } else {
                 name
             };
@@ -495,6 +561,7 @@ impl<'a> SessionWriter<'a> {
             };
             let escaped = normalize_and_escape(&abs_dir.to_string_lossy());
             self.output.push_str(&format!("lcd {escaped}\n"));
+            self.did_lcd = true;
         }
     }
 
@@ -503,16 +570,19 @@ impl<'a> SessionWriter<'a> {
             return;
         };
         let line = win_state.cursor.lnum.max(1);
-        self.output
-            .push_str(&format!("let s:l = {line}\nkeepjumps exe s:l\nnormal! 0\n"));
+        self.output.push_str(&format!(
+            "let s:l = {line}\nif s:l < 1 | let s:l = 1 | endif\nkeepjumps exe s:l\nnormal! zt\nkeepjumps {line}\nnormal! 0\n"
+        ));
     }
 
     fn write_tabpage(&mut self, tabpage: &TabpageState, tab_index: usize) {
-        if self.options.tabpages && tab_index > 0 {
-            self.output.push_str("tabnew\n");
-        }
+        let mut need_tabnext = self.options.tabpages && tab_index > 0;
 
         if self.options.curdir && let Some(dir) = &tabpage.local_directory {
+            if need_tabnext {
+                self.output.push_str("tabnext\n");
+                need_tabnext = false;
+            }
             let abs_dir = if dir.is_absolute() {
                 dir.clone()
             } else {
@@ -520,6 +590,7 @@ impl<'a> SessionWriter<'a> {
             };
             let escaped = normalize_and_escape(&abs_dir.to_string_lossy());
             self.output.push_str(&format!("tcd {escaped}\n"));
+            self.did_lcd = true;
         }
 
         let layout = tabpage.layout();
@@ -535,17 +606,29 @@ impl<'a> SessionWriter<'a> {
             && let Ok(first_state) = layout.window(first_win)
             && let Ok(buf_state) = self.editor.buffer(first_state.buffer)
         {
-            let raw_name = buf_state.name().to_string_lossy();
-            let edit_name = if self.did_lcd && !Path::new(&*raw_name).is_absolute() {
-                Path::new(self.cwd)
-                    .join(&*raw_name)
-                    .to_string_lossy()
-                    .into_owned()
+            if need_tabnext {
+                self.output.push_str("tabnext\n");
+                need_tabnext = false;
+            }
+            let raw_name = normalize_term_name(&buf_state.name().to_string_lossy());
+            let edit_name = if self.did_lcd && !Path::new(&raw_name).is_absolute() {
+                if let Some(file_path) = &buf_state.file_path {
+                    file_path.to_string_lossy().into_owned()
+                } else {
+                    Path::new(self.cwd)
+                        .join(&raw_name)
+                        .to_string_lossy()
+                        .into_owned()
+                }
             } else {
-                raw_name.into_owned()
+                raw_name
             };
             let escaped = normalize_and_escape(&edit_name);
             self.output.push_str(&format!("edit {escaped}\n"));
+        }
+
+        if need_tabnext {
+            self.output.push_str("tabnext\n");
         }
 
         let windows: Vec<WinHandle> = layout
@@ -559,15 +642,22 @@ impl<'a> SessionWriter<'a> {
             self.output.push_str(
                 "let s:save_splitbelow = &splitbelow\nlet s:save_splitright = &splitright\nset splitbelow splitright\n",
             );
-            self.write_frame(root);
+            self.write_frame(tabpage, root);
             self.output.push_str(
                 "let &splitbelow = s:save_splitbelow\nlet &splitright = s:save_splitright\nwincmd t\n",
             );
             if self.options.winsize {
+                if !self.restore_height_width {
+                    self.output.push_str(
+                        "let s:save_winminheight = &winminheight\nlet s:save_winminwidth = &winminwidth\n",
+                    );
+                    self.restore_height_width = true;
+                }
                 self.output.push_str(
-                    "let s:save_winminheight = &winminheight\nlet s:save_winminwidth = &winminwidth\nset winminheight=0\nset winheight=1\nset winminwidth=0\nset winwidth=1\n",
+                    "set winminheight=0\nset winheight=1\nset winminwidth=0\nset winwidth=1\n",
                 );
             }
+            self.write_winsizes(tabpage, &windows);
         }
 
         let curwin = tabpage.current_window();
@@ -584,18 +674,15 @@ impl<'a> SessionWriter<'a> {
                 self.write_window_buffer_load(layout, win);
             }
             self.write_window_leaf(layout, win);
-            self.write_window_resizes(layout, root, win, idx + 1);
             self.write_window_cursor(layout, win);
-        }
-
-        if has_splits && self.options.winsize {
-            self.output.push_str(
-                "let &winminheight = s:save_winminheight\nlet &winminwidth = s:save_winminwidth\n",
-            );
         }
 
         if curwin_nr > 1 {
             self.output.push_str(&format!("{curwin_nr}wincmd w\n"));
+        }
+
+        if has_splits && self.options.winsize {
+            self.write_winsizes(tabpage, &windows);
         }
     }
 
@@ -607,6 +694,14 @@ impl<'a> SessionWriter<'a> {
         };
         let curtab = self.editor.current_tabpage();
 
+        if self.options.tabpages && tabs.len() > 1 {
+            self.output.push_str("set stal=2\n");
+            for _ in 0..tabs.len().saturating_sub(1) {
+                self.output.push_str("tabnew +setlocal\\ bufhidden=wipe\n");
+            }
+            self.output.push_str("tabrewind\n");
+        }
+
         for (tab_index, &tab) in tabs.iter().enumerate() {
             if let Ok(tabpage) = self.editor.tabpage(tab) {
                 self.write_tabpage(tabpage, tab_index);
@@ -617,6 +712,9 @@ impl<'a> SessionWriter<'a> {
             if let Some(pos) = tabs.iter().position(|t| *t == curtab) {
                 self.output.push_str(&format!("tabnext {}\n", pos + 1));
             }
+        }
+        if self.options.tabpages && tabs.len() > 1 {
+            self.output.push_str("set stal=1\n");
         }
     }
 
@@ -639,6 +737,11 @@ impl<'a> SessionWriter<'a> {
             self.output.push_str(&format!("set shortmess={cur_shm}\n"));
         } else {
             self.output.push_str("let &shortmess = s:shortmess_save\n");
+        }
+        if self.restore_height_width {
+            self.output.push_str(
+                "let &winminheight = s:save_winminheight\nlet &winminwidth = s:save_winminwidth\n",
+            );
         }
         self.output.push_str(
             "let &g:so = s:so_save | let &g:siso = s:siso_save\nset hlsearch\ndoautoall SessionLoadPost\nunlet SessionLoad\n\" vim: set ft=vim :\n",
@@ -710,11 +813,23 @@ fn generate_file_content<E: ExEditorAccess>(access: &E, cmd_name: &str) -> Strin
                     "blank,buffers,curdir,folds,help,tabpages,winsize,terminal".to_owned()
                 });
             let ssop = SessionOptions::from_str(&ssop_str);
-            let raw_cwd = editor
-                .global_directory()
-                .map(Path::to_path_buf)
-                .or_else(|| editor.effective_directory())
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let has_local_dir = editor
+                .tabpages()
+                .iter()
+                .filter_map(|&t| editor.tabpage(t).ok())
+                .any(|t| t.local_directory.is_some())
+                || editor
+                    .windows()
+                    .into_iter()
+                    .filter_map(|w| editor.window(w).ok())
+                    .any(|w| w.local_directory.is_some());
+            let raw_cwd = if has_local_dir && let Some(gdir) = editor.global_directory() {
+                gdir.to_path_buf()
+            } else {
+                editor
+                    .effective_directory()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            };
             let cwd = resolve_absolute_cwd(&raw_cwd);
             let cwd_str = cwd.to_string_lossy().into_owned();
             generate_session(editor, &ssop, &ssop_str, &cwd_str)
@@ -779,7 +894,7 @@ pub(crate) fn command_session<F: FileIO, E: ExEditorAccess>(
         Ok(fname) => fname,
         Err(flow) => return flow,
     };
-    let path = PathBuf::from(&fname);
+    let path = resolve_absolute_cwd(Path::new(&fname));
 
     if runtime
         .scripts

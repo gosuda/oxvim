@@ -168,6 +168,34 @@ impl Message {
             _ => None,
         }
     }
+    /// Creates an attributed message from a sequence of `(text, optional_hl_group)` pairs.
+    #[must_use]
+    pub fn from_chunks<I, T, H>(chunks: I, history: bool, leading_newline: bool) -> Self
+    where
+        I: IntoIterator<Item = (T, Option<H>)>,
+        T: Into<String>,
+        H: Into<String>,
+    {
+        let array = chunks
+            .into_iter()
+            .map(|(text, hl_group)| {
+                let text_obj = Object::String(OxStr::from(text.into().as_bytes()));
+                match hl_group {
+                    Some(group) => Object::Array(vec![
+                        text_obj,
+                        Object::String(OxStr::from(group.into().as_bytes())),
+                    ]),
+                    None => Object::Array(vec![text_obj]),
+                }
+            })
+            .collect();
+        Self {
+            kind: MessageKind::Echo,
+            content: Object::Array(array),
+            history,
+            leading_newline,
+        }
+    }
 }
 
 /// `nvim_echo` identity retained parallel to the message sink: the
