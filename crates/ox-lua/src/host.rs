@@ -246,12 +246,6 @@ fn to_slash(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Upstream `vim_isAbsName`: drive-qualified or rooted at either separator,
-/// so `/x` and `\x` are absolute even on Windows.
-fn is_absolute(path: &Path) -> bool {
-    path.is_absolute() || (cfg!(windows) && path.has_root())
-}
-
 fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result<()> {
     let package: Table = lua.globals().get("package")?;
     if runtime_root.resolve("").as_os_str().is_empty() {
@@ -281,6 +275,7 @@ fn configure_package_path(lua: &Lua, runtime_root: &RuntimeRoot) -> mlua::Result
     );
     package.set("path", entries.join(";"))
 }
+
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
@@ -357,5 +352,102 @@ mod tests {
             .load("return require('vim.version')")
             .eval()
             .unwrap();
+    }
+
+    #[test]
+    fn vim_system_env_matrix_honors_explicit_env_and_clear_env() {
+        let lua = Lua::new();
+        embedded::install(&lua).unwrap();
+
+        let script = r#"
+            local captured = {}
+            vim = {
+                uv = {
+                    spawn = function(cmd, opts, on_exit)
+                        table.insert(captured, { cmd = cmd, opts = opts })
+                        return {}, 123
+                    end,
+                    pipe = function() return { read = 1, write = 2 } end,
+                    new_pipe = function()
+                        return {
+                            open = function() end,
+                            read_start = function() end,
+                            is_closing = function() return true end,
+                            close = function() end,
+                        }
+                    end,
+                    fs_close = function() end,
+                },
+                fn = {
+                    has = function() return 0 end,
+                    environ = function()
+                        return { PARENT_VAR = "parent_val", GIT_DIR = "/repo/.git" }
+                    end,
+                },
+                v = {
+                    servername = "/tmp/nvim.pipe",
+                },
+                validate = function() end,
+                list_slice = function(t, from)
+                    local res = {}
+                    for i = from, #t do table.insert(res, t[i]) end
+                    return res
+                end,
+                tbl_extend = function(behavior, deep_or_t1, ...)
+                    local res = {}
+                    for k, v in pairs(deep_or_t1) do res[k] = v end
+                    local tables = { ... }
+                    for _, t in ipairs(tables) do
+                        for k, v in pairs(t) do res[k] = v end
+                    end
+                    return res
+                end,
+            }
+
+            require('vim._core.system')
+
+            local function to_map(arr)
+                if not arr then return nil end
+                local m = {}
+                for _, s in ipairs(arr) do
+                    local eq = s:find('=')
+                    if eq then
+                        m[s:sub(1, eq - 1)] = s:sub(eq + 1)
+                    end
+                end
+                return m
+            end
+
+            vim.system({'echo', '1'}, { env = { CUSTOM = "custom_val" }, clear_env = true })
+            local case1 = to_map(captured[1].opts.env)
+            assert(case1.CUSTOM == "custom_val")
+            assert(case1.PARENT_VAR == nil)
+            assert(case1.GIT_DIR == nil)
+            assert(case1.NVIM == nil)
+
+            vim.system({'echo', '2'}, { env = { CUSTOM = "custom_val" }, clear_env = false })
+            local case2 = to_map(captured[2].opts.env)
+            assert(case2.CUSTOM == "custom_val")
+            assert(case2.PARENT_VAR == "parent_val")
+            assert(case2.GIT_DIR == "/repo/.git")
+            assert(case2.NVIM == "/tmp/nvim.pipe")
+
+            vim.system({'echo', '3'}, { clear_env = true })
+            assert(captured[3].opts.env == nil)
+
+            vim.system({'echo', '4'}, { clear_env = false })
+            local case4 = to_map(captured[4].opts.env)
+            assert(case4.PARENT_VAR == "parent_val")
+            assert(case4.GIT_DIR == "/repo/.git")
+            assert(case4.NVIM == "/tmp/nvim.pipe")
+
+            local pack_env = vim.fn.environ()
+            pack_env.GIT_DIR = nil
+            vim.system({'git', 'status'}, { env = pack_env, clear_env = true })
+            local case5 = to_map(captured[5].opts.env)
+            assert(case5.PARENT_VAR == "parent_val")
+            assert(case5.GIT_DIR == nil)
+        "#;
+        lua.load(script).exec().unwrap();
     }
 }

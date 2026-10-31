@@ -375,7 +375,26 @@ impl Default for OptionStore {
         let mut global = HashMap::with_capacity(OPTION_COUNT);
         for metadata in OPTION_METADATA {
             if let Some(value) = metadata.default.value {
-                global.insert(metadata.name, value.into());
+                let initial = if metadata.name == "packlockfile" {
+                    let config_dir = crate::script::stdpath(crate::script::StdPath::Config)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "~/.config/nvim".to_string());
+                    OptionValue::String(format!(
+                        "{}/nvim-pack-lock.json",
+                        config_dir.trim_end_matches('/')
+                    ))
+                } else if metadata.expand {
+                    match value {
+                        OptionDefaultValue::String(s) if s.contains('$') || s.contains('~') => {
+                            OptionValue::String(crate::excmd_exec::expand_env_esc(s))
+                        }
+                        _ => value.into(),
+                    }
+                } else {
+                    value.into()
+                };
+                global.insert(metadata.name, initial);
             }
         }
         Self {
@@ -1218,4 +1237,23 @@ fn get_global_baseline_reads_any_option() {
         store.get_global("autoindent"),
         Err(super::OptionError::WrongScope { .. })
     ));
+}
+
+#[test]
+fn packlockfile_and_expandable_defaults_expand_at_option_store_init() {
+    use super::{OptionStore, OptionValue};
+    let store = OptionStore::new();
+    let plf = store.get_global("packlockfile").unwrap();
+    let OptionValue::String(path) = plf else {
+        panic!("packlockfile must be a string");
+    };
+    assert!(!path.starts_with("$XDG_CONFIG_HOME"));
+    assert!(path.ends_with("/nvim-pack-lock.json"));
+    assert_eq!(store.get_global("plf").unwrap(), plf);
+
+    let helpfile = store.get_global("helpfile").unwrap();
+    let OptionValue::String(help_path) = helpfile else {
+        panic!("helpfile must be a string");
+    };
+    assert!(help_path.ends_with("/doc/help.txt"));
 }

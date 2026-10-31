@@ -854,7 +854,10 @@ fn call_feedkeys_builtin<F: FileIO, E: ExEditorAccess>(
             .map_err(|error| EvalError::new("E475", 0, error.to_string()))
     })?;
     if execute {
-        let machine = std::rc::Rc::new(std::cell::RefCell::new(ModeMachine::default()));
+        let machine = runtime
+            .mode_machine
+            .clone()
+            .unwrap_or_else(|| std::rc::Rc::new(std::cell::RefCell::new(ModeMachine::default())));
         let flow = drain_typeahead(runtime, access, scope, lua, &machine, usize::MAX);
         if !matches!(flow, Flow::Normal) {
             return Err(flow_to_eval_error(flow, "feedkeys"));
