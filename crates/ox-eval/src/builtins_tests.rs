@@ -431,7 +431,7 @@ fn environment_builtins_preserve_non_utf8_bytes() {
     let Typval::Dict(environment) = call("environ", Vec::new()).unwrap() else {
         panic!("environ() must return a Dict")
     };
-    assert!(environment.borrow().entries.iter().any(|entry| {
+    assert!(environment.borrow().iter().any(|entry| {
         entry.key.as_bytes() == name_bytes && entry.value == Typval::String(value.clone())
     }));
 }
@@ -1137,7 +1137,7 @@ case!(
         (OxStr::from("b"), number(2)),
         (OxStr::from("a"), number(1))
     ])],
-    text("{\"b\":2,\"a\":1}")
+    text("{\"a\":1,\"b\":2}")
 );
 case!(
     json_decode_null,
@@ -2402,9 +2402,7 @@ fn string_builtin_raises_e724_on_self_referencing_container() {
 
     let dict = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]);
     let Typval::Dict(d) = &dict else { unreachable!() };
-    d.borrow_mut()
-        .entries
-        .push(ox_types::DictEntry::new(OxStr::from("self"), dict.clone()));
+    d.borrow_mut().insert(OxStr::from("self"), dict.clone());
     let err_d = call("string", vec![dict]).unwrap_err();
     assert_eq!(err_d.code, "E724");
     assert_eq!(
@@ -4910,16 +4908,13 @@ fn getenv_and_environ_answer_the_process_environment() {
     let Typval::Dict(entries) = &environment else {
         panic!("environ() must answer a Dict: {environment:?}")
     };
-    let entries = entries.borrow().entries.clone();
+    let data = entries.borrow();
     assert_eq!(
-        entries
-            .iter()
-            .find(|entry| entry.key == OxStr::from(NAME))
-            .map(|entry| entry.value.clone()),
+        data.get(NAME.as_bytes()).cloned(),
         Some(text("value")),
     );
     assert!(
-        !entries
+        !data
             .iter()
             .any(|entry| entry.key == OxStr::from(MISSING))
     );
@@ -5255,11 +5250,8 @@ fn msgpack_parse_honours_special_types_and_stream_joins() {
     };
     let data = entries.try_borrow().unwrap();
     let get = |key: &str| {
-        data.entries
-            .iter()
-            .find(|entry| entry.key.as_bytes() == key.as_bytes())
+        data.get(key.as_bytes())
             .unwrap()
-            .value
             .clone()
     };
     assert!(matches!(get("_TYPE"), Typval::List(_)));

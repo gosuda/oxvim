@@ -453,10 +453,7 @@ fn default_args_do_not_count_toward_a0() {
     let entry = |scope: &Scope, name: &str, key: &[u8]| match value(scope, name) {
         Some(Typval::Dict(cell)) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|candidate| candidate.key.as_bytes() == key)
-                .map(|entry| entry.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict for {name}"),
     };
@@ -2938,9 +2935,10 @@ fn function_builtin_constructs_named_and_bound_references() {
     };
     assert_eq!(bound.args, vec![Typval::Number(1)]);
     let dict = bound.dict.as_ref().unwrap().borrow();
-    assert_eq!(dict.entries.len(), 1);
-    assert_eq!(dict.entries[0].key, OxStr::from("answer"));
-    assert_eq!(dict.entries[0].value, Typval::Number(42));
+    assert_eq!(dict.len(), 1);
+    let entry = dict.iter().next().unwrap();
+    assert_eq!(entry.key, OxStr::from("answer"));
+    assert_eq!(entry.value, Typval::Number(42));
 }
 
 #[test]
@@ -3485,10 +3483,7 @@ fn routed_dict_entry(value: &Typval, key: &[u8]) -> Option<Typval> {
     match value {
         Typval::Dict(cell) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|e| e.key.as_bytes() == key)
-                .map(|e| e.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict, got {value:?}"),
     }

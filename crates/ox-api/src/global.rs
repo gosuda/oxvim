@@ -2640,7 +2640,6 @@ fn typval_to_object_inner(
             let result = values
                 .try_borrow()
                 .map_err(|_| ApiError::exception("Cannot convert mutably borrowed Dictionary"))?
-                .entries
                 .iter()
                 .map(|entry| {
                     Ok((

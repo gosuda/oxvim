@@ -8296,11 +8296,7 @@ fn maparg_key(
         other => panic!("maparg did not answer a dictionary: {other:?}"),
     };
     let entries = dict.borrow();
-    entries
-        .entries
-        .iter()
-        .find(|entry| entry.key.as_bytes() == key.as_bytes())
-        .map(|entry| entry.value.clone())
+    entries.get(key.as_bytes()).cloned()
 }
 
 /// `maparg()`'s compatible `rhs` is `m_orig_str`, the right-hand side *as
@@ -14070,11 +14066,8 @@ fn api_set_container_retains_self_reference_after_eval_append() {
     };
     let d_inner = d
         .borrow()
-        .entries
-        .iter()
-        .find(|e| e.key.as_bytes() == b"d")
+        .get(b"d")
         .unwrap()
-        .value
         .clone();
     let ox_types::Typval::Dict(inner_dict) = &d_inner else {
         panic!("expected inner entry to be Dict, got {d_inner:?}");

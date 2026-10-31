@@ -535,7 +535,10 @@ impl Scope {
             .map(|(key, value)| scope_var_entry(kind, key, value))
             .collect();
         if let Ok(mut data) = dict.try_borrow_mut() {
-            data.entries = entries;
+            data.clear();
+            for entry in entries {
+                data.insert_entry(entry);
+            }
         }
         let snapshot = Typval::Dict(dict);
         self.mark_aliased(kind, &snapshot);
@@ -561,17 +564,15 @@ impl Scope {
         };
         match stored {
             Some(entry) => {
-                if let Some(slot) = data
-                    .entries
-                    .iter_mut()
-                    .find(|slot| slot.key.as_bytes() == name)
-                {
+                if let Some(slot) = data.get_entry_mut(name) {
                     *slot = entry;
                 } else {
-                    data.entries.push(entry);
+                    data.insert_entry(entry);
                 }
             }
-            None => data.entries.retain(|slot| slot.key.as_bytes() != name),
+            None => {
+                data.remove(name);
+            }
         }
     }
 

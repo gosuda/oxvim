@@ -58,8 +58,7 @@ fn typval_to_object_inner(value: &Typval, seen: &mut Vec<(u8, *const ())>) -> Ob
             seen.push(identity);
             let converted = values.try_borrow().map_or(Object::Nil, |data| {
                 Object::Dict(Dict(
-                    data.entries
-                        .iter()
+                    data.iter()
                         .map(|entry| (entry.key.clone(), typval_to_object_inner(&entry.value, seen)))
                         .collect(),
                 ))
@@ -205,10 +204,10 @@ mod tests {
         let Typval::Dict(entries) = &dict else {
             unreachable!()
         };
-        entries.borrow_mut().entries.push(ox_types::DictEntry::new(
+        entries.borrow_mut().insert(
             OxStr::from("self"),
             Typval::Dict(std::rc::Rc::clone(entries)),
-        ));
+        );
         let Object::Dict(converted) = typval_to_object(&dict) else {
             unreachable!("typval_to_object maps Typval::Dict to Object::Dict");
         };

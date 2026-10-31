@@ -127,19 +127,17 @@ fn call_getscriptinfo_builtin<F: FileIO, E: ExEditorAccess>(
     };
     let requested_sid = match query {
         Some(Typval::Dict(entries)) => {
-            let entries = entries.borrow().entries.clone();
-            match entries.iter().find(|entry| entry.key.as_bytes() == b"sid") {
-                Some(entry) => {
-                    // `tv_get_number_chk` (`typval.c:4178-4179`) names the type
-                    // before the range check reports E475.
-                    let sid = ox_eval::builtins::number_arg(&entry.value)?;
+            let entries = entries.borrow();
+            match entries.get(b"sid") {
+                Some(value) => {
+                    let sid = ox_eval::builtins::number_arg(value)?;
                     if sid <= 0 {
                         return Err(EvalError::new(
                             "E475",
                             0,
                             format!(
                                 "Invalid argument: sid: {}",
-                                crate::excmd_exec::typval_to_text(&entry.value)
+                                crate::excmd_exec::typval_to_text(value)
                             ),
                         ));
                     }
@@ -154,9 +152,9 @@ fn call_getscriptinfo_builtin<F: FileIO, E: ExEditorAccess>(
     };
     let pattern = match (requested_sid, query) {
         (None, Some(Typval::Dict(entries))) => {
-            let entries = entries.borrow().entries.clone();
-            match entries.iter().find(|entry| entry.key.as_bytes() == b"name") {
-                Some(entry) => Some(ox_eval::builtins::string_arg(&entry.value)?),
+            let entries = entries.borrow();
+            match entries.get(b"name") {
+                Some(value) => Some(ox_eval::builtins::string_arg(value)?),
                 None => None,
             }
         }
@@ -1425,7 +1423,6 @@ mod api_and_highlight_tests {
         match value {
             Typval::Dict(dict) => Some(
                 dict.borrow()
-                    .entries
                     .iter()
                     .map(|field| field.key.to_string_lossy().into_owned())
                     .collect(),

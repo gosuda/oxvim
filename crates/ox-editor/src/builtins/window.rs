@@ -890,7 +890,7 @@ fn call_winrestview(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typ
     let mut coladd = None;
     let mut curswant = None;
     let mut topline = None;
-    for entry in &dict.entries {
+    for entry in dict.iter() {
         match entry.key.as_bytes() {
             b"lnum" => lnum = typval_number(&entry.value),
             b"col" => col = typval_number(&entry.value),
@@ -1612,11 +1612,7 @@ mod tests {
             panic!("getwininfo entry must be a dict")
         };
         let field = |key: &[u8]| {
-            dict.borrow()
-                .entries
-                .iter()
-                .find(|entry| entry.key.as_bytes() == key)
-                .map(|entry| entry.value.clone())
+            dict.borrow().get(key).cloned()
         };
         let expected_buffer = i64::from(editor.window(current).unwrap().buffer);
         assert_eq!(field(b"bufnr"), Some(Typval::Number(expected_buffer)));
@@ -1918,7 +1914,7 @@ let g:low = screenpos(win_getid(), 0, 1)
             .scope()
             .get_scoped(ox_eval::ScopeKind::Global, b"badwin", 0)
         {
-            Ok(Typval::Dict(dict)) => assert!(dict.borrow().entries.is_empty()),
+            Ok(Typval::Dict(dict)) => assert!(dict.borrow().is_empty()),
             other => panic!("expected empty dict, got {other:?}"),
         }
         let error = exec

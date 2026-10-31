@@ -3781,10 +3781,10 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                         dict: None,
                         registry: None,
                     });
-                    if let Some(entry) = data.entries.iter_mut().find(|entry| entry.key == key) {
+                    if let Some(entry) = data.get_entry_mut(key.as_bytes()) {
                         entry.value = value;
                     } else {
-                        data.entries.push(DictEntry::new(key, value));
+                        data.insert_entry(DictEntry::new(key, value));
                     }
                 }
                 pc = block_end + 1;
@@ -26940,10 +26940,8 @@ fn dictionary_function_target(
                     "Unable to correctly dump variable with self-referencing container".to_owned(),
                 )
             })?
-            .entries
-            .iter()
-            .find(|entry| entry.key.as_bytes() == key.as_bytes())
-            .map(|entry| entry.value.clone())
+            .get(key.as_bytes())
+            .cloned()
             .ok_or_else(|| ("E716", format!("Key not present in Dictionary: {key}")))?;
         current = match value {
             Typval::Dict(dictionary) => dictionary,
@@ -27559,8 +27557,8 @@ fn typval_matches_object_inner(
                 .try_borrow()
                 .map_or(matches!(object, Object::Nil), |data| match object {
                     Object::Dict(items) => {
-                        data.entries.len() == items.0.len()
-                            && data.entries.iter().zip(&items.0).all(|(a, (key, b))| {
+                        data.len() == items.0.len()
+                            && data.iter().zip(&items.0).all(|(a, (key, b))| {
                                 a.key == *key && typval_matches_object_inner(&a.value, b, seen)
                             })
                     }
@@ -27663,8 +27661,7 @@ fn typval_to_object_inner(value: &Typval, seen: &mut Vec<(u8, *const ())>) -> Ob
             seen.push(identity);
             let converted = value.try_borrow().map_or(Object::Nil, |data| {
                 Object::Dict(Dict(
-                    data.entries
-                        .iter()
+                    data.iter()
                         .map(|entry| {
                             (
                                 entry.key.clone(),

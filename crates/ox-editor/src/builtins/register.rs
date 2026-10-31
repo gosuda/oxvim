@@ -618,7 +618,7 @@ fn setreg_dict<F: FileIO, E: ExEditorAccess>(
     let entries = entries
         .try_borrow()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
-    if entries.entries.is_empty() {
+    if entries.is_empty() {
         drop(entries);
         if name == '#' {
             host.access.with_ex_editor(|editor| {

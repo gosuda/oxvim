@@ -71,8 +71,7 @@ fn typval_to_lua_inner(
             let entries = dict
                 .try_borrow()
                 .map_err(|_| ConversionError::UnsupportedType("borrowed Vimscript Dictionary"))?
-                .entries
-                .clone();
+                .to_vec();
             let table = if entries.is_empty() {
                 let Value::Table(table) =
                     object_to_lua(lua, &ox_types::Object::Dict(ox_types::Dict(Vec::new())))?
@@ -128,7 +127,6 @@ pub fn collect_typval_refs(value: &Typval, out: &mut Vec<i32>) {
             .for_each(|item| collect_typval_refs(item, out)),
         Typval::Dict(pairs) => pairs
             .borrow()
-            .entries
             .iter()
             .for_each(|entry| collect_typval_refs(&entry.value, out)),
         Typval::Funcref(funcref) | Typval::Partial(funcref) => {
@@ -270,11 +268,16 @@ fn table_to_typval(
             lua_to_typval_inner(lua, &value, depth + 1, containers)?,
         ));
     }
-    let Typval::Dict(dict) = &result else {
+    let Typval::Dict(dict) = result.clone() else {
         return Err(ConversionError::UnsupportedType("Vimscript Dictionary"));
     };
-    dict.try_borrow_mut()
-        .map_err(|_| ConversionError::UnsupportedType("borrowed Vimscript Dictionary"))?
-        .entries = entries;
+    {
+        let mut dict_mut = dict
+            .try_borrow_mut()
+            .map_err(|_| ConversionError::UnsupportedType("borrowed Vimscript Dictionary"))?;
+        for entry in entries {
+            dict_mut.insert_entry(entry);
+        }
+    }
     Ok(result)
 }

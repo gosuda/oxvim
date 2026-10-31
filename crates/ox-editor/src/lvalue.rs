@@ -997,11 +997,7 @@ fn dict_write_key<F: FileIO>(
         return Err(lvalue_error(runtime, "E741", "Value is locked"));
     }
     let old = data.get(key.as_bytes()).cloned();
-    if let Some(entry) = data
-        .entries
-        .iter_mut()
-        .find(|entry| entry.key.as_bytes() == key.as_bytes())
-    {
+    if let Some(entry) = data.get_entry_mut(key.as_bytes()) {
         // `get_lval_dict_item` (eval.c:949): the reached item's read-only
         // flag refuses the write with E46, naming the target verbatim.
         if entry.flags.intersects(DictEntryFlags::READ_ONLY) {
@@ -1013,8 +1009,7 @@ fn dict_write_key<F: FileIO>(
         }
         entry.value = value.clone();
     } else {
-        data.entries
-            .push(DictEntry::new(key.clone(), value.clone()));
+        data.insert_entry(DictEntry::new(key.clone(), value.clone()));
     }
     let event = DictWatchEvent {
         target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
@@ -1039,11 +1034,7 @@ fn dict_remove_key<F: FileIO>(
     if data.lock.locked {
         return Err(lvalue_error(runtime, "E741", "Value is locked"));
     }
-    let Some(index) = data
-        .entries
-        .iter()
-        .position(|entry| entry.key.as_bytes() == key.as_bytes())
-    else {
+    let Some(entry) = data.get_entry(key.as_bytes()) else {
         if bang {
             return Ok(false);
         }
@@ -1056,19 +1047,23 @@ fn dict_remove_key<F: FileIO>(
             ),
         ));
     };
-    // Dict-item resolution checks the read-only flag only; the fixed bit is
-    // not consulted on this path (`do_unlet_var`).
-    if data.entries[index]
-        .flags
-        .intersects(DictEntryFlags::READ_ONLY)
-    {
+    if entry.flags.intersects(DictEntryFlags::READ_ONLY) {
         return Err(lvalue_error(
             runtime,
             "E46",
             format!("Cannot change read-only variable \"{target}\""),
         ));
     }
-    let removed = data.entries.remove(index);
+    let removed = data.remove(key.as_bytes()).ok_or_else(|| {
+        lvalue_error(
+            runtime,
+            "E716",
+            format!(
+                "Key not present in Dictionary: \"{}\"",
+                key.to_string_lossy()
+            ),
+        )
+    })?;
     let event = DictWatchEvent {
         target: WatchTarget::Dict(Rc::as_ptr(dict) as usize),
         dict: Some(Typval::Dict(Rc::clone(dict))),

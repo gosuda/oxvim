@@ -895,8 +895,7 @@ fn get_list(editor: &mut Editor, scope: QfScope, args: &[Typval]) -> Result<Typv
     let what = reference
         .try_borrow()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-        .entries
-        .clone();
+        .to_vec();
     // 'lines' parses raw text through 'errorformat' (or what.efm) into a
     // throwaway list and returns early with just 'items' (upstream
     // qf_get_list_from_lines, quickfix.c:6219-6255).
@@ -1254,8 +1253,7 @@ fn dict_entries(value: &Typval) -> Result<Option<Vec<DictEntry>>> {
     let entries = reference
         .try_borrow()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-        .entries
-        .clone();
+        .to_vec();
     Ok(Some(entries))
 }
 
@@ -1783,8 +1781,7 @@ fn what_argument(args: &[Typval], no_items: bool) -> Result<(Vec<DictEntry>, Opt
             let entries = reference
                 .try_borrow()
                 .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?
-                .entries
-                .clone();
+                .to_vec();
             if !no_items {
                 return Err(EvalError::new(
                     "E475",
@@ -2127,10 +2124,10 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        let answer = answer.borrow();
-        assert_eq!(dict_number(&answer.entries, "nr"), Some(1));
-        assert_eq!(dict_number(&answer.entries, "id"), Some(1));
-        let Some(Typval::List(items)) = dict_value(&answer.entries, "items") else {
+        let answer = answer.borrow().to_vec();
+        assert_eq!(dict_number(&answer, "nr"), Some(1));
+        assert_eq!(dict_number(&answer, "id"), Some(1));
+        let Some(Typval::List(items)) = dict_value(&answer, "items") else {
             panic!("items expected")
         };
         assert_eq!(items.borrow().items.len(), 1);
@@ -2362,7 +2359,7 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        assert_eq!(dict_number(&answer.borrow().entries, "size"), Some(1));
+        assert_eq!(dict_number(&answer.borrow().to_vec(), "size"), Some(1));
         let answer = call(
             &mut editor,
             "getqflist",
@@ -2375,7 +2372,7 @@ mod tests {
         let Typval::Dict(answer) = answer else {
             panic!("dictionary expected")
         };
-        assert_eq!(dict_number(&answer.borrow().entries, "size"), Some(1));
+        assert_eq!(dict_number(&answer.borrow().to_vec(), "size"), Some(1));
     }
     #[test]
     fn first_and_last_skip_invalid_entries() {
@@ -2593,31 +2590,31 @@ mod tests {
             let Typval::Dict(answer) = answer else {
                 panic!("dictionary expected")
             };
-            let answer = answer.borrow();
+            let answer = answer.borrow().to_vec();
             assert_eq!(
-                dict_value(&answer.entries, "nr").is_some(),
+                dict_value(&answer, "nr").is_some(),
                 present,
                 "nr presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "winid").is_some(),
+                dict_value(&answer, "winid").is_some(),
                 present,
                 "winid presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "qfbufnr").is_some(),
+                dict_value(&answer, "qfbufnr").is_some(),
                 present,
                 "qfbufnr presence"
             );
             assert_eq!(
-                dict_value(&answer.entries, "title").is_some(),
+                dict_value(&answer, "title").is_some(),
                 present,
                 "title presence"
             );
             if present {
-                assert_eq!(dict_number(&answer.entries, "nr"), Some(1));
-                assert!(dict_number(&answer.entries, "winid").is_some_and(|id| id != 0));
-                assert!(dict_number(&answer.entries, "qfbufnr").is_some_and(|id| id != 0));
+                assert_eq!(dict_number(&answer, "nr"), Some(1));
+                assert!(dict_number(&answer, "winid").is_some_and(|id| id != 0));
+                assert!(dict_number(&answer, "qfbufnr").is_some_and(|id| id != 0));
             }
         }
     }
@@ -2792,11 +2789,11 @@ mod tests {
         let Typval::Dict(dict) = answer else {
             panic!("dict expected")
         };
-        let entries = &dict.borrow().entries;
-        assert_eq!(dict_value(entries, "id"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "idx"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "size"), Some(&Typval::Number(0)));
-        assert_eq!(dict_value(entries, "changedtick"), Some(&Typval::Number(0)));
+        let entries = dict.borrow().to_vec();
+        assert_eq!(dict_value(&entries, "id"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "idx"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "size"), Some(&Typval::Number(0)));
+        assert_eq!(dict_value(&entries, "changedtick"), Some(&Typval::Number(0)));
     }
 
     #[test]

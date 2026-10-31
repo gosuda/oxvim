@@ -28,7 +28,7 @@ impl BuiltinHost for Host {
                     i64::try_from(v.as_bytes().len()).unwrap_or(i64::MAX),
                 )),
                 Some(Typval::Dict(v)) => Ok(Typval::Number(
-                    i64::try_from(v.borrow().entries.len()).unwrap_or(i64::MAX),
+                    i64::try_from(v.borrow().len()).unwrap_or(i64::MAX),
                 )),
                 _ => Err(EvalError::new("E701", 0, "invalid type for len")),
             },

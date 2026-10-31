@@ -10,6 +10,7 @@ mod handle;
 mod object;
 mod path;
 mod typval;
+pub mod hashtab;
 
 pub use byte_str::OxStr;
 pub use error::ApiError;
@@ -22,3 +23,4 @@ pub use typval::{
     ListRef, LockScope, LockState, Special, Typval, VAR_BLOB, VAR_BOOL, VAR_DICT, VAR_FLOAT,
     VAR_FUNC, VAR_LIST, VAR_NUMBER, VAR_PARTIAL, VAR_SPECIAL, VAR_STRING, VAR_UNKNOWN,
 };
+pub use hashtab::{hash_key, HashItem, HashTable, Slot};

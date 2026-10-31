@@ -4055,11 +4055,7 @@ fn recursive_containers_have_finite_display_text() {
     };
     reference
         .borrow_mut()
-        .entries
-        .push(ox_types::DictEntry::new(
-            OxStr::from("self"),
-            dictionary.clone(),
-        ));
+        .insert(OxStr::from("self"), dictionary.clone());
 
     assert_eq!(
         crate::excmd_exec::typval_to_text(&dictionary),
@@ -4072,7 +4068,7 @@ fn recursive_containers_have_finite_display_text() {
     ]);
     assert_eq!(
         crate::excmd_exec::typval_to_text(&reversed),
-        "{'two': 2, 'one': 1}"
+        "{'one': 1, 'two': 2}"
     );
     assert_eq!(
         crate::excmd_exec::typval_to_text(&Typval::Float(5.0)),

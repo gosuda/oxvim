@@ -4454,10 +4454,7 @@ fn typval_dict_entry(value: &Typval, key: &[u8]) -> Option<Typval> {
     match value {
         Typval::Dict(cell) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|entry| entry.key.as_bytes() == key)
-                .map(|entry| entry.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict, got {value:?}"),
     }

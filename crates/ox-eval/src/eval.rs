@@ -1372,10 +1372,8 @@ fn dict_lookup(
     let found = entries
         .try_borrow()
         .map_err(|_| borrow_error(offset))?
-        .entries
-        .clone()
-        .into_iter()
-        .find(|entry| entry.key.as_bytes() == key)
+        .get(key)
+        .cloned()
         .ok_or_else(|| {
             EvalError::new(
                 "E716",
@@ -1386,7 +1384,7 @@ fn dict_lookup(
                 ),
             )
         })?;
-    Ok(Evaluated::plain(bind_self_dict(found.value, entries)))
+    Ok(Evaluated::plain(bind_self_dict(found, entries)))
 }
 
 /// Gives an unbound callable `self = dictionary`, keeping an explicit binding.
@@ -1743,27 +1741,20 @@ fn equal_values(
                 if !seen.insert(pair) {
                     return Ok(true);
                 }
-                let left = left
-                    .try_borrow()
-                    .map_err(|_| borrow_error(0))?
-                    .entries
-                    .clone();
-                let right = right
-                    .try_borrow()
-                    .map_err(|_| borrow_error(0))?
-                    .entries
-                    .clone();
-                if left.len() != right.len() {
+                let left_borrow = left.try_borrow().map_err(|_| borrow_error(0))?;
+                let right_borrow = right.try_borrow().map_err(|_| borrow_error(0))?;
+                if left_borrow.len() != right_borrow.len() {
                     return Ok(false);
                 }
-                for entry in &left {
-                    let Some(other) = right.iter().find(|candidate| candidate.key == entry.key)
-                    else {
+                let left_entries = left_borrow.to_vec();
+                drop(left_borrow);
+                for entry in &left_entries {
+                    let Some(other_val) = right_borrow.get(entry.key.as_bytes()) else {
                         return Ok(false);
                     };
                     if !recurse(
                         &entry.value,
-                        &other.value,
+                        other_val,
                         ignore_case,
                         depth + 1,
                         maximum,

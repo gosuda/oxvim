@@ -1265,7 +1265,7 @@ let g:local_dict = maparg('<Plug>(local)', 'n', 0, 1)
         assert_eq!(dict_number(&g_borrowed, "mode_bits"), Some(1));
         assert!(dict_number(&g_borrowed, "sid").is_some());
         assert!(dict_number(&g_borrowed, "lnum").is_some());
-        assert_eq!(g_borrowed.entries.len(), 16, "global mapping dict has exactly 16 keys");
+        assert_eq!(g_borrowed.len(), 16, "global mapping dict has exactly 16 keys");
 
         let local_val = exec
             .scope()
@@ -1296,7 +1296,7 @@ let g:local_dict = maparg('<Plug>(local)', 'n', 0, 1)
         );
         assert!(dict_number(&l_borrowed, "sid").is_some());
         assert!(dict_number(&l_borrowed, "lnum").is_some());
-        assert_eq!(l_borrowed.entries.len(), 16, "local mapping dict has exactly 16 keys");
+        assert_eq!(l_borrowed.len(), 16, "local mapping dict has exactly 16 keys");
     }
 
     /// Shape and field values of `maparg(..., true)` for a global abbreviation
@@ -1399,7 +1399,7 @@ let g:cb_str = maparg('<Plug>(x)', 'n', 0, 0)
             dict_string_for_test(&borrowed, "lhs").as_deref(),
             Some("<Plug>(x)")
         );
-        assert_eq!(borrowed.entries.len(), 17, "callback mapping has 15 standard keys + callback + desc");
+        assert_eq!(borrowed.len(), 17, "callback mapping has 15 standard keys + callback + desc");
         assert_eq!(
             dict_string_for_test(&borrowed, "rhs"),
             None,

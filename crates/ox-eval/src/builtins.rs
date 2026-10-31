@@ -1152,9 +1152,10 @@ impl<'a> Builtins<'a> {
                     {
                         return Err(locked_error());
                     }
-                    let entries = data.entries.clone();
+                    let entries = data.to_vec();
                     let previous = data.lock;
                     data.lock.locked = true;
+                    data.lock_table();
                     (entries, previous)
                 };
                 let mut output = Vec::with_capacity(entries.len());
@@ -1169,18 +1170,10 @@ impl<'a> Builtins<'a> {
                             scope,
                         )?;
                         match operation {
-                            // Upstream re-checks the live item per iteration
-                            // (`list.c` filter_map_dict): the check happens
-                            // inside the mutation borrow window, and the first
-                            // violation aborts the whole loop.
                             CollectionOp::Map => {
                                 let mut data =
                                     reference.try_borrow_mut().map_err(|_| borrow_error())?;
-                                let Some(slot) = data
-                                    .entries
-                                    .iter_mut()
-                                    .find(|candidate| candidate.key == entry.key)
-                                else {
+                                let Some(slot) = data.get_entry_mut(entry.key.as_bytes()) else {
                                     return Err(borrow_error());
                                 };
                                 check_value_lock(slot.value_lock, "map() argument")?;
@@ -1193,15 +1186,12 @@ impl<'a> Builtins<'a> {
                                         let mut data = reference
                                             .try_borrow_mut()
                                             .map_err(|_| borrow_error())?;
-                                        let Some(index) = data
-                                            .entries
-                                            .iter()
-                                            .position(|candidate| candidate.key == entry.key)
-                                        else {
+                                        let Some(slot) = data.get_entry(entry.key.as_bytes()) else {
                                             return Err(borrow_error());
                                         };
-                                        check_deletable(&data.entries[index], "filter() argument")?;
-                                        data.entries.remove(index)
+                                        check_deletable(slot, "filter() argument")?;
+                                        data.remove(entry.key.as_bytes())
+                                            .ok_or_else(borrow_error)?
                                     };
                                     let key = removed.key.as_bytes().to_vec();
                                     let old = Some(removed.value);
@@ -1214,7 +1204,11 @@ impl<'a> Builtins<'a> {
                     }
                     Ok(())
                 })();
-                reference.try_borrow_mut().map_err(|_| borrow_error())?.lock = previous_lock;
+                {
+                    let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
+                    data.unlock_table();
+                    data.lock = previous_lock;
+                }
                 evaluated?;
                 Ok(match operation {
                     CollectionOp::MapNew => Typval::dict(output),
@@ -2500,7 +2494,7 @@ fn list_items(reference: &ox_types::ListRef) -> Result<Vec<Typval>> {
 fn cloned_entries(reference: &ox_types::DictRef) -> Result<Vec<ox_types::DictEntry>> {
     reference
         .try_borrow()
-        .map(|data| data.entries.clone())
+        .map(|data| data.to_vec())
         .map_err(|_| borrow_error())
 }
 
@@ -2786,7 +2780,7 @@ fn is_empty(value: &Typval) -> bool {
             .map_or(true, |data| data.items.is_empty()),
         Typval::Dict(value) => value
             .try_borrow()
-            .map_or(true, |data| data.entries.is_empty()),
+            .map_or(true, |data| data.is_empty()),
         Typval::Bool(value) => !value,
         Typval::Special(Special::Null) => true,
         Typval::Funcref(value) | Typval::Partial(value) => value.name.as_bytes().is_empty(),
@@ -2816,7 +2810,7 @@ fn length(value: &Typval, string_length: bool) -> Result<Typval> {
         Typval::Number(value) => value.to_string().len(),
         Typval::Blob(value) => value.len(),
         Typval::List(value) => list_items(value)?.len(),
-        Typval::Dict(value) => cloned_entries(value)?.len(),
+        Typval::Dict(value) => value.try_borrow().map(|data| data.len()).map_err(|_| borrow_error())?,
         _ => return Err(EvalError::new("E701", 0, "Invalid type for len()")),
     };
     Ok(Typval::Number(saturating_i64(length)))
@@ -4381,11 +4375,7 @@ fn extend_common<H: BuiltinHost>(
             ensure_unlocked(left.lock)?;
             let mode = mode.as_ref().map_or(b"force".as_slice(), OxStr::as_bytes);
             for entry in right {
-                if let Some(existing) = left
-                    .entries
-                    .iter_mut()
-                    .find(|candidate| candidate.key == entry.key)
-                {
+                if let Some(existing) = left.get_entry_mut(entry.key.as_bytes()) {
                     match mode {
                         b"keep" => {}
                         b"error" => {
@@ -4414,7 +4404,7 @@ fn extend_common<H: BuiltinHost>(
                 } else {
                     let key = entry.key.as_bytes().to_vec();
                     let new = Some(entry.value.clone());
-                    left.entries.push(DictEntry::new(entry.key, entry.value));
+                    left.insert_entry(DictEntry::new(entry.key, entry.value));
                     if notify {
                         host.record_dict_mutation(left_ref, &key, None, new);
                     }
@@ -4824,14 +4814,13 @@ fn remove<H: BuiltinHost>(host: &mut H, args: &[Typval]) -> Result<Typval> {
                 .ok_or_else(|| EvalError::new("E731", 0, "Dictionary key must be a String"))?;
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             ensure_unlocked(data.lock)?;
-            let index = data
-                .entries
-                .iter()
-                .position(|entry| entry.key == key)
+            let Some(entry) = data.get_entry(key.as_bytes()) else {
+                return Err(EvalError::new("E716", 0, "Key not present in Dictionary"));
+            };
+            check_deletable(entry, "remove() argument")?;
+            let removed = data
+                .remove(key.as_bytes())
                 .ok_or_else(|| EvalError::new("E716", 0, "Key not present in Dictionary"))?;
-            // `tv_dict_remove` (`typval.c:3439`): fixed, then read-only.
-            check_deletable(&data.entries[index], "remove() argument")?;
-            let removed = data.entries.remove(index);
             let key_bytes = removed.key.as_bytes().to_vec();
             let old = Some(removed.value.clone());
             let value = removed.value;
@@ -4978,15 +4967,14 @@ pub(crate) fn deep_copy(value: &Typval) -> Result<Typval> {
                 };
                 dicts.insert(key, target.clone());
                 let source_entries = cloned_entries(source)?;
-                let mut entries = Vec::with_capacity(source_entries.len());
+                let mut target_data = target.try_borrow_mut().map_err(|_| borrow_error())?;
                 for source_entry in &source_entries {
-                    // Fresh entries carry no flags or value lock.
-                    entries.push(DictEntry::new(
+                    target_data.insert_entry(DictEntry::new(
                         source_entry.key.clone(),
                         copy(&source_entry.value, lists, dicts, depth + 1)?,
                     ));
                 }
-                target.try_borrow_mut().map_err(|_| borrow_error())?.entries = entries;
+                drop(target_data);
                 Ok(Typval::Dict(target))
             }
             _ => Ok(value.clone()),
@@ -5048,7 +5036,7 @@ pub fn lock_value(value: &Typval, depth: i32, lock: bool) -> Result<()> {
                 let entries = {
                     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
                     data.lock = state;
-                    data.entries.clone()
+                    data.to_vec()
                 };
                 if recurse {
                     for entry in &entries {
@@ -5829,10 +5817,8 @@ fn msgpack_type_lists(scope: &Scope) -> [ox_types::ListRef; 8] {
             .as_ref()
             .and_then(|entries| {
                 entries
-                    .entries
-                    .iter()
-                    .find(|entry| entry.key.as_bytes() == name)
-                    .and_then(|entry| match &entry.value {
+                    .get(name)
+                    .and_then(|value| match value {
                         Typval::List(reference) => Some(reference.clone()),
                         _ => None,
                     })
@@ -6161,21 +6147,18 @@ impl MsgpackDumpEncoder<'_> {
     /// whose `_TYPE` merely looks empty) encodes as a regular map.
     fn special_payload(&self, reference: &ox_types::DictRef) -> Option<(usize, Typval)> {
         let entries = reference.try_borrow().ok()?;
-        if entries.entries.len() != 2 {
+        if entries.len() != 2 {
             return None;
         }
-        let kind = entries.entries.iter().find_map(|entry| match &entry.value {
-            Typval::List(list) if entry.key.as_bytes() == b"_TYPE" => self
-                .types
-                .iter()
-                .position(|canonical| Rc::ptr_eq(canonical, list)),
-            _ => None,
-        })?;
-        let payload = entries
-            .entries
+        let type_val = entries.get(b"_TYPE")?;
+        let Typval::List(list) = type_val else {
+            return None;
+        };
+        let kind = self
+            .types
             .iter()
-            .find(|entry| entry.key.as_bytes() == b"_VAL")
-            .map(|entry| entry.value.clone())?;
+            .position(|canonical| Rc::ptr_eq(canonical, list))?;
+        let payload = entries.get(b"_VAL")?.clone();
         Some((kind, payload))
     }
 
@@ -6619,8 +6602,7 @@ fn msgpack_echo_value(value: &Typval) -> String {
                                 let entries = reference
                     .try_borrow()
                     .map(|data| {
-                        data.entries
-                            .iter()
+                        data.iter()
                             .map(|entry| (entry.key.clone(), entry.value.clone()))
                             .collect::<Vec<_>>()
                     })
@@ -6662,8 +6644,7 @@ fn msgpack_echo_value(value: &Typval) -> String {
             let entries = reference
                 .try_borrow()
                 .map(|data| {
-                    data.entries
-                        .iter()
+                    data.iter()
                         .map(|entry| (entry.key.clone(), entry.value.clone()))
                         .collect::<Vec<_>>()
                 })

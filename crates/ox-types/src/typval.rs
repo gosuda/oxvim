@@ -10,6 +10,7 @@ use std::ops::{BitOr, BitOrAssign};
 use std::rc::Rc;
 
 use crate::byte_str::OxStr;
+use crate::hashtab::{self, HashItem, HashTable};
 
 /// Unspecified value tag.
 pub const VAR_UNKNOWN: u8 = 0;
@@ -172,6 +173,11 @@ impl DictEntry {
         Self::new(self.key.clone(), self.value.clone())
     }
 }
+impl HashItem for DictEntry {
+    fn key(&self) -> &[u8] {
+        self.key.as_bytes()
+    }
+}
 
 /// Mutable payload of a shared List reference.
 #[derive(Clone)]
@@ -185,8 +191,7 @@ pub struct ListData {
 /// Mutable payload of a shared Dictionary reference.
 #[derive(Clone)]
 pub struct DictData {
-    /// Ordered Dictionary entries.
-    pub entries: Vec<DictEntry>,
+    pub(crate) table: HashTable<DictEntry>,
     /// Container lock metadata.
     pub lock: LockState,
     /// Whether this is the null dictionary sentinel.
@@ -200,14 +205,112 @@ impl DictData {
         self.get_entry(key).map(|entry| &entry.value)
     }
 
+    /// Look up an entry's value mutably by byte key.
+    #[must_use]
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Typval> {
+        self.get_entry_mut(key).map(|entry| &mut entry.value)
+    }
+
     /// Look up an entry and its metadata by byte key.
     #[must_use]
     pub fn get_entry(&self, key: &[u8]) -> Option<&DictEntry> {
-        self.entries
-            .iter()
-            .find(|entry| entry.key.as_bytes() == key)
+        self.table.get(key)
+    }
+
+    /// Look up an entry and its metadata mutably by byte key.
+    #[must_use]
+    pub fn get_entry_mut(&mut self, key: &[u8]) -> Option<&mut DictEntry> {
+        self.table.get_mut(key)
+    }
+
+    /// Insert an entry if not present; duplicates keep the first value and drop later.
+    pub fn insert(&mut self, key: OxStr, value: Typval) -> bool {
+        self.insert_entry(DictEntry::new(key, value))
+    }
+
+    /// Insert an explicit entry; duplicates keep the first value and drop later.
+    pub fn insert_entry(&mut self, entry: DictEntry) -> bool {
+        self.table.insert(entry)
+    }
+
+    /// Set an entry, replacing any existing entry with the same key.
+    pub fn set(&mut self, key: OxStr, value: Typval) {
+        self.table.set(DictEntry::new(key, value));
+    }
+
+    /// Remove an entry by byte key.
+    pub fn remove(&mut self, key: &[u8]) -> Option<DictEntry> {
+        self.table.remove(key)
+    }
+
+    /// Number of live entries in the dictionary.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// Whether the dictionary has no live entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    /// Return an iterator over live entries in ascending slot order.
+    pub fn iter(&self) -> hashtab::Iter<'_, DictEntry> {
+        self.table.iter()
+    }
+
+    /// Return a mutable iterator over live entries in ascending slot order.
+    pub fn iter_mut(&mut self) -> hashtab::IterMut<'_, DictEntry> {
+        self.table.iter_mut()
+    }
+
+    /// Clear all entries from the dictionary.
+    pub fn clear(&mut self) {
+        self.table.clear();
+    }
+
+    /// Inhibit resize during iteration or bulk operations.
+    pub fn lock_table(&mut self) {
+        self.table.lock();
+    }
+
+    /// Release resize inhibition.
+    pub fn unlock_table(&mut self) {
+        self.table.unlock();
+    }
+
+    /// Return whether table resize is currently inhibited.
+    #[must_use]
+    pub fn is_table_locked(&self) -> bool {
+        self.table.is_locked()
+    }
+
+    /// Clone live entries into a `Vec` in ascending slot order.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<DictEntry> {
+        self.iter().cloned().collect()
     }
 }
+
+impl<'a> IntoIterator for &'a DictData {
+    type Item = &'a DictEntry;
+    type IntoIter = hashtab::Iter<'a, DictEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut DictData {
+    type Item = &'a mut DictEntry;
+    type IntoIter = hashtab::IterMut<'a, DictEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 
 /// Shared List identity.
 pub type ListRef = Rc<RefCell<ListData>>;
@@ -286,19 +389,26 @@ impl Typval {
     /// Construct a new unlocked ordered Dictionary identity.
     #[must_use]
     pub fn dict(entries: Vec<(OxStr, Self)>) -> Self {
-        Self::dict_with_entries(
-            entries
-                .into_iter()
-                .map(|(key, value)| DictEntry::new(key, value))
-                .collect(),
-        )
+        let mut table = HashTable::new();
+        for (key, value) in entries {
+            table.insert(DictEntry::new(key, value));
+        }
+        Self::Dict(Rc::new(RefCell::new(DictData {
+            table,
+            lock: LockState::default(),
+            is_null: false,
+        })))
     }
 
     /// Construct a Dictionary from entries carrying explicit metadata.
     #[must_use]
     pub fn dict_with_entries(entries: Vec<DictEntry>) -> Self {
+        let mut table = HashTable::new();
+        for entry in entries {
+            table.insert(entry);
+        }
         Self::Dict(Rc::new(RefCell::new(DictData {
-            entries,
+            table,
             lock: LockState::default(),
             is_null: false,
         })))
@@ -308,7 +418,7 @@ impl Typval {
     #[must_use]
     pub fn null_dict() -> Self {
         Self::Dict(Rc::new(RefCell::new(DictData {
-            entries: Vec::new(),
+            table: HashTable::new(),
             lock: LockState::default(),
             is_null: true,
         })))
@@ -348,7 +458,7 @@ impl Typval {
             Self::String(s) => !s.as_bytes().is_empty(),
             Self::Blob(b) => !b.is_empty(),
             Self::List(list) => list.try_borrow().is_ok_and(|data| !data.items.is_empty()),
-            Self::Dict(dict) => dict.try_borrow().is_ok_and(|data| !data.entries.is_empty()),
+            Self::Dict(dict) => dict.try_borrow().is_ok_and(|data| !data.is_empty()),
             Self::Funcref(funcref) => !funcref.name.as_bytes().is_empty(),
             Self::Partial(_) => true,
             Self::Bool(value) => *value,
@@ -607,8 +717,7 @@ impl Typval {
                 let entries = dict
                     .try_borrow()
                     .map_err(|_| fmt::Error)?
-                    .entries
-                    .clone();
+                    .to_vec();
                 // Empty dictionaries dump immediately without cycle tracking (typval_encode.c.h:414).
                 if entries.is_empty() {
                     return formatter.write_str("{}");
@@ -792,17 +901,15 @@ impl PartialEq for Typval {
                     let (Ok(a), Ok(b)) = (a.try_borrow(), b.try_borrow()) else {
                         return false;
                     };
-                    let left = a.entries.clone();
-                    let right = b.entries.clone();
+                    if a.len() != b.len() {
+                        return false;
+                    }
+                    let left = a.to_vec();
                     drop(a);
-                    drop(b);
-                    left.len() == right.len()
-                        && left.iter().all(|entry| {
-                            right
-                                .iter()
-                                .find(|candidate| candidate.key == entry.key)
-                                .is_some_and(|other| equal(&entry.value, &other.value, seen))
-                        })
+                    left.iter().all(|entry| {
+                        b.get(entry.key.as_bytes())
+                            .is_some_and(|other| equal(&entry.value, other, seen))
+                    })
                 }
                 _ => false,
             }
@@ -860,7 +967,7 @@ impl fmt::Debug for Typval {
                         return f.write_str("Dict({...})");
                     }
                     f.write_str("Dict({")?;
-                    let entries = dict.try_borrow().map_err(|_| fmt::Error)?.entries.clone();
+                    let entries = dict.try_borrow().map_err(|_| fmt::Error)?.to_vec();
                     for (index, entry) in entries.iter().enumerate() {
                         if index != 0 {
                             f.write_str(", ")?;
@@ -1095,7 +1202,7 @@ mod tests {
             dict: Some(d_t20.clone()),
             registry: None,
         });
-        d_t20.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("tdr"), tdr.clone()));
+        d_t20.borrow_mut().insert(OxStr::from("tdr"), tdr.clone());
         assert_eq!(
             super::echo_text(&tdr),
             "function('TestDict', {'tdr': function('TestDict', {...@1})})"
@@ -1203,12 +1310,12 @@ mod tests {
             dict: Some(d_t24.clone()),
             registry: None,
         });
-        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("p"), p_self));
-        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("f"), fn_script.clone()));
-        d_t24.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("v"), Typval::Bool(true)));
+        d_t24.borrow_mut().insert(OxStr::from("p"), p_self);
+        d_t24.borrow_mut().insert(OxStr::from("f"), fn_script.clone());
+        d_t24.borrow_mut().insert(OxStr::from("v"), Typval::Bool(true));
         assert_eq!(
             super::echo_text(&Typval::Dict(d_t24)),
-            "{'p': function('<SNR>1_Test2', {...@0}), 'f': function('<SNR>1_Test2'), 'v': v:true}"
+            "{'p': function('<SNR>1_Test2', {...@0}), 'v': v:true, 'f': function('<SNR>1_Test2')}"
         );
 
         // T25: reference cycles in arguments
@@ -1256,8 +1363,8 @@ mod tests {
             dict: Some(d_t26.clone()),
             registry: None,
         });
-        d_t26.borrow_mut().entries.insert(0, super::DictEntry::new(OxStr::from("f"), fn_script));
-        d_t26.borrow_mut().entries.insert(0, super::DictEntry::new(OxStr::from("p"), p_d_f));
+        d_t26.borrow_mut().insert(OxStr::from("f"), fn_script);
+        d_t26.borrow_mut().insert(OxStr::from("p"), p_d_f);
         assert_eq!(
             super::echo_text(&Typval::Dict(d_t26)),
             "{'p': function('<SNR>1_Test2', [[[...@3], function('Test1', [[...@3]]), function('Test1', {...@0})], function('Test1', [[[...@5], function('Test1', [[...@5]]), function('Test1', {...@0})]]), function('Test1', {...@0})], {...@0}), 'f': function('<SNR>1_Test2'), 'v': v:true}"
@@ -1294,7 +1401,7 @@ mod tests {
         assert_eq!(super::echo_text(&Typval::list(vec![Typval::List(l_rec.clone())])), "[[[...@1]]]");
 
         let Typval::Dict(d_rec) = Typval::dict(vec![]) else { unreachable!() };
-        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("d"), Typval::Dict(d_rec.clone())));
+        d_rec.borrow_mut().insert(OxStr::from("d"), Typval::Dict(d_rec.clone()));
         assert_eq!(super::echo_text(&Typval::Dict(d_rec.clone())), "{'d': {...@0}}");
         assert_eq!(
             super::echo_text(&Typval::dict(vec![(OxStr::from("out"), Typval::Dict(d_rec.clone()))])),
@@ -1313,7 +1420,7 @@ mod tests {
 
         // T37: recursive dictionaries
         let Typval::Dict(d_rec) = Typval::dict(vec![]) else { unreachable!() };
-        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("d"), Typval::Dict(d_rec.clone())));
+        d_rec.borrow_mut().insert(OxStr::from("d"), Typval::Dict(d_rec.clone()));
         assert_eq!(super::echo_text(&Typval::Dict(d_rec.clone())), "{'d': {...@0}}");
         assert_eq!(super::echo_text_quoted(&Typval::Dict(d_rec)), "{'d': {...@0}}");
 
@@ -1359,7 +1466,7 @@ mod tests {
 
         // Self-referencing dict
         let Typval::Dict(d_rec) = Typval::dict(vec![(OxStr::from("a"), Typval::Number(1))]) else { unreachable!() };
-        d_rec.borrow_mut().entries.push(super::DictEntry::new(OxStr::from("self"), Typval::Dict(d_rec.clone())));
+        d_rec.borrow_mut().insert(OxStr::from("self"), Typval::Dict(d_rec.clone()));
         let dict_val = Typval::Dict(d_rec.clone());
         let (echo_d, has_cycle_d) = super::echo_text_with_cycle(&dict_val);
         assert_eq!(echo_d, "{'a': 1, 'self': {...@0}}");

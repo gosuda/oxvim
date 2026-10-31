@@ -593,7 +593,7 @@ fn call_term_open<F: FileIO, E: ExEditorAccess>(
     if let Some(options) = args.get(1) {
         match options {
             Typval::Dict(options) => {
-                for entry in &options.borrow().entries {
+                for entry in options.borrow().iter() {
                     if entry.key.as_bytes() == b"term" {
                         continue;
                     }
@@ -1165,7 +1165,7 @@ fn normalize_job_options(shell: &[String], args: &[Typval]) -> ox_eval::Result<J
         None => None,
         Some(Typval::Dict(values)) => {
             let mut environment = std::env::vars_os().collect::<Vec<_>>();
-            for entry in &values.borrow().entries {
+            for entry in values.borrow().iter() {
                 let value = value_text(&entry.value)?;
                 let name = OsString::from(entry.key.to_string_lossy().into_owned());
                 if let Some((_, current)) =
