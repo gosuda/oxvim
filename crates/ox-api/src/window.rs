@@ -684,7 +684,7 @@ fn set_dimension(
         }
         if let Some(height) = height {
             editor
-                .set_window_height(window, height)
+                .set_window_text_height(window, height)
                 .map_err(exception)?;
         }
         Ok(())
@@ -997,11 +997,7 @@ pub fn nvim_win_set_cursor(
 pub fn nvim_win_get_height(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
     let win = resolve_window(session, win)?;
     session.with_editor(|editor| {
-        if let Some(config) = editor.window_config(win).map_err(exception)? {
-            return i64::try_from(config.height)
-                .map_err(|_| ApiError::exception("Window height exceeds API integer range"));
-        }
-        i64::try_from(editor.window_geometry(win).map_err(exception)?.height)
+        i64::try_from(editor.window_text_height(win).map_err(exception)?)
             .map_err(|_| ApiError::exception("Window height exceeds API integer range"))
     })
 }
@@ -1701,17 +1697,19 @@ pub fn nvim_win_resize(
         let floating = editor.window_config(win).map_err(exception)?.is_some();
         let current = editor.current_window() == Some(win);
         if height >= 0 {
-            // win_setheight_win (window.c:6242): the current window keeps at
+            // win_setheight_win (window.c:6250): the current window keeps at
             // least max('winminheight', 1) rows plus the winbar row; other
-            // windows 'winminheight' rows plus the winbar row; floats at
-            // least one row (window.c:6246).
+            // windows 'winminheight' rows plus the winbar row; floats also
+            // clamp to at least one row (window.c:6253).
             let minimum = option_number(editor.options(), "winminheight", 1);
             let minimum = if current { minimum.max(1) } else { minimum };
             let height =
-                height.max(minimum + i64::from(winbar_shown(editor.options(), win, false)));
+                height.max(minimum + i64::from(winbar_shown(editor.options(), win, floating)));
             let height = if floating { height.max(1) } else { height };
             let rows = usize::try_from(height).unwrap_or(usize::MAX);
-            editor.set_window_height(win, rows).map_err(exception)?;
+            editor
+                .set_window_text_height(win, rows)
+                .map_err(exception)?;
         }
         if width >= 0 {
             // win_setwidth_win (window.c:6415-6419): only the current window
@@ -3063,6 +3061,74 @@ mod tests {
     }
 
     #[test]
+    fn resize_clamps_non_current_float_height_to_one_when_winminheight_is_zero() {
+        // win_setheight_win (window.c:6246): even when 'winminheight' is zero
+        // and the float is not current, its height is clamped to at least one row.
+        let (session, buffer, _window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .options_mut()
+                    .set_global("winminheight", OptionValue::Number(0))
+            })
+            .unwrap();
+        let float = nvim_open_win(
+            &session,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("editor"))),
+                ("row", Object::Float(2.0)),
+                ("col", Object::Float(4.0)),
+                ("width", Object::Integer(20)),
+                ("height", Object::Integer(5)),
+            ]),
+        )
+        .unwrap();
+        assert!(session.with_editor(|editor| editor.current_window() != Some(float)));
+        nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 1);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+    }
+
+    #[test]
+    fn resize_clamps_float_height_to_winminheight() {
+        // win_setheight_win (window.c:6250): floating windows clamp their
+        // height to 'winminheight' (plus winbar) before enforcing the minimum
+        // of one row. When 'winminheight' is 5, requested heights of 2 and 0
+        // both clamp to 5.
+        let (session, buffer, _window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .options_mut()
+                    .set_global("winminheight", OptionValue::Number(5))
+            })
+            .unwrap();
+        let float = nvim_open_win(
+            &session,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("editor"))),
+                ("row", Object::Float(2.0)),
+                ("col", Object::Float(4.0)),
+                ("width", Object::Integer(20)),
+                ("height", Object::Integer(5)),
+            ]),
+        )
+        .unwrap();
+        assert!(session.with_editor(|editor| editor.current_window() != Some(float)));
+        nvim_win_resize(&session, float, -1, 2, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 5);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+
+        nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 5);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+    }
+
+    #[test]
     fn resize_resizes_a_tiled_split() {
         let (session, buffer, window) = session_with(&["a"], 80, 24);
         let other = session.with_editor_mut(|editor| {
@@ -3077,6 +3143,7 @@ mod tests {
     #[test]
     fn resize_clamps_height_to_winminheight() {
         // The clamp is a split negotiation: a lone window fills the frame
+
         // and cannot shrink (nothing can take the space), so the clamp
         // needs a sibling (win_setheight_win -> frame_setheight,
         // window.c:6238-6254).
@@ -3092,6 +3159,22 @@ mod tests {
             .unwrap();
         nvim_win_resize(&session, window, -1, 2, dict(&[])).unwrap();
         assert_eq!(nvim_win_get_height(&session, window).unwrap(), 5);
+    }
+    #[test]
+    fn resize_height_round_trips_text_rows_for_a_tiled_window() {
+        let (session, buffer, window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                let tab = editor.window_tabpage(window).unwrap();
+                editor.split_horizontal(tab, window, buffer, false)
+            })
+            .unwrap();
+        let saved = nvim_win_get_height(&session, window).unwrap();
+        let reduced = saved.saturating_sub(2).max(1);
+        nvim_win_resize(&session, window, -1, reduced, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, window).unwrap(), reduced);
+        nvim_win_resize(&session, window, -1, saved, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, window).unwrap(), saved);
     }
 
     // -- nvim_win_text_height ------------------------------------------------

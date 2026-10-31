@@ -4666,6 +4666,83 @@ fn open_win_float_enter_false_preserves_current_window() {
 }
 
 #[test]
+fn win_resize_non_current_float_clamps_height_to_one_when_winminheight_is_zero() {
+    // Upstream window.c:6246: floating windows keep at least one row even
+    // when 'winminheight' is zero and the float is not the current window.
+    let (editor, buffer, _, origin) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session
+        .with_editor_mut(|editor| {
+            editor
+                .options_mut()
+                .set_global("winminheight", OptionValue::Number(0))
+        })
+        .unwrap();
+    let float = crate::window::nvim_open_win(
+        &session,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("editor"))),
+            ("row", Object::Float(2.0)),
+            ("col", Object::Float(4.0)),
+            ("width", Object::Integer(20)),
+            ("height", Object::Integer(5)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(origin),
+        "float enter=false preserves the current window"
+    );
+    crate::window::nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 1);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+}
+
+#[test]
+fn win_resize_float_clamps_height_to_winminheight_when_requested_less() {
+    // Upstream window.c:6250: floating windows clamp their height to
+    // 'winminheight' (plus winbar) before enforcing the minimum of one row.
+    // When 'winminheight' is 5, requested heights of 2 and 0 both clamp to 5.
+    let (editor, buffer, _, origin) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session
+        .with_editor_mut(|editor| {
+            editor
+                .options_mut()
+                .set_global("winminheight", OptionValue::Number(5))
+        })
+        .unwrap();
+    let float = crate::window::nvim_open_win(
+        &session,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("editor"))),
+            ("row", Object::Float(2.0)),
+            ("col", Object::Float(4.0)),
+            ("width", Object::Integer(20)),
+            ("height", Object::Integer(5)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(origin),
+        "float enter=false preserves the current window"
+    );
+    crate::window::nvim_win_resize(&session, float, -1, 2, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 5);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+
+    crate::window::nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 5);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+}
+
+#[test]
 fn open_win_external_reports_typed_not_implemented() {
     let (editor, buffer, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);

@@ -2141,6 +2141,14 @@ fn window_screen_and_state_builtins_use_editor_state() {
             "let g:id = win_getid()\n",
             "let g:width = winwidth(0)\n",
             "let g:height = winheight(0)\n",
+            "let g:height_invalid = winheight(2)\n",
+            "let g:height_negative = winheight(-1)\n",
+            "set laststatus=0\n",
+            "let g:height_ls0 = winheight(0)\n",
+            "set laststatus=1\n",
+            "let g:height_ls1 = winheight(0)\n",
+            "set laststatus=2\n",
+            "let g:height_ls2 = winheight(0)\n",
             "let g:attr = screenattr(1, 1)\n",
             "let g:char = screenchar(1, 1)\n",
             "let g:chars = screenchars(1, 1)\n",
@@ -2149,13 +2157,57 @@ fn window_screen_and_state_builtins_use_editor_state() {
             "let g:bufvar = getbufvar(bufnr('%'), 'answer')\n",
             "let g:command = fullcommand('res')\n",
             "let g:event = eventhandler()\n",
+            "new\n",
+            "let g:split_current = winheight(0)\n",
+            "let g:split_saved = winheight(0)\n",
+            "resize 1\n",
+            "let g:split_changed = winheight(0)\n",
+            "execute 'resize ' . g:split_saved\n",
+            "let g:split_restored = winheight(0)\n",
+            "let g:split_first_id = winheight(win_getid(1))\n",
+            "let g:split_first = winheight(1)\n",
+            "let g:split_second = winheight(2)\n",
+            "let g:split_invalid = winheight(3)\n",
+            "set laststatus=0\n",
+            "let g:split_ls0_first = winheight(1)\n",
+            "let g:split_ls0_second = winheight(2)\n",
+            "set laststatus=1\n",
+            "let g:split_ls1_first = winheight(1)\n",
+            "let g:split_ls1_second = winheight(2)\n",
+            "set laststatus=2\n",
+            "let g:split_ls2_first = winheight(1)\n",
+            "let g:split_ls2_second = winheight(2)\n",
         ),
     )
     .unwrap();
 
     assert_eq!(global_number(exec.scope(), "id"), Some(i64::from(window)));
     assert_eq!(global_number(exec.scope(), "width"), Some(20));
-    assert_eq!(global_number(exec.scope(), "height"), Some(6));
+    assert_eq!(global_number(exec.scope(), "height"), Some(4));
+    assert_eq!(global_number(exec.scope(), "height_invalid"), Some(-1));
+    assert_eq!(
+        global_number(exec.scope(), "split_restored"),
+        global_number(exec.scope(), "split_saved")
+    );
+    assert!(
+        global_number(exec.scope(), "split_changed").unwrap()
+            < global_number(exec.scope(), "split_saved").unwrap()
+    );
+    assert_eq!(global_number(exec.scope(), "height_negative"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "height_ls0"), Some(5));
+    assert_eq!(global_number(exec.scope(), "height_ls1"), Some(5));
+    assert_eq!(global_number(exec.scope(), "height_ls2"), Some(4));
+    assert_eq!(global_number(exec.scope(), "split_current"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_first_id"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_second"), Some(1));
+    assert_eq!(global_number(exec.scope(), "split_invalid"), Some(-1));
+    assert_eq!(global_number(exec.scope(), "split_ls0_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls0_second"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls1_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls1_second"), Some(1));
+    assert_eq!(global_number(exec.scope(), "split_ls2_first"), Some(2));
+    assert_eq!(global_number(exec.scope(), "split_ls2_second"), Some(1));
     assert_eq!(global_number(exec.scope(), "attr"), Some(0));
     assert_eq!(
         global_number(exec.scope(), "char"),

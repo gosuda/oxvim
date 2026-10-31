@@ -3572,6 +3572,41 @@ impl Editor {
         Self::revalidate_window_toplines(tabpage, laststatus)?;
         Ok(())
     }
+    /// Changes a window's renderable text height.
+    ///
+    /// The layout stores tiled-window extents as frames, while the editor
+    /// APIs and Ex commands address the rows available to buffer text. Keep
+    /// that conversion here so statusline and message-row reservations are
+    /// shared with [`Self::window_text_height`]. Floating windows have no
+    /// reservation and therefore receive the requested height unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::set_window_height`].
+    pub fn set_window_text_height(
+        &mut self,
+        window: WinHandle,
+        height: usize,
+    ) -> Result<(), EditorError> {
+        let resolved = if window.is_current() {
+            self.current_window().ok_or(EditorError::NoCurrentTabpage)?
+        } else {
+            window
+        };
+        let tab = self.window_tabpage(resolved)?;
+        let laststatus = self.laststatus();
+        let frame_height = {
+            let tabpage = self
+                .tabpages
+                .get(&tab)
+                .ok_or(EditorError::UnknownTabpage(tab))?;
+            let geometry = tabpage.window_geometry(resolved)?;
+            let text_height = viewport_height(tabpage, resolved, laststatus);
+            height.saturating_add(geometry.height.saturating_sub(text_height))
+        };
+        self.set_window_height(resolved, frame_height)
+    }
+
     /// Returns the renderable text-row count for a window.
     ///
     /// # Errors

@@ -654,25 +654,21 @@ fn call_window_builtin(editor: &Editor, name: &str, args: &[Typval]) -> Typval {
     }
 
     let number = args.first().and_then(typval_number).unwrap_or(-1);
-    let Some(tab) = editor.current_tabpage() else {
-        return Typval::Number(-1);
-    };
-    let windows = editor.tabpage_windows(tab).unwrap_or_default();
-    let window = if number == 0 {
-        editor.current_window()
-    } else {
-        one_based_index(number).and_then(|index| windows.get(index).copied())
-    };
+    let window = resolve_window_by_number(editor, number);
+    // `winheight()` is the renderable viewport height, not the raw layout
+    // frame height; keep its statusline/message reservations in one owner.
     let value = window
-        .and_then(|window| editor.window_geometry(window).ok())
-        .map_or(-1, |geometry| {
-            i64::try_from(if name == "winwidth" {
-                geometry.width
+        .and_then(|window| {
+            if name == "winheight" {
+                editor.window_text_height(window).ok()
             } else {
-                geometry.height
-            })
-            .unwrap_or(i64::MAX)
-        });
+                editor
+                    .window_geometry(window)
+                    .ok()
+                    .map(|geometry| geometry.width)
+            }
+        })
+        .map_or(-1, |value| i64::try_from(value).unwrap_or(i64::MAX));
     Typval::Number(value)
 }
 

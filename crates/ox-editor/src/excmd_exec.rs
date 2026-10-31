@@ -5273,21 +5273,20 @@ fn command_resize<F: FileIO>(
             "Cannot rotate when another window is split",
         );
     };
-    // The relative base is the window's layout extent (upstream
-    // `wp->w_height`/`wp->w_width`), not its text extent minus the
-    // status line.
+    // Relative height uses the window's text extent (`wp->w_height`), while
+    // the layout owner stores a tiled frame extent. `set_window_text_height`
+    // performs the corresponding statusline/message-row conversion.
     let tabpage = editor
         .current_tabpage()
         .and_then(|tab| editor.tabpage(tab).ok());
-    let current_extent = tabpage
-        .and_then(|tabpage| tabpage.layout().window_geometry(window).ok())
-        .map_or(1, |geometry| {
-            if vertical {
-                geometry.width
-            } else {
-                geometry.height
-            }
-        });
+    let current_extent = if vertical {
+        tabpage
+            .as_ref()
+            .and_then(|tabpage| tabpage.layout().window_geometry(window).ok())
+            .map_or(1, |geometry| geometry.width)
+    } else {
+        editor.window_text_height(window).unwrap_or(1)
+    };
     let extent = if relative {
         signed + current_extent.cast_signed()
     } else if args.is_empty() {
@@ -5310,7 +5309,7 @@ fn command_resize<F: FileIO>(
     let result = if vertical {
         editor.set_window_width(window, extent)
     } else {
-        editor.set_window_height(window, extent)
+        editor.set_window_text_height(window, extent)
     };
     match result {
         Ok(()) => Flow::Normal,

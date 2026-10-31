@@ -1841,7 +1841,11 @@ fn resize_wincmd_and_echohl_mutate_existing_editor_state() {
     assert_ne!(split, original);
 
     executor.execute_line(&editor, "resize 2").unwrap();
-    assert_eq!(editor.editor().window_geometry(split).unwrap().height, 2);
+    assert_eq!(
+        editor.editor().window_text_height(split).unwrap(),
+        2,
+        ":resize uses text rows; the frame includes the statusline row"
+    );
     executor.execute_line(&editor, "wincmd w").unwrap();
     assert_eq!(editor.editor().current_window(), Some(original));
     executor.execute_line(&editor, "echohl Search").unwrap();
