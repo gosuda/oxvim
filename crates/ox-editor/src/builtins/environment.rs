@@ -19,7 +19,7 @@ use ox_types::{OxStr, Typval};
 
 use super::input_string_arg;
 use crate::builtins::position::cell_width;
-use crate::excmd_exec::{EvalHost, VimRegex, change_directory, typval_number, typval_to_text};
+use crate::excmd_exec::{EvalHost, VimRegex, change_directory, typval_number};
 
 /// Routes one ambient-environment builtin.
 pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
@@ -523,37 +523,7 @@ fn call_chdir_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<T
 }
 
 fn call_strftime_builtin(args: &[Typval]) -> ox_eval::Result<Typval> {
-    if args.is_empty() {
-        return Err(EvalError::new(
-            "E119",
-            0,
-            "Not enough arguments for function: strftime",
-        ));
-    }
-    if args.len() > 2 {
-        return Err(EvalError::new(
-            "E118",
-            0,
-            "Too many arguments for function: strftime",
-        ));
-    }
-    if typval_to_text(&args[0]) != "%H:%M:%S" {
-        return Err(EvalError::not_implemented(OxStr::from("strftime format")));
-    }
-    let timestamp = args.get(1).and_then(typval_number).unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |duration| {
-                i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-            })
-    });
-    let seconds = timestamp.rem_euclid(86_400);
-    let hours = seconds / 3_600;
-    let minutes = seconds % 3_600 / 60;
-    let seconds = seconds % 60;
-    Ok(Typval::String(OxStr::from(
-        format!("{hours:02}:{minutes:02}:{seconds:02}").as_str(),
-    )))
+    super::datetime::call_strftime_builtin(args)
 }
 
 fn call_hlexists_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {

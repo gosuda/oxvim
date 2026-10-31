@@ -10,6 +10,7 @@ pub(crate) mod assert;
 pub(crate) mod buffer;
 pub(crate) mod cmdline;
 pub(crate) mod completion;
+pub(crate) mod datetime;
 pub(crate) mod environment;
 pub(crate) mod eval;
 pub(crate) mod filesystem;

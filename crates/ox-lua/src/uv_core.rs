@@ -389,6 +389,11 @@ fn install_misc(lua: &Lua, uv: &Table) -> mlua::Result<()> {
     )?;
 
     uv.set(
+        "available_parallelism",
+        lua.create_function(|_, ()| Ok(lua_int(misc::available_parallelism())))?,
+    );
+
+    uv.set(
         "sleep",
         lua.create_function(|_, milliseconds: i64| {
             let duration = u64::try_from(milliseconds.max(0)).map(Duration::from_millis);

@@ -27,6 +27,14 @@ pub fn hrtime() -> u64 {
     u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
+/// Returns the number of parallel threads the runtime reports, as
+/// `uv.available_parallelism()` does.
+pub fn available_parallelism() -> u64 {
+    std::thread::available_parallelism()
+        .map(|n| u64::try_from(n.get()).unwrap_or(u64::MAX))
+        .unwrap_or(1)
+}
+
 /// Returns Unix seconds and microseconds within the current second.
 ///
 /// # Errors
