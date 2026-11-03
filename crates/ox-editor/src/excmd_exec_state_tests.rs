@@ -4119,3 +4119,87 @@ fn buffer_predicates_resolve_zero_to_the_alternate() {
     assert_eq!(number(b"exists_percent"), Some(0));
     assert_eq!(number(b"exists_empty"), Some(0));
 }
+
+/// `:vimgrep` fires `QuickFixCmdPre` before argument parsing and
+/// `QuickFixCmdPost` after the list fills and before the jump
+/// (`ex_vimgrep`, quickfix.c:5842,5891).
+#[test]
+fn vimgrep_fires_quickfixcmd_events() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-au-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(
+        &editor,
+        "autocmd QuickFixCmdPre * let g:order = get(g:, 'order', '') . 'pre,'",
+    )
+    .unwrap();
+    exec.execute_line(
+        &editor,
+        "autocmd QuickFixCmdPost * let g:order = get(g:, 'order', '') . 'post,'",
+    )
+    .unwrap();
+    let pattern = format!("vimgrep /t/ {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let order = exec
+        .scope()
+        .get_scoped(ScopeKind::Global, b"order", 0)
+        .unwrap();
+    assert_eq!(order, &Typval::String(OxStr::from("pre,post,")));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `undo_allowed` gates the splice (`ex_change` calls `u_save` before the
+/// deletion, `ex_append` inside the per-line insert loop, ex_cmds.c:2976,
+/// 3124): `'nomodifiable'` reports E21 for `:change` always and for
+/// `:append`/`:insert` only when a line is actually inserted.
+#[test]
+fn append_and_change_report_e21_on_nomodifiable() {
+    let (editor, buffer, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['a', 'b'])")
+        .unwrap();
+    exec.execute_line(&editor, "setlocal nomodifiable").unwrap();
+
+    assert_vim_error(exec.execute_line(&editor, "1change\nx\n."), "E21");
+    assert_vim_error(exec.execute_line(&editor, "1append\nx\n."), "E21");
+    assert_vim_error(exec.execute_line(&editor, "1insert\nx\n."), "E21");
+    // An immediate `.` inserts nothing, so `u_save` never runs (upstream
+    // answers no error for an empty append).
+    exec.execute_line(&editor, "1append\n.\n").unwrap();
+    exec.execute_line(&editor, "0insert\n.\n").unwrap();
+    exec.execute_line(&editor, "setlocal modifiable").unwrap();
+
+    let ed = editor.editor();
+    let text = ed.buffer(buffer).unwrap().text().unwrap();
+    let lines: Vec<String> = (1..=text.line_count())
+        .map(|lnum| String::from_utf8_lossy(&text.line(lnum).unwrap()).into_owned())
+        .collect();
+    assert_eq!(lines, vec!["a", "b"]);
+}
+
+/// `skip_regexp` compares the delimiter byte-by-byte; a multi-byte
+/// delimiter's first byte can match inside another multi-byte char, so the
+/// slices after the scan must stay on char boundaries instead of panicking.
+#[test]
+fn match_command_accepts_a_multibyte_delimiter() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "call setline(1, ['a'])").unwrap();
+    // `／` (U+FF0F) is the delimiter: the byte-level close can land mid-char;
+    // the pattern must not panic the command.
+    exec.execute_line(&editor, "match ErrorMsg ／a／").unwrap();
+    // ASCII delimiters keep their normal behavior, including E488 on
+    // trailing garbage.
+    assert_vim_error(
+        exec.execute_line(&editor, "match ErrorMsg /a/ xx"),
+        "E488",
+    );
+}

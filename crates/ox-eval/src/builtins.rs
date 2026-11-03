@@ -6393,10 +6393,13 @@ impl MsgpackDumpEncoder<'_> {
         index: usize,
         payload: &Typval,
     ) -> Result<rmpv::Value> {
+        // Copy the canonical type list instead of sharing it: `special_payload`
+        // detects special maps by `Rc` identity against `eval_msgpack_type_lists`,
+        // so reusing the same `Rc` would re-enter special encoding forever.
         let fallback = Typval::dict(vec![
             (
                 OxStr::from("_TYPE"),
-                Typval::List(self.types[index].clone()),
+                Typval::list(list_items(&self.types[index])?),
             ),
             (OxStr::from("_VAL"), payload.clone()),
         ]);

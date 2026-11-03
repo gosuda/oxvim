@@ -35,6 +35,25 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     args: &[Typval],
     scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
+    // The old `ox-eval` path ran `check_arity` before dispatch; keep the
+    // same `eval.lua` table gate here so `uniq()`/call()` report E119
+    // instead of indexing past `args`.
+    let spec = ox_eval::builtin_spec(name)
+        .ok_or_else(|| EvalError::new("E117", 0, format!("Unknown function: {name}")))?;
+    if args.len() < spec.min_args {
+        return Err(EvalError::new(
+            "E119",
+            0,
+            format!("Not enough arguments for function: {name}"),
+        ));
+    }
+    if spec.max_args.is_some_and(|maximum| args.len() > maximum) {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            format!("Too many arguments for function: {name}"),
+        ));
+    }
     match name {
         "eval" => call_eval_builtin(host, args, scope),
         "call" => call_call_builtin(host, args, scope),
@@ -145,6 +164,11 @@ fn call_uniq_builtin<F: FileIO, E: ExEditorAccess>(
     let mut data = reference
         .try_borrow_mut()
         .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
+    // `uniq` removes items in place, so a `:lockvar`-locked list fails
+    // `tv_check_lock` with E741 before any removal.
+    if data.lock.locked {
+        return Err(EvalError::new("E741", 0, "Value is locked"));
+    }
     if data.items.len() != snapshot.len() {
         return Err(EvalError::new("E741", 0, "Cannot change list"));
     }
@@ -1402,5 +1426,31 @@ mod tests {
         assert_eq!(eval(&mut exec, &editor, "expand('%:p')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('%:h')"), text(""));
         assert_eq!(eval(&mut exec, &editor, "expand('%:p:h')"), Typval::String(unnamed_dir.clone()));
+    }
+
+    /// The `eval.lua` arity table gates  this family the way the old
+    /// `ox-eval` dispatch did: too few arguments report E119 instead of
+    /// reaching a body that indexes past `args`.
+    #[test]
+    fn missing_arguments_report_e119_not_a_panic() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert!(failure(&mut exec, &editor, "uniq()").contains("E119"));
+        assert!(failure(&mut exec, &editor, "call('toupper')").contains("E119"));
+        assert!(failure(&mut exec, &editor, "execute()").contains("E119"));
+    }
+
+    /// `uniq` removes items in place, so a `:lockvar`-locked list reports
+    /// E741 before any removal and keeps its contents.
+    #[test]
+    fn uniq_refuses_a_locked_list_with_e741() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(&mut exec, &editor, "let l = [1, 1, 2]\nlockvar l");
+        assert!(failure(&mut exec, &editor, "uniq(l)").contains("E741"));
+        assert_eq!(eval(&mut exec, &editor, "len(l)"), Typval::Number(3));
+        script(&mut exec, &editor, "unlockvar l");
+        script(&mut exec, &editor, "call uniq(l)");
+        assert_eq!(eval(&mut exec, &editor, "len(l)"), Typval::Number(2));
     }
 }

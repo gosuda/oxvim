@@ -3816,6 +3816,15 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                     // (`ML_EMPTY`); the insert below must replace it rather
                     // than append after it.
                     let deleted_all = start == 1 && end >= existing.len();
+                    // `ex_change` fails `u_save` (undo.c `undo_allowed`) with
+                    // E21 on a non-modifiable buffer before deleting anything.
+                    if access.with_ex_editor(|editor| !editor.is_modifiable(buffer)) {
+                        return error_flow(
+                            runtime,
+                            "E21",
+                            "Cannot make changes, 'modifiable' is off",
+                        );
+                    }
                     let replacement = if deleted_all {
                         vec![Vec::new()]
                     } else {
@@ -3903,6 +3912,19 @@ fn run_instructions<F: FileIO, E: ExEditorAccess>(
                 let existing = access
                     .with_ex_editor(|editor| buffer_lines(editor, buffer))
                     .unwrap_or_default();
+                // `ex_append` saves for undo inside its per-line insert loop,
+                // so a non-modifiable buffer only fails E21 when a line is
+                // actually inserted; `:change` already failed above.
+                if name != "change"
+                    && !lines.is_empty()
+                    && access.with_ex_editor(|editor| !editor.is_modifiable(buffer))
+                {
+                    return error_flow(
+                        runtime,
+                        "E21",
+                        "Cannot make changes, 'modifiable' is off",
+                    );
+                }
                 // `:change` that deleted every line replaces the dummy line
                 // the deletion left, exactly like `:append` on an empty
                 // buffer.
@@ -7722,10 +7744,13 @@ fn helptags_help_files<F: FileIO>(io: &F, dir: &Path) -> Vec<String> {
 /// Language code of a help file name (`helpfile_lang`, help.lua:413-421):
 /// `"en"` for `*.txt`, the two letters of `*.??x` otherwise.
 fn helptags_lang(file_name: &str) -> Option<String> {
-    if file_name.len() < 4 {
+    let tail = file_name.as_bytes();
+    if tail.len() < 4 {
         return None;
     }
-    let suffix = file_name[file_name.len() - 4..].to_ascii_lowercase();
+    // The 4-byte tail can straddle a multi-byte char boundary; decode
+    // lossily instead of slicing so `日本語`-style names yield no lang.
+    let suffix = String::from_utf8_lossy(&tail[tail.len() - 4..]).to_ascii_lowercase();
     let bytes = suffix.as_bytes();
     if bytes == b".txt" {
         return Some("en".to_owned());
@@ -13295,6 +13320,34 @@ fn fire_read_autocmd<F: FileIO, E: ExEditorAccess>(
     run_autocmd_plan(runtime, access, scope, lua, plan)
 }
 
+/// Runs one `QuickFixCmdPre`/`QuickFixCmdPost` autocommand event
+/// (`apply_autocmds(EVENT_QUICKFIXCMD*, au_name, curbuf->b_fname, true,
+/// curbuf)` — quickfix.c:5842,5891): `<amatch>` is the command name and the
+/// event file name is the current buffer's name.
+fn fire_quickfix_autocmd<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    event: Event,
+    command_name: &str,
+) -> Flow {
+    let buffer = access.with_ex_editor(|editor| editor.current_buffer());
+    let buffer_name = access.with_ex_editor(|editor| current_buffer_name(editor));
+    let plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            event,
+            AutocmdContext {
+                buffer,
+                file_name: Some(buffer_name.as_bytes()),
+                match_name: Some(command_name.as_bytes()),
+                ..AutocmdContext::default()
+            },
+        )
+    });
+    run_autocmd_plan(runtime, access, scope, lua, plan)
+}
+
 /// `do_filetype_autocmd` (`autocmd.c:2516-2539`) as reached from a committed
 /// `filetype` assignment: fire `FileType` for the buffer whose option was
 /// just written, with the committed value as `<amatch>`, the buffer name as
@@ -16291,18 +16344,19 @@ fn command_match<F: FileIO>(
     let Some(close) = close else {
         return error_flow(runtime, "E475", format!("Invalid argument: {rest}"));
     };
-    if !rest[close + 1..].bytes().all(|byte| byte == b' ' || byte == b'\t') {
+    // The scan compares single bytes like `skip_regexp`, so a multi-byte
+    // delimiter's first byte can match inside another multi-byte char;
+    // `get` slices only on char boundaries and yields empty otherwise.
+    let tail = rest.get(close + 1..).unwrap_or_default();
+    if !tail.bytes().all(|byte| byte == b' ' || byte == b'\t') {
         return error_flow(
             runtime,
             "E488",
-            format!(
-                "Trailing characters: {}",
-                rest[close + 1..].trim_start_matches([' ', '\t'])
-            ),
+            format!("Trailing characters: {}", tail.trim_start_matches([' ', '\t'])),
         );
     }
     let group = &args[..group_end];
-    let pattern = &rest[1..close];
+    let pattern = rest.get(1..close).unwrap_or_default();
     if pattern.is_empty() {
         // `match_add` rejects an empty pattern without an error
         // (match.c:62-64); the old highlight is already deleted above.
@@ -29160,8 +29214,8 @@ fn ensure_vimgrep_buffer<E: ExEditorAccess>(access: &E, name: &str) -> Option<Bu
 fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
     access: &E,
-    _scope: &mut Scope,
-    _lua: Option<&Rc<dyn LuaExec>>,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let name = command.command.name();
@@ -29173,6 +29227,12 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
             "E1513",
             "Cannot switch buffer. 'winfixbuf' is enabled",
         );
+    }
+    // `ex_vimgrep` fires QuickFixCmdPre after the curbuf check and before
+    // argument parsing; an aborted event ends the command (quickfix.c:5842).
+    let flow = fire_quickfix_autocmd(runtime, access, scope, lua, Event::QuickFixCmdPre, name);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
     }
     let Some(split) = ox_excmd::split_vimgrep_args(&command.args) else {
         return error_flow(runtime, "E682", "Invalid search pattern or delimiter");
@@ -29304,6 +29364,12 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
             }
         }
     });
+    // `ex_vimgrep` fires QuickFixCmdPost once the list is filled, before
+    // the empty-list report and the first-match jump (quickfix.c:5891).
+    let flow = fire_quickfix_autocmd(runtime, access, scope, lua, Event::QuickFixCmdPost, name);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
     let empty = access.with_ex_editor(|editor| {
         qf_scope
             .stack(editor)
@@ -29676,5 +29742,21 @@ mod shared_watcher_pair_tests {
             vec!["first:key".to_owned(), "second:key".to_owned()]
         );
         assert!(!nested.runtime.functions.has_dictwatchers());
+    }
+}
+
+#[cfg(test)]
+mod helptags_lang_tests {
+    use super::helptags_lang;
+
+    /// The `*.??x` tail check decodes the last four bytes lossily: a
+    /// multi-byte name whose tail straddles a char boundary yields no
+    /// language instead of panicking on the slice.
+    #[test]
+    fn multibyte_tail_does_not_panic() {
+        assert_eq!(helptags_lang("日本語"), None);
+        assert_eq!(helptags_lang("readme.txt"), Some("en".to_owned()));
+        assert_eq!(helptags_lang("doc.frx"), Some("fr".to_owned()));
+        assert_eq!(helptags_lang("a"), None);
     }
 }

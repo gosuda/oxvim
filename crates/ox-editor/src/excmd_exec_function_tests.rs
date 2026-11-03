@@ -4505,3 +4505,50 @@ fn sourced_script_error_displays_and_aborts() {
     assert_eq!(global_number(exec.scope(), "inner_after"), None);
     assert!(exec.did_emsg());
 }
+
+/// A `chansend` that fails on a socket channel must not consume the job
+/// manager with the error: the send reports E900 and later channel calls
+/// still see the manager (process.rs restores `runtime.jobs` before `?`).
+#[cfg(unix)]
+#[test]
+fn chansend_socket_failure_keeps_the_job_manager() {
+    let (editor, mut exec, _guard) = channel_suite();
+    let path = unique_socket_path("rst-peer");
+    let listener = bind_peer(&path);
+    // Peer accepts then shuts down and drops: the client's next writes
+    // fail with EPIPE once the kernel has reaped the other end.
+    let peer = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("peer accepts");
+        stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shutdown");
+        drop(stream);
+    });
+    script(
+        &mut exec,
+        &editor,
+        &format!(
+            "let g:job = jobstart(['cat'])\nlet g:sock = sockconnect('pipe', '{}')\n",
+            path.display()
+        ),
+    );
+    peer.join().expect("peer resets");
+    // The first write may still land in the orphaned socket buffer, so keep
+    // sending until the failure surfaces (bounded to stay deterministic).
+    let mut error = None;
+    for _ in 0..64 {
+        if let Err(failed) = exec.execute_line(&editor, "call chansend(g:sock, 'x')") {
+            error = Some(failed);
+            break;
+        }
+    }
+    let error = error.expect("sending on a closed socket must fail");
+    assert_eq!(error_code(&error), "E900");
+    // The manager survived: the live job still resolves and stops.
+    script(
+        &mut exec,
+        &editor,
+        "let g:pid = jobpid(g:job)\ncall jobstop(g:job)\n",
+    );
+    assert!(global_number(exec.scope(), "pid") > Some(0));
+}

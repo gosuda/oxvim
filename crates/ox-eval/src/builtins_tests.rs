@@ -5392,3 +5392,45 @@ fn unterminated_single_quoted_string_fails() {
     let error = Parser::new(source).parse().unwrap_err();
     assert_eq!(error.code, "E115");
 }
+
+/// A `{"_TYPE": <canonical>, "_VAL": bad}` map rejected by the special
+/// encoder falls back to a plain two-key map; the `_TYPE` list must be a
+/// copy — sharing the canonical `Rc` re-detects the map as special and
+/// recurses until the stack overflows.
+#[test]
+fn msgpackdump_rejected_special_map_encodes_as_a_plain_dict() {
+    // `uint64::MAX` decodes to the integer special dict.
+    let parsed = call(
+        "msgpackparse",
+        vec![Typval::Blob(vec![0xcf, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])],
+    )
+    .unwrap();
+    let Typval::List(items) = parsed else {
+        panic!("parse must answer a List");
+    };
+    let dict = items.borrow().items[0].clone();
+    // Corrupt `_VAL`: the integer encoder wants a four-number list.
+    let Typval::Dict(reference) = &dict else {
+        panic!("decoded value must be the special dict");
+    };
+    reference
+        .borrow_mut()
+        .set(OxStr::from("_VAL"), number(7));
+    let dumped = call("msgpackdump", vec![Typval::list(vec![dict.clone()])]).unwrap();
+    // It round-trips as a regular map: `_TYPE` decoded as an ordinary list
+    // (identity no longer matches the canonical `v:msgpack_types` list).
+    let back = call("msgpackparse", vec![dumped]).unwrap();
+    let Typval::List(items) = back else {
+        panic!("parse must answer a List");
+    };
+    let Typval::Dict(entries) = &items.borrow().items[0] else {
+        panic!("round trip must answer a dict");
+    };
+    let data = entries.borrow();
+    assert_eq!(
+        data.get(b"_VAL").unwrap().clone(),
+        number(7),
+        "the plain-dict fallback must keep the payload"
+    );
+    assert!(matches!(data.get(b"_TYPE"), Some(Typval::List(_))));
+}

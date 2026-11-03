@@ -731,8 +731,11 @@ pub fn diffgetput(
         .map_err(|_| DiffGetPutError::new("E749", "Empty buffer"))?;
 
     // `off` tracks how edits to the current buffer shift the lines below
-    // them; edits to the other buffer (`:diffput`) keep original coordinates.
+    // them; `off_to` does the same for the other buffer on `:diffput`.
+    // Upstream keeps both inside the live diff entries (mark_adjust
+    // mutates `df_lnum[idx]`); this snapshot keeps the offset outside.
     let mut off: i64 = 0;
+    let mut off_to: i64 = 0;
     let mut index = 0;
     while index < hunks.len() {
         // With no range, adjacent hunks at or above the cursor collapse to
@@ -754,13 +757,13 @@ pub fn diffgetput(
             break;
         }
         if hunk.current.0 + hunk.current.1 > line_number(line1) {
-            off += apply_hunk(
+            let delta = apply_hunk(
                 editor,
                 HunkEdit {
                     hunk,
                     to: if put { other } else { current },
                     current,
-                    tracks_off: !put,
+                    edit_off: if put { off_to } else { off },
                     from_lines: &from_lines,
                     line1: line_number(line1) + off,
                     line2: line_number(line2) + off,
@@ -768,6 +771,11 @@ pub fn diffgetput(
                     window,
                 },
             )?;
+            if put {
+                off_to += delta;
+            } else {
+                off += delta;
+            }
         }
         index += 1;
     }
@@ -788,8 +796,9 @@ struct HunkEdit<'a> {
     to: BufHandle,
     /// Buffer the range addresses.
     current: BufHandle,
-    /// Whether the net delta feeds the caller's `off` tracking.
-    tracks_off: bool,
+    /// Net delta earlier hunks already applied to the edit's target buffer
+    /// (`off` for a get, `off_to` for a put).
+    edit_off: i64,
     /// Current source buffer lines.
     from_lines: &'a [Vec<u8>],
     /// 1-based range start in current-buffer coordinates.
@@ -905,7 +914,7 @@ fn apply_hunk(editor: &mut Editor, edit: HunkEdit<'_>) -> Result<i64, DiffGetPut
         hunk,
         to,
         current,
-        tracks_off,
+        edit_off,
         from_lines,
         line1,
         line2,
@@ -913,10 +922,18 @@ fn apply_hunk(editor: &mut Editor, edit: HunkEdit<'_>) -> Result<i64, DiffGetPut
         window,
     } = edit;
     let put = to != current;
-    let (mut to_start, mut to_count) = if put { hunk.other } else { hunk.current };
+    // The target span rides the delta earlier hunks applied to the buffer
+    // being edited; the source side is never edited, so it stays in
+    // original coordinates (upstream `mark_adjust` mutates `df_lnum` in
+    // place, which this snapshot cannot).
+    let (to_lnum, mut to_count) = if put { hunk.other } else { hunk.current };
+    let mut to_start = to_lnum + edit_off;
+    // A get clips the range against current-buffer coordinates that carry
+    // the same shift; a put's current buffer is the unedited source side.
+    let cur_start = hunk.current.0 + if put { 0 } else { edit_off };
     let (mut from_start, mut from_count) = if put { hunk.current } else { hunk.other };
     if ranged {
-        let mut start_skip = line1 - hunk.current.0;
+        let mut start_skip = line1 - cur_start;
         if start_skip > 0 {
             if start_skip > to_count {
                 to_start += to_count;
@@ -928,7 +945,7 @@ fn apply_hunk(editor: &mut Editor, edit: HunkEdit<'_>) -> Result<i64, DiffGetPut
         } else {
             start_skip = 0;
         }
-        let mut end_skip = hunk.current.0 + hunk.current.1 - 1 - line2;
+        let mut end_skip = cur_start + hunk.current.1 - 1 - line2;
         if end_skip > 0 {
             if put {
                 to_count = to_count.min(hunk.current.1 - start_skip - end_skip);
@@ -1005,11 +1022,7 @@ fn apply_hunk(editor: &mut Editor, edit: HunkEdit<'_>) -> Result<i64, DiffGetPut
             timestamp: 0,
         })
         .map_err(|error| DiffGetPutError::new("E749", error.to_string()))?;
-    Ok(if tracks_off {
-        line_number(inserted.len()) - deleted
-    } else {
-        0
-    })
+    Ok(line_number(inserted.len()) - deleted)
 }
 
 /// Whether `buffer` accepts edits (`'modifiable'`).
@@ -1769,5 +1782,66 @@ mod diffgetput_tests {
         exec.execute_script(&access, "diffmode.vim", "wincmd w")
             .unwrap();
         assert_eq!(buffer_strings(&access), vec!["1", "2", "3", "4", "6"]);
+    }
+
+    // Upstream mutates `df_lnum[idx_to]` through `mark_adjust` so the next
+    // hunk sees shifted coordinates; this port's snapshot must add the same
+    // offset. An earlier net insertion must move the later hunk's target:
+    // without the shift the replace lands three lines too high.
+    #[test]
+    fn diffget_rides_the_offset_of_an_earlier_inserting_hunk() {
+        let access = editor();
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &access,
+            "diffmode.vim",
+            "call setline(1, ['1','2','3','4','5','6','7','8','9','10'])\n\
+             diffthis\n\
+             new\n\
+             call setline(1, ['1','2','3','4','5','a0','a1','a2','6','7','8','9','TAIL'])\n\
+             diffthis\n\
+             wincmd p",
+        )
+        .unwrap();
+        let mut editor = access.editor_mut();
+        diffgetput(&mut editor, false, None, 1, 10, 1).unwrap();
+        drop(editor);
+        assert_eq!(
+            buffer_strings(&access),
+            vec![
+                "1", "2", "3", "4", "5", "a0", "a1", "a2", "6", "7", "8", "9", "TAIL"
+            ]
+        );
+    }
+
+    // The same drift applies to `:diffput`: the earlier insertion shifts
+    // the *other* buffer's later hunk (`off_to`).
+    #[test]
+    fn diffput_rides_the_offset_of_an_earlier_inserting_hunk() {
+        let access = editor();
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &access,
+            "diffmode.vim",
+            "call setline(1, ['1','2','3','4','5','a0','a1','a2','6','7','8','9','TAIL'])\n\
+             diffthis\n\
+             new\n\
+             call setline(1, ['1','2','3','4','5','6','7','8','9','10'])\n\
+             diffthis\n\
+             wincmd p",
+        )
+        .unwrap();
+        let mut editor = access.editor_mut();
+        diffgetput(&mut editor, true, None, 1, 13, 1).unwrap();
+        drop(editor);
+        let mut exec = ExExecutor::new();
+        exec.execute_script(&access, "diffmode.vim", "wincmd w")
+            .unwrap();
+        assert_eq!(
+            buffer_strings(&access),
+            vec![
+                "1", "2", "3", "4", "5", "a0", "a1", "a2", "6", "7", "8", "9", "TAIL"
+            ]
+        );
     }
 }

@@ -81,10 +81,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             // so route by channel kind first: socket bytes must not be copied
             // through the job path only to miss the table.
             if manager.is_socket_channel(id) {
-                let sent = manager
-                    .socket_send(id, &data)
-                    .map_err(|message| EvalError::new("E900", 0, message))?;
+                let sent = manager.socket_send(id, &data);
                 runtime.jobs = Some(manager);
+                let sent = sent.map_err(|message| EvalError::new("E900", 0, message))?;
                 return Ok(Typval::Number(i64::from(sent)));
             }
             let (manager, sent) = chansend_send(manager, id, data, terminal);
