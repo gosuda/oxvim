@@ -16,13 +16,15 @@ const FIRST_GLOBAL_MARK: char = 'A';
 const LAST_GLOBAL_MARK: char = 'Z';
 const FIRST_NUMBERED_MARK: char = '0';
 const LAST_NUMBERED_MARK: char = '9';
-const SPECIAL_LOCAL_MARKS: [char; 8] = ['\'', '`', '.', '^', ':', '[', ']', '"'];
+const SPECIAL_LOCAL_MARKS: [char; 10] = [
+    '\'', '`', '.', '^', ':', '[', ']', '"', '<', '>',
+];
 
 /// An invalid named-mark operation.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MarkError {
     /// The name is not one of `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`,
-    /// or `"`.
+    /// `"`, `<`, or `>`.
     #[error("invalid local mark name '{0}'")]
     InvalidLocal(char),
     /// The name is not in `A-Z` or `0-9`.
@@ -110,7 +112,7 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn set(&mut self, name: char, position: Position) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.set(id, position))
@@ -121,7 +123,7 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn get(&self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.get(id))
@@ -132,13 +134,13 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn remove(&mut self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.remove(id))
     }
 
-    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"` order.
+    /// Iterates over set marks in `a-z`, specials, `<`, `>` order.
     pub fn iter(&self) -> impl Iterator<Item = (char, Position)> + '_ {
         self.marks
             .iter()

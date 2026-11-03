@@ -41,6 +41,81 @@ pub trait BuiltinHost {
         self.call(name, args, scope)
     }
 
+    /// Invoke a named Vimscript function with per-argument identities.
+    ///
+    /// The default strips the identities and delegates to
+    /// [`call`](Self::call), so hosts without identity-sensitive builtins
+    /// keep working unchanged. A host that resolves scope-namespace
+    /// arguments (like `dictwatcheradd`'s bare `g:`) overrides this and
+    /// matches the identities against the live `scope` maps.
+    ///
+    /// # Errors
+    ///
+    /// See [`call`](Self::call).
+    fn call_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call(name, values, scope)
+    }
+
+    /// Invoke a named function through `receiver->name(...)` with identities.
+    ///
+    /// The default strips the identities and delegates to
+    /// [`call_method`](Self::call_method); see
+    /// [`call_with_identities`](Self::call_with_identities).
+    ///
+    /// # Errors
+    ///
+    /// See [`call`](Self::call).
+    fn call_method_with_identities(
+        &mut self,
+        name: &OxStr,
+        args: Vec<CallArg>,
+        scope: &mut Scope,
+    ) -> Result<Typval> {
+        let values = args.into_iter().map(|arg| arg.value).collect();
+        self.call_method(name, values, scope)
+    }
+
+    /// Records the dictionary a Partial carries, so a host that owns
+    /// user-function frames can bind it as `self` for the next call.
+    fn set_call_receiver(&mut self, _receiver: Option<ox_types::DictRef>) {}
+
+    /// Reports one successful dictionary mutation for watcher notification.
+    ///
+    /// `dict` is the live mutated dictionary, `key` its byte key, `old` the
+    /// previous value (`None` for a newly added key) and `new` the new value
+    /// (`None` for a removal). The default drops the report, so hosts without
+    /// watchers (including unit-test dispatchers) keep working unchanged.
+    fn record_dict_mutation(
+        &mut self,
+        _dict: &ox_types::DictRef,
+        _key: &[u8],
+        _old: Option<Typval>,
+        _new: Option<Typval>,
+    ) {
+    }
+
+    /// Reports one successful scope-namespace mutation for watcher
+    /// notification: `remove()`/`extend()`/`filter()` on a bare `g:`/`b:`/
+    /// `w:`/`t:` argument mutate the scope map itself (not a snapshot), so
+    /// the event targets [`ScopeKind`] instead of a live `Dict` identity.
+    /// `old` is the previous value (`None` for a newly added key) and `new`
+    /// the new value (`None` for a removal). The default drops the report,
+    /// so hosts without watchers keep working unchanged.
+    fn record_scope_mutation(
+        &mut self,
+        _kind: ScopeKind,
+        _key: &[u8],
+        _old: Option<Typval>,
+        _new: Option<Typval>,
+    ) {
+    }
+
     /// Registry shared with callback-capable builtins, when this host owns one.
     fn closure_registry(&self) -> Option<ClosureRegistry> {
         None
@@ -353,6 +428,19 @@ impl Evaluated {
     }
 }
 
+/// One evaluated call argument: the value the builtin receives plus the
+/// source identity [`Evaluated`] carried for it (the same identity the
+/// `is` operator compares). A bare `g:`/`b:`/`w:`/`t:` argument keeps the
+/// live scope map's identity, so an identity-sensitive host can resolve it
+/// against the same maps in `scope` instead of a dead snapshot pointer.
+#[derive(Clone, Debug)]
+pub struct CallArg {
+    /// The argument value handed to the builtin.
+    pub value: Typval,
+    /// The identity of the argument expression, when it had one.
+    pub identity: Option<usize>,
+}
+
 /// A reusable evaluator with host seams and a shared closure registry.
 pub struct Evaluator<'a, H: BuiltinHost, R: RegexEngine> {
     host: &'a mut H,
@@ -636,7 +724,11 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                 let receiver = self.eval_at(receiver, scope, next)?;
                 let mut values = Vec::with_capacity(args.len() + 1);
                 for arg in args {
-                    values.push(self.eval_at(arg, scope, next)?.value);
+                    let evaluated = self.eval_at(arg, scope, next)?;
+                    values.push(CallArg {
+                        value: evaluated.value,
+                        identity: evaluated.identity,
+                    });
                 }
                 let slot = match &method.kind {
                     ExprKind::Variable(name) => crate::builtin_spec(&name.to_string_lossy())
@@ -644,7 +736,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     _ => 1,
                 };
                 let index = slot.saturating_sub(1).min(values.len());
-                values.insert(index, receiver.value);
+                values.insert(
+                    index,
+                    CallArg {
+                        value: receiver.value,
+                        identity: receiver.identity,
+                    },
+                );
                 self.call_method(method, values, scope, next)
             }
             ExprKind::Lambda { params, body, .. } => {
@@ -945,20 +1043,40 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     ) -> Result<Evaluated> {
         let mut values = Vec::with_capacity(args.len());
         for arg in args {
-            values.push(self.eval_at(arg, scope, depth)?.value);
+            let evaluated = self.eval_at(arg, scope, depth)?;
+            values.push(CallArg {
+                value: evaluated.value,
+                identity: evaluated.identity,
+            });
         }
         if let ExprKind::Variable(name) = &callee.kind {
             // A Funcref/Partial variable is callable (`g:Xsetlist()`). A
             // Number argument named `line` must not steal `line('.')`
             // (test_goto.vim `XTest_goto_decl`).
-            match Self::eval_variable(name, callee.span.start, scope) {
+            let variable = Self::eval_variable(name, callee.span.start, scope);
+            // `deref_func_name` (`eval/userfunc.c:445-460`) reports through
+            // `found_var` whether a variable of this name exists. A variable
+            // holding no callable is `E1085`, not `E117` — but only for the
+            // lookup failure itself; an `E117` raised inside a resolved
+            // function's body keeps its own text (`userfunc.c:1612`).
+            let found_var = variable.is_ok();
+            let missing = format!("Unknown function: {}", name.to_string_lossy());
+            match variable {
                 Ok(value) if matches!(value.value, Typval::Funcref(_) | Typval::Partial(_)) => {
                     return self.call_value(value.value, values, scope, depth);
                 }
                 Err(error) if error.code != "E121" => return Err(error),
                 Ok(_) | Err(_) => {}
             }
-            return self.call_named(name, values, scope, callee.span.start, depth);
+            return self
+                .call_named(name, values, scope, callee.span.start, depth)
+                .map_err(|mut error| {
+                    if found_var && error.code == "E117" && error.message == missing {
+                        error.code = "E1085";
+                        error.message = format!("Not a callable type: {}", name.to_string_lossy());
+                    }
+                    error
+                });
         }
         let callee = self.eval_at(callee, scope, depth)?;
         self.call_value(callee.value, values, scope, depth)
@@ -967,13 +1085,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_method(
         &mut self,
         method: &Expr,
-        args: Vec<Typval>,
+        args: Vec<CallArg>,
         scope: &mut Scope,
         depth: usize,
     ) -> Result<Evaluated> {
         if let ExprKind::Variable(name) = &method.kind {
             self.host
-                .call_method(name, args, scope)
+                .call_method_with_identities(name, args, scope)
                 .map(Evaluated::plain)
                 .map_err(|mut error| {
                     if error.code == "E117" {
@@ -990,17 +1108,36 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_named(
         &mut self,
         name: &OxStr,
-        args: Vec<Typval>,
+        args: Vec<CallArg>,
         scope: &mut Scope,
         offset: usize,
         _depth: usize,
     ) -> Result<Evaluated> {
+        // `call_func` skips a leading `g:` before it resolves the function
+        // (`eval/userfunc.c:1732`): global functions share one namespace, so
+        // `g:Name()` reaches `Name` while `string()` and the error messages
+        // keep the prefix. A builtin keeps the name as written, because
+        // `call_func` picks the internal table from the *stripped* name and
+        // then calls it with the original: `g:printf()` is E117.
+        let stripped = global_stripped_name(name);
+        let target = stripped.as_ref().unwrap_or(name);
+        // `user_func_error` reports the lookup failure under the *original*
+        // spelling (`eval/userfunc.c:1610-1616`), so `g:Nope()` says
+        // `Unknown function: g:Nope` even though the lookup used `Nope`.
+        // Only that exact lookup failure is relabelled; an error raised
+        // inside a function keeps its own text.
+        let missing = stripped
+            .as_ref()
+            .map(|target| format!("Unknown function: {}", target.to_string_lossy()));
         self.host
-            .call(name, args, scope)
+            .call_with_identities(target, args, scope)
             .map(Evaluated::plain)
             .map_err(|mut error| {
                 if error.code == "E117" {
                     error.offset = offset;
+                    if missing.as_deref() == Some(error.message.as_str()) {
+                        error.message = format!("Unknown function: {}", name.to_string_lossy());
+                    }
                 }
                 error
             })
@@ -1021,6 +1158,13 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         args: Vec<Typval>,
         scope: &mut Scope,
     ) -> Result<Typval> {
+        let args = args
+            .into_iter()
+            .map(|value| CallArg {
+                value,
+                identity: None,
+            })
+            .collect();
         self.call_value(callee, args, scope, 0)
             .map(|evaluated| evaluated.value)
     }
@@ -1028,30 +1172,35 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
     fn call_value(
         &mut self,
         callee: Typval,
-        mut args: Vec<Typval>,
+        mut args: Vec<CallArg>,
         scope: &mut Scope,
         depth: usize,
     ) -> Result<Evaluated> {
         match callee {
-            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+            Typval::Funcref(mut funcref) | Typval::Partial(mut funcref) => {
                 if !funcref.args.is_empty() {
-                    let mut bound = funcref.args;
+                    let mut bound: Vec<CallArg> = std::mem::take(&mut funcref.args)
+                        .into_iter()
+                        .map(|value| CallArg {
+                            value,
+                            identity: None,
+                        })
+                        .collect();
                     bound.append(&mut args);
                     args = bound;
                 }
-                match funcref.registry {
-                    Some(registry_id) => {
-                        let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
-                            EvalError::new(
-                                "E117",
-                                0,
-                                format!("Unknown function: {}", funcref.name.to_string_lossy()),
-                            )
-                        })?;
-                        self.call_closure(&funcref.name, registry_id, id, &args, depth, 0)
-                    }
-                    None => self.call_named(&funcref.name, args, scope, 0, depth),
+                let receiver = funcref.dict.clone();
+                if receiver.is_some() {
+                    self.host.set_call_receiver(receiver);
                 }
+                let result = match funcref.registry {
+                    Some(_) => self.call_closure(&funcref, &args, scope, depth, 0),
+                    None => self.call_named(&funcref.name, args, scope, 0, depth),
+                };
+                if funcref.dict.is_some() {
+                    self.host.set_call_receiver(None);
+                }
+                result
             }
             _ => Err(EvalError::new("E1085", 0, "not a callable value")),
         }
@@ -1059,18 +1208,34 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
 
     fn call_closure(
         &mut self,
-        name: &OxStr,
-        registry_id: usize,
-        id: usize,
-        args: &[Typval],
+        funcref: &Funcref,
+        args: &[CallArg],
+        caller: &mut Scope,
         depth: usize,
         offset: usize,
     ) -> Result<Evaluated> {
+        // The registry nonce lives on the Funcref, not in the `<lambda>N`
+        // name, so a stored Partial resolves to its own closure even when an
+        // unrelated registry holds a same-index closure.
+        let registry_id = funcref.registry.ok_or_else(|| {
+            EvalError::new(
+                "E117",
+                offset,
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
+            )
+        })?;
+        let id = closure_index(funcref.name.as_bytes()).ok_or_else(|| {
+            EvalError::new(
+                "E117",
+                offset,
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
+            )
+        })?;
         let closure = self.closures.resolve_any(registry_id, id).ok_or_else(|| {
             EvalError::new(
                 "E117",
                 offset,
-                format!("Unknown function: {}", name.to_string_lossy()),
+                format!("Unknown function: {}", funcref.name.to_string_lossy()),
             )
         })?;
         if args.len() < closure.params.len() {
@@ -1081,10 +1246,36 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
             ));
         }
         let mut scope = closure.captured;
+        // A closure body runs against the caller's live `g:` state. The
+        // capture above is a snapshot from lambda creation: evaluating in it
+        // untouched would strand the body's global assignments in the clone
+        // (`execute('let g:x = 1')` runs, then its write is dropped with the
+        // scope) and read stale globals. Locals stay captured — that is the
+        // closure — but the editor-synced global map, with the mirror and
+        // stamps the differential sync reasons about, is borrowed from the
+        // caller for the call and handed back afterwards, so writes land
+        // directly in the caller's scope and its dirty marks survive.
+        std::mem::swap(&mut scope.global, &mut caller.global);
+        std::mem::swap(&mut scope.global_mirror, &mut caller.global_mirror);
+        std::mem::swap(&mut scope.synced, &mut caller.synced);
+        // `b:`, `w:`, `t:`, `v:` and `s:` are live shared tables upstream
+        // (`eval/vars.c`: `b_bufvar`, `w_vars`, `tp_vars`, `vimvarht`, the
+        // current `sc_sid` dict), never per-call state. A lambda that read
+        // the creation-time snapshot answered fossil values and its writes
+        // died with the invocation scope, so each map is borrowed from the
+        // caller for the call exactly like `g:`. `synced` travels with them
+        // wholesale: it holds the stamps the differential sync compares, and
+        // pairing the caller's stamps with a capture's map would pin the
+        // staleness instead of refreshing it.
+        std::mem::swap(&mut scope.buffer, &mut caller.buffer);
+        std::mem::swap(&mut scope.window, &mut caller.window);
+        std::mem::swap(&mut scope.tab, &mut caller.tab);
+        std::mem::swap(&mut scope.vim, &mut caller.vim);
+        std::mem::swap(&mut scope.script, &mut caller.script);
         for (param, value) in closure.params.iter().zip(args) {
             // Named parameters resolve both unqualified and as `a:name`.
             scope.local.retain(|(name, _)| name != param);
-            bind_argument(&mut scope, param, value.clone());
+            bind_argument(&mut scope, param, value.value.clone());
         }
         // Any extra arguments behave like a variadic `...`: `a:0` is their
         // count, `a:000` is the List, and `a:1`, `a:2`, ... index them. Vim
@@ -1095,13 +1286,27 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         bind_argument(
             &mut scope,
             &OxStr::from("000"),
-            Typval::list(extras.to_vec()),
+            Typval::list(extras.iter().map(|arg| arg.value.clone()).collect()),
         );
         for (index, value) in extras.iter().enumerate() {
             let name = OxStr(format!("{}", index + 1).into_bytes());
-            bind_argument(&mut scope, &name, value.clone());
+            bind_argument(&mut scope, &name, value.value.clone());
         }
-        self.eval_at(&closure.body, &mut scope, depth)
+        let result = self.eval_at(&closure.body, &mut scope, depth);
+        // Hand the borrowed global state back: the body's assignments and
+        // dirty marks already sit in the caller's maps, and the capture's
+        // locals stay with the dropped invocation scope. Swapping back on
+        // both paths keeps Vim's no-rollback semantics — a body that errors
+        // after `:let g:x = 1` still leaves `g:x` set.
+        std::mem::swap(&mut scope.global, &mut caller.global);
+        std::mem::swap(&mut scope.global_mirror, &mut caller.global_mirror);
+        std::mem::swap(&mut scope.synced, &mut caller.synced);
+        std::mem::swap(&mut scope.buffer, &mut caller.buffer);
+        std::mem::swap(&mut scope.window, &mut caller.window);
+        std::mem::swap(&mut scope.tab, &mut caller.tab);
+        std::mem::swap(&mut scope.vim, &mut caller.vim);
+        std::mem::swap(&mut scope.script, &mut caller.script);
+        result
     }
 }
 
@@ -1121,6 +1326,23 @@ fn identity_type(value: &Typval) -> bool {
     )
 }
 
+/// The name a `g:`-prefixed call dispatches under, or `None` when the name
+/// must be used verbatim.
+///
+/// `call_func` (`eval/userfunc.c:1732-1735`) strips `g:` into `rfname` and
+/// takes the builtin branch from *that*, then calls the internal table with
+/// the name as written — so a builtin reached through `g:` still fails:
+/// `g:printf('%d', 3)` is `E117: Unknown function: g:printf`. Every other
+/// name resolves as a user function under the stripped spelling, because
+/// global functions share a single namespace.
+fn global_stripped_name(name: &OxStr) -> Option<OxStr> {
+    let rest = name.as_bytes().strip_prefix(b"g:")?;
+    if rest.is_empty() || crate::builtins::builtin_spec(&String::from_utf8_lossy(rest)).is_some() {
+        return None;
+    }
+    Some(OxStr(rest.to_vec()))
+}
+
 /// Parses the local index out of a `<lambda>N` closure name.
 #[must_use]
 pub fn closure_index(name: &[u8]) -> Option<usize> {
@@ -1129,6 +1351,15 @@ pub fn closure_index(name: &[u8]) -> Option<usize> {
     text.parse().ok()
 }
 
+/// Reads one dictionary member.
+///
+/// A callable read out of a dictionary is a partial bound to that dictionary
+/// (`set_selfdict`, `eval.c:6057-6070`): `{"f": Fn}.f` and `d.f` are the same
+/// function with `self` set, unless the member is already bound explicitly.
+///
+/// # Errors
+///
+/// Returns E715 when `value` is not a dictionary and E716 when `key` is absent.
 fn dict_lookup(
     value: &Typval,
     key: &[u8],
@@ -1138,15 +1369,11 @@ fn dict_lookup(
     let Typval::Dict(entries) = value else {
         return Err(EvalError::new("E715", offset, "Dictionary required"));
     };
-    let entries = entries
+    let found = entries
         .try_borrow()
         .map_err(|_| borrow_error(offset))?
-        .entries
-        .clone();
-    entries
-        .into_iter()
-        .find(|entry| entry.key.as_bytes() == key)
-        .map(|entry| Evaluated::plain(entry.value))
+        .get(key)
+        .cloned()
         .ok_or_else(|| {
             EvalError::new(
                 "E716",
@@ -1156,7 +1383,23 @@ fn dict_lookup(
                     String::from_utf8_lossy(key)
                 ),
             )
-        })
+        })?;
+    Ok(Evaluated::plain(bind_self_dict(found, entries)))
+}
+
+/// Gives an unbound callable `self = dictionary`, keeping an explicit binding.
+fn bind_self_dict(value: Typval, dict: &ox_types::DictRef) -> Typval {
+    match value {
+        Typval::Funcref(funcref) => Typval::Partial(Funcref {
+            dict: Some(Rc::clone(dict)),
+            ..funcref
+        }),
+        Typval::Partial(funcref) if funcref.dict.is_none() => Typval::Partial(Funcref {
+            dict: Some(Rc::clone(dict)),
+            ..funcref
+        }),
+        value => value,
+    }
 }
 
 fn numeric_binary(op: BinaryOp, lhs: &Typval, rhs: &Typval, offset: usize) -> Result<Evaluated> {
@@ -1498,27 +1741,20 @@ fn equal_values(
                 if !seen.insert(pair) {
                     return Ok(true);
                 }
-                let left = left
-                    .try_borrow()
-                    .map_err(|_| borrow_error(0))?
-                    .entries
-                    .clone();
-                let right = right
-                    .try_borrow()
-                    .map_err(|_| borrow_error(0))?
-                    .entries
-                    .clone();
-                if left.len() != right.len() {
+                let left_borrow = left.try_borrow().map_err(|_| borrow_error(0))?;
+                let right_borrow = right.try_borrow().map_err(|_| borrow_error(0))?;
+                if left_borrow.len() != right_borrow.len() {
                     return Ok(false);
                 }
-                for entry in &left {
-                    let Some(other) = right.iter().find(|candidate| candidate.key == entry.key)
-                    else {
+                let left_entries = left_borrow.to_vec();
+                drop(left_borrow);
+                for entry in &left_entries {
+                    let Some(other_val) = right_borrow.get(entry.key.as_bytes()) else {
                         return Ok(false);
                     };
                     if !recurse(
                         &entry.value,
-                        &other.value,
+                        other_val,
                         ignore_case,
                         depth + 1,
                         maximum,

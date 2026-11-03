@@ -45,25 +45,25 @@ impl RegisterContent {
         for line in &lines {
             validate_register_line(line)?;
         }
+        // Upstream `y_width` is a display-cell width (`update_yankreg_width`
+        // sums `win_charsize`, `register.c`), so a multibyte row passes when
+        // its cells fit even though its bytes do not.
         if let RegisterKind::BlockWise { width } = kind
-            && (width == 0 || lines.iter().any(|line| line.len() > width))
+            && (width == 0 || lines.iter().any(|line| Self::display_cells(line) > width))
         {
             return Err(RegisterError::InvalidBlockWidth { width });
         }
         Ok(Self { kind, lines })
     }
 
-    /// Creates a register value from newline-free logical rows without
-    /// requiring valid UTF-8.
+    /// Creates a register value from logical rows without requiring valid
+    /// UTF-8 or newline-free rows.
     ///
-    /// Macro registers hold encoded key sequences, which are binary; the
-    /// newline invariant still applies, and rows are newline-free by
-    /// construction because their separators became row boundaries.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a row contains a newline: callers split macro bytes at
-    /// row separators before storing, so one left behind is a caller bug.
+    /// Macro registers hold encoded key sequences, which are binary, and
+    /// `setreg()` stores its argument verbatim the way upstream's
+    /// `str_to_reg` does: invalid UTF-8 stays invalid (it renders as
+    /// `<xx>`), and a list item may carry an embedded line feed (it renders
+    /// as `^@`). Callers that need validated text use [`Self::new`].
     #[must_use]
     pub fn from_binary_lines(kind: RegisterKind, lines: Vec<Vec<u8>>) -> Self {
         let lines = if lines.is_empty() {
@@ -71,8 +71,86 @@ impl RegisterContent {
         } else {
             lines
         };
-        debug_assert!(lines.iter().all(|line| !line.contains(&b'\n')));
         Self { kind, lines }
+    }
+
+    /// Counts display cells in a register row the way upstream's
+    /// `mb_string2cells_len` does for `str_to_reg` block widths: printable
+    /// ASCII and tabs are one cell, control bytes two, each invalid byte
+    /// four (`<xx>`), and other characters their `unicode-width` cells.
+    /// An embedded line feed counts two (`^@`).
+    #[must_use]
+    pub(crate) fn display_cells(line: &[u8]) -> usize {
+        use unicode_width::UnicodeWidthChar;
+
+        let mut cells = 0;
+        let mut index = 0;
+        while index < line.len() {
+            let first = line[index];
+            if first < 0x80 {
+                cells += match first {
+                    0x00..=0x08 | 0x0a..=0x1f | 0x7f => 2,
+                    _ => 1,
+                };
+                index += 1;
+                continue;
+            }
+            let width = match first {
+                0xc2..=0xdf => {
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                0xe0..=0xef => {
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 2)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    {
+                        3
+                    } else {
+                        0
+                    }
+                }
+                0xf0..=0xf4 => {
+                    if line
+                        .get(index + 1)
+                        .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 2)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                        && line
+                            .get(index + 3)
+                            .is_some_and(|byte| (0x80..=0xbf).contains(byte))
+                    {
+                        4
+                    } else {
+                        0
+                    }
+                }
+                _ => 0,
+            };
+            if width == 0 {
+                // An invalid byte renders as `<xx>`.
+                cells += 4;
+                index += 1;
+                continue;
+            }
+            let text = std::str::from_utf8(&line[index..index + width]);
+            let character = text.ok().and_then(|text| text.chars().next());
+            cells += character.map_or(1, |character| {
+                UnicodeWidthChar::width(character).unwrap_or(1).max(1)
+            });
+            index += width;
+        }
+        cells
     }
     /// # Errors
     ///
@@ -442,6 +520,13 @@ pub struct Registers {
     search_pattern: Option<RegisterContent>,
     command_line: Option<RegisterContent>,
     insert_content: Option<RegisterContent>,
+    /// Raw text staged by a `#` write (`:let @# = ...`), resolved against
+    /// live buffers at read time. `Some` empty text means cleared; `None`
+    /// means no staged write, so reads fall through to the window's
+    /// alternate buffer.
+    alternate_override: Option<Vec<u8>>,
+    /// Bumped by every mutation so the Vimscript register mirror can be cached.
+    version: u64,
 }
 
 impl Default for Registers {
@@ -451,6 +536,12 @@ impl Default for Registers {
 }
 
 impl Registers {
+    /// Monotonic counter incremented by every mutation.
+    #[must_use]
+    pub const fn version(&self) -> u64 {
+        self.version
+    }
+
     /// Creates an empty register bank.
     #[must_use]
     pub fn new() -> Self {
@@ -463,7 +554,22 @@ impl Registers {
             search_pattern: None,
             command_line: None,
             insert_content: None,
+            alternate_override: None,
+            version: 0,
         }
+    }
+
+    /// Stages raw `#` text for later buffer resolution, or clears the
+    /// staged write with `None`.
+    pub fn set_alternate_override(&mut self, staged: Option<Vec<u8>>) {
+        self.version = self.version.wrapping_add(1);
+        self.alternate_override = staged;
+    }
+
+    /// Returns raw `#` text staged by a write, if any.
+    #[must_use]
+    pub fn alternate_override(&self) -> Option<&[u8]> {
+        self.alternate_override.as_deref()
     }
 
     /// Returns stored content. Provider-backed registers return `None`.
@@ -521,6 +627,7 @@ impl Registers {
                 // `y_regs[0]` for `"` and `finish_write_reg` keeps that
                 // pointer (`register.c:362-373, 2685-2694`).
                 if let Some(slot) = self.numbered.get_mut(0) {
+                    self.version = self.version.wrapping_add(1);
                     *slot = Some(content);
                 }
                 self.unnamed_target = Some(UnnamedTarget::Slot('0'));
@@ -535,22 +642,32 @@ impl Registers {
                 self.expression_source = Some(content.to_bytes());
                 Ok(())
             }
+            // An empty pattern clears the search register: upstream stores
+            // no text (`set_last_search_pat("")`), so reads answer empty
+            // instead of a lone line feed.
             RegisterName::SearchPattern => {
-                self.search_pattern = Some(content);
+                if content.to_bytes().is_empty() {
+                    self.search_pattern = None;
+                } else {
+                    self.search_pattern = Some(content);
+                }
                 Ok(())
             }
-            RegisterName::CommandLine => {
-                self.command_line = Some(content);
-                Ok(())
+            // `.`, `:`, and `%` are readable but never writable: writing
+            // them fails yank-register validation
+            // (`valid_yank_reg(name, true)`, `register.c:153-165`), which
+            // surfaces as E354.
+            RegisterName::CommandLine | RegisterName::InsertContent | RegisterName::CurrentFile => {
+                Err(RegisterError::InvalidName(name))
             }
-            RegisterName::InsertContent => {
-                self.insert_content = Some(content);
+            // `#` resolves against live buffers at read time, so a write
+            // only stages the raw text; the read side resolves it against
+            // the buffer list or treats empty text as cleared.
+            RegisterName::AlternateFile => {
+                self.alternate_override = Some(content.to_bytes());
                 Ok(())
             }
             RegisterName::Selection(_) => Err(RegisterError::ProviderRequired(name)),
-            RegisterName::AlternateFile | RegisterName::CurrentFile => {
-                Err(RegisterError::InvalidName(name))
-            }
         }
     }
     /// Stores content, forwarding selection registers to the clipboard host.
@@ -574,6 +691,7 @@ impl Registers {
     /// Records an ordinary yank in register `0` and points the unnamed
     /// register at it (`get_yank_register`'s `YREG_YANK` pointer update).
     pub fn yank(&mut self, content: RegisterContent) {
+        self.version = self.version.wrapping_add(1);
         if let Some(slot) = self.numbered.get_mut(0) {
             *slot = Some(content);
         }
@@ -599,6 +717,7 @@ impl Registers {
         }
         self.set(name, content)?;
         if let Some(target) = unnamed_pointer_name(parsed) {
+            self.version = self.version.wrapping_add(1);
             self.unnamed_target = Some(UnnamedTarget::Slot(target));
         }
         Ok(())
@@ -644,33 +763,69 @@ impl Registers {
     /// `y_previous = &y_regs[DELETION_REGISTER]` and
     /// `y_previous = &y_regs[1]` updates).
     pub fn delete(&mut self, content: RegisterContent) {
+        self.version = self.version.wrapping_add(1);
         let small = content.kind == RegisterKind::CharacterWise && content.lines.len() == 1;
         if small {
             self.small_delete = Some(content);
             self.unnamed_target = Some(UnnamedTarget::Slot('-'));
         } else {
-            for destination in (2..=9).rev() {
-                let source = destination - 1;
-                let shifted = self.numbered.get(source).cloned().flatten();
-                if let Some(slot) = self.numbered.get_mut(destination) {
-                    *slot = shifted;
-                }
-            }
-            if let Some(slot) = self.numbered.get_mut(1) {
-                *slot = Some(content);
-            }
-            self.unnamed_target = Some(UnnamedTarget::Slot('1'));
+            self.shift_numbered(content);
         }
     }
 
+    /// Shifts registers `1` through `9` and records a big deletion in `1`
+    /// (`shift_delete_registers`, `register.c:969-985`), pointing the
+    /// unnamed register there.
+    fn shift_numbered(&mut self, content: RegisterContent) {
+        for destination in (2..=9).rev() {
+            let source = destination - 1;
+            let shifted = self.numbered.get(source).cloned().flatten();
+            if let Some(slot) = self.numbered.get_mut(destination) {
+                *slot = shifted;
+            }
+        }
+        if let Some(slot) = self.numbered.get_mut(1) {
+            *slot = Some(content);
+        }
+        self.unnamed_target = Some(UnnamedTarget::Slot('1'));
+    }
+
     /// Records a delete in an explicit register and updates unnamed.
+    ///
+    /// A linewise or multi-line deletion also shifts the numbered registers
+    /// (`op_delete`, `ops.c:808-814`): the text lands in the named slot and
+    /// in `1`. Single-line characterwise deletions stay in the named slot
+    /// only. Motion-driven `use_reg_one` shifts for single-line `%`, `(`, or
+    /// search motions are not representable here — the model never sees the
+    /// motion — so those stay residual. The black hole discards everything
+    /// without shifting.
     ///
     /// # Errors
     ///
     /// Returns [`RegisterError::InvalidName`] if `name` is not a supported
     /// register.
     pub fn delete_to(&mut self, name: char, content: RegisterContent) -> Result<(), RegisterError> {
-        self.yank_to(name, content)
+        let shift =
+            name != '_' && (content.kind == RegisterKind::LineWise || content.lines.len() > 1);
+        self.yank_to(name, content.clone())?;
+        if shift {
+            self.shift_numbered(content);
+            // A named delete yanks into the named slot first and only then
+            // shifts the numbered registers (`op_delete`, `ops.c:793-817),
+            // but `shift_delete_registers` repoints the unnamed register at
+            // `1` unless the delete appended (`register.c:976-979`). Only an
+            // appending delete keeps the named target, so `""p` after
+            // `"add"Add` pastes both lines while a plain `"add` still reads
+            // through `1`.
+            if let Ok(parsed) = RegisterName::try_from(name)
+                && matches!(parsed, RegisterName::Named { append: true, .. })
+                && let Some(target) = unnamed_pointer_name(parsed)
+            {
+                self.version = self.version.wrapping_add(1);
+                self.unnamed_target = Some(UnnamedTarget::Slot(target));
+            }
+        }
+        Ok(())
     }
 
     /// The canonical single-character name of the register the unnamed
@@ -690,6 +845,8 @@ impl Registers {
     /// `#`, or an unsupported character — leaves the current target
     /// unchanged, like upstream's failed index lookup.
     pub fn set_unnamed_target(&mut self, name: char) {
+        self.version = self.version.wrapping_add(1);
+        self.version = self.version.wrapping_add(1);
         if let Ok(parsed) = RegisterName::try_from(name)
             && let Some(target) = unnamed_pointer_name(parsed)
         {
@@ -776,19 +933,86 @@ impl Registers {
                 }
                 Ok(())
             }
+            // `write_reg_contents_ex` ignores the append flag for `/`
+            // (`register.c:2755-2766`): setting the search pattern always
+            // replaces it, and empty text clears it.
             RegisterName::SearchPattern => {
-                append_slot_from_setreg_if(&mut self.search_pattern, content, append);
+                if content.to_bytes().is_empty() {
+                    self.search_pattern = None;
+                } else {
+                    self.search_pattern = Some(content);
+                }
                 Ok(())
             }
-            RegisterName::CommandLine => {
-                append_slot_from_setreg_if(&mut self.command_line, content, append);
-                Ok(())
-            }
-            RegisterName::InsertContent => {
-                append_slot_from_setreg_if(&mut self.insert_content, content, append);
-                Ok(())
-            }
+            // `.`, `:`, `%`, `#`, and the selections fall through to
+            // `set`, which stages `#`, rejects the read-only names, and
+            // demands a provider for `*`/`+`.
             _ => self.set(name, content),
+        }
+    }
+
+    /// Clears a register the way `write_reg_contents_lst` with an empty list
+    /// does (`eval/funcs.c:6461-6468`): `/` and `=` take one empty line, the
+    /// staged `#` text is dropped (the caller clears the window's alternate
+    /// buffer, which needs host access), and every other writable slot is
+    /// unset so reads answer empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError::InvalidName`] if `name` is not a supported or
+    /// writable register, or [`RegisterError::ProviderRequired`] for selection
+    /// registers without a clipboard host.
+    pub fn clear_for_setreg(&mut self, name: char) -> Result<(), RegisterError> {
+        match RegisterName::try_from(name)? {
+            RegisterName::Named { index, .. } => {
+                let Some(slot) = self.named.get_mut(index) else {
+                    return Err(RegisterError::InvalidName(name));
+                };
+                self.version = self.version.wrapping_add(1);
+                *slot = None;
+                Ok(())
+            }
+            RegisterName::Numbered(index) => {
+                let Some(slot) = self.numbered.get_mut(index) else {
+                    return Err(RegisterError::InvalidName(name));
+                };
+                self.version = self.version.wrapping_add(1);
+                *slot = None;
+                Ok(())
+            }
+            RegisterName::Unnamed => {
+                if let Some(slot) = self.numbered.get_mut(0) {
+                    self.version = self.version.wrapping_add(1);
+                    *slot = None;
+                }
+                self.unnamed_target = Some(UnnamedTarget::Slot('0'));
+                Ok(())
+            }
+            RegisterName::SmallDelete => {
+                self.version = self.version.wrapping_add(1);
+                self.small_delete = None;
+                Ok(())
+            }
+            RegisterName::BlackHole => Ok(()),
+            RegisterName::Expression => {
+                self.version = self.version.wrapping_add(1);
+                self.expression_source = Some(Vec::new());
+                Ok(())
+            }
+            RegisterName::SearchPattern => {
+                self.version = self.version.wrapping_add(1);
+                self.search_pattern = None;
+                Ok(())
+            }
+            RegisterName::AlternateFile => {
+                self.version = self.version.wrapping_add(1);
+                self.alternate_override = None;
+                Ok(())
+            }
+            RegisterName::CommandLine | RegisterName::InsertContent | RegisterName::CurrentFile => {
+                Err(RegisterError::InvalidName(name))
+            }
+            RegisterName::Selection(_) => Err(RegisterError::ProviderRequired(name)),
         }
     }
 }

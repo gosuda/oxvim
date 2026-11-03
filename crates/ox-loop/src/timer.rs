@@ -104,6 +104,27 @@ impl TimerHeap {
         expired
     }
 
+    /// Fires all timers due at `now`. Each callback invocation is wrapped so
+    /// a panicking timer does not discard sibling one-shot timers due in the
+    /// same tick. If any timer callback panics, the first panic is resumed
+    /// after all due timers have been fired.
+    pub fn fire_expired(&mut self, now: Instant) {
+        let mut first_panic = None;
+        for mut timer in self.expired(now) {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                timer.fire();
+            }));
+            if let Err(payload) = result {
+                if first_panic.is_none() {
+                    first_panic = Some(payload);
+                }
+            }
+        }
+        if let Some(payload) = first_panic {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
     /// Returns the earliest pending deadline.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {

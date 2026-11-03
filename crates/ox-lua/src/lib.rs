@@ -5,6 +5,7 @@ pub mod buf_attach;
 pub mod converter;
 mod embedded;
 pub mod host;
+mod pipe_fds;
 mod stdlib;
 mod treesitter;
 pub mod typval_bridge;

@@ -71,7 +71,7 @@ fn resolve_window(
     if let Some(Typval::Dict(dict)) = args.get(dict_index)
         && let Ok(dict_ref) = dict.try_borrow()
     {
-        for entry in &dict_ref.entries {
+        for entry in dict_ref.iter() {
             if entry.key.as_bytes() == b"window"
                 && let Typval::Number(id) = entry.value
             {
@@ -113,7 +113,7 @@ fn call_matchadd(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval
         if let Typval::Dict(dict) = d
             && let Ok(dict_ref) = dict.try_borrow()
         {
-            for entry in &dict_ref.entries {
+            for entry in dict_ref.iter() {
                 if entry.key.as_bytes() == b"conceal" {
                     return input_string_arg(&entry.value)
                         .ok()
@@ -214,7 +214,7 @@ fn call_matchaddpos(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typ
         if let Typval::Dict(dict) = d
             && let Ok(dict_ref) = dict.try_borrow()
         {
-            for entry in &dict_ref.entries {
+            for entry in dict_ref.iter() {
                 if entry.key.as_bytes() == b"conceal" {
                     return input_string_arg(&entry.value)
                         .ok()

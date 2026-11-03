@@ -517,6 +517,63 @@ impl Layout {
         self.split(target, window, state, SplitAxis::Horizontal, enter)
     }
 
+    /// Splits the whole layout horizontally, placing `window` below every
+    /// existing window.
+    ///
+    /// This is what `:botright` needs: upstream `win_split` with `WSP_BOT`
+    /// splits the outermost frame, so the new window spans the tabpage width
+    /// instead of nesting inside the current column (`win_split_ins`,
+    /// window.c:1290-1360).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled, or an equalization failure when the split cannot fill
+    /// the root rectangle.
+    pub fn split_root_horizontal(
+        &mut self,
+        window: WinHandle,
+        state: WindowState,
+        enter: bool,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if find_leaf(&self.root, window).is_some() {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        let geometry = self.root.geometry();
+        if geometry.height < 2 {
+            return Err(LayoutError::InsufficientSpace {
+                available: geometry.height,
+                children: 2,
+            });
+        }
+        let old_root = std::mem::replace(
+            &mut self.root,
+            Frame::Leaf(LeafFrame {
+                window,
+                state,
+                geometry,
+            }),
+        );
+        let new_leaf = std::mem::replace(
+            &mut self.root,
+            Frame::Column {
+                geometry,
+                children: Vec::new(),
+            },
+        );
+        self.root = Frame::Column {
+            geometry,
+            children: vec![old_root, new_leaf],
+        };
+        equalize_frame(&mut self.root, geometry)?;
+        if enter {
+            self.current = window;
+        }
+        Ok(())
+    }
+
     /// Splits `target` vertically, placing `window` to its left.
     ///
     /// # Errors
@@ -1012,6 +1069,12 @@ pub struct TabpageState {
     variables_version: u64,
     current: WinHandle,
     previous: Option<WinHandle>,
+    /// Tabpage-local working directory set by `:tcd` (`tp_localdir`); `None`
+    /// means the tabpage follows the global directory.
+    pub local_directory: Option<PathBuf>,
+    /// Previous directory for this tabpage's `tcd -` (`tp_prevdir`); `None`
+    /// when no `:tcd` has recorded one yet.
+    pub previous_directory: Option<PathBuf>,
 }
 
 impl TabpageState {
@@ -1032,6 +1095,8 @@ impl TabpageState {
             variables_version: 1,
             current,
             previous: None,
+            local_directory: None,
+            previous_directory: None,
         }
     }
 
@@ -1110,24 +1175,91 @@ impl TabpageState {
         self.resolve_window_geometry(resolved, 0)
     }
 
-    /// Returns the renderable text rows for a tiled window.
+    /// Returns whether a tiled window draws its local statusline.
     ///
-    /// This excludes the message row and split statusline that the compositor
-    /// reserves from the layout frame.
+    /// This follows `last_status_rec` and `is_bottom_win`
+    /// (`window.c:3770-3781,7302-7338`). `laststatus=0` keeps a
+    /// non-bottom tiled window's local statusline, `laststatus=1` enables
+    /// local statuslines for splits, and `laststatus=2` enables them for
+    /// every tiled window. `laststatus=3` removes every local statusline:
+    /// the compositor draws one global statusline row instead
+    /// (`global_stl_height`, `window.c:7445-7449`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when `window` is not tiled.
+    pub fn tiled_window_statusline_visible(
+        &self,
+        window: WinHandle,
+        laststatus: i64,
+    ) -> Result<bool, LayoutError> {
+        let resolved = self.resolve(window);
+        let is_bottom = is_bottom_window(&self.layout.root, resolved)
+            .ok_or(LayoutError::UnknownWindow(resolved))?;
+        Ok(match laststatus {
+            0 => !is_bottom,
+            1 => self.layout.window_count() > 1,
+            3 => false,
+            _ => true,
+        })
+    }
+    /// Returns whether a tiled window reserves a horizontal separator below
+    /// its text area while the statusline is global.
+    ///
+    /// Upstream replaces every non-bottom local statusline with one
+    /// `w_hsep_height` row (`window.c:7302-7338,4107-4108`). Vertical splits
+    /// do not reserve a separator because each leaf is bottommost.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::UnknownWindow`] when `window` is not tiled.
+    pub fn tiled_window_separator_visible(
+        &self,
+        window: WinHandle,
+        laststatus: i64,
+    ) -> Result<bool, LayoutError> {
+        let resolved = self.resolve(window);
+        let is_bottom = is_bottom_window(&self.layout.root, resolved)
+            .ok_or(LayoutError::UnknownWindow(resolved))?;
+        Ok(laststatus == 3 && !is_bottom)
+    }
+
+
+    /// This excludes the message row and the configured statusline rows that
+    /// the compositor reserves from the layout frame. `laststatus` is the
+    /// editor-wide option: zero hides the bottom window's statusline while
+    /// non-bottom split windows retain theirs, one shows them for splits, two
+    /// shows them for every window, and three replaces all local statuslines
+    /// with one global row.
     ///
     /// # Errors
     ///
     /// Returns [`LayoutError::UnknownWindow`] for a non-tiled window.
-    pub fn tiled_window_text_height(&self, window: WinHandle) -> Result<usize, LayoutError> {
+    pub fn tiled_window_text_height(
+        &self,
+        window: WinHandle,
+        laststatus: i64,
+    ) -> Result<usize, LayoutError> {
         let geometry = self.layout.window_geometry(self.resolve(window))?;
         let root = self.layout.root.geometry();
         // The work area ends at the root's absolute bottom row (exclusive),
-        // less the message row. `height` alone is relative to the screen,
-        // so a root below row zero would truncate every window under it.
-        let work_bottom = root.row.saturating_add(root.height).saturating_sub(1);
-        let statusline = usize::from(self.layout.window_count() > 1);
+        // less the message row and, for `laststatus=3`, the global
+        // statusline row. `height` alone is relative to the screen, so a root
+        // below row zero would truncate every window under it.
+        let global_statusline = usize::from(laststatus == 3);
+        let work_bottom = root
+            .row
+            .saturating_add(root.height)
+            .saturating_sub(1 + global_statusline);
+        let statusline = usize::from(self.tiled_window_statusline_visible(window, laststatus)?);
+        let separator = usize::from(self.tiled_window_separator_visible(window, laststatus)?);
         let frame_end = geometry.row.saturating_add(geometry.height);
-        let content_end = frame_end.min(work_bottom).saturating_sub(statusline);
+        // The bottom window's frame ends at the message/global rows; every
+        // other window reserves its own local statusline or global separator
+        // row from the frame.
+        let content_end = frame_end
+            .min(work_bottom)
+            .saturating_sub(statusline.saturating_add(separator));
         Ok(content_end.saturating_sub(geometry.row).max(1))
     }
 
@@ -1515,6 +1647,34 @@ impl TabpageState {
         Ok(())
     }
 
+    /// Splits the whole tabpage horizontally, placing `window` across the
+    /// bottom. See [`Layout::split_root_horizontal`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LayoutError::CurrentWindow`] when `window` is
+    /// [`WinHandle::CURRENT`], [`LayoutError::DuplicateWindow`] when it is
+    /// already tiled or floating, or an equalization failure when the split
+    /// cannot fill the root rectangle.
+    pub fn split_root_horizontal(
+        &mut self,
+        window: WinHandle,
+        state: WindowState,
+        enter: bool,
+    ) -> Result<(), LayoutError> {
+        validate_identity(window)?;
+        if self.contains(window) {
+            return Err(LayoutError::DuplicateWindow(window));
+        }
+        self.layout.split_root_horizontal(window, state, enter)?;
+        self.window_api.insert(window, WindowApiState::new());
+        if enter {
+            self.previous = Some(self.current);
+            self.current = window;
+        }
+        Ok(())
+    }
+
     /// Splits a tiled window horizontally.
     ///
     /// # Errors
@@ -1841,6 +2001,21 @@ fn validate_geometry(geometry: Geometry) -> Result<(), LayoutError> {
         return Err(LayoutError::GeometryOverflow);
     }
     Ok(())
+}
+
+/// Returns whether `window` has no tiled window below it in any ancestor
+/// [`Frame::Column`], matching `is_bottom_win` (`window.c:3770-3781`).
+fn is_bottom_window(frame: &Frame, window: WinHandle) -> Option<bool> {
+    match frame {
+        Frame::Leaf(leaf) => (leaf.window == window).then_some(true),
+        Frame::Row { children, .. } => children
+            .iter()
+            .find_map(|child| is_bottom_window(child, window)),
+        Frame::Column { children, .. } => children.iter().enumerate().find_map(|(index, child)| {
+            is_bottom_window(child, window)
+                .map(|is_bottom| is_bottom && index.saturating_add(1) == children.len())
+        }),
+    }
 }
 
 fn find_leaf(frame: &Frame, window: WinHandle) -> Option<&LeafFrame> {
@@ -2317,6 +2492,37 @@ mod tests {
         )
     }
 
+    /// `:botright` splits the outermost frame, so a bottom window spans the
+    /// whole tabpage instead of the current column (`win_split_ins` with
+    /// `WSP_BOT`, window.c:1290-1360). `:copen` relies on it.
+    #[test]
+    fn root_split_spans_the_tabpage_width() {
+        let (left, right, bottom) = handles();
+        let layout = Layout::new(left, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        tabpage
+            .split_vertical(left, right, state(), false)
+            .unwrap();
+        tabpage
+            .split_root_horizontal(bottom, state(), true)
+            .unwrap();
+
+        let geometry = |window| tabpage.window_geometry(window).unwrap();
+        let (left_rect, right_rect, bottom_rect) =
+            (geometry(left), geometry(right), geometry(bottom));
+        assert_eq!(bottom_rect.width, 80, "the bottom window spans the tabpage");
+        assert_eq!(bottom_rect.row, 12, "and sits below both columns");
+        assert_eq!(left_rect.width, 40, "the columns keep half the width");
+        assert_eq!(right_rect.width, 40);
+        assert_eq!(left_rect.row, 0, "the columns stay on the first row");
+        assert_eq!(right_rect.col, 40, "and keep their left-to-right order");
+        assert_eq!(
+            tabpage.layout().windows(),
+            vec![left, right, bottom],
+            "window order puts the two columns before the bottom row"
+        );
+    }
+
     #[test]
     fn non_entering_split_keeps_both_current_windows() {
         // Review finding: the inner layout always selected the new window,
@@ -2338,6 +2544,38 @@ mod tests {
         assert_eq!(tabpage.layout.current_window(), third);
         assert_eq!(tabpage.previous_window(), Some(first));
     }
+    #[test]
+    fn text_height_reserves_global_statusline_for_single_horizontal_and_vertical() {
+        let (first, second, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let single = TabpageState::new(layout);
+        assert!(!single.tiled_window_statusline_visible(first, 3).unwrap());
+        assert_eq!(single.tiled_window_text_height(first, 3).unwrap(), 22);
+
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut horizontal = TabpageState::new(layout);
+        horizontal
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        assert!(!horizontal.tiled_window_statusline_visible(first, 3).unwrap());
+        assert!(!horizontal.tiled_window_statusline_visible(second, 3).unwrap());
+        assert!(horizontal.tiled_window_separator_visible(first, 3).unwrap());
+        assert!(!horizontal.tiled_window_separator_visible(second, 3).unwrap());
+        assert_eq!(horizontal.tiled_window_text_height(first, 3).unwrap(), 11);
+        assert_eq!(horizontal.tiled_window_text_height(second, 3).unwrap(), 10);
+
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut vertical = TabpageState::new(layout);
+        vertical
+            .split_vertical(first, second, state(), false)
+            .unwrap();
+        assert!(!vertical.tiled_window_statusline_visible(first, 3).unwrap());
+        assert!(!vertical.tiled_window_statusline_visible(second, 3).unwrap());
+        assert!(!vertical.tiled_window_separator_visible(first, 3).unwrap());
+        assert!(!vertical.tiled_window_separator_visible(second, 3).unwrap());
+        assert_eq!(vertical.tiled_window_text_height(first, 3).unwrap(), 22);
+        assert_eq!(vertical.tiled_window_text_height(second, 3).unwrap(), 22);
+    }
 
     #[test]
     fn text_height_counts_from_the_absolute_root_origin() {
@@ -2346,7 +2584,93 @@ mod tests {
         let (first, _, _) = handles();
         let layout = Layout::new(first, state(), Geometry::new(10, 0, 80, 24).unwrap()).unwrap();
         let tabpage = TabpageState::new(layout);
-        assert_eq!(tabpage.tiled_window_text_height(first).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 23);
+    }
+
+    #[test]
+    fn text_height_honors_laststatus_for_single_and_split_windows() {
+        let (first, second, _) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 1).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(first, 2).unwrap(), 22);
+        tabpage
+            .split_horizontal(first, second, state(), false)
+            .unwrap();
+        // `laststatus=0` keeps the upper split's statusline and hides only
+        // the bottom split's statusline (`window.c:7302-7338`).
+        assert!(
+            tabpage
+                .tiled_window_statusline_visible(first, 0)
+                .unwrap()
+        );
+        assert!(
+            !tabpage
+                .tiled_window_statusline_visible(second, 0)
+                .unwrap()
+        );
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(first, 1).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(first, 2).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(second, 0).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(second, 1).unwrap(), 10);
+        assert_eq!(tabpage.tiled_window_text_height(second, 2).unwrap(), 10);
+    }
+
+    #[test]
+    fn laststatus_zero_tracks_nested_and_vertical_bottom_windows() {
+        let (first, second, third) = handles();
+        let layout = Layout::new(first, state(), Geometry::new(0, 0, 80, 24).unwrap()).unwrap();
+        let mut tabpage = TabpageState::new(layout);
+
+        // A full-height vertical split has no window below either leaf.
+        tabpage
+            .split_vertical(first, second, state(), false)
+            .unwrap();
+        assert!(
+            !tabpage
+                .tiled_window_statusline_visible(first, 0)
+                .unwrap()
+        );
+        assert!(
+            !tabpage
+                .tiled_window_statusline_visible(second, 0)
+                .unwrap()
+        );
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 23);
+        assert_eq!(tabpage.tiled_window_text_height(second, 0).unwrap(), 23);
+
+        // Nesting a horizontal split in the left column makes the upper
+        // window non-bottom while the lower sibling and right column remain
+        // bottom windows.
+        tabpage
+            .split_horizontal(first, third, state(), false)
+            .unwrap();
+        assert!(
+            tabpage
+                .tiled_window_statusline_visible(first, 0)
+                .unwrap()
+        );
+        assert!(
+            !tabpage
+                .tiled_window_statusline_visible(third, 0)
+                .unwrap()
+        );
+        assert!(
+            !tabpage
+                .tiled_window_statusline_visible(second, 0)
+                .unwrap()
+        );
+        assert_eq!(tabpage.tiled_window_text_height(first, 0).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(third, 0).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(second, 0).unwrap(), 23);
+        assert!(tabpage.tiled_window_separator_visible(first, 3).unwrap());
+        assert!(!tabpage.tiled_window_separator_visible(third, 3).unwrap());
+        assert!(!tabpage.tiled_window_separator_visible(second, 3).unwrap());
+        assert_eq!(tabpage.tiled_window_text_height(first, 3).unwrap(), 11);
+        assert_eq!(tabpage.tiled_window_text_height(third, 3).unwrap(), 10);
+        assert_eq!(tabpage.tiled_window_text_height(second, 3).unwrap(), 22);
     }
 
     #[test]

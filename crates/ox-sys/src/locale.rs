@@ -28,7 +28,10 @@ impl LocaleCategory {
     /// Windows has no C-library message category; the environment owns it.
     #[cfg_attr(
         not(windows),
-        expect(clippy::unnecessary_wraps, reason = "Windows has an environment-owned category without a C constant")
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Windows has an environment-owned category without a C constant"
+        )
     )]
     fn raw(self) -> Option<c_int> {
         Some(match self {

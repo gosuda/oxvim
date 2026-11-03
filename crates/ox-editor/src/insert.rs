@@ -531,7 +531,10 @@ pub fn sibling_char(
     let Some(slice) = sibling.get(cursor.col..) else {
         return Ok(cursor);
     };
-    let Some(ch) = std::str::from_utf8(slice).ok().and_then(|text| text.chars().next()) else {
+    let Some(ch) = std::str::from_utf8(slice)
+        .ok()
+        .and_then(|text| text.chars().next())
+    else {
         return Ok(cursor);
     };
     insert_char(editor, buffer, window, cursor, ch, timestamp)

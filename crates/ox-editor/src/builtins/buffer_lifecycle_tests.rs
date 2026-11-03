@@ -293,7 +293,7 @@ fn bufload_read_pre_handler_reenters_two_levels() {
             .register_legacy(
                 &[Event::BufReadPre],
                 "<buffer>",
-                &AutocmdKind::ExString(format!("call bufload({})", i64::from(next))),
+                &AutocmdKind::ExString { source: format!("call bufload({})", i64::from(next)), script: None },
                 &AutocmdOptions {
                     buffer: Some(buffer),
                     nested: true,
@@ -308,7 +308,7 @@ fn bufload_read_pre_handler_reenters_two_levels() {
         .register_legacy(
             &[Event::BufReadPre],
             "<buffer>",
-            &AutocmdKind::ExString(format!("let g:deep = [bufname({})]", i64::from(outer))),
+            &AutocmdKind::ExString { source: format!("let g:deep = [bufname({})]", i64::from(outer)), script: None },
             &AutocmdOptions {
                 buffer: Some(inner),
                 nested: true,

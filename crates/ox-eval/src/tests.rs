@@ -14,7 +14,7 @@ use crate::{EvalError, Result};
 struct Host;
 
 impl BuiltinHost for Host {
-    fn call(&mut self, name: &OxStr, mut args: Vec<Typval>, _scope: &mut Scope) -> Result<Typval> {
+    fn call(&mut self, name: &OxStr, mut args: Vec<Typval>, scope: &mut Scope) -> Result<Typval> {
         match name.as_bytes() {
             b"id" => args
                 .into_iter()
@@ -28,7 +28,7 @@ impl BuiltinHost for Host {
                     i64::try_from(v.as_bytes().len()).unwrap_or(i64::MAX),
                 )),
                 Some(Typval::Dict(v)) => Ok(Typval::Number(
-                    i64::try_from(v.borrow().entries.len()).unwrap_or(i64::MAX),
+                    i64::try_from(v.borrow().len()).unwrap_or(i64::MAX),
                 )),
                 _ => Err(EvalError::new("E701", 0, "invalid type for len")),
             },
@@ -44,6 +44,17 @@ impl BuiltinHost for Host {
                     }
                 }
                 Ok(Typval::Number(total))
+            }
+            b"bump" => {
+                // Stands in for `execute('let g:count += 1')`: a builtin the
+                // closure body calls that assigns a global in the scope it is
+                // handed, the way `:let` marks the map dirty for write-back.
+                let next = match scope.get_scoped(ScopeKind::Global, b"count", 0) {
+                    Ok(Typval::Number(n)) => n + 1,
+                    _ => 1,
+                };
+                scope.set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(next))?;
+                Ok(Typval::Number(next))
             }
             b"append" => {
                 if args.len() != 2 {
@@ -113,6 +124,18 @@ fn error(source: &[u8]) -> EvalError {
         }
         Err(error) => error,
     }
+}
+
+/// The `(code, message)` pair an expression fails with when evaluated against
+/// a caller-supplied scope.
+fn in_scope_error(source: &[u8], scope: &mut Scope) -> (String, String) {
+    let expression = Parser::new(source).parse().unwrap();
+    let mut host = Host;
+    let regex = Regex;
+    let failure = Evaluator::new(&mut host, &regex)
+        .eval(&expression, scope)
+        .unwrap_err();
+    (failure.code.to_owned(), failure.message)
 }
 
 macro_rules! eval_cases {
@@ -911,6 +934,96 @@ fn lambda_resolves_across_separate_evaluators() {
 }
 
 #[test]
+fn stored_lambda_called_through_invoke_runs_body_against_caller_globals() {
+    // Probe 1 (`let F = {-> execute('let g:x = 1')}` then `call(F, [])`):
+    // the stored Partial must run its body against the caller's live `g:`
+    // map, not the creation-time capture, so global assignments survive.
+    // `bump()` stands in for `execute()`: a builtin the body calls that
+    // assigns a global in the scope it is handed.
+    let lambda = {
+        let expression = Parser::new(b"{-> bump()}").parse().unwrap();
+        let mut host = Host;
+        let regex = Regex;
+        let mut define_scope = Scope::new();
+        define_scope
+            .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+            .unwrap();
+        Evaluator::new(&mut host, &regex)
+            .eval(&expression, &mut define_scope)
+            .unwrap()
+    };
+    assert!(matches!(lambda, Typval::Partial(_)));
+
+    // `:let F = ...` stores the Partial; the variable outlives the defining
+    // scope, and `call(F, [])` dispatches through `Evaluator::invoke`.
+    let mut caller_scope = Scope::new();
+    caller_scope.set(b"F", lambda).unwrap();
+    caller_scope
+        .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+        .unwrap();
+    let call = Parser::new(b"F()").parse().unwrap();
+    let mut call_host = Host;
+    let regex = Regex;
+    let mut caller = Evaluator::new(&mut call_host, &regex);
+    let returned = caller.eval(&call, &mut caller_scope).unwrap();
+    assert_eq!(returned, Typval::Number(1));
+    assert_eq!(
+        caller_scope
+            .get_scoped(ScopeKind::Global, b"count", 0)
+            .unwrap(),
+        &Typval::Number(1)
+    );
+    // A later `g:` read still sees the caller's map, not the capture: the
+    // borrowed global state was handed back after the call.
+    caller_scope
+        .set_scoped(ScopeKind::Global, b"after", 0, Typval::Number(7))
+        .unwrap();
+    assert_eq!(
+        caller_scope
+            .get_scoped(ScopeKind::Global, b"after", 0)
+            .unwrap(),
+        &Typval::Number(7)
+    );
+}
+
+#[test]
+fn lambda_callback_fires_through_fresh_evaluator() {
+    // Probe 2 (`timer_start(20, {-> ...})` then `:sleep`): the callback value
+    // is stored and delivered later through an evaluator that did not create
+    // it — a fresh registry, like the sleep pump's — and the body's global
+    // write must land in the delivery scope.
+    let stored = {
+        let expression = Parser::new(b"{-> bump()}").parse().unwrap();
+        let mut host = Host;
+        let regex = Regex;
+        let mut define_scope = Scope::new();
+        Evaluator::new(&mut host, &regex)
+            .eval(&expression, &mut define_scope)
+            .unwrap()
+        // The defining evaluator (and its registry handle) drops here, the
+        // way the `:sleep` pump outlives the `timer_start()` expression; the
+        // stored Partial keeps the closure alive through the live registries.
+    };
+    let mut delivery_host = Host;
+    let regex = Regex;
+    let mut delivery_scope = Scope::new();
+    delivery_scope
+        .set_scoped(ScopeKind::Global, b"count", 0, Typval::Number(0))
+        .unwrap();
+    let mut delivery = Evaluator::new(&mut delivery_host, &regex);
+    let fired = delivery
+        .invoke(stored, Vec::new(), &mut delivery_scope)
+        .unwrap();
+    assert_eq!(fired, Typval::Number(1));
+    assert_eq!(
+        delivery_scope
+            .get_scoped(ScopeKind::Global, b"count", 0)
+            .unwrap(),
+        &Typval::Number(1)
+    );
+}
+
+#[test]
 fn lambda_with_unknown_registry_stays_unknown() {
     // The fallback resolves live registries only; a nonce that never
     // existed keeps the honest E117 instead of inventing a result.
@@ -1624,4 +1737,77 @@ fn unparsable_expression_boundaries_keep_specific_diagnostics() {
     assert_eq!(error(b"").code, "E15");
     assert_eq!(error(b"").message, "Invalid expression: \"\"");
     assert_eq!(error(b"1 ? 2").code, "E109");
+}
+
+// ---------------------------------------------------------------------------
+// `g:`-prefixed call names
+// Upstream: `call_func` strips a leading `g:` into `rfname` and resolves the
+// user function under that stripped spelling (`eval/userfunc.c:1732-1735`),
+// while the builtin branch still calls the internal table with the name as
+// written, so `g:printf('%d', 3)` stays `E117: Unknown function: g:printf`.
+// `deref_func_name`'s `found_var` turns a resolved non-callable variable into
+// `E1085` instead of `E117` (`eval/userfunc.c:445-460,1610-1616`).
+// ---------------------------------------------------------------------------
+
+/// A function registered under its bare name is reachable through `g:`.
+/// `first` is served by this module's host and is deliberately not a real
+/// builtin, so the `g:` stripping — not the builtin table — answers the call.
+#[test]
+fn call_strips_the_global_prefix_from_a_user_function_name() {
+    assert_eq!(value(b"first(7)"), Typval::Number(7));
+    assert_eq!(value(b"g:first(7)"), Typval::Number(7));
+}
+
+/// The `g:` prefix cannot reach a builtin, because `call_func` keeps the
+/// written name for the internal dispatch.
+#[test]
+fn call_does_not_strip_the_global_prefix_for_builtins() {
+    let failure = error(b"g:printf('%d', 3)");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:printf");
+}
+
+/// An unknown `g:`-prefixed name reports the spelling the caller wrote, not
+/// the one the lookup used.
+#[test]
+fn call_reports_unknown_global_prefixed_names_verbatim() {
+    let failure = error(b"g:NoSuchFunction()");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:NoSuchFunction");
+}
+
+/// An existing variable that holds no callable is a type error, not a missing
+/// function: upstream keeps `E1085` for every namespace and quotes the
+/// spelling the caller used.
+#[test]
+fn call_to_a_non_callable_variable_reports_e1085() {
+    // Unqualified resolution reaches `g:`, so the bare form names `Fn`.
+    let mut bare = Scope::new();
+    bare.global.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"Fn(1)", &mut bare),
+        ("E1085".to_owned(), "Not a callable type: Fn".to_owned())
+    );
+
+    let mut global = Scope::new();
+    global.global.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"g:Fn(1)", &mut global),
+        ("E1085".to_owned(), "Not a callable type: g:Fn".to_owned())
+    );
+
+    let mut script = Scope::new();
+    script.script.push((OxStr::from("Fn"), Typval::Number(5)));
+    assert_eq!(
+        in_scope_error(b"s:Fn(1)", &mut script),
+        ("E1085".to_owned(), "Not a callable type: s:Fn".to_owned())
+    );
+}
+
+/// A missing name keeps `E117`: only a variable that *exists* becomes E1085.
+#[test]
+fn call_to_a_missing_name_stays_e117() {
+    let failure = error(b"g:NoSuchVariable(1)");
+    assert_eq!(failure.code, "E117");
+    assert_eq!(failure.message, "Unknown function: g:NoSuchVariable");
 }

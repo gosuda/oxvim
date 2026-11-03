@@ -392,7 +392,7 @@ fn call_getchar_builtin(
         let options = options
             .try_borrow()
             .map_err(|_| EvalError::new("E742", 0, "Cannot change value"))?;
-        for entry in &options.entries {
+        for entry in options.iter() {
             match entry.key.as_bytes() {
                 b"number" if name == "getcharstr" => {
                     return Err(EvalError::new(

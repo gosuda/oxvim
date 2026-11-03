@@ -386,14 +386,19 @@ fn setpos_previous_context_mark_ignores_a_nonexistent_fnum() {
 // funcs.c:set_position — a mark name ox-editor does not model answers the
 // failure upstream answers for a name it cannot set.
 #[test]
-fn setpos_unmodelled_mark_name_fails() {
+fn setpos_round_trips_the_visual_area_marks() {
     let (editor, _buffer, _window) = editor_with_window();
+    // `'<` and `'>` are ordinary marks to `setpos`/`getpos` (eval/funcs.c
+    // `set_position`), and the oracle answers 0 for both and returns the
+    // stored position. A name that is not a mark at all still raises E474
+    // (`setpos_unknown_name_raises_e474`).
     let exec = run(
         &editor,
         "call setline(1, ['aaaaa'])\n\
-         let g:rc = setpos(\"'<\", [0, 1, 1, 0])",
+         let g:rc = setpos(\"'<\", [0, 1, 1, 0])\n\
+         let g:back = getpos(\"'<\")",
     );
-    assert_eq!(number(&exec, "rc"), -1);
+    assert_eq!(number(&exec, "rc"), 0);
 }
 
 // funcs.c:set_position — a name that is neither `.` nor a two-character mark

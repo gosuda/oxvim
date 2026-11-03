@@ -12,7 +12,7 @@ use crate::ops::OperatorError;
 use crate::{
     BufferRelease, Editor, ExExecutor, Geometry, InsertState, Keys, MapMode, MappingAction,
     MappingOptions, Mode, ModeError, ModeMachine, NullExprEval, OptionValue, TestEditorAccess,
-    TypeaheadFlags, VisualKind,
+    TypeaheadFlags, VisualKind, VisualState,
 };
 use ox_types::{OxStr, Typval};
 
@@ -2836,6 +2836,21 @@ fn jump_motions_record_only_jump_origins() {
     assert_eq!(editor.jumplist().len(), 1);
     assert_eq!(editor.jumplist().entries()[0].position, position(3, 0));
 }
+
+#[test]
+fn jump_motions_dedupe_repeated_goto_and_skip_same_line() {
+    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(1, 0), "GG");
+    assert_eq!(editor.jumplist().len(), 1);
+    assert_eq!(editor.jumplist().entries()[0].position, position(1, 0));
+
+    let (_, _, _, editor, _) = run("one\ntwo\nthree", position(1, 0), "GGgg");
+    assert_eq!(editor.jumplist().len(), 2);
+    assert_eq!(editor.jumplist().entries()[0].position, position(1, 0));
+    assert_eq!(editor.jumplist().entries()[1].position, position(3, 0));
+
+    let (_, _, _, editor, _) = run("single line", position(1, 0), "G");
+    assert_eq!(editor.jumplist().len(), 0);
+}
 // Real behavior matrix (replaces earlier padded A/x/l/dd repetition).  Each
 // family cites the upstream function or oldtest that defines it.
 
@@ -4295,6 +4310,60 @@ fn reset_visual_mode_is_noop_outside_visual() {
     );
 }
 
+#[test]
+fn visual_swap_ends_tracks_cursor_move_and_sets_marks() {
+    let mut editor = Editor::new();
+    let buffer = editor
+        .create_buffer_with(
+            Buffer::from_bytes(b"some short lines\nof test text\n").unwrap(),
+            true,
+        )
+        .unwrap();
+    let tab = editor
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let window = editor.tabpage(tab).unwrap().current_window();
+    editor.set_window_cursor(window, position(1, 0)).unwrap();
+    let mut machine = ModeMachine::default();
+    let mut eval = NullExprEval;
+
+    machine.feed_keys(&mut editor, "v", &mut eval).unwrap();
+    assert_eq!(
+        machine.mode(),
+        &Mode::Visual(VisualState {
+            anchor: position(1, 0),
+            cursor: position(1, 0),
+            kind: VisualKind::Character,
+            count: 0,
+            register: None,
+            prefix: String::new(),
+            wanted: None,
+        })
+    );
+
+    editor.set_window_cursor(window, position(1, 2)).unwrap();
+    machine.feed_keys(&mut editor, "o", &mut eval).unwrap();
+    assert_eq!(
+        machine.mode(),
+        &Mode::Visual(VisualState {
+            anchor: position(1, 2),
+            cursor: position(1, 0),
+            kind: VisualKind::Character,
+            count: 0,
+            register: None,
+            prefix: String::new(),
+            wanted: None,
+        })
+    );
+    assert_eq!(editor.window(window).unwrap().cursor, position(1, 0));
+
+    editor.set_window_cursor(window, position(2, 3)).unwrap();
+    machine.feed_keys(&mut editor, "\u{1b}", &mut eval).unwrap();
+    assert!(matches!(machine.mode(), Mode::Normal(_)));
+    assert_eq!(editor.local_mark(buffer, '<').unwrap().unwrap(), position(1, 2));
+    assert_eq!(editor.local_mark(buffer, '>').unwrap().unwrap(), position(2, 3));
+}
+
 // ---------------------------------------------------------------------------
 // v:register command-state lifecycle
 // ---------------------------------------------------------------------------
@@ -4454,10 +4523,7 @@ fn typval_dict_entry(value: &Typval, key: &[u8]) -> Option<Typval> {
     match value {
         Typval::Dict(cell) => {
             let data = cell.borrow();
-            data.entries
-                .iter()
-                .find(|entry| entry.key.as_bytes() == key)
-                .map(|entry| entry.value.clone())
+            data.get(key).cloned()
         }
         _ => panic!("expected dict, got {value:?}"),
     }
@@ -4739,10 +4805,7 @@ fn ctrl_w_less_reaches_wincmd_through_the_typeahead() {
     machine.run_once(&mut editor, &mut eval).unwrap();
     machine.run_once(&mut editor, &mut eval).unwrap();
 
-    assert_eq!(
-        editor.window_geometry(focused).unwrap().width,
-        before - 1
-    );
+    assert_eq!(editor.window_geometry(focused).unwrap().width, before - 1);
 }
 
 /// Builds the `run` helper's editor without feeding keys — for tests
@@ -4763,9 +4826,10 @@ fn named_editor(text: &str, cursor: Position) -> (Editor, ox_types::BufHandle, M
 /// Feeds one `K_SPECIAL` triple through the typeahead — the same
 /// `nvim_input` decode path a terminal key event takes.
 fn feed_special(editor: &mut Editor, machine: &mut ModeMachine, second: u8, third: u8) {
-    editor
-        .typeahead_mut()
-        .append(&Keys::special(second, third).unwrap(), TypeaheadFlags::default());
+    editor.typeahead_mut().append(
+        &Keys::special(second, third).unwrap(),
+        TypeaheadFlags::default(),
+    );
     let mut eval = NullExprEval;
     machine.run_once(editor, &mut eval).unwrap();
 }
@@ -4799,8 +4863,8 @@ fn normal_named_keys_are_motions() {
 fn normal_del_and_insert_dispatch() {
     let (mut editor, buffer, mut machine) = named_editor("abc", position(1, 0));
     feed_special(&mut editor, &mut machine, b'k', b'D');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "bc");
 
     feed_special(&mut editor, &mut machine, b'k', b'I');
@@ -4827,8 +4891,8 @@ fn operator_pending_del_is_noop() {
     machine.feed_keys(&mut editor, "d", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'D');
     machine.feed_keys(&mut editor, "w", &mut eval).unwrap();
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "bar");
 }
 
@@ -4980,8 +5044,8 @@ fn insert_del_deletes_forward() {
     feed_special(&mut editor, &mut machine, b'k', b'D');
     feed_special(&mut editor, &mut machine, b'@', b'7');
     feed_special(&mut editor, &mut machine, b'k', b'D');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "ac\ndef");
 }
 
@@ -4996,7 +5060,9 @@ fn cmdline_up_down_walk_matching_history() {
         "e /tmp/alt".to_owned(),
     ]);
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, ":e /tmp/al", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, ":e /tmp/al", &mut eval)
+        .unwrap();
     let text_of = |machine: &ModeMachine| match machine.mode() {
         Mode::Cmdline(state) => (state.text.clone(), state.cursor_byte),
         _ => panic!("expected cmdline mode"),
@@ -5041,8 +5107,8 @@ fn ctrl_bslash_named_key_inserts_literal_then_moves() {
     machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
     machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'u');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "ab\n\u{1c}cd");
     // The named key still dispatched: the cursor moved up a line.
     assert_eq!(window_cursor(&editor).lnum, 1);
@@ -5059,8 +5125,8 @@ fn ctrl_bslash_named_key_overwrites_in_replace() {
     machine.feed_keys(&mut editor, "R", &mut eval).unwrap();
     machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'u');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "abc\n\u{1c}ef");
     assert_eq!(window_cursor(&editor).lnum, 1);
     assert!(matches!(machine.mode(), Mode::Replace(_)));
@@ -5076,9 +5142,7 @@ fn cmdline_ctrl_bslash_named_key_inserts_literal_then_runs() {
     machine.set_cmdline_history(vec!["edit file".to_owned()]);
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, ":", &mut eval).unwrap();
-    machine
-        .feed_keys(&mut editor, "\u{1c}", &mut eval)
-        .unwrap();
+    machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'u');
     let text_of = |machine: &ModeMachine| match machine.mode() {
         Mode::Cmdline(state) => state.text.clone(),
@@ -5112,19 +5176,16 @@ fn cmdline_ctrl_bslash_char_inserts_literal_then_types() {
 /// (`ins_compl_use_match(K_CTRL_Y)` is true).
 #[test]
 fn insert_ctrl_y_accepts_arrow_selected_completion() {
-    let (mut editor, buffer, mut machine) =
-        named_editor("foobar foobat\nx", position(2, 0));
+    let (mut editor, buffer, mut machine) = named_editor("foobar foobat\nx", position(2, 0));
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
     machine
         .feed_keys(&mut editor, "fo\u{0e}", &mut eval)
         .unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'd');
-    machine
-        .feed_keys(&mut editor, "\u{19}", &mut eval)
-        .unwrap();
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    machine.feed_keys(&mut editor, "\u{19}", &mut eval).unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "foobar foobat\nfoobatx");
     assert!(!machine.completion.is_active());
 }
@@ -5135,8 +5196,7 @@ fn insert_ctrl_y_accepts_arrow_selected_completion() {
 /// original.
 #[test]
 fn insert_ctrl_y_restores_leader_when_selection_is_original() {
-    let (mut editor, buffer, mut machine) =
-        named_editor("foobar foobat\nx", position(2, 0));
+    let (mut editor, buffer, mut machine) = named_editor("foobar foobat\nx", position(2, 0));
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
     machine
@@ -5145,11 +5205,9 @@ fn insert_ctrl_y_restores_leader_when_selection_is_original() {
     // Selection on the original entry: the inserted "obar" tail stays
     // until accept (`ins_compl_use_match(K_UP)` is false).
     feed_special(&mut editor, &mut machine, b'k', b'u');
-    machine
-        .feed_keys(&mut editor, "\u{19}", &mut eval)
-        .unwrap();
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    machine.feed_keys(&mut editor, "\u{19}", &mut eval).unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "foobar foobat\nfox");
     assert!(!machine.completion.is_active());
 }
@@ -5159,8 +5217,7 @@ fn insert_ctrl_y_restores_leader_when_selection_is_original() {
 /// for them) — the cursor and the last-inserted match stay put.
 #[test]
 fn insert_arrows_select_completion_without_inserting() {
-    let (mut editor, buffer, mut machine) =
-        named_editor("foobar foobat\nx", position(2, 0));
+    let (mut editor, buffer, mut machine) = named_editor("foobar foobat\nx", position(2, 0));
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "i", &mut eval).unwrap();
     machine
@@ -5194,8 +5251,8 @@ fn insert_down_snaps_column_to_char_boundary() {
     // 2): the cursor lands on byte 3, not inside `é` (bytes 1..3).
     assert_eq!(window_cursor(&editor), position(2, 3));
     machine.feed_keys(&mut editor, "Z", &mut eval).unwrap();
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "abcd\naéZx");
 }
 
@@ -5226,7 +5283,9 @@ fn cmdline_up_matches_prefix_through_cursor_only() {
     let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
     machine.set_cmdline_history(vec!["edit file".to_owned(), "edit target".to_owned()]);
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, ":edit typo", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, ":edit typo", &mut eval)
+        .unwrap();
     // `c_<C-Left>` lands before `typo` — cursor at byte 5.
     feed_special(&mut editor, &mut machine, crate::KS_EXTRA, 85);
     feed_special(&mut editor, &mut machine, b'k', b'u');
@@ -5318,13 +5377,13 @@ fn insert_pending_literal_and_register_take_named_key() {
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "i\x16", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'u');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "<Up>");
     machine.feed_keys(&mut editor, "\x12", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'd');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
-        .unwrap();
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "<Up><Down>");
 }
 
@@ -5334,10 +5393,12 @@ fn insert_pending_literal_and_register_take_named_key() {
 fn insert_named_key_flushes_digit_literal_first() {
     let (mut editor, buffer, mut machine) = named_editor("xy\nzz", position(2, 0));
     let mut eval = NullExprEval;
-    machine.feed_keys(&mut editor, "i\x1665", &mut eval).unwrap();
-    feed_special(&mut editor, &mut machine, b'k', b'u');
-    let text = String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes())
+    machine
+        .feed_keys(&mut editor, "i\x1665", &mut eval)
         .unwrap();
+    feed_special(&mut editor, &mut machine, b'k', b'u');
+    let text =
+        String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "xy\nAzz");
     assert_eq!(window_cursor(&editor), position(1, 1));
 }
@@ -5348,11 +5409,12 @@ fn insert_named_key_flushes_digit_literal_first() {
 /// and its text destroyed).
 #[test]
 fn insert_ctrl_r_linewise_register_preserves_current_line() {
-    let (mut editor, buffer, mut machine) =
-        named_editor("alpha bravo\nfifteen", position(1, 0));
+    let (mut editor, buffer, mut machine) = named_editor("alpha bravo\nfifteen", position(1, 0));
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, "\"ayy", &mut eval).unwrap();
-    machine.feed_keys(&mut editor, "G0i\x12a", &mut eval).unwrap();
+    machine
+        .feed_keys(&mut editor, "G0i\x12a", &mut eval)
+        .unwrap();
     let text =
         String::from_utf8(editor.buffer(buffer).unwrap().text().unwrap().to_bytes()).unwrap();
     assert_eq!(text, "alpha bravo\nalpha bravo\nfifteen");
@@ -5374,4 +5436,17 @@ fn search_cmdline_typing_sets_incsearch_preview_mark() {
         state.preview_mark.is_some(),
         "incsearch preview mark not set for /NEEDL"
     );
+}
+
+/// Normal mode `CTRL-^` (`0x1E`) without count queues `:buffer #` to edit the
+/// alternate file; with count, queues `:buffer <count>`.
+#[test]
+fn normal_ctrl_hat_queues_buffer_switch_command() {
+    let (mut editor, _buffer, mut machine) = named_editor("hello", position(1, 0));
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, "\x1e", &mut eval).unwrap();
+    assert_eq!(machine.take_ex_command().as_deref(), Some("buffer #"));
+
+    machine.feed_keys(&mut editor, "3\x1e", &mut eval).unwrap();
+    assert_eq!(machine.take_ex_command().as_deref(), Some("buffer 3"));
 }

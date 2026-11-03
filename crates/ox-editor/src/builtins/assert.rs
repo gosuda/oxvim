@@ -380,21 +380,17 @@ fn assert_equal_message(expected: &Typval, actual: &Typval) -> String {
         left.key == right.key && left.value == right.value
     };
     let equal = expected_data
-        .entries
         .iter()
         .filter(|entry| {
             actual_data
-                .entries
                 .iter()
                 .any(|other| entries_equal(entry, other))
         })
         .count();
     let mut expected_difference = expected_data
-        .entries
         .iter()
         .filter(|entry| {
             !actual_data
-                .entries
                 .iter()
                 .any(|other| entries_equal(entry, other))
         })
@@ -402,11 +398,9 @@ fn assert_equal_message(expected: &Typval, actual: &Typval) -> String {
         .collect::<Vec<_>>();
     expected_difference.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
     let mut actual_difference = actual_data
-        .entries
         .iter()
         .filter(|entry| {
             !expected_data
-                .entries
                 .iter()
                 .any(|other| entries_equal(entry, other))
         })

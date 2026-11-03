@@ -1639,6 +1639,19 @@ pub(super) fn current_lnum_arg(editor: &Editor, value: &Typval) -> ox_eval::Resu
     get_lnum(editor, value, &win)
 }
 
+/// `tv_get_lnum` resolved against an explicit window, for the builtins that
+/// name their window (`screenpos`, `diff_filler` via the current window):
+/// expression forms read that window's cursor and marks instead of the
+/// current window's, matching `textpos2screenpos` callers that pass `wp`.
+pub(crate) fn lnum_arg_for_window(
+    editor: &Editor,
+    value: &Typval,
+    window: WinHandle,
+) -> ox_eval::Result<i64> {
+    let win = PosWin::new(editor, window)?;
+    get_lnum(editor, value, &win)
+}
+
 /// `window.c:win_id2wp_tp`: a window id names a window, and `0` names none.
 fn resolve_window_id(editor: &Editor, value: &Typval) -> ox_eval::Result<Option<WinHandle>> {
     let id = number_value(value)?;

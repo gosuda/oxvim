@@ -206,7 +206,7 @@ fn settagstack(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> 
         .map_err(|_| EvalError::new("E698", 0, "variable nested too deep"))?;
     let mut items = None;
     let mut curidx = None;
-    for entry in &data.entries {
+    for entry in data.iter() {
         match entry.key.as_bytes() {
             b"items" => match &entry.value {
                 Typval::List(list) => {
@@ -251,7 +251,7 @@ fn parse_stack_items(values: &[Typval]) -> ox_eval::Result<Vec<TagStackItem>> {
         let mut bufnr = None;
         let mut matchnr = 1usize;
         let mut user_data = None;
-        for entry in &data.entries {
+        for entry in data.iter() {
             match entry.key.as_bytes() {
                 b"tagname" => {
                     tagname = Some(match &entry.value {

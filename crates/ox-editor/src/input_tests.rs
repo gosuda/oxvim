@@ -23,7 +23,7 @@ fn buffer(value: i64) -> BufHandle {
 }
 
 fn ex(value: &str) -> AutocmdKind {
-    AutocmdKind::ExString(value.to_owned())
+    AutocmdKind::ExString { source: value.to_owned(), script: None }
 }
 
 fn context(buffer: Option<BufHandle>, file_name: Option<&str>) -> AutocmdContext<'_> {
@@ -433,7 +433,7 @@ fn definitions_fire_in_registration_order_regardless_of_group() {
         .ready
         .iter()
         .map(|action| match &action.kind {
-            AutocmdKind::ExString(value) => value.as_str(),
+            AutocmdKind::ExString { source: value, .. } => value.as_str(),
             AutocmdKind::VimscriptFunction(_) => "vimscript",
             AutocmdKind::LuaCallback(_) => "lua",
         })
@@ -645,7 +645,7 @@ fn nested_outer_plans_all_matching_inner_actions() {
         .ready
         .iter()
         .map(|action| match &action.kind {
-            AutocmdKind::ExString(value) => value.as_str(),
+            AutocmdKind::ExString { source: value, .. } => value.as_str(),
             AutocmdKind::VimscriptFunction(_) => "vimscript",
             AutocmdKind::LuaCallback(_) => "lua",
         })
@@ -1565,6 +1565,18 @@ fn mapping_rhs_parses_cmd_form_with_ex_parser() {
     };
     assert_eq!(commands.len(), 1);
     assert_eq!(rhs.as_bytes(), b"<Cmd>echo hi\r");
+}
+
+#[test]
+fn mapping_rhs_parses_case_insensitive_cmd_and_cr() {
+    for rhs in ["<Cmd>echo hi<cr>", "<cmd>echo hi<CR>", "<CMD>echo hi<cr>"] {
+        let MappingAction::ExCommands { commands, .. } =
+            MappingAction::parse_rhs(rhs, "\\", "\\").unwrap()
+        else {
+            panic!("expected parsed Ex commands for {rhs}");
+        };
+        assert_eq!(commands.len(), 1);
+    }
 }
 
 #[test]

@@ -55,6 +55,9 @@ jobs:
       - run: rustup toolchain install 1.98.0 --profile minimal
       - run: cargo test --locked -p ox-tui --lib
       - run: cargo test --locked -p ox-sys --lib
+      - name: Check the whole workspace for the host MSVC target
+        run: cargo check --locked --workspace --all-targets
+      - run: cargo test --locked -p ox-editor --test platform_startup
       - run: rustup target add i686-pc-windows-msvc
       - name: Preserve libuv uname behavior under WOW64
         run: cargo test --locked -p ox-sys --lib --target i686-pc-windows-msvc

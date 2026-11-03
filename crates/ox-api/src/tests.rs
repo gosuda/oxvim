@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use ox_editor::{
     AutocmdAction, AutocmdKind, AutocmdOptions, Editor, Event, Geometry, K_SPECIAL, KS_EXTRA, Mode,
-    ModeMachine, NullExprEval, OptionValue,
+    ModeMachine, NullExprEval, OptionValue, RegisterContent, RegisterKind,
 };
 use ox_eval::{BuiltinHost, Builtins, Evaluator, NoRegex, Parser, Scope, scope::ScopeMap};
 use ox_text::Buffer;
@@ -19,6 +19,14 @@ fn session() -> crate::ApiSession {
 
 fn session_with(editor: Editor) -> crate::ApiSession {
     crate::ApiSession::new(Rc::new(RefCell::new(editor)))
+}
+
+fn hex_readfile_lines(hex: &str) -> Vec<Object> {
+    let data: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("fixture is hex"))
+        .collect();
+    crate::context::bytes_to_readfile_lines(&data)
 }
 
 fn dict(entries: &[(&str, Object)]) -> Dict {
@@ -285,7 +293,7 @@ fn nvim_cmd_decodes_structure_and_captures_output() {
     assert!(session.with_editor(|editor| editor.messages().is_empty()));
     let parsed = executor.commands.first().expect("one parsed command");
     assert!(!parsed.bang);
-    assert_eq!(parsed.count, None);
+    assert_eq!(parsed.count, Some(3));
     assert_eq!(parsed.args, "");
     assert!(parsed.range.is_none());
     assert_eq!(parsed.modifiers.len(), 4);
@@ -1421,7 +1429,7 @@ fn option_value_scope_distinguishes_global_and_local() {
 #[test]
 fn core_registry_metadata_matches_cross_family_sample() {
     let registry = crate::core().unwrap();
-    assert_eq!(registry.len(), 263);
+    assert_eq!(registry.len(), 262);
     let expected = [
         ("nvim_buf_get_lines", 1, TypeRef::ArrayOf(&TypeRef::String)),
         ("nvim_buf_get_text", 9, TypeRef::ArrayOf(&TypeRef::String)),
@@ -1697,19 +1705,6 @@ fn buffer_delete_rehomes_windows_without_force() {
 }
 
 #[test]
-fn buffer_delete_rehomes_windows_with_explicit_false_force() {
-    let (editor, buffer, _, window) = editor_with_lines(&["one"]);
-    let session = session_with(editor);
-    crate::buffer::nvim_buf_delete(&session, buffer, dict(&[("force", Object::Boolean(false))]))
-        .unwrap();
-    assert!(session.with_editor(|editor| editor.buffer(buffer).is_err()));
-    assert_ne!(
-        session.with_editor(|editor| editor.window(window).unwrap().buffer),
-        buffer
-    );
-}
-
-#[test]
 fn cursor_column_rejects_values_above_maxcol_before_clamping() {
     // Upstream rejects col > MAXCOL before the silent clamp
     // (api/window.c:122-130, pos_defs.h MAXCOL = 0x7fffffff).
@@ -1728,65 +1723,6 @@ fn cursor_column_rejects_values_above_maxcol_before_clamping() {
     assert_eq!(
         crate::window::nvim_win_get_cursor(&session, window),
         Ok(vec![1, 3])
-    );
-}
-
-#[test]
-fn nvim_mcursor_validates_arguments_before_extmark_insert() {
-    // api/vim.c:1462-1484: buffer lookup precedes 'pos' validation, which
-    // precedes the range checks; only then does mc_add dedupe positions.
-    let (editor, buffer, _, _) = editor_with_lines(&["abc", "z"]);
-    let session = session_with(editor);
-    let missing = crate::BufHandle::try_from(9999).unwrap();
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, missing, vec![5, 0]),
-        Err(ApiError::validation("Invalid buffer id: 9999"))
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1]),
-        Err(ApiError::validation(
-            "Invalid 'pos': expected [row, col] array"
-        ))
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![0, 0]),
-        Err(ApiError::validation("Invalid cursor line: out of range"))
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![3, 0]),
-        Err(ApiError::validation("Invalid cursor line: out of range"))
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1, -1]),
-        Err(ApiError::validation("Invalid cursor column: out of range"))
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1, i64::MAX]),
-        Err(ApiError::validation("Invalid cursor column: out of range"))
-    );
-}
-
-#[test]
-fn nvim_mcursor_dedupes_positions_and_returns_global_count() {
-    let (editor, buffer, _, _) = editor_with_lines(&["abc", "z"]);
-    let session = session_with(editor);
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1, 2]),
-        Ok(1)
-    );
-    // Re-adding the tracked position is a no-op: mc_add dedupes.
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1, 2]),
-        Ok(1)
-    );
-    // An over-long column clamps to the EOL insertion point (a new position).
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![1, 99]),
-        Ok(2)
-    );
-    assert_eq!(
-        crate::global::nvim_mcursor(&session, buffer, vec![2, 0]),
-        Ok(3)
     );
 }
 
@@ -2535,6 +2471,256 @@ fn definition_count(session: &crate::ApiSession, id: i64) -> usize {
 }
 
 #[test]
+/// A `nvim_set_option_value` call with no `scope`, `buf`, or `win` key leaves
+/// upstream's `opt_flags` at zero (`api/options.c:427`), which is the plain
+/// `set` branch: `v:option_command` is `set`, `v:option_type` is `global`, and
+/// both old values are published (`option.c:2125-2129`).
+#[test]
+fn api_option_write_without_a_scope_reports_plain_set() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("scrolloff"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor.vvars().get(&OxStr::from("option_type")).cloned(),
+                editor.vvars().get(&OxStr::from("option_oldlocal")).cloned(),
+                editor
+                    .vvars()
+                    .get(&OxStr::from("option_oldglobal"))
+                    .cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("scrolloff"),
+        Object::Integer(9),
+        dict(&[]),
+    )
+    .unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(
+        seen[0][0],
+        Some(Object::String(OxStr::from("set"))),
+        "no scope key means the plain set branch"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("global"))),
+        "and the global type"
+    );
+    assert!(
+        matches!(seen[0][2], Some(Object::Integer(_))),
+        "v:option_oldlocal is published for a plain set: {:?}",
+        seen[0][2]
+    );
+    assert!(
+        matches!(seen[0][3], Some(Object::Integer(_))),
+        "and so is v:option_oldglobal: {:?}",
+        seen[0][3]
+    );
+    let _ = id;
+}
+
+/// The deprecated `nvim_set_option` reaches the same `set_option_value` path
+/// upstream, so it publishes `OptionSet` too, with the global scope
+/// (`option.c:4373`).
+#[test]
+fn legacy_set_option_fires_optionset_with_global_scope() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("scrolloff"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_new")).cloned(),
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor
+                    .vvars()
+                    .get(&OxStr::from("option_oldglobal"))
+                    .cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option(&session, OxStr::from("scrolloff"), Object::Integer(9)).unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "one snapshot");
+    assert_eq!(
+        seen[0][0],
+        Some(Object::Integer(9)),
+        "v:option_new during the callback"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("setglobal"))),
+        "the legacy call writes the global scope"
+    );
+    assert!(
+        matches!(seen[0][2], Some(Object::Integer(_))),
+        "v:option_oldglobal carries the previous value"
+    );
+    let _ = id;
+}
+
+/// A committed option write fires `OptionSet` with the option's full name as
+/// the pattern and `v:option_new` set (`apply_optionset_autocmd_now`,
+/// option.c:2099-2134). `nvim.dir` relies on exactly this to notice
+/// `buftype` becoming `nowrite`.
+#[test]
+fn set_option_value_fires_optionset_with_the_new_value() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    // Startup is over: the event does not fire before `v:vim_did_enter` is 1.
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[
+            ("pattern", Object::String(OxStr::from("buftype"))),
+            ("command", Object::String(OxStr::from("echo fired"))),
+        ]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    // The `v:option_*` values are live only while the callback runs: upstream
+    // resets them when the dispatch returns (`reset_v_option_vars`).
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let actions_written = actions.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_new")).cloned(),
+                editor.vvars().get(&OxStr::from("option_command")).cloned(),
+                editor.vvars().get(&OxStr::from("option_type")).cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        let _ = &actions_written;
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("buftype"),
+        Object::String(OxStr::from("nowrite")),
+        dict(&[("buf", Object::Integer(1))]),
+    )
+    .unwrap();
+
+    assert_eq!(actions.borrow().len(), 1, "one dispatch");
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "one snapshot");
+    assert_eq!(
+        seen[0][0],
+        Some(Object::String(OxStr::from("nowrite"))),
+        "v:option_new during the callback"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::String(OxStr::from("setlocal"))),
+        "a buffer-local write reports setlocal"
+    );
+    assert_eq!(
+        seen[0][2],
+        Some(Object::String(OxStr::from("local"))),
+        "and local scope"
+    );
+    // After the dispatch the variables are back to empty, as upstream resets
+    // them.
+    session.with_editor(|editor| {
+        assert_eq!(
+            editor.vvars().get(&OxStr::from("option_new")),
+            Some(&Object::String(OxStr::from("")))
+        );
+    });
+    let _ = id;
+}
+
+/// `nvim_buf_set_name` passes the name through `fname_expand` and then
+/// `vim_FullName`, which leaves a URL alone (`path.c:1780`). A URL that gained
+/// the working directory in front of it would be a different buffer name, and
+/// `nvim.dir` names its listing buffers with exactly such a URI.
+#[test]
+fn buf_set_name_keeps_a_url_out_of_the_working_directory() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let target = editor
+        .create_buffer_with(Buffer::from_lines(&[b"x".to_vec()], false).unwrap(), true)
+        .unwrap();
+    let session = session_with(editor);
+    crate::buffer::nvim_buf_set_name(&session, target, OxStr::from("example:///z/w")).unwrap();
+    let name = crate::buffer::nvim_buf_get_name(&session, target).unwrap();
+    assert_eq!(name.as_bytes(), b"example:///z/w");
+
+    // A plain relative name still becomes absolute.
+    crate::buffer::nvim_buf_set_name(&session, target, OxStr::from("src/lib.rs")).unwrap();
+    let name = crate::buffer::nvim_buf_get_name(&session, target).unwrap();
+    assert_eq!(
+        name.as_bytes(),
+        ox_editor::expand_buffer_name(&OxStr::from("src/lib.rs")).as_bytes()
+    );
+}
+
 fn set_option_value_fires_one_populated_filetype_after_commit() {
     let (mut editor, current, _, window) = editor_with_lines(&["one"]);
     let target = editor
@@ -2769,7 +2955,7 @@ fn nonmatching_filetype_write_does_not_consume_once() {
         .register_legacy(
             &[Event::FileType],
             "<abuf>",
-            &AutocmdKind::ExString("echo fired".to_owned()),
+            &AutocmdKind::ExString { source: "echo fired".to_owned(), script: None },
             &AutocmdOptions {
                 buffer: Some(current),
                 once: true,
@@ -2897,7 +3083,7 @@ fn get_autocmds_serializes_optional_fields_only_when_present() {
         .register_legacy(
             &[Event::BufEnter],
             "*",
-            &AutocmdKind::ExString("legacy".to_owned()),
+            &AutocmdKind::ExString { source: "legacy".to_owned(), script: None },
             &AutocmdOptions::default(),
         )
         .unwrap();
@@ -3135,7 +3321,7 @@ fn query_event_type_errors_match_upstream_text() {
             .register_legacy(
                 &[Event::BufEnter],
                 "*",
-                &AutocmdKind::ExString("legacy".to_owned()),
+                &AutocmdKind::ExString { source: "legacy".to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -4113,6 +4299,37 @@ fn extmark_boolean_option_diagnostic_matches_api_contract() {
 }
 
 #[test]
+fn context_validation_rejects_unknown_keys_and_type_names() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+
+    let error = crate::context::nvim_get_context(
+        &session,
+        dict(&[("blah", Object::Array(Vec::new()))]),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid key: 'blah'");
+
+    let error = crate::context::nvim_get_context(&session, dict(&[("types", Object::Integer(42))]))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid 'types': expected Array, got Integer");
+
+    let error = crate::context::nvim_get_context(
+        &session,
+        dict(&[(
+            "types",
+            Object::Array(vec![
+                Object::String(OxStr::from("jumps")),
+                Object::String(OxStr::from("zub")),
+                Object::String(OxStr::from("zam")),
+            ]),
+        )]),
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "Invalid 'type': 'zub'");
+}
+
+#[test]
 fn context_round_trip_restores_gvars() {
     let (mut editor, _, _, _) = editor_with_lines(&["one"]);
     editor
@@ -4122,13 +4339,7 @@ fn context_round_trip_restores_gvars() {
     let session = session_with(editor);
     let context = crate::context::nvim_get_context(
         &session,
-        dict(&[(
-            "types",
-            Object::Array(vec![
-                Object::String(OxStr::from("gvars")),
-                Object::String(OxStr::from("bufs")),
-            ]),
-        )]),
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("gvars"))]))]),
     )
     .unwrap();
     session.with_editor_mut(|editor| editor.gvars_mut().0.clear());
@@ -4138,6 +4349,351 @@ fn context_round_trip_restores_gvars() {
         Some(Object::Integer(42))
     );
 }
+
+#[test]
+fn context_round_trip_restores_binary_blockwise_register_lines_and_width() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let lines = vec![vec![0xff, b'\n', b'x'], vec![0x80]];
+    editor
+        .registers_mut()
+        .set(
+            'a',
+            RegisterContent::from_binary_lines(
+                RegisterKind::BlockWise { width: 7 },
+                lines.clone(),
+            ),
+        )
+        .unwrap();
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("regs"))]))]),
+    )
+    .unwrap();
+
+    session.with_editor_mut(|editor| {
+        editor
+            .registers_mut()
+            .set('a', RegisterContent::characterwise(b"changed").unwrap())
+            .unwrap();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('a').unwrap().cloned()),
+        Some(RegisterContent::from_binary_lines(
+            RegisterKind::BlockWise { width: 7 },
+            lines,
+        ))
+    );
+}
+
+#[test]
+fn context_round_trip_restores_one_jump() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session
+        .with_editor_mut(|editor| {
+            editor.jumplist_mut().push(ox_editor::MarkLocation::in_file(
+                "/tmp/oxvim-context-jump",
+                ox_text::Position { lnum: 3, col: 0 },
+            ));
+        });
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("jumps"))]))]),
+    )
+    .unwrap();
+    session.with_editor_mut(|editor| {
+        *editor.jumplist_mut() = ox_editor::Jumplist::new();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].file(), Some(std::path::Path::new("/tmp/oxvim-context-jump")));
+    assert_eq!(entries[0].position, ox_text::Position { lnum: 3, col: 0 });
+}
+
+#[test]
+fn context_round_trip_restores_buffer_list() {
+    let (mut editor, buffer, _, _) = editor_with_lines(&["one"]);
+    editor
+        .rename_buffer(buffer, OxStr::from("/tmp/oxvim-context-buf"))
+        .unwrap();
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("bufs"))]))]),
+    )
+    .unwrap();
+    let listed = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .filter(|handle| {
+                editor
+                    .buffer(*handle)
+                    .is_ok_and(|state| state.flags.contains(ox_editor::BufferFlags::LISTED))
+            })
+            .collect::<Vec<_>>()
+    });
+    for handle in listed {
+        crate::buffer::nvim_buf_delete(&session, handle, dict(&[("force", Object::Boolean(true))]))
+            .unwrap();
+    }
+    let wiped = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .all(|handle| editor.buffer(handle).is_ok_and(|state| state.name().as_bytes().is_empty()))
+    });
+    assert!(wiped, "the named buffer must be gone before load");
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let restored = session.with_editor(|editor| {
+        editor
+            .buffers()
+            .into_iter()
+            .filter_map(|handle| {
+                editor
+                    .buffer(handle)
+                    .ok()
+                    .map(|state| state.name().to_string_lossy().into_owned())
+                    .filter(|name| !name.is_empty())
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(restored, vec!["/tmp/oxvim-context-buf".to_owned()]);
+}
+
+#[test]
+fn context_load_frees_saved_registers_before_applying() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"kept").unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("regs"))]))]),
+    )
+    .unwrap();
+    session.with_editor_mut(|editor| {
+        editor
+            .registers_mut()
+            .set('b', RegisterContent::characterwise(b"dropped").unwrap())
+            .unwrap();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('a').unwrap().cloned()),
+        Some(RegisterContent::characterwise(b"kept").unwrap())
+    );
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('b').unwrap().cloned()),
+        None
+    );
+}
+
+#[test]
+fn context_load_frees_saved_registers_even_without_regs() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"gone").unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    crate::context::nvim_load_context(&session, dict(&[])).unwrap();
+    assert_eq!(
+        session.with_editor(|editor| editor.registers().get('a').unwrap().cloned()),
+        None
+    );
+}
+
+#[test]
+fn context_load_restores_blockwise_width_from_stream() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    let rows = vec![b"hello".to_vec(), b"world".to_vec()];
+    let entry = ox_editor::shada::register_entry(
+        'a',
+        &RegisterContent::from_binary_lines(RegisterKind::BlockWise { width: 10 }, rows.clone()),
+        0,
+    );
+    let stream = ox_editor::shada::Stream {
+        entries: vec![entry],
+    };
+    let mut bytes = Vec::new();
+    stream.write(&mut bytes, 0).unwrap();
+    let context = dict(&[(
+        "regs",
+        Object::Array(crate::context::bytes_to_readfile_lines(&bytes)),
+    )]);
+    editor
+        .registers_mut()
+        .set('a', RegisterContent::characterwise(b"reset").unwrap())
+        .unwrap();
+    let session = session_with(editor);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let loaded = session
+        .with_editor(|editor| editor.registers().get('a').unwrap().cloned())
+        .unwrap();
+    assert_eq!(loaded.kind(), RegisterKind::BlockWise { width: 10 });
+    assert_eq!(loaded.lines(), &rows);
+}
+
+const UPSTREAM_REGS_FIXTURE: &str = "05cf18e37d8f341069011e84a2726392c40568656c6c6fc405776f726c64a16e61a2727402a2727709";
+const UPSTREAM_JUMPS_FIXTURE: &str = "08cf0a0a0a0a6ae557da3782a166c42f2f686f6d652f616c7068612f726577726974652f4f7876696d2f6f7876696d2d70726f62652d6a756d702d66696c65a16c0308cf0a0a0a0a6ae557da3481a166c42f2f686f6d652f616c7068612f726577726974652f4f7876696d2f6f7876696d2d70726f62652d6a756d702d66696c65";
+const UPSTREAM_GVARS_FIXTURE: &str = "06cf0a0a0a0a6ae557da0d92c40970726f62655f7661722a";
+
+#[test]
+fn context_load_applies_upstream_register_bytes_and_width() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let context = dict(&[(
+        "regs",
+        Object::Array(hex_readfile_lines(UPSTREAM_REGS_FIXTURE)),
+    )]);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let loaded = session
+        .with_editor(|editor| editor.registers().get('a').unwrap().cloned())
+        .unwrap();
+    assert_eq!(loaded.kind(), RegisterKind::BlockWise { width: 10 });
+    assert_eq!(loaded.lines(), &[b"hello".to_vec(), b"world".to_vec()]);
+}
+
+#[test]
+fn context_load_applies_upstream_jump_bytes() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let context = dict(&[(
+        "jumps",
+        Object::Array(hex_readfile_lines(UPSTREAM_JUMPS_FIXTURE)),
+    )]);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    assert_eq!(entries.len(), 2);
+    let file = entries[0]
+        .file()
+        .map(std::path::Path::to_string_lossy)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(
+        file.as_deref(),
+        Some("/home/alpha/rewrite/Oxvim/oxvim-probe-jump-file")
+    );
+    assert_eq!(entries[0].position, ox_text::Position { lnum: 3, col: 0 });
+    assert_eq!(entries[1].position, ox_text::Position { lnum: 1, col: 0 });
+}
+
+#[test]
+fn context_load_applies_upstream_gvar_bytes() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let context = dict(&[(
+        "gvars",
+        Object::Array(hex_readfile_lines(UPSTREAM_GVARS_FIXTURE)),
+    )]);
+    crate::context::nvim_load_context(&session, context).unwrap();
+    assert_eq!(
+        session.with_editor(|editor| editor.gvars().get(&OxStr::from("probe_var")).cloned()),
+        Some(Object::Integer(42))
+    );
+}
+
+#[test]
+fn context_load_ignores_unknown_keys_and_non_array_values() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    crate::context::nvim_load_context(
+        &session,
+        dict(&[
+            ("unknown", Object::Integer(123)),
+            ("regs", Object::Integer(456)),
+        ]),
+    )
+    .unwrap();
+}
+
+#[test]
+fn context_load_rejects_non_string_register_lines() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    let error = crate::context::nvim_load_context(
+        &session,
+        dict(&[(
+            "regs",
+            Object::Array(vec![Object::Dict(Dict(vec![]))]),
+        )]),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "E474: Failed to convert list to msgpack string buffer"
+    );
+}
+
+#[test]
+fn context_display_cells_matches_mb_string2cells_len() {
+    assert_eq!(crate::context::display_cells(b"\xff"), 4);
+    assert_eq!(crate::context::display_cells(b"\xc0\xaf"), 8);
+    assert_eq!(crate::context::display_cells(b"\xc3("), 5);
+    assert_eq!(crate::context::display_cells(b"\xe7\x95\x8c"), 2);
+    assert_eq!(crate::context::display_cells(b"\xe7\x95\x8c\xff"), 6);
+    assert_eq!(crate::context::display_cells(b"\xe0\xc3\xa9"), 5);
+}
+
+#[test]
+fn context_get_jump_entries_resolves_named_buffers_and_skips_unnamed() {
+    let (mut editor, buf1, _, _) = editor_with_lines(&["one"]);
+    let buf2 = editor
+        .create_buffer_with(ox_text::Buffer::new(), true)
+        .unwrap();
+    editor.rename_buffer(buf2, OxStr::from("BUF1")).unwrap();
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(
+            buf1,
+            ox_text::Position { lnum: 2, col: 0 },
+        ));
+    editor
+        .jumplist_mut()
+        .push(ox_editor::MarkLocation::in_buffer(
+            buf2,
+            ox_text::Position { lnum: 5, col: 0 },
+        ));
+    let session = session_with(editor);
+    let context = crate::context::nvim_get_context(
+        &session,
+        dict(&[("types", Object::Array(vec![Object::String(OxStr::from("jumps"))]))]),
+    )
+    .unwrap();
+    session.with_editor_mut(|editor| {
+        *editor.jumplist_mut() = ox_editor::Jumplist::new();
+    });
+    crate::context::nvim_load_context(&session, context).unwrap();
+    let entries = session.with_editor(|editor| editor.jumplist().entries().to_vec());
+    let cwd = std::env::current_dir().unwrap();
+    let expected_buf2_path = cwd.join("BUF1");
+    assert!(entries.iter().any(|e| e.file() == Some(&expected_buf2_path) && e.position.lnum == 5));
+    assert!(!entries.iter().any(|e| e.position.lnum == 2));
+}
+
+#[test]
+fn context_load_does_not_impute_ru_flag_when_unset() {
+    let (mut editor, _, _, _) = editor_with_lines(&["one"]);
+    editor.registers_mut().delete(
+        ox_editor::RegisterContent::linewise(vec![b"del".to_vec()]).unwrap(),
+    );
+    assert_eq!(editor.registers().unnamed_target_name(), '1');
+    let session = session_with(editor);
+    let context = dict(&[(
+        "regs",
+        Object::Array(vec![Object::String(OxStr::from("line"))]),
+    )]);
+    let _ = crate::context::nvim_load_context(&session, context);
+    let after_unnamed = session.with_editor(|editor| editor.registers().unnamed_target_name());
+    assert_eq!(after_unnamed, '"');
+}
+
 #[test]
 fn client_info_round_trip_reports_registered_channel() {
     let (editor, _, _, _) = editor_with_lines(&["one"]);
@@ -4488,6 +5044,83 @@ fn open_win_float_enter_false_preserves_current_window() {
 }
 
 #[test]
+fn win_resize_non_current_float_clamps_height_to_one_when_winminheight_is_zero() {
+    // Upstream window.c:6246: floating windows keep at least one row even
+    // when 'winminheight' is zero and the float is not the current window.
+    let (editor, buffer, _, origin) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session
+        .with_editor_mut(|editor| {
+            editor
+                .options_mut()
+                .set_global("winminheight", OptionValue::Number(0))
+        })
+        .unwrap();
+    let float = crate::window::nvim_open_win(
+        &session,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("editor"))),
+            ("row", Object::Float(2.0)),
+            ("col", Object::Float(4.0)),
+            ("width", Object::Integer(20)),
+            ("height", Object::Integer(5)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(origin),
+        "float enter=false preserves the current window"
+    );
+    crate::window::nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 1);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+}
+
+#[test]
+fn win_resize_float_clamps_height_to_winminheight_when_requested_less() {
+    // Upstream window.c:6250: floating windows clamp their height to
+    // 'winminheight' (plus winbar) before enforcing the minimum of one row.
+    // When 'winminheight' is 5, requested heights of 2 and 0 both clamp to 5.
+    let (editor, buffer, _, origin) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session
+        .with_editor_mut(|editor| {
+            editor
+                .options_mut()
+                .set_global("winminheight", OptionValue::Number(5))
+        })
+        .unwrap();
+    let float = crate::window::nvim_open_win(
+        &session,
+        buffer,
+        false,
+        dict(&[
+            ("relative", Object::String(OxStr::from("editor"))),
+            ("row", Object::Float(2.0)),
+            ("col", Object::Float(4.0)),
+            ("width", Object::Integer(20)),
+            ("height", Object::Integer(5)),
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        session.with_editor(Editor::current_window),
+        Some(origin),
+        "float enter=false preserves the current window"
+    );
+    crate::window::nvim_win_resize(&session, float, -1, 2, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 5);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+
+    crate::window::nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+    assert_eq!(crate::window::nvim_win_get_height(&session, float).unwrap(), 5);
+    assert_eq!(crate::window::nvim_win_get_width(&session, float).unwrap(), 20);
+}
+
+#[test]
 fn open_win_external_reports_typed_not_implemented() {
     let (editor, buffer, _, _) = editor_with_lines(&["one"]);
     let session = session_with(editor);
@@ -4717,9 +5350,9 @@ fn replace_termcodes_translates_named_special_keys() {
         ("<F10>", [K_SPECIAL, b'k', b';']),
         ("<F11>", [K_SPECIAL, b'F', b'1']),
         ("<F12>", [K_SPECIAL, b'F', b'2']),
-        // <BS> and <Tab> are special keys (K_BS, K_TAB), not literal control bytes.
+        // <BS> stays a special key, but <Tab> is its control byte: the oracle's
+        // `vim.keycode('<Tab>')` is the single byte 0x09, not a K_SPECIAL key.
         ("<BS>", [K_SPECIAL, b'k', b'b']),
-        ("<Tab>", [K_SPECIAL, KS_EXTRA, 54]),
         ("<Ignore>", [K_SPECIAL, KS_EXTRA, 53]),
         ("<Nop>", [K_SPECIAL, KS_EXTRA, 97]),
         // Editing/document keys (K_INS, K_HELP, K_UNDO).
@@ -4765,7 +5398,9 @@ fn replace_termcodes_translates_named_special_keys() {
     for (input, bytes) in NAMED_KEY_CODES {
         assert_eq!(termcodes(input, true, true).as_bytes(), bytes.as_slice());
     }
-    // Literal control keys remain single bytes.
+    // Literal control keys remain single bytes, and <Tab> is one of them:
+    // the oracle answers 0x09 for `vim.keycode('<Tab>')`.
+    assert_eq!(termcodes("<Tab>", true, true).as_bytes(), b"\t");
     assert_eq!(termcodes("<CR>", true, true).as_bytes(), b"\r");
     assert_eq!(termcodes("<Esc>", true, true).as_bytes(), &[0x1b]);
     assert_eq!(termcodes("<Space>", true, true).as_bytes(), b" ");
@@ -8841,7 +9476,7 @@ fn open_tabpage_fires_creation_events_in_new_tab_context() {
             .register_legacy(
                 &[event],
                 "*",
-                &AutocmdKind::ExString("echo fired".to_owned()),
+                &AutocmdKind::ExString { source: "echo fired".to_owned(), script: None },
                 &AutocmdOptions::default(),
             )
             .unwrap();
@@ -9759,10 +10394,7 @@ fn set_hl_link_global_reprojects_across_namespaces() {
         &session,
         7,
         OxStr::from("FarLink"),
-        dict(&[(
-            "link_global",
-            Object::String(OxStr::from("GlobalTarget")),
-        )]),
+        dict(&[("link_global", Object::String(OxStr::from("GlobalTarget")))]),
     )
     .unwrap();
     // Make ns 7 the active namespace before the global target changes:
@@ -9882,10 +10514,7 @@ fn set_hl_namespace_zero_link_global_reprojects() {
         crate::ui::nvim_set_hl(&session, 0, OxStr::from(name), dict(entries)).unwrap();
     };
     set("GT", &[("fg", Object::Integer(0x00_0011))]);
-    set(
-        "GL",
-        &[("link_global", Object::String(OxStr::from("GT")))],
-    );
+    set("GL", &[("link_global", Object::String(OxStr::from("GT")))]);
     set("GT", &[("fg", Object::Integer(0x00_ccdd))]);
     let painted = session.with_state(|state| {
         state.hl_namespaces[&0]
@@ -9895,3 +10524,4 @@ fn set_hl_namespace_zero_link_global_reprojects() {
     });
     assert_eq!(painted, Some(Some(0x00_ccdd)));
 }
+

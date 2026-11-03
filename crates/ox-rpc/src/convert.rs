@@ -18,6 +18,15 @@ use ox_types::{Dict, Funcref, Object, OxStr, Special, Typval};
 /// has no wire form collapses to [`Object::Nil`] instead of erroring.
 #[must_use]
 pub fn typval_to_object(value: &Typval) -> Object {
+    typval_to_object_inner(value, &mut Vec::new())
+}
+
+/// Recursion-guarded conversion: a container already on the active path
+/// (self-referential List/Dict, e.g. after `add(l, l)`) has no finite wire
+/// form, so it degrades to NIL instead of overflowing the stack and killing
+/// the daemon mid-`nvim_eval`. Siblings sharing one container still expand
+/// fully — only the active path is tracked, popped on the way out.
+fn typval_to_object_inner(value: &Typval, seen: &mut Vec<(u8, *const ())>) -> Object {
     match value {
         Typval::Number(value) => Object::Integer(*value),
         Typval::Float(value) => Object::Float(*value),
@@ -29,17 +38,34 @@ pub fn typval_to_object(value: &Typval) -> Object {
             Object::Integer(i64::try_from(*id).unwrap_or(i64::MAX))
         }
         Typval::Funcref(function) | Typval::Partial(function) => funcref_to_object(function),
-        Typval::List(values) => values.try_borrow().map_or(Object::Nil, |data| {
-            Object::Array(data.items.iter().map(typval_to_object).collect())
-        }),
-        Typval::Dict(values) => values.try_borrow().map_or(Object::Nil, |data| {
-            Object::Dict(Dict(
-                data.entries
-                    .iter()
-                    .map(|entry| (entry.key.clone(), typval_to_object(&entry.value)))
-                    .collect(),
-            ))
-        }),
+        Typval::List(values) => {
+            let identity = (0u8, std::rc::Rc::as_ptr(values).cast());
+            if seen.contains(&identity) {
+                return Object::Nil;
+            }
+            seen.push(identity);
+            let converted = values.try_borrow().map_or(Object::Nil, |data| {
+                Object::Array(data.items.iter().map(|item| typval_to_object_inner(item, seen)).collect())
+            });
+            seen.pop();
+            converted
+        }
+        Typval::Dict(values) => {
+            let identity = (1u8, std::rc::Rc::as_ptr(values).cast());
+            if seen.contains(&identity) {
+                return Object::Nil;
+            }
+            seen.push(identity);
+            let converted = values.try_borrow().map_or(Object::Nil, |data| {
+                Object::Dict(Dict(
+                    data.iter()
+                        .map(|entry| (entry.key.clone(), typval_to_object_inner(&entry.value, seen)))
+                        .collect(),
+                ))
+            });
+            seen.pop();
+            converted
+        }
     }
 }
 
@@ -118,6 +144,7 @@ mod tests {
                 registry: Some(3),
             }),
         ]);
+
         assert_eq!(
             typval_to_object(&list),
             Object::Array(vec![Object::Integer(1), Object::LuaRef(3)])
@@ -142,5 +169,51 @@ mod tests {
         };
         let _guard = values.borrow_mut();
         assert_eq!(typval_to_object(&locked), Object::Nil);
+    }
+
+    #[test]
+    fn self_referential_containers_degrade_to_nil_instead_of_overflowing() {
+        // `eval('add(l, l)')` returns a List containing itself; the boundary
+        // must stay finite so the daemon survives `nvim_eval` (echo_spec T25).
+        let list = Typval::list(vec![Typval::Number(1)]);
+        let Typval::List(values) = &list else {
+            unreachable!()
+        };
+        values
+            .borrow_mut()
+            .items
+            .push(Typval::List(std::rc::Rc::clone(values)));
+        assert_eq!(
+            typval_to_object(&list),
+            Object::Array(vec![Object::Integer(1), Object::Nil])
+        );
+
+        // Shared-but-acyclic containers still expand at every site.
+        let shared = Typval::list(vec![Typval::Number(2)]);
+        let pair = Typval::list(vec![shared.clone(), shared]);
+        assert_eq!(
+            typval_to_object(&pair),
+            Object::Array(vec![
+                Object::Array(vec![Object::Integer(2)]),
+                Object::Array(vec![Object::Integer(2)]),
+            ])
+        );
+
+        // Self-referential dictionaries degrade the same way.
+        let dict = Typval::dict(vec![(OxStr::from("d"), Typval::Number(1))]);
+        let Typval::Dict(entries) = &dict else {
+            unreachable!()
+        };
+        entries.borrow_mut().insert(
+            OxStr::from("self"),
+            Typval::Dict(std::rc::Rc::clone(entries)),
+        );
+        let Object::Dict(converted) = typval_to_object(&dict) else {
+            unreachable!("typval_to_object maps Typval::Dict to Object::Dict");
+        };
+        assert_eq!(
+            converted.get(&OxStr::from("self")),
+            Some(&Object::Nil)
+        );
     }
 }

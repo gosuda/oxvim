@@ -299,7 +299,10 @@ fn split_current(editor: &mut Editor) -> Result<(), IdentSearchError> {
 
 fn jump_to(editor: &mut Editor, hit: &IdentSearchHit) -> Result<(), IdentSearchError> {
     if let Some(filename) = &hit.filename {
-        let bytes = std::fs::read(filename).unwrap_or_default();
+        let bytes = std::fs::read(filename).map_err(|error| IdentSearchError {
+            code: "E484",
+            message: format!("Can't open file {filename}: {error}"),
+        })?;
         let text = ox_text::Buffer::from_bytes(&bytes).unwrap_or_else(|_| ox_text::Buffer::new());
         let handle = editor
             .create_buffer_with(text, true)
@@ -389,5 +392,37 @@ mod tests {
         assert_eq!(hits[4].filename, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_include_file_returns_e484_without_creating_buffer() {
+        let mut editor = Editor::new();
+        let current = editor.create_buffer(true).unwrap();
+        let tab = editor
+            .create_tabpage(current, crate::layout::Geometry::new(0, 0, 20, 10).unwrap())
+            .unwrap();
+        assert_eq!(editor.current_tabpage(), Some(tab));
+
+        let missing = std::env::temp_dir().join(format!(
+            "ox-include-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        let result = jump_to(
+            &mut editor,
+            &IdentSearchHit {
+                lnum: 1,
+                col: 0,
+                text: "missing".to_owned(),
+                filename: Some(missing.to_string_lossy().into_owned()),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(IdentSearchError { code: "E484", .. })
+        ));
+        assert_eq!(editor.buffers(), vec![current]);
+        assert_eq!(editor.current_buffer(), Some(current));
     }
 }

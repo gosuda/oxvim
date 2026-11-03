@@ -525,8 +525,7 @@ impl ChromeState {
     pub fn hide_history_pager(&mut self) {
         if self.history_shown {
             self.history_shown = false;
-            self.pending
-                .push(UiEvent::new("msg_history_hide", vec![]));
+            self.pending.push(UiEvent::new("msg_history_hide", vec![]));
         }
     }
 

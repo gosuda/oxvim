@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use ox_editor::{
     Anchor, AutocmdContext, Border, BorderText, BufferFlags, BufferRelease, BufferState, Editor,
     Event, Extmark, ExtmarkPosition, ExtmarkVirtualLinesOverflow, ExtmarkVirtualTextPosition,
-    FileIO, Margins, OptionStore, OptionValue, RealFileIO, RelativeTo, TextAlignment,
-    VirtualTextChunk, WinConfig,
+    FileIO, Margins, MarkLocation, MarkTarget, OptionStore, OptionValue, RealFileIO, RelativeTo,
+    TextAlignment, VirtualTextChunk, WinConfig,
 };
 use ox_text::{Buffer, Position};
 use unicode_width::UnicodeWidthChar;
@@ -684,7 +684,7 @@ fn set_dimension(
         }
         if let Some(height) = height {
             editor
-                .set_window_height(window, height)
+                .set_window_text_height(window, height)
                 .map_err(exception)?;
         }
         Ok(())
@@ -807,9 +807,7 @@ where
         Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Err(_) => {
-            return Err(exception(
-                ox_editor::buffer::BufferStateError::Unloaded,
-            ));
+            return Err(exception(ox_editor::buffer::BufferStateError::Unloaded));
         }
     };
 
@@ -848,9 +846,7 @@ where
         Ok(content) => content,
         Err(_) => {
             finish_buffer_switch(session, buffer, &mut restore, false, true);
-            return Err(exception(
-                ox_editor::buffer::BufferStateError::Unloaded,
-            ));
+            return Err(exception(ox_editor::buffer::BufferStateError::Unloaded));
         }
     };
     let text = match Buffer::from_bytes(content.as_bytes()) {
@@ -918,16 +914,10 @@ pub fn nvim_win_set_buf(
         move |session, succeeded| {
             session.with_editor_mut(|editor| {
                 if !succeeded
-                    && editor
-                        .window(win)
-                        .is_ok_and(|window| window.buffer == buf)
+                    && editor.window(win).is_ok_and(|window| window.buffer == buf)
                     && editor.buffer(original).is_ok()
                 {
-                    let _ = editor.set_window_buffer(
-                        win,
-                        original,
-                        BufferRelease::KeepLoaded,
-                    );
+                    let _ = editor.set_window_buffer(win, original, BufferRelease::KeepLoaded);
                 }
                 if caller != win && editor.window(caller).is_ok() {
                     let _ = editor.set_current_window(caller);
@@ -1007,11 +997,7 @@ pub fn nvim_win_set_cursor(
 pub fn nvim_win_get_height(session: &ApiSession, win: WinHandle) -> Result<i64, ApiError> {
     let win = resolve_window(session, win)?;
     session.with_editor(|editor| {
-        if let Some(config) = editor.window_config(win).map_err(exception)? {
-            return i64::try_from(config.height)
-                .map_err(|_| ApiError::exception("Window height exceeds API integer range"));
-        }
-        i64::try_from(editor.window_geometry(win).map_err(exception)?.height)
+        i64::try_from(editor.window_text_height(win).map_err(exception)?)
             .map_err(|_| ApiError::exception("Window height exceeds API integer range"))
     })
 }
@@ -1096,6 +1082,11 @@ pub fn nvim_win_set_var(
     value: Object,
 ) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.set_window_var(session, win, name, value)
+        });
+    }
     session.with_editor_mut(|editor| {
         editor
             .window_variables_mut(win)
@@ -1112,6 +1103,11 @@ pub fn nvim_win_set_var(
 )]
 pub fn nvim_win_del_var(session: &ApiSession, win: WinHandle, name: OxStr) -> Result<(), ApiError> {
     let win = resolve_window(session, win)?;
+    if crate::global::host_present(session) {
+        return crate::runtime::with_command_executor(session, |session, executor| {
+            executor.del_window_var(session, win, name)
+        });
+    }
     session.with_editor_mut(|editor| {
         let variables = editor.window_variables_mut(win).map_err(exception)?;
         let Some(index) = variables
@@ -1303,17 +1299,13 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
                 events.push(Event::BufDelete);
                 events.push(Event::BufWipeout);
             }
-            BufferClosePolicy::Hide
-            | BufferClosePolicy::Default
-            | BufferClosePolicy::Unload => {}
+            BufferClosePolicy::Hide | BufferClosePolicy::Default | BufferClosePolicy::Unload => {}
         }
     }
     for event in events {
         fire_buffer_event(session, event, buffer)?;
         let target_live = session.with_editor(|editor| {
-            editor
-                .window(win)
-                .is_ok_and(|state| state.buffer == buffer)
+            editor.window(win).is_ok_and(|state| state.buffer == buffer)
                 && editor.buffer(buffer).is_ok()
         });
         if !target_live {
@@ -1325,10 +1317,7 @@ pub fn nvim_win_close(session: &ApiSession, win: WinHandle, force: bool) -> Resu
         // An event may have attached the buffer elsewhere or closed this
         // window without deleting the buffer. Revalidate before committing
         // the structural removal and its policy-specific state change.
-        if !editor
-            .window(win)
-            .is_ok_and(|state| state.buffer == buffer)
-        {
+        if !editor.window(win).is_ok_and(|state| state.buffer == buffer) {
             return Ok(());
         }
         editor
@@ -1708,17 +1697,19 @@ pub fn nvim_win_resize(
         let floating = editor.window_config(win).map_err(exception)?.is_some();
         let current = editor.current_window() == Some(win);
         if height >= 0 {
-            // win_setheight_win (window.c:6242): the current window keeps at
+            // win_setheight_win (window.c:6250): the current window keeps at
             // least max('winminheight', 1) rows plus the winbar row; other
-            // windows 'winminheight' rows plus the winbar row; floats at
-            // least one row (window.c:6246).
+            // windows 'winminheight' rows plus the winbar row; floats also
+            // clamp to at least one row (window.c:6253).
             let minimum = option_number(editor.options(), "winminheight", 1);
             let minimum = if current { minimum.max(1) } else { minimum };
             let height =
-                height.max(minimum + i64::from(winbar_shown(editor.options(), win, false)));
+                height.max(minimum + i64::from(winbar_shown(editor.options(), win, floating)));
             let height = if floating { height.max(1) } else { height };
             let rows = usize::try_from(height).unwrap_or(usize::MAX);
-            editor.set_window_height(win, rows).map_err(exception)?;
+            editor
+                .set_window_text_height(win, rows)
+                .map_err(exception)?;
         }
         if width >= 0 {
             // win_setwidth_win (window.c:6415-6419): only the current window
@@ -2894,7 +2885,10 @@ mod tests {
         );
         let (loaded, line) = session.with_editor(|editor| {
             let state = editor.buffer(target).unwrap();
-            (state.residency.is_loaded(), state.text().unwrap().line(1).unwrap())
+            (
+                state.residency.is_loaded(),
+                state.text().unwrap().line(1).unwrap(),
+            )
         });
         assert!(loaded);
         assert!(line.is_empty());
@@ -3067,6 +3061,74 @@ mod tests {
     }
 
     #[test]
+    fn resize_clamps_non_current_float_height_to_one_when_winminheight_is_zero() {
+        // win_setheight_win (window.c:6246): even when 'winminheight' is zero
+        // and the float is not current, its height is clamped to at least one row.
+        let (session, buffer, _window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .options_mut()
+                    .set_global("winminheight", OptionValue::Number(0))
+            })
+            .unwrap();
+        let float = nvim_open_win(
+            &session,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("editor"))),
+                ("row", Object::Float(2.0)),
+                ("col", Object::Float(4.0)),
+                ("width", Object::Integer(20)),
+                ("height", Object::Integer(5)),
+            ]),
+        )
+        .unwrap();
+        assert!(session.with_editor(|editor| editor.current_window() != Some(float)));
+        nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 1);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+    }
+
+    #[test]
+    fn resize_clamps_float_height_to_winminheight() {
+        // win_setheight_win (window.c:6250): floating windows clamp their
+        // height to 'winminheight' (plus winbar) before enforcing the minimum
+        // of one row. When 'winminheight' is 5, requested heights of 2 and 0
+        // both clamp to 5.
+        let (session, buffer, _window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                editor
+                    .options_mut()
+                    .set_global("winminheight", OptionValue::Number(5))
+            })
+            .unwrap();
+        let float = nvim_open_win(
+            &session,
+            buffer,
+            false,
+            dict(&[
+                ("relative", Object::String(OxStr::from("editor"))),
+                ("row", Object::Float(2.0)),
+                ("col", Object::Float(4.0)),
+                ("width", Object::Integer(20)),
+                ("height", Object::Integer(5)),
+            ]),
+        )
+        .unwrap();
+        assert!(session.with_editor(|editor| editor.current_window() != Some(float)));
+        nvim_win_resize(&session, float, -1, 2, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 5);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+
+        nvim_win_resize(&session, float, -1, 0, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, float).unwrap(), 5);
+        assert_eq!(nvim_win_get_width(&session, float).unwrap(), 20);
+    }
+
+    #[test]
     fn resize_resizes_a_tiled_split() {
         let (session, buffer, window) = session_with(&["a"], 80, 24);
         let other = session.with_editor_mut(|editor| {
@@ -3081,6 +3143,7 @@ mod tests {
     #[test]
     fn resize_clamps_height_to_winminheight() {
         // The clamp is a split negotiation: a lone window fills the frame
+
         // and cannot shrink (nothing can take the space), so the clamp
         // needs a sibling (win_setheight_win -> frame_setheight,
         // window.c:6238-6254).
@@ -3096,6 +3159,22 @@ mod tests {
             .unwrap();
         nvim_win_resize(&session, window, -1, 2, dict(&[])).unwrap();
         assert_eq!(nvim_win_get_height(&session, window).unwrap(), 5);
+    }
+    #[test]
+    fn resize_height_round_trips_text_rows_for_a_tiled_window() {
+        let (session, buffer, window) = session_with(&["a"], 80, 24);
+        session
+            .with_editor_mut(|editor| {
+                let tab = editor.window_tabpage(window).unwrap();
+                editor.split_horizontal(tab, window, buffer, false)
+            })
+            .unwrap();
+        let saved = nvim_win_get_height(&session, window).unwrap();
+        let reduced = saved.saturating_sub(2).max(1);
+        nvim_win_resize(&session, window, -1, reduced, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, window).unwrap(), reduced);
+        nvim_win_resize(&session, window, -1, saved, dict(&[])).unwrap();
+        assert_eq!(nvim_win_get_height(&session, window).unwrap(), saved);
     }
 
     // -- nvim_win_text_height ------------------------------------------------

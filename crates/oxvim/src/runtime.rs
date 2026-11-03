@@ -59,6 +59,28 @@ pub fn seed_argv(editor: &mut Editor) {
         .insert(OxStr::from("argv"), Object::Array(argv));
 }
 
+/// Seeds `v:argf` (`vvars.txt`): the positional file arguments given at
+/// startup, as absolute paths, without option arguments and without the
+/// `:args` list that later commands can change.
+pub fn seed_argf(editor: &mut Editor, files: &[String]) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let args = files
+        .iter()
+        .map(|file| {
+            let path = std::path::Path::new(file);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            Object::String(OxStr::from(absolute.to_string_lossy().as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    editor
+        .vvars_mut()
+        .insert(OxStr::from("argf"), Object::Array(args));
+}
+
 /// Rebuilds the parsed command line for the embedded child process.
 ///
 /// The child is the editor, so every option the scanner parsed has its
@@ -399,6 +421,20 @@ pub fn open_startup_buffers(
     if cli.window_layout != WindowLayout::Single {
         create_startup_windows(editor, cli, &buffers)?;
     }
+    if cli.diff_mode {
+        // `-d` is `diff_mode` in `main.c`: every window that shows a startup
+        // file starts with `'diff'` set, which is what the difftool plugin
+        // checks before opening itself (`plugin/difftool.lua` `start_diff`).
+        let windows = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
+        for window in windows {
+            let _ = editor
+                .options_mut()
+                .set_window(window, "diff", OptionValue::Boolean(true));
+        }
+    }
     Ok(())
 }
 
@@ -469,6 +505,30 @@ fn open_startup_files(
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
+        // A directory argument shows its listing, not an `E484`. Startup
+        // reuses the `:edit <dir>` view so `-d dir1 dir2` can reach VimEnter
+        // with both directories loaded.
+        if std::path::Path::new(file).is_dir() {
+            let buffer = if index == 0 && first_into_current {
+                editor
+                    .current_buffer()
+                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?
+            } else {
+                editor
+                    .create_buffer_with(Buffer::from_bytes(b"").map_err(|error| {
+                        AppError::Editor(error.to_string())
+                    })?, true)
+                    .map_err(|error| AppError::Editor(error.to_string()))?
+            };
+            ox_editor::excmd_exec::load_directory_view(
+                editor,
+                buffer,
+                std::path::Path::new(file),
+            )
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+            handles.push(buffer);
+            continue;
+        }
         let bytes = read_startup_file(file)?;
         // `file_readonly` (fileio.c:462): a file with no write permission
         // bit loads 'readonly'; a file that does not exist yet stays
@@ -487,9 +547,10 @@ fn open_startup_files(
                 .current_buffer()
                 .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
             if flags.binary {
-                let _ = editor
-                    .options_mut()
-                    .set_buffer(current, "binary", OptionValue::Boolean(true));
+                let _ =
+                    editor
+                        .options_mut()
+                        .set_buffer(current, "binary", OptionValue::Boolean(true));
             }
             let read = startup_file_read(editor, Some(current), &bytes);
             let text = startup_file_buffer(&read)?;
@@ -521,9 +582,10 @@ fn open_startup_files(
             "fileformat",
             OptionValue::String(read.fileformat.to_owned()),
         );
-        let _ = editor
-            .options_mut()
-            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
+        let _ =
+            editor
+                .options_mut()
+                .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
@@ -699,6 +761,8 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             })?;
         } else {
             session.with_editor_mut(|editor| {
+                // `v:argf` is fixed at startup, before any `:args` change.
+                seed_argf(editor, &cli.files);
                 open_startup_buffers(editor, cli, cli.stdin_file.then_some(input.as_str()))
             })?;
         }
@@ -707,6 +771,17 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             exit_code = code;
             break 'startup;
         }
+        // Startup is over: `v:vim_did_enter` turns 1 and `VimEnter` applies
+        // before the Ex loop reads standard input (main.c:620). Batch mode
+        // never fired either, so every `-S`/`-c` script after startup saw 0.
+        session.with_editor_mut(ox_editor::Editor::set_v_vim_did_enter);
+        let plan = session.with_editor_mut(|editor| {
+            editor
+                .autocmds_mut()
+                .plan(ox_editor::Event::VimEnter, ox_editor::AutocmdContext::default())
+        });
+        ox_api::execute_firing_plan(&session, plan)
+            .map_err(|error| AppError::Api(error.to_string()))?;
         // The Ex-commands read sits at the end of startup (main.c:670-685)
         // and only when stdin is not a tty (main.c:674-676: "nvim -es +cmd"
         // in a tty executes and exits, it doesn't wait for input).
@@ -872,11 +947,11 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     crate::server::seed_executor_from(&mut nested, &primary, &channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(crate::server::EditorBuiltins {
-            session: session.clone(),
-            ex: Rc::new(RefCell::new(primary)),
-            nested_ex: Rc::new(RefCell::new(nested)),
-        }),
+        Rc::new(crate::server::EditorBuiltins::new(
+            session.clone(),
+            Rc::new(RefCell::new(primary)),
+            Rc::new(RefCell::new(nested)),
+        )),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;

@@ -773,9 +773,7 @@ fn forward_terminal_events(client: &mut Client, state: &mut TuiState) -> Result<
                 // consume and let it be handled normally below.
                 state.consume_terminal_string = None;
             } else if let Event::Key(key) = event {
-                if key.kind != event::KeyEventKind::Release
-                    && is_terminal_string_terminator(key)
-                {
+                if key.kind != event::KeyEventKind::Release && is_terminal_string_terminator(key) {
                     state.consume_terminal_string = None;
                 } else {
                     state.consume_terminal_string = Some(std::time::Instant::now());
@@ -2779,7 +2777,12 @@ mod tests {
     fn encode_key_reencodes_ctrl_digit_folds_as_control_bytes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-        for (digit, byte) in [('4', '\u{1c}'), ('5', '\u{1d}'), ('6', '\u{1e}'), ('7', '\u{1f}')] {
+        for (digit, byte) in [
+            ('4', '\u{1c}'),
+            ('5', '\u{1d}'),
+            ('6', '\u{1e}'),
+            ('7', '\u{1f}'),
+        ] {
             assert_eq!(
                 encode_key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::CONTROL)),
                 Some(byte.to_string())
@@ -2803,11 +2806,7 @@ mod tests {
     /// (`nvim/tui/termkey/driver-csi.c:847`).
     #[test]
     fn terminal_string_intros_and_terminators() {
-        for code in [
-            KeyCode::Char('P'),
-            KeyCode::Char(']'),
-            KeyCode::Char('_'),
-        ] {
+        for code in [KeyCode::Char('P'), KeyCode::Char(']'), KeyCode::Char('_')] {
             assert!(is_terminal_string_intro(KeyEvent::new(
                 code,
                 KeyModifiers::ALT
@@ -2858,11 +2857,7 @@ mod tests {
     /// bytes already queued behind it starts a consume.
     #[test]
     fn alt_intro_chord_encodes_as_key() {
-        for code in [
-            KeyCode::Char('P'),
-            KeyCode::Char(']'),
-            KeyCode::Char('_'),
-        ] {
+        for code in [KeyCode::Char('P'), KeyCode::Char(']'), KeyCode::Char('_')] {
             assert!(matches!(
                 encode_key(KeyEvent::new(code, KeyModifiers::ALT)),
                 Some(ref encoded) if encoded.starts_with("<A-")

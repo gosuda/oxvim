@@ -142,3 +142,4 @@ tmtags
 # copies the ABI-compatible reference build artifacts here so the
 # `parser/<lang>.*` runtime lookup resolves them).
 runtime/parser/
+target-*/

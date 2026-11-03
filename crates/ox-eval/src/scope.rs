@@ -9,9 +9,9 @@
 //!
 //! Missing variables produce E121; `islocked` consults `:lockvar` marks.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-use ox_types::{BufHandle, DictEntry, DictEntryFlags, EntryValueLock, OxStr, Typval};
+use ox_types::{BufHandle, DictEntry, DictEntryFlags, DictRef, EntryValueLock, OxStr, Typval};
 
 use crate::error::{EvalError, Result};
 
@@ -82,6 +82,20 @@ impl ScopeKind {
             _ => return None,
         })
     }
+
+    /// Position of this kind's stable dictionary in the scope's identity cache.
+    fn cache_index(self) -> usize {
+        match self {
+            Self::Global => 0,
+            Self::Buffer => 1,
+            Self::Window => 2,
+            Self::Tab => 3,
+            Self::Script => 4,
+            Self::Local => 5,
+            Self::Argument => 6,
+            Self::Vim => 7,
+        }
+    }
 }
 
 /// An ordered map of byte-keyed variables to [`Typval`] values.
@@ -90,6 +104,39 @@ impl ScopeKind {
 /// `Vec<(OxStr, Typval)>` directly because `ox_types::Dict` is
 /// `Object`-valued rather than `Typval`-valued.
 pub type ScopeMap = Vec<(OxStr, Typval)>;
+
+/// Stable per-kind scope-namespace dictionary identities.
+///
+/// Upstream names one live `dict_T` per scope (`vimvardict`, ...), so `g:`
+/// always denotes the same object. The scope map stays the single source
+/// of truth; each cached dict mirrors it entry-wise, refreshed on every
+/// [`Scope::scope_dict`] read and on every in-`Scope` map write
+/// ([`Scope::set_scoped`], [`Scope::replace_pair`], [`Scope::restore_pair`],
+/// [`Scope::remove_pair`]). `Clone` starts empty so a snapshot gets
+/// its own identities instead of aliasing the original's live dicts, and
+/// `PartialEq` ignores the cache so map equality keeps its meaning.
+#[derive(Default)]
+struct ScopeDictCache {
+    cached: RefCell<[Option<DictRef>; 8]>,
+}
+
+impl std::fmt::Debug for ScopeDictCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ScopeDictCache").finish_non_exhaustive()
+    }
+}
+
+impl Clone for ScopeDictCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for ScopeDictCache {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
 
 /// Deep copy of one scope value for the write-back mirror: containers copy
 /// by value (cycle-aware, like `:h copy()`'s `deepcopy()`), so an in-place
@@ -194,6 +241,8 @@ pub struct Scope {
     /// values — and the mutability metadata on their dictionary entries —
     /// survive across commands.
     pub synced: SyncVersions,
+    /// Stable per-kind scope dictionaries; the maps above stay authoritative.
+    scope_dicts: ScopeDictCache,
 }
 
 /// The variable-map versions a [`Scope`] last mirrored from the editor.
@@ -208,6 +257,10 @@ pub struct SyncVersions {
     window: Cell<u64>,
     tab: Cell<u64>,
     vim: Cell<u64>,
+    // The option-store stamp the mirrored `&opt` tables were built from.
+    options: Cell<u64>,
+    // The register-store stamp the mirrored `@r` table was built from.
+    registers: Cell<u64>,
     // Buffer identity + version tracking: a `current_buffer()` switch
     // invalidates the cached `b:` map even when versions coincide.
     buffer_handle: Cell<Option<BufHandle>>,
@@ -257,6 +310,28 @@ impl SyncVersions {
             ScopeKind::Vim => self.vim.set(version),
             _ => {}
         }
+    }
+
+    /// The register-store stamp the mirrored `@r` table was built from.
+    #[must_use]
+    pub fn registers(&self) -> u64 {
+        self.registers.get()
+    }
+
+    /// Record the register-store stamp the mirror was built from.
+    pub fn set_registers(&self, version: u64) {
+        self.registers.set(version);
+    }
+
+    /// The option-store stamp the mirrored `&opt` tables were built from.
+    #[must_use]
+    pub fn options(&self) -> u64 {
+        self.options.get()
+    }
+
+    /// Record the option-store stamp the mirror was built from.
+    pub fn set_options(&self, version: u64) {
+        self.options.set(version);
     }
 
     /// The buffer whose variables the cached `b:` map mirrors, if any.
@@ -424,26 +499,81 @@ impl Scope {
             self.synced.mark_dirty(kind);
         }
     }
-
-    /// Return a namespace dictionary snapshot for a bare scope expression.
+    /// Return the stable namespace dictionary for a bare scope expression.
     ///
     /// Entries owned by a scope (upstream embeds them in `buf_T` and friends)
-    /// materialize with their mutability metadata attached, so a snapshot
-    /// like `let d = b:` still refuses to mutate `d.changedtick`.
+    /// materialize with their mutability metadata attached, so a dict like
+    /// `let d = b:` still refuses to mutate `d.changedtick`.
     ///
-    /// The snapshot shares every container value with the map, so a bare `g:`
-    /// read hands out aliases just like [`Scope::get_scoped`] and marks the
-    /// map dirty.
+    /// The same [`DictRef`] is handed out on every read of one kind, so
+    /// `a:dict isnot g:` inside a `g:` watcher callback is false. The map
+    /// stays authoritative: the cached dict's entries are rebuilt from it on
+    /// each read, and every in-`Scope` map write mirrors into it. The dict
+    /// shares every container value with the map, so a bare `g:` read hands
+    /// out aliases just like [`Scope::get_scoped`] and marks the map dirty.
+    ///
+    /// A read that finds the dict already mutably borrowed (a reentrant read
+    /// through a live alias) keeps the previous contents instead of
+    /// panicking — identity is what the read owes — and the next read
+    /// retries the refresh.
     #[must_use]
     pub fn scope_dict(&self, kind: ScopeKind) -> Typval {
-        let snapshot = Typval::dict_with_entries(
-            self.map(kind)
-                .iter()
-                .map(|(key, value)| scope_var_entry(kind, key, value))
-                .collect(),
-        );
+        let cached = self.scope_dicts.cached.borrow()[kind.cache_index()].clone();
+        let dict = match cached {
+            Some(dict) => dict,
+            None => {
+                let Typval::Dict(dict) = Typval::dict_with_entries(Vec::new()) else {
+                    unreachable!("dict_with_entries always builds a Dict");
+                };
+                self.scope_dicts.cached.borrow_mut()[kind.cache_index()] = Some(dict.clone());
+                dict
+            }
+        };
+        let entries: Vec<DictEntry> = self
+            .map(kind)
+            .iter()
+            .map(|(key, value)| scope_var_entry(kind, key, value))
+            .collect();
+        if let Ok(mut data) = dict.try_borrow_mut() {
+            data.clear();
+            for entry in entries {
+                data.insert_entry(entry);
+            }
+        }
+        let snapshot = Typval::Dict(dict);
         self.mark_aliased(kind, &snapshot);
         snapshot
+    }
+
+    /// Mirror one map write into the cached namespace dict, if materialized.
+    ///
+    /// Reads the stored entry back from the map (the authoritative copy), so
+    /// a [`Scope::set_scoped`] after an earlier [`Scope::scope_dict`] read is
+    /// visible through the previously handed-out dict; a missing key (after
+    /// [`Scope::remove_pair`]) drops the mirrored entry instead. A contested
+    /// borrow skips the mirror rather than panicking; the next read retries
+    /// the refresh.
+    fn mirror_cached_pair(&self, kind: ScopeKind, name: &[u8]) {
+        let Some(dict) = self.scope_dicts.cached.borrow()[kind.cache_index()].clone() else {
+            return;
+        };
+        let stored = find_pair(self.map(kind), name)
+            .map(|(key, value)| scope_var_entry(kind, key, value));
+        let Ok(mut data) = dict.try_borrow_mut() else {
+            return;
+        };
+        match stored {
+            Some(entry) => {
+                if let Some(slot) = data.get_entry_mut(name) {
+                    *slot = entry;
+                } else {
+                    data.insert_entry(entry);
+                }
+            }
+            None => {
+                data.remove(name);
+            }
+        }
     }
 
     /// Assign a value to an unqualified name, storing it in `l:`.
@@ -675,6 +805,7 @@ impl Scope {
             self.check_assignable(&written, offset)?;
         }
         assign(self.map_mut(kind), name, value);
+        self.mirror_cached_pair(kind, name);
         self.synced.mark_dirty(kind);
         Ok(())
     }
@@ -779,6 +910,7 @@ impl Scope {
         map.retain(|(key, _)| key.as_bytes() != name.as_bytes());
         map.push((OxStr::from(name), value));
         self.synced.mark_dirty(kind);
+        self.mirror_cached_pair(kind, name.as_bytes());
         previous
     }
 
@@ -794,6 +926,7 @@ impl Scope {
             map.push((OxStr::from(name), value));
         }
         self.synced.mark_dirty(kind);
+        self.mirror_cached_pair(kind, name.as_bytes());
     }
 
     /// Remove one entry from a scope map, marking the map dirty.
@@ -808,6 +941,7 @@ impl Scope {
             false
         } else {
             self.synced.mark_dirty(kind);
+            self.mirror_cached_pair(kind, name);
             true
         }
     }
@@ -900,4 +1034,51 @@ fn undefined_scoped(kind: ScopeKind, name: &[u8], offset: usize) -> EvalError {
 
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod scope_dict_identity_tests {
+    use super::*;
+
+    fn dict_ref(value: &Typval) -> DictRef {
+        let Typval::Dict(dict) = value else {
+            panic!("scope_dict must hand out a Dict, got {value:?}");
+        };
+        dict.clone()
+    }
+
+    #[test]
+    fn repeated_reads_share_one_dict_identity() {
+        let scope = Scope::new();
+        let first = dict_ref(&scope.scope_dict(ScopeKind::Global));
+        let second = dict_ref(&scope.scope_dict(ScopeKind::Global));
+        assert!(std::rc::Rc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn write_after_read_is_visible_through_cached_dict() {
+        let mut scope = Scope::new();
+        let before = scope.scope_dict(ScopeKind::Global);
+        scope
+            .set_scoped(ScopeKind::Global, b"later", 0, Typval::Number(1))
+            .unwrap();
+        let after = scope.scope_dict(ScopeKind::Global);
+        assert!(std::rc::Rc::ptr_eq(&dict_ref(&before), &dict_ref(&after)));
+        let dict = dict_ref(&before);
+        assert_eq!(dict.borrow().get(b"later"), Some(&Typval::Number(1)));
+    }
+
+    #[test]
+    fn removal_after_read_disappears_from_cached_dict() {
+        let mut scope = Scope::new();
+        scope
+            .set_scoped(ScopeKind::Global, b"gone", 0, Typval::Number(1))
+            .unwrap();
+        let before = scope.scope_dict(ScopeKind::Global);
+        assert!(scope.remove_pair(ScopeKind::Global, b"gone"));
+        let dict = dict_ref(&before);
+        assert_eq!(dict.borrow().get(b"gone"), None);
+        let after = scope.scope_dict(ScopeKind::Global);
+        assert!(std::rc::Rc::ptr_eq(&dict, &dict_ref(&after)));
+    }
 }

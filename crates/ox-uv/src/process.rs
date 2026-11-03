@@ -80,6 +80,27 @@ pub struct ExtraStdio {
     pub config: StdioConfig,
 }
 
+/// Descriptors the caller owns and hands to a child's standard slots.
+///
+/// luv's `uv.spawn` accepts an arbitrary descriptor number as a `stdio` entry
+/// and takes ownership of it (`luvref.txt`, `uv.spawn-options.stdio`). The
+/// copyable [`StdioConfig`] cannot carry an `OwnedFd`, so owned descriptors
+/// travel in this separate, deliberately non-`Clone` value through
+/// [`spawn_with_owned_stdio`]. A `Some` slot wins over the matching
+/// [`StdioConfig`] entry.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct OwnedStdio(pub [Option<std::os::fd::OwnedFd>; 3]);
+
+#[cfg(unix)]
+impl OwnedStdio {
+    /// No owned descriptors: every slot keeps its [`StdioConfig`].
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self([None, None, None])
+    }
+}
+
 /// Options accepted by [`spawn`].
 ///
 /// `environment: None` inherits the parent environment. `Some(entries)`
@@ -308,6 +329,27 @@ impl std::fmt::Debug for ProcessPipe {
 
 #[cfg(unix)]
 impl ProcessPipe {
+    /// Adopts an owned descriptor as a pipe endpoint, the way luv's
+    /// `pipe:open(fd)` does. The descriptor's access mode decides the
+    /// direction: a write-only descriptor becomes the child-stdin endpoint,
+    /// anything else is read from. The caller builds the `OwnedFd`, so this
+    /// crate never touches a raw descriptor itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the loop-registration or non-blocking-mode failure.
+    pub fn adopt(uv_loop: &mut UvLoop, owned: std::os::fd::OwnedFd) -> NetResult<Self> {
+        let write_only = rustix::fs::fcntl_getfl(&owned)
+            .map(|flags| flags.contains(rustix::fs::OFlags::WRONLY))
+            .unwrap_or(false);
+        let stream = if write_only {
+            ChildStream::In(ChildStdin::from(owned))
+        } else {
+            ChildStream::Out(ChildStdout::from(owned))
+        };
+        Self::attach(uv_loop, stream)
+    }
+
     fn attach(uv_loop: &mut UvLoop, stream: ChildStream) -> NetResult<Self> {
         stream.set_nonblocking().map_err(NetError::Io)?;
         let token = uv_loop.allocate_io_token()?;
@@ -846,6 +888,62 @@ impl ProcessError {
             source: source.into(),
         }
     }
+
+    /// Stable POSIX/libuv-compatible error name and message (`"{name}: {strerror}"`).
+    #[must_use]
+    pub fn luv_error_parts(&self) -> (&'static str, String) {
+        match self {
+            Self::Io { source, .. } => {
+                let raw = source.raw_os_error();
+                #[cfg(unix)]
+                if let Some(raw) = raw {
+                    use rustix::io::Errno;
+                    if raw == Errno::SRCH.raw_os_error() {
+                        return ("ESRCH", "ESRCH: no such process".to_string());
+                    }
+                    if raw == Errno::PERM.raw_os_error() {
+                        return ("EPERM", "EPERM: operation not permitted".to_string());
+                    }
+                    if raw == Errno::INVAL.raw_os_error() {
+                        return ("EINVAL", "EINVAL: invalid argument".to_string());
+                    }
+                    if raw == Errno::ACCESS.raw_os_error() {
+                        return ("EACCES", "EACCES: permission denied".to_string());
+                    }
+                }
+                match source.kind() {
+                    io::ErrorKind::PermissionDenied => {
+                        ("EPERM", "EPERM: operation not permitted".to_string())
+                    }
+                    io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => {
+                        ("EINVAL", "EINVAL: invalid argument".to_string())
+                    }
+                    _ => {
+                        let name = match raw {
+                            Some(3) => "ESRCH",
+                            Some(1) => "EPERM",
+                            Some(22) => "EINVAL",
+                            _ => "EIO",
+                        };
+                        let desc = match name {
+                            "ESRCH" => "no such process",
+                            "EPERM" => "operation not permitted",
+                            "EINVAL" => "invalid argument",
+                            _ => "unknown error",
+                        };
+                        (name, format!("{name}: {desc}"))
+                    }
+                }
+            }
+            Self::InvalidPid(_) | Self::InvalidSignal(_) | Self::InvalidPriority(_) => {
+                ("EINVAL", "EINVAL: invalid argument".to_string())
+            }
+            Self::Unsupported { feature, reason } => {
+                ("ENOSYS", format!("ENOSYS: {feature} is unsupported: {reason}"))
+            }
+            Self::Handle(err) => ("EINVAL", format!("EINVAL: {err}")),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -991,6 +1089,71 @@ pub fn spawn<F>(
 where
     F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
 {
+    #[cfg(unix)]
+    {
+        spawn_with_stdio(uv_loop, options, OwnedStdio::empty(), on_exit)
+    }
+    #[cfg(not(unix))]
+    {
+        spawn_with_slots(uv_loop, options, |config, _slot| map_stdio(config), on_exit)
+    }
+}
+
+/// Spawns with caller-owned descriptors wired over the standard slots.
+///
+/// This is the entry point luv's numeric `stdio` entries need: the caller
+/// keeps ownership until here, and `Stdio::from(OwnedFd)` transfers it to the
+/// child's slot, closing the parent copy as the child starts.
+///
+/// # Errors
+///
+/// Same failures as [`spawn`].
+#[cfg(unix)]
+pub fn spawn_with_owned_stdio<F>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    owned: OwnedStdio,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+{
+    spawn_with_stdio(uv_loop, options, owned, on_exit)
+}
+
+#[cfg(unix)]
+fn spawn_with_stdio<F>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    owned: OwnedStdio,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+{
+    let OwnedStdio([stdin_owned, stdout_owned, stderr_owned]) = owned;
+    let mut slots = [stdin_owned, stdout_owned, stderr_owned];
+    spawn_with_slots(
+        uv_loop,
+        options,
+        |config, slot| stdio_for(config, slots[slot].take()),
+        on_exit,
+    )
+}
+
+/// Shared spawn body: `slot` maps one standard slot's config (and its index)
+/// to the `Stdio` the child receives, so the owned-descriptor form and the
+/// plain form differ only in that mapper.
+fn spawn_with_slots<F, M>(
+    uv_loop: &mut UvLoop,
+    options: SpawnOptions,
+    mut slot: M,
+    on_exit: F,
+) -> Result<SpawnedProcess, ProcessError>
+where
+    F: FnOnce(&mut UvLoop, ProcessExitResult) + Send + 'static,
+    M: FnMut(StdioConfig, usize) -> Result<Stdio, ProcessError>,
+{
     let SpawnOptions {
         program,
         args,
@@ -1015,9 +1178,9 @@ where
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    command.stdin(map_stdio(stdio[0])?);
-    command.stdout(map_stdio(stdio[1])?);
-    command.stderr(map_stdio(stdio[2])?);
+    command.stdin(slot(stdio[0], 0)?);
+    command.stdout(slot(stdio[1], 1)?);
+    command.stderr(slot(stdio[2], 2)?);
     configure_platform_command(&mut command, uid, gid, detached, hide);
 
     let prepared = prepare_extra_stdio(&extra_stdio)?;
@@ -1115,6 +1278,14 @@ pub fn process_kill(process: &Process, signal: Option<i32>) -> Result<(), Proces
 #[must_use]
 pub fn getpid() -> u32 {
     crate::misc::getpid()
+}
+
+/// Returns the current process user ID.
+///
+/// See `luvref.txt`, `uv.getuid()` (lines 4208-4215).
+#[must_use]
+pub fn getuid() -> u32 {
+    crate::misc::getuid()
 }
 
 /// Returns the parent process ID, or zero when the platform exposes no parent.
@@ -1875,6 +2046,18 @@ where
         master,
         pty_slave,
     })
+}
+
+/// `Stdio` for one slot: an owned descriptor wins over the copyable config.
+#[cfg(unix)]
+fn stdio_for(
+    config: StdioConfig,
+    owned: Option<std::os::fd::OwnedFd>,
+) -> Result<Stdio, ProcessError> {
+    match owned {
+        Some(owned) => Ok(Stdio::from(owned)),
+        None => map_stdio(config),
+    }
 }
 
 fn map_stdio(config: StdioConfig) -> Result<Stdio, ProcessError> {

@@ -740,3 +740,66 @@ fn query_inspect_preserves_interleaved_predicate_order() {
     .eval::<()>()
     .unwrap();
 }
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "needs a built tree-sitter parser: OXVIM_TREE_SITTER_PARSER or OXVIM_REF_ROOT"
+)]
+fn emit_highlights_applies_ancestor_and_parent_predicates() {
+    let (parser, language) = require_parser();
+    let (host, session) = with_api_host();
+    let buffer = session
+        .with_editor_mut(|editor| editor.create_buffer(true))
+        .unwrap();
+    let bufnr = i64::from(buffer);
+    let lua = host.lua();
+
+    lua.globals()
+        .set("parser_path", parser.to_string_lossy().as_ref())
+        .unwrap();
+    lua.globals().set("parser_language", language).unwrap();
+    lua.globals().set("test_buf", bufnr).unwrap();
+
+    lua.load(
+        r#"
+        assert(vim._ts_add_language_from_object(parser_path, parser_language))
+        local parser = vim._create_ts_parser(parser_language)
+        vim.api.nvim_buf_set_lines(test_buf, 0, -1, false, {'local value = 1'})
+        local tree = parser:parse(nil, test_buf)
+        local root = tree:root()
+        local root_type = root:type()
+
+        local ns = vim.api.nvim_create_namespace('test_ts_predicates')
+
+        -- 1. #has-ancestor? with actual root ancestor matches and emits extmark
+        local q_ancestor = vim._ts_parse_query(parser_language, '((identifier) @val (#has-ancestor? @val "' .. root_type .. '"))')
+        vim._ts_emit_highlights(root, q_ancestor, test_buf, ns)
+        local marks = vim.api.nvim_buf_get_extmarks(test_buf, ns, 0, -1, {})
+        assert(#marks > 0, 'expected extmarks for matching #has-ancestor?')
+
+        -- 2. #has-ancestor? with nonexistent ancestor fails and emits nothing
+        vim.api.nvim_buf_clear_namespace(test_buf, ns, 0, -1)
+        local q_no_ancestor = vim._ts_parse_query(parser_language, '((identifier) @val (#has-ancestor? @val "nonexistent_ancestor"))')
+        vim._ts_emit_highlights(root, q_no_ancestor, test_buf, ns)
+        marks = vim.api.nvim_buf_get_extmarks(test_buf, ns, 0, -1, {})
+        assert(#marks == 0, 'expected no extmarks for failing #has-ancestor?')
+
+        -- 3. #not-has-ancestor? with actual root ancestor fails and emits nothing
+        vim.api.nvim_buf_clear_namespace(test_buf, ns, 0, -1)
+        local q_not_ancestor = vim._ts_parse_query(parser_language, '((identifier) @val (#not-has-ancestor? @val "' .. root_type .. '"))')
+        vim._ts_emit_highlights(root, q_not_ancestor, test_buf, ns)
+        marks = vim.api.nvim_buf_get_extmarks(test_buf, ns, 0, -1, {})
+        assert(#marks == 0, 'expected no extmarks for failing #not-has-ancestor?')
+
+        -- 4. #has-parent? with nonexistent parent fails and emits nothing
+        vim.api.nvim_buf_clear_namespace(test_buf, ns, 0, -1)
+        local q_no_parent = vim._ts_parse_query(parser_language, '((identifier) @val (#has-parent? @val "nonexistent_parent"))')
+        vim._ts_emit_highlights(root, q_no_parent, test_buf, ns)
+        marks = vim.api.nvim_buf_get_extmarks(test_buf, ns, 0, -1, {})
+        assert(#marks == 0, 'expected no extmarks for failing #has-parent?')
+        "#,
+    )
+    .eval::<()>()
+    .unwrap();
+}

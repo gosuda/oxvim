@@ -340,9 +340,7 @@ impl HlState {
         // unresolvable. Falling through just mints elsewhere.
         if let Some(&id) = self.retired.get(&highlight) {
             let slot = usize::try_from(id & SLOT_MASK).map_err(|_| HlError::IdExhausted)?;
-            if slot < self.definitions.len()
-                && self.occupied.get(slot).copied() == Some(false)
-            {
+            if slot < self.definitions.len() && self.occupied.get(slot).copied() == Some(false) {
                 self.free.retain(|&free| free != slot as u64);
                 self.occupied[slot] = true;
                 self.refcounts[slot] = 0;
@@ -449,7 +447,7 @@ impl HlState {
         (index < self.definitions.len()
             && self.occupied[index]
             && self.generations[index] == (id >> 32))
-        .then_some(index)
+            .then_some(index)
     }
 
     /// Iterates definitions in identifier order.

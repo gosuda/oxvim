@@ -19,7 +19,7 @@
 
 use crate::excmd_exec::ExEditorAccess;
 use ox_eval::EvalError;
-use ox_types::{BufHandle, Typval};
+use ox_types::{BufHandle, Typval, WinHandle};
 
 use crate::Editor;
 use crate::excmd_exec::{EvalHost, buffer_lines};
@@ -35,7 +35,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
 ) -> ox_eval::Result<Typval> {
     check_arity(name, args.len())?;
     host.access.with_ex_editor(|editor| {
-        // `tv_get_lnum` runs before the range check in every one of the three, so
+        // `tv_get_lnum` runs before the range check in every one of the four, so
         // an argument with no numeric value raises its error whatever the folds
         // hold.
         let lnum = super::position::current_lnum_arg(editor, &args[0])?;
@@ -43,6 +43,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
             "foldclosed" => closed_line(editor, lnum, false),
             "foldclosedend" => closed_line(editor, lnum, true),
             "foldlevel" => level(editor, lnum),
+            "diff_filler" => diff_filler(editor, lnum),
             _ => unreachable!("fold builtin route and dispatcher disagree"),
         };
         Ok(Typval::Number(value))
@@ -96,6 +97,18 @@ fn closed_line(editor: &mut Editor, lnum: i64, end: bool) -> i64 {
     i64::try_from(result).unwrap_or(i64::MAX)
 }
 
+/// `f_diff_filler` (`diff.c:4359-4361`): the filler lines above `{lnum}` in
+/// the current window, through the tabpage's computed diff blocks
+/// (`diff_check_fill`, `diff.c:2414`). A window outside diff mode, filler
+/// display disabled, or a line outside `1..=line_count + 1` all answer 0 —
+/// never a negative number.
+fn diff_filler(editor: &mut Editor, lnum: i64) -> i64 {
+    let Some(window) = editor.current_window() else {
+        return 0;
+    };
+    crate::diffmode::diff_filler_for(editor, window, lnum)
+}
+
 /// `f_foldlevel` (`fold.c:3206-3212`): the nesting level at `lnum`, and `0`
 /// when no fold covers it or it lies outside the buffer.
 fn level(editor: &mut Editor, lnum: i64) -> i64 {
@@ -116,18 +129,30 @@ fn level(editor: &mut Editor, lnum: i64) -> i64 {
 /// buffer's line count. `None` reproduces `hasAnyFolding` being false: no
 /// window, no buffer, or `'foldenable'` off.
 ///
-/// Named gaps, most of them upstream behaviour this port has no seam for:
-/// `'foldmethod'` of `expr` or `syntax` needs a host computation
-/// [`Folds::refresh`] can only request, so those methods answer from whatever
-/// a host last applied — nothing, by default. `diff` is computed by the host
-/// module [`crate::diffmode`] from the tabpage's diff blocks.
-/// `'foldnestmax'` does not cap
-/// computed levels and `'foldignore'` does not exclude lines, so an indent
-/// fold deeper than `'foldnestmax'` or starting at an ignored line is reported
-/// where upstream would not report it. `'foldlevel'` does not close computed
-/// folds by level either; a computed fold starts closed, which is what
-/// `'foldlevel'` at its default of zero produces.
+/// Named gaps: `'foldmethod'` of `expr` or `syntax` needs a per-line host
+/// evaluation [`Folds::refresh`] can only request, so those methods answer
+/// from whatever a host last applied — nothing, by default. `diff` is
+/// computed by the host module [`crate::diffmode`] from the tabpage's diff
+/// blocks. `'foldlevel'` does not close computed folds by level either; a
+/// computed fold starts closed, which is what `'foldlevel'` at its default
+/// of zero produces.
 fn synced_folds(editor: &mut Editor) -> Option<(&Folds, usize)> {
+    let line_count = refresh_for_window(editor)?;
+    let buffer = editor.current_buffer()?;
+    let state = editor.buffer(buffer).ok()?;
+    Some((&state.folds, line_count))
+}
+
+/// Brings the current buffer's folds up to date under the current window's
+/// fold options, answering the buffer's line count, or `None` when
+/// `hasAnyFolding` (`fold.h:23-25`) is false.
+///
+/// This is the [`synced_folds`] mutation half, exposed so Ex command handlers
+/// (`:foldopen`, `:foldclose`, yank over closed folds) can refresh computed
+/// folds before operating on them — upstream's `checkupdate`
+/// (`fold.c:1113-1122`) runs on the same paths, and without it every computed
+/// method answers `E490: No fold found` from a stale empty cache.
+pub(crate) fn refresh_for_window(editor: &mut Editor) -> Option<usize> {
     let window = editor.current_window()?;
     let buffer = editor.current_buffer()?;
     if !matches!(
@@ -141,6 +166,15 @@ fn synced_folds(editor: &mut Editor) -> Option<(&Folds, usize)> {
         _ => FoldMethod::Manual,
     };
     let shift_width = effective_shift_width(editor, buffer);
+    // Upstream defaults (`src/nvim/options.lua`): 'tabstop' 8, 'foldnestmax'
+    // 20, 'foldminlines' 1. The `max` calls below mirror `get_indent_buf`
+    // (a zero tab width falls back to 8) and `foldlevelIndent`/`checkSmall`
+    // (a negative cap or floor reports no deeper/smaller than nothing).
+    let tab_width = buffer_number(editor, buffer, "tabstop", 8).max(1);
+    let nest_max = window_number(editor, window, "foldnestmax", 20);
+    let min_lines = window_number(editor, window, "foldminlines", 1).max(0);
+    let ignore = window_text(editor, window, "foldignore", "#");
+    let markers = window_text(editor, window, "foldmarker", "{{{,}}}");
     let lines = buffer_lines(editor, buffer).ok()?;
     let line_count = lines.len();
     // `'foldmethod'` = `diff` delegates to the host: `refresh` can only
@@ -156,6 +190,19 @@ fn synced_folds(editor: &mut Editor) -> Option<(&Folds, usize)> {
     let changedtick = state.changedtick();
     state.folds.set_method(method);
     let _ = state.folds.set_shift_width(shift_width);
+    if let Ok(tab_width) = usize::try_from(tab_width) {
+        let _ = state.folds.set_tab_width(tab_width);
+    }
+    state.folds.set_fold_ignore(ignore.into_bytes());
+    state.folds.set_nest_max(nest_max);
+    if let Ok(min_lines) = usize::try_from(min_lines) {
+        state.folds.set_fold_min_lines(min_lines);
+    }
+    if let Some((start, end)) = markers.split_once(',') {
+        let _ = state
+            .folds
+            .set_markers(start.as_bytes().to_vec(), end.as_bytes().to_vec());
+    }
     // A host request or a computation error leaves the cached set answering,
     // which is the closest honest reading of folds this port cannot compute.
     match state.folds.refresh(changedtick, &lines) {
@@ -167,7 +214,31 @@ fn synced_folds(editor: &mut Editor) -> Option<(&Folds, usize)> {
         }
         _ => {}
     }
-    Some((&state.folds, line_count))
+    Some(line_count)
+}
+
+/// Reads a numeric buffer option, answering `default` when it is missing.
+fn buffer_number(editor: &Editor, buffer: BufHandle, name: &str, default: i64) -> i64 {
+    match editor.options().get_buffer(buffer, name) {
+        Ok(OptionValue::Number(value)) => *value,
+        _ => default,
+    }
+}
+
+/// Reads a numeric window option, answering `default` when it is missing.
+fn window_number(editor: &Editor, window: WinHandle, name: &str, default: i64) -> i64 {
+    match editor.options().get_window(window, name) {
+        Ok(OptionValue::Number(value)) => *value,
+        _ => default,
+    }
+}
+
+/// Reads a string window option, answering `default` when it is missing.
+fn window_text(editor: &Editor, window: WinHandle, name: &str, default: &str) -> String {
+    match editor.options().get_window(window, name) {
+        Ok(OptionValue::String(value)) => value.clone(),
+        _ => default.to_owned(),
+    }
 }
 
 /// `get_sw_value_col` (`indent.c:362-366`): `'shiftwidth'`, or `'tabstop'`
@@ -452,5 +523,65 @@ mod tests {
         assert_eq!(error_code("let g:a = foldclosed(1, 2)"), "E118");
         assert_eq!(error_code("let g:a = foldclosedend(1, 2)"), "E118");
         assert_eq!(error_code("let g:a = foldlevel(1, 2)"), "E118");
+    }
+
+    /// `diff_filler({lnum})` (`diff.c:4359-4361`).
+    ///
+    /// Oracle ground truth (headless `nvim -u NONE -S`, left window holding
+    /// the 7-line side of a 2-line insertion after line 2, right window the
+    /// 5-line side): every line of the insertion side answers 0, and the
+    /// other side answers 2 above its line 3 and 0 elsewhere; outside diff
+    /// mode the answer is always 0.
+    #[test]
+    fn diff_filler_reports_insertion_filler() {
+        let editor = TestEditorAccess::new(editor());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "diff_filler.vim",
+            r#"
+call setline(1, ['one','two','three','four','five'])
+let g:plain = diff_filler(2)
+split | enew
+call setline(1, ['one','two','AAA','BBB','three','four','five'])
+windo diffthis
+let g:here = win_getid()
+wincmd w
+let g:a_f3 = diff_filler(3)
+let g:a_end = diff_filler(line('$') + 1)
+let g:a_lines = line('$')
+call win_gotoid(g:here)
+let g:b_f3 = diff_filler(3)
+let g:b_lines = line('$')
+"#,
+        )
+        .unwrap();
+        let values = ["a_f3", "a_end", "a_lines", "b_f3", "b_lines", "plain"]
+            .into_iter()
+            .map(|name| {
+                match exec
+                    .scope()
+                    .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+                    .unwrap_or_else(|error| panic!("no g:{name}: {error:?}"))
+                {
+                    Typval::Number(value) => *value,
+                    other => panic!("expected a Number in g:{name}, got {other:?}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let (a_f3, a_end, a_lines, b_f3, b_lines, plain) =
+            (values[0], values[1], values[2], values[3], values[4], values[5]);
+        assert_eq!(plain, 0, "outside diff mode diff_filler answers 0");
+        // One window holds 5 lines, the other 7; whichever holds 5 answers
+        // the 2-line insertion filler above its line 3.
+        assert!((a_lines, b_lines) == (5, 7) || (a_lines, b_lines) == (7, 5));
+        let (five_f3, seven_f3) = if a_lines == 5 {
+            (a_f3, b_f3)
+        } else {
+            (b_f3, a_f3)
+        };
+        assert_eq!(five_f3, 2, "filler above the insertion point");
+        assert_eq!(seven_f3, 0, "no filler inside the insertion");
+        assert_eq!(a_end, 0, "nothing past the last hunk");
     }
 }

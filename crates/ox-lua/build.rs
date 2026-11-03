@@ -165,7 +165,10 @@ fn build_lpeg() -> Result<(), Box<dyn Error>> {
     // artifacts of a sibling build script that Cargo may still be running.
     let include_dir = manifest_dir.join("../../third_party/lua51");
     for header in ["lua.h", "luaconf.h", "lauxlib.h"] {
-        println!("cargo:rerun-if-changed={}", include_dir.join(header).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            include_dir.join(header).display()
+        );
     }
 
     let mut build = cc::Build::new();

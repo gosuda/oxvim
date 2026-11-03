@@ -905,7 +905,7 @@ function vim.str_utfindex(s, encoding, index, strict_indexing)
   end
 
   if not index then
-    index = math.huge
+    index = vim._maxint
     strict_indexing = false
   end
 

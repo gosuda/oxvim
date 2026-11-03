@@ -110,9 +110,14 @@ impl MultiQueue {
     /// Returns [`Error::UnknownOwner`] if `owner` does not identify an
     /// existing queue.
     pub fn put(&mut self, owner: Owner, event: Event) -> Result<()> {
-        if !self.queues.contains_key(&owner) {
-            return Err(Error::UnknownOwner(owner));
+        let mut queue = Some(owner);
+        while let Some(current) = queue {
+            let Some(current_queue) = self.queues.get(&current) else {
+                return Err(Error::UnknownOwner(current));
+            };
+            queue = current_queue.parent;
         }
+
         let event_id = self.next_event;
         self.next_event = self.next_event.wrapping_add(1);
         self.events.insert(event_id, event);
@@ -123,10 +128,9 @@ impl MultiQueue {
         // the upstream root/child representation without changing its behavior.
         let mut queue = Some(owner);
         while let Some(current) = queue {
-            let current_queue = self
-                .queues
-                .get_mut(&current)
-                .ok_or(Error::UnknownOwner(current))?;
+            let Some(current_queue) = self.queues.get_mut(&current) else {
+                unreachable!("validated owner chain cannot change during insertion");
+            };
             current_queue.entries.push_back(event_id);
             queue = current_queue.parent;
         }
@@ -253,7 +257,37 @@ impl MultiQueue {
             let Some(parent) = self.queues.get(&candidate).and_then(|queue| queue.parent) else {
                 return false;
             };
+
             candidate = parent;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "test constructs a known-good queue before corrupting its parent"
+    )]
+    fn put_rejects_missing_ancestor_without_mutation() {
+        let mut queues = MultiQueue::new();
+        let root = queues.root();
+        let child = queues.child(root).unwrap();
+        queues.queues.remove(&root);
+        let event_count = queues.events.len();
+        let origin_count = queues.origins.len();
+        let next_event = queues.next_event;
+        let child_len = queues.len(child).unwrap();
+
+        let result = queues.put(child, Event::Signal(7));
+
+        assert!(matches!(result, Err(Error::UnknownOwner(owner)) if owner == root));
+        assert_eq!(queues.events.len(), event_count);
+        assert_eq!(queues.origins.len(), origin_count);
+        assert_eq!(queues.next_event, next_event);
+        assert_eq!(queues.len(child).unwrap(), child_len);
     }
 }

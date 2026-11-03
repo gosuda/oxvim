@@ -225,8 +225,15 @@ pub struct AutocmdEntryId(pub u64);
 /// Host-owned action referenced by an autocommand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AutocmdKind {
-    /// Ex source to execute later.
-    ExString(String),
+    /// Ex source to execute later, with the script that defined it so an `s:`
+    /// reference in the body keeps that script's scope. `None` means the
+    /// definition had no script context.
+    ExString {
+        /// The Ex source registered for this entry.
+        source: String,
+        /// The `s:` script that defined the body (`autocmd.c` `sc_sid`).
+        script: Option<crate::script::Sid>,
+    },
     /// Named zero-argument Vimscript function to invoke later.
     VimscriptFunction(String),
     /// Lua registry callback identity to invoke later.
@@ -289,10 +296,7 @@ impl AutocmdAction {
                 Object::String(self.match_name.clone()),
             ),
             (OxStr::from("buf"), buffer),
-            (
-                OxStr::from("file"),
-                Object::String(self.file_name.clone()),
-            ),
+            (OxStr::from("file"), Object::String(self.file_name.clone())),
         ];
         if self.group != AugroupId::default() {
             let group = i64::try_from(self.group.0)
@@ -1036,27 +1040,32 @@ impl Autocmds {
             }),
             match_name: match context.match_name {
                 Some(name) => OxStr::from(name),
-                None => context.file_name.map_or_else(|| OxStr(Vec::new()), |name| {
-                    let name = OxStr::from(name);
-                    if entry.event.pattern_kind() == PatternKind::None || name.as_bytes().is_empty() {
-                        return name;
-                    }
-                    let path = crate::excmd_exec::path_from_ox_str(&name);
-                    if path.is_absolute() {
-                        return name;
-                    }
-                    let full = std::env::current_dir().unwrap_or_default().join(path);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::ffi::OsStrExt;
+                None => context.file_name.map_or_else(
+                    || OxStr(Vec::new()),
+                    |name| {
+                        let name = OxStr::from(name);
+                        if entry.event.pattern_kind() == PatternKind::None
+                            || name.as_bytes().is_empty()
+                        {
+                            return name;
+                        }
+                        let path = crate::excmd_exec::path_from_ox_str(&name);
+                        if path.is_absolute() {
+                            return name;
+                        }
+                        let full = std::env::current_dir().unwrap_or_default().join(path);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::ffi::OsStrExt;
 
-                        OxStr::from(full.as_os_str().as_bytes())
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        OxStr::from(full.to_string_lossy().as_ref())
-                    }
-                }),
+                            OxStr::from(full.as_os_str().as_bytes())
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            OxStr::from(full.to_string_lossy().as_ref())
+                        }
+                    },
+                ),
             },
             file_name: OxStr::from(context.file_name.unwrap_or_default()),
             description: entry.options.description.clone(),

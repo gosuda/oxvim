@@ -20,7 +20,8 @@ use crate::{Editor, LineReplaceRequest};
 use crate::autocmd::Event;
 use crate::excmd_exec::{
     CurrentBuffer, EvalHost, Flow, fire_buffer_lifecycle, flow_to_eval_error, object_to_typval,
-    option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number, typval_to_object,
+    find_buffer_argument, option_to_typval, path_from_ox_str, resolve_buffer_argument, typval_number,
+    typval_to_object,
     typval_to_option, typval_to_text,
 };
 
@@ -72,6 +73,9 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         "changenr" => host
             .access
             .with_ex_editor(|editor| call_changenr_builtin(editor, args)),
+        "did_filetype" => host
+            .access
+            .with_ex_editor(|editor| call_did_filetype_builtin(editor, args)),
         "undotree" => host
             .access
             .with_ex_editor(|editor| call_undotree_builtin(editor, args)),
@@ -237,8 +241,7 @@ fn call_bufexists_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<T
         };
         return Err(EvalError::new(code, 0, message));
     }
-    let exists = !matches!(args.first(), Some(Typval::Number(0)))
-        && resolve_buffer_argument(editor, args.first()).is_some();
+    let exists = find_buffer_argument(editor, args.first()).is_some();
     Ok(Typval::Number(i64::from(exists)))
 }
 
@@ -285,9 +288,34 @@ fn call_buffer_identity_builtin(
     }
     let name = buffer
         .and_then(|handle| editor.buffer(handle).ok())
-        .map_or_else(|| OxStr::from(""), |state| state.name().clone());
+        .map_or_else(
+            || OxStr::from(""),
+            |state| shorten_against_cwd(editor, state.name()),
+        );
 
     Ok(Typval::String(name))
+}
+
+/// The name `bufname()` reports: a full path under the current directory is
+/// trimmed to its tail (`shorten_buf_fname`, `fileio.c:2434-2463`).
+///
+/// The reference stores that shortened form when the directory changes
+/// (`shorten_fnames`, `fileio.c:2468`); this port keeps the full name and trims
+/// on read, which answers the same string for every `bufname()` call.
+fn shorten_against_cwd(editor: &Editor, name: &OxStr) -> OxStr {
+    let Some(directory) = editor.effective_directory() else {
+        return name.clone();
+    };
+    let text = name.to_string_lossy();
+    if text.contains("://") {
+        return name.clone();
+    }
+    let directory = directory.to_string_lossy();
+    let prefix = format!("{}/", directory.trim_end_matches('/'));
+    match text.strip_prefix(prefix.as_str()) {
+        Some(tail) if !tail.is_empty() => OxStr::from(tail),
+        _ => name.clone(),
+    }
 }
 
 fn call_bufadd_builtin(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
@@ -1123,6 +1151,25 @@ fn call_changenr_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Ty
         .and_then(|buffer| editor.buffer_undo_tree(buffer).ok())
         .map_or(0, ox_text::UndoTree::current_seq);
     Ok(Typval::Number(i64::try_from(seq).unwrap_or(i64::MAX)))
+}
+
+/// `did_filetype()`: whether the `FileType` event fired for the current
+/// buffer with a non-empty value and no reset has run since (upstream
+/// `f_did_filetype`, reading `b_did_filetype`). A missing current buffer
+/// answers false.
+fn call_did_filetype_builtin(editor: &Editor, args: &[Typval]) -> ox_eval::Result<Typval> {
+    if !args.is_empty() {
+        return Err(EvalError::new(
+            "E118",
+            0,
+            "Too many arguments for function: did_filetype",
+        ));
+    }
+    let did = editor
+        .current_buffer()
+        .and_then(|buffer| editor.buffer(buffer).ok())
+        .is_some_and(|state| state.did_filetype());
+    Ok(Typval::Number(i64::from(did)))
 }
 
 /// `undotree([{buf}])`: the buffer's undo state and header list
