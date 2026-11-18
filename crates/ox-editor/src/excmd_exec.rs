@@ -20046,6 +20046,10 @@ fn command_move<F: FileIO>(
     }) {
         return error_flow(runtime, "E16", error.to_string());
     }
+    // The equal-length splice above keeps every mark on its old line; the
+    // move permutation relocates named marks, history, and other windows'
+    // cursors so they follow their text (`do_move`'s mark handling).
+    editor.move_line_positions(buffer, line1, line2, dest);
     if let Some(window) = editor.current_window()
         && let Err(error) = editor.set_window_cursor(window, cursor)
     {

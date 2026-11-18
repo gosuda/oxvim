@@ -4885,8 +4885,6 @@ impl Editor {
     ) -> Result<bool, EditorError> {
         let window = self.resolve_window_handle(put.window)?;
         let buffer = self.window(window)?.buffer;
-        let text = self.buffer(buffer)?.text()?;
-        let old_count = text.line_count();
         // `'<'`/`'>` track the selection (`b_visual`), with `MAXCOL` for a
         // linewise end (`getpos("'>")` answers `v:maxcol`, `test_put.vim`).
         let mut visual_end = put.range.end;
@@ -4916,9 +4914,11 @@ impl Editor {
                 content
             }
         };
-        let deleted_all = matches!(put.kind, VisualKind::Line)
-            && put.range.start.lnum <= 1
-            && put.range.end.lnum >= old_count;
+        // The insertion boundary of a linewise put is the selection's own
+        // edge: deleting a range that reaches EOF clamps the cursor onto
+        // the last surviving line, so the boundary must come from the
+        // range, not the post-delete cursor.
+        let put_boundary = put.range.start.lnum.saturating_sub(1);
         let resolved = ResolvedPut {
             window,
             direction: put.direction,
@@ -4936,10 +4936,7 @@ impl Editor {
             // it held (`PUT_LINE`).
             let lines = content.getreg_lines();
             let lines = self.maybe_reindent(buffer, window, put, lines)?;
-            self.insert_visual_lines(buffer, window, &lines, put.timestamp)?;
-            if deleted_all {
-                self.drop_trailing_empty_line(buffer, put.timestamp)?;
-            }
+            self.insert_visual_lines(buffer, window, &lines, put_boundary, put.timestamp)?;
         } else if matches!(put.kind, VisualKind::Block)
             && matches!(content.kind(), RegisterKind::CharacterWise)
             && content.lines().len() == 1
@@ -5023,6 +5020,7 @@ impl Editor {
         buffer: BufHandle,
         window: WinHandle,
         lines: &[Vec<u8>],
+        put_boundary: usize,
         timestamp: i64,
     ) -> Result<(), EditorError> {
         if lines.is_empty() {
@@ -5059,7 +5057,7 @@ impl Editor {
             self.set_first_nonblank(window, buffer, last)?;
             return Ok(());
         }
-        let after_lnum = cursor.lnum.saturating_sub(1).min(line_count);
+        let after_lnum = put_boundary.min(line_count);
         let before = Position {
             lnum: after_lnum.saturating_add(1).min(line_count),
             col: 0,
@@ -5114,30 +5112,6 @@ impl Editor {
             .position(|byte| !matches!(byte, b' ' | b'\t'))
             .unwrap_or(0);
         self.set_window_cursor(window, Position { lnum, col })?;
-        Ok(())
-    }
-
-    /// Drops a leftover empty last line after a whole-buffer visual put
-    /// (`nv_put`'s `empty` cleanup, `normal.c:6684-6695`).
-    fn drop_trailing_empty_line(
-        &mut self,
-        buffer: BufHandle,
-        timestamp: i64,
-    ) -> Result<(), EditorError> {
-        let text = self.buffer(buffer)?.text()?;
-        let line_count = text.line_count();
-        if line_count > 1
-            && text
-                .line(line_count)
-                .map_err(crate::buffer::BufferStateError::from)?
-                .is_empty()
-        {
-            let cursor = Position {
-                lnum: line_count.saturating_sub(1),
-                col: 0,
-            };
-            self.buffer_mut(buffer)?.delete_lines(line_count, line_count, cursor, timestamp)?;
-        }
         Ok(())
     }
 
@@ -5565,6 +5539,55 @@ impl Editor {
                 kind: ToplineSpliceKind::Lines,
             });
             state.skiprows = 0;
+        }
+    }
+
+    /// Reapplies a `:move` line permutation to every position-bearing
+    /// subsystem: lines `start..=end` were spliced to below `dest` (in the
+    /// original numbering), so marks and history on moved lines follow the
+    /// block, positions in the intervening span shift by its size, and
+    /// everything else keeps its line.
+    pub(crate) fn move_line_positions(&mut self, buffer: BufHandle, start: usize, end: usize, dest: usize) {
+        let count = end.saturating_sub(start).saturating_add(1);
+        let adjust = move |lnum: usize| -> usize {
+            if (start..=end).contains(&lnum) {
+                if dest >= end {
+                    lnum + dest - end
+                } else {
+                    lnum + dest + 1 - start
+                }
+            } else if dest >= end {
+                if lnum > end && lnum <= dest {
+                    lnum - count
+                } else {
+                    lnum
+                }
+            } else if lnum > dest && lnum < start {
+                lnum + count
+            } else {
+                lnum
+            }
+        };
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.marks.adjust_lines(&adjust);
+        }
+        self.global_marks.adjust_buffer_lines(buffer, &adjust);
+        self.jumplist.adjust_buffer_lines(buffer, &adjust);
+        self.changelists.adjust_buffer_lines(buffer, &adjust);
+        let windows = &self.windows;
+        let tabpages = &mut self.tabpages;
+        for (&window, &tab) in windows {
+            let Some(tabpage) = tabpages.get_mut(&tab) else {
+                continue;
+            };
+            let Ok(state) = tabpage.window_mut(window) else {
+                continue;
+            };
+            if state.buffer != buffer {
+                continue;
+            }
+            state.cursor.lnum = adjust(state.cursor.lnum);
+            state.topline = adjust(state.topline);
         }
     }
 

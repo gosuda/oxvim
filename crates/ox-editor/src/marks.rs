@@ -151,6 +151,18 @@ impl LocalMarks {
     pub fn splice(&mut self, start: usize, old_count: usize, new_count: usize) {
         self.marks.splice(start, old_count, new_count);
     }
+
+    /// Runs every mark's line number through `adjust` (columns preserved),
+    /// for line permutations a range splice cannot express, like `:move`.
+    pub fn adjust_lines(&mut self, adjust: impl Fn(usize) -> usize) {
+        let entries: Vec<(char, Position)> = self.iter().collect();
+        for (name, position) in entries {
+            let lnum = adjust(position.lnum);
+            if lnum != position.lnum {
+                let _ = self.set(name, Position { lnum, ..position });
+            }
+        }
+    }
 }
 
 /// Global `A-Z` and numbered `0-9` marks.
@@ -232,6 +244,17 @@ impl GlobalMarks {
                 (positions.get(id as u64), self.marks.get_mut(&name))
             {
                 location.position = position;
+            }
+        }
+    }
+
+    /// Runs the line number of every mark pointing at `buffer` through
+    /// `adjust` (columns preserved), for permutations a range splice
+    /// cannot express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        for location in self.marks.values_mut() {
+            if location.buffer() == Some(buffer) {
+                location.position.lnum = adjust(location.position.lnum);
             }
         }
     }
@@ -322,6 +345,17 @@ impl Jumplist {
         new_count: usize,
     ) {
         splice_locations(&mut self.entries, buffer, start, old_count, new_count);
+    }
+
+    /// Runs the line number of every jump into `buffer` through `adjust`
+    /// (columns preserved), for permutations a range splice cannot
+    /// express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        for entry in &mut self.entries {
+            if entry.buffer() == Some(buffer) {
+                entry.position.lnum = adjust(entry.position.lnum);
+            }
+        }
     }
 }
 
@@ -423,6 +457,18 @@ impl Changelists {
             return;
         };
         splice_positions(&mut history.entries, start, old_count, new_count);
+    }
+
+    /// Runs the line number of every retained change in `buffer` through
+    /// `adjust` (columns preserved), for permutations a range splice
+    /// cannot express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        let Some(history) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        for position in &mut history.entries {
+            position.lnum = adjust(position.lnum);
+        }
     }
 
     /// Removes all history and navigation state for `buffer`.
