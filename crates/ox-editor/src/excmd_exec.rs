@@ -29279,15 +29279,10 @@ fn read_vimgrep_file_lines<F: FileIO, E: ExEditorAccess>(
         .io()
         .read_bytes(std::path::Path::new(name))
         .ok()?;
-    Some(
-        bytes
-            .split(|byte| *byte == b'\n')
-            .map(|line| {
-                line.strip_suffix(b"\r")
-                    .map_or_else(|| line.to_vec(), <[u8]>::to_vec)
-            })
-            .collect(),
-    )
+    // `split_read_lines`: the terminal separator ends the last line rather
+    // than opening an empty one, so a file ending in `\n` searches exactly
+    // its buffer lines — a bare `^$` never invents a line past the end.
+    Some(split_read_lines(&bytes))
 }
 
 /// Finds the buffer named `name`, creating an unloaded one when absent so a
@@ -29304,10 +29299,12 @@ fn ensure_vimgrep_buffer<E: ExEditorAccess>(access: &E, name: &str) -> Option<Bu
             return Some(handle);
         }
         let handle = editor.create_buffer(true).ok()?;
-        editor
-            .buffer_mut(handle)
-            .ok()
-            .map(|state| state.set_name(OxStr::from(name)))?;
+        let state = editor.buffer_mut(handle).ok()?;
+        state.set_name(OxStr::from(name));
+        // A buffer created for a name has no text yet; mark it unloaded so
+        // the quickfix jump reads the file (`quickfix::named_buffer` does
+        // the same for its own allocation path).
+        let _ = state.unload();
         Some(handle)
     })
 }
@@ -29455,12 +29452,24 @@ fn command_vimgrep<F: FileIO, E: ExEditorAccess>(
                         break;
                     }
                     // Without `g` only the first match per line is listed;
-                    // `col == endcol` steps one byte past a zero-width match
-                    // so `^`/`$` cannot loop forever (vgr_match_buflines).
+                    // `col == endcol` steps past a zero-width match so
+                    // `^`/`$` cannot loop forever (vgr_match_buflines) — by
+                    // a whole character, not a byte: landing mid-codepoint
+                    // makes the next `position` reject and silently ends
+                    // the line's `g` search.
                     if !split.global {
                         break;
                     }
-                    cursor = found.end.byte + usize::from(found.end.byte == found.start.byte);
+                    cursor = if found.end.byte == found.start.byte {
+                        let lead = line
+                            .get(found.end.byte)
+                            .copied()
+                            .unwrap_or_default();
+                        found.end.byte
+                            + utf8_sequence_len(lead, line.len().saturating_sub(found.end.byte))
+                    } else {
+                        found.end.byte
+                    };
                     if cursor > line.len() {
                         break;
                     }

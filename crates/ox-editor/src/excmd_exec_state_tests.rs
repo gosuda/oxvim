@@ -2652,6 +2652,77 @@ fn vimgrep_builds_list_and_jumps_to_first_match() {
     std::fs::remove_dir_all(&root).unwrap();
 }
 
+/// `:vimgrep` on a file without a buffer lands the jump on the file's
+/// text: the buffer created for its name is marked unloaded, so the
+/// quickfix jump reads disk instead of displaying an empty buffer.
+#[test]
+fn vimgrep_jump_into_created_buffer_shows_file_text() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let pattern = format!("vimgrep /two/ {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let ed = editor.editor();
+    let text = ed
+        .current_buffer()
+        .and_then(|buffer| ed.buffer(buffer).ok())
+        .and_then(|state| state.text().ok().map(|text| text.to_bytes()));
+    assert_eq!(text.as_deref(), Some(b"one\ntwo\n".as_slice()));
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// `:vimgrep` searches exactly the file's buffer lines: the terminal
+/// separator does not open an extra empty line, while a genuine blank
+/// line still matches `^$`.
+#[test]
+fn vimgrep_does_not_invent_a_trailing_empty_line() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "a\n\nb\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let pattern = format!("vimgrep /^$/ {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let ed = editor.editor();
+    let list = ed.quickfix().current().expect("quickfix list");
+    assert_eq!(list.items().len(), 1);
+    assert_eq!(list.items()[0].lnum, 2);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// With `g`, a zero-width match advances by a whole character: on `éx`
+/// the match before `x` survives instead of dying on a mid-character
+/// cursor.
+#[test]
+fn vimgrep_global_zero_width_advances_by_character() {
+    let _guard = crate::lock_process_state();
+    let root = std::env::temp_dir().join(format!("oxvim-vimgrep-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "éx\n").unwrap();
+
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let pattern = format!("vimgrep /\\ze./gj {}/*.txt", root.display());
+    exec.execute_line(&editor, &pattern).unwrap();
+
+    let ed = editor.editor();
+    let list = ed.quickfix().current().expect("quickfix list");
+    let cols: Vec<i64> = list.items().iter().map(|item| item.col).collect();
+    assert_eq!(cols, vec![1, 3]);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 #[test]
 fn writable_vim_variables_match_upstream_table() {
     for name in [
