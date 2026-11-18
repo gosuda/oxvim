@@ -1367,6 +1367,97 @@ mod tests {
         assert!(failure(&mut exec, &editor, "uniq(1)").contains("E686"));
     }
 
+    /// The `{func}` argument parses upstream's modes before a function
+    /// name: `"i"` dedupes case-insensitively and `"n"` numerically, and
+    /// a non-zero number other than `1` is E474.
+    #[test]
+    fn uniq_parses_comparison_modes() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq(['a', 'A', 'b', 'B'], 'i')"),
+            eval(&mut exec, &editor, "['a', 'b']")
+        );
+        // `'n'`: every string key is `strtod("'")` — i.e. `0` — so the
+        // adjacent strings all collapse into the leading `0`.
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([0, 'x', 'y'], 'n')"),
+            eval(&mut exec, &editor, "[0]")
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([1, 1], 0)"),
+            eval(&mut exec, &editor, "[1]")
+        );
+        assert!(failure(&mut exec, &editor, "uniq([1, 1], 5)").contains("E474"));
+    }
+
+    /// A named comparator resolves as a function name without a `{dict}`
+    /// argument, not by passing the raw string to the invocation path.
+    #[test]
+    fn uniq_named_comparator_resolves_a_function_name() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "function! Same(a, b) abort\nreturn a:a == a:b ? 0 : 1\nendfunction",
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "uniq([1, 1, 2, 2], 'Same')"),
+            eval(&mut exec, &editor, "[1, 2]")
+        );
+    }
+
+    /// Mutating `self` inside a `call()`-bound function lands on the
+    /// caller's dictionary: the bound `self` is the same dictionary, not
+    /// a snapshot of it.
+    #[test]
+    fn call_self_mutations_reach_the_bound_dictionary() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let g:d = {'v': 0}\nfunction! Inc() dict abort\nlet self.v += 1\nendfunction",
+        );
+        script(&mut exec, &editor, "call call('Inc', [], g:d)");
+        assert_eq!(eval(&mut exec, &editor, "g:d.v"), Typval::Number(1));
+    }
+
+    /// `extendnew()` merges into a copy: the source dictionary — and a
+    /// live scope namespace — stay unmodified.
+    #[test]
+    fn extendnew_leaves_the_source_and_scope_untouched() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = executor();
+        script(
+            &mut exec,
+            &editor,
+            "let g:a = {'x': 1}\nlet g:b = extendnew(g:a, {'y': 2})",
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "g:a"),
+            eval(&mut exec, &editor, "{'x': 1}")
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "g:b"),
+            eval(&mut exec, &editor, "{'x': 1, 'y': 2}")
+        );
+        script(
+            &mut exec,
+            &editor,
+            "let g:merged = extendnew(g:, {'zz_probe': 1})",
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "g:merged.zz_probe"),
+            Typval::Number(1)
+        );
+        assert_eq!(
+            eval(&mut exec, &editor, "exists('g:zz_probe')"),
+            Typval::Number(0)
+        );
+    }
+
     #[test]
     fn expand_resolves_alternate_and_numbered_buffers_with_modifiers() {
         let editor = TestEditorAccess::new(Editor::new());
