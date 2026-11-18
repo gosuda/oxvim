@@ -16,6 +16,7 @@ use crate::builtins::position::{
 };
 use crate::excmd_exec::{
     EvalHost, Flow, buffer_lines, flow_to_eval_error, parse_program, run_program,
+    sync_editor_into_scope, sync_scope_into_editor,
 };
 use crate::script::LogicalLine;
 use crate::excmd_exec::{SetLayer, option_value, typval_number, typval_to_text};
@@ -1360,13 +1361,20 @@ fn call_win_execute<F: FileIO, E: ExEditorAccess>(
         .access
         .with_ex_editor(|editor| editor.previous_window());
     let saved_directory = std::env::current_dir().ok();
+    let mut switched = false;
     host.access
         .with_ex_editor(|editor| {
             if editor.current_window() != Some(target) {
-                editor.set_current_window(target)
-            } else {
-                Ok(())
+                switched = true;
+                // `ctx_switch`: the caller's `b:`/`w:`/`t:` namespaces
+                // mirror its window; flush its pending writes before the
+                // switch, then mirror the target's locals so the command
+                // below reads and writes the target's variables.
+                let _ = sync_scope_into_editor(editor, scope);
+                editor.set_current_window(target)?;
+                let _ = sync_editor_into_scope(editor, scope);
             }
+            Ok(())
         })
         .map_err(|error: crate::editor::EditorError| {
             EvalError::new("E957", 0, error.to_string())
@@ -1396,12 +1404,22 @@ fn call_win_execute<F: FileIO, E: ExEditorAccess>(
         program.len(),
     );
     host.access.with_ex_editor(|editor| {
+        if switched {
+            // Persist target-side `b:`/`w:`/`t:` writes while the target
+            // window is still current; a stale-identity write would be
+            // dropped after the restore.
+            let _ = sync_scope_into_editor(editor, scope);
+        }
         if let Some(window) = previous
             && editor.current_window() != Some(window)
         {
             let _ = editor.set_current_window(window);
         }
         editor.set_previous_window(previous_previous);
+        if switched {
+            // The scope goes back to mirroring the caller's locals.
+            let _ = sync_editor_into_scope(editor, scope);
+        }
     });
     if !matches!(flow, Flow::Normal) {
         return Err(flow_to_eval_error(flow, "win_execute"));

@@ -25868,16 +25868,22 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
         scope.synced.clear_dirty(ScopeKind::Global);
     }
     sync_buffer_scope(editor, scope)?;
+    // `w:`/`t:` gate on identity as well as version: a current-window or
+    // tabpage switch must rebuild the map even when two windows (or tabs)
+    // share a variable-map version.
     if let Some(window) = editor.current_window() {
         let window_version = editor
             .window_variables_version(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
-        if scope.synced.get(ScopeKind::Window) != window_version {
+        if scope.synced.window_identity() != Some(window)
+            || scope.synced.get(ScopeKind::Window) != window_version
+        {
             let live = editor
                 .window_variables(window)
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
             pull_scope_map_from_editor(live, &mut scope.window, &mut mirror, ScopeKind::Window)?;
+            scope.synced.set_window_identity(Some(window));
             scope.synced.set(ScopeKind::Window, window_version);
             scope.synced.clear_dirty(ScopeKind::Window);
         }
@@ -25886,12 +25892,15 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
         let tab_version = editor
             .tabpage_variables_version(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
-        if scope.synced.get(ScopeKind::Tab) != tab_version {
+        if scope.synced.tab_identity() != Some(tab)
+            || scope.synced.get(ScopeKind::Tab) != tab_version
+        {
             let live = editor
                 .tabpage_variables(tab)
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
             pull_scope_map_from_editor(live, &mut scope.tab, &mut mirror, ScopeKind::Tab)?;
+            scope.synced.set_tab_identity(Some(tab));
             scope.synced.set(ScopeKind::Tab, tab_version);
             scope.synced.clear_dirty(ScopeKind::Tab);
         }
@@ -25942,9 +25951,17 @@ pub(crate) fn sync_editor_into_scope(editor: &Editor, scope: &mut Scope) -> Resu
     // register bank version is unchanged by a buffer switch.
     refresh_special_registers(editor, scope);
     let option_version = editor.options().version();
-    if scope.synced.options() != option_version {
+    // `&l:` values resolve against the current buffer/window, so the
+    // cache key pairs the option-store stamp with that context: a window
+    // switch rebuilds the local table even when the stamp is unchanged.
+    let options_context = (editor.current_buffer(), editor.current_window());
+    if scope.synced.options() != option_version || scope.synced.options_context() != options_context
+    {
         mirror_options(editor, scope);
         scope.synced.set_options(option_version);
+        scope
+            .synced
+            .set_options_context(options_context.0, options_context.1);
     }
     Ok(())
 }
@@ -26144,15 +26161,25 @@ pub(crate) fn sync_scope_into_editor(
         }
     }
 
+    // Same identity rule as `b:` above: a `w:`/`t:` write only lands on
+    // the owner the map was mirrored from — a switched context keeps the
+    // dirt pending for the next read sync rather than writing into the
+    // wrong window/tabpage.
     let window_dirty = scope.synced.is_dirty(ScopeKind::Window);
-    if window_dirty && let Some(window) = editor.current_window() {
+    let window = editor.current_window().filter(|window| {
+        scope
+            .synced
+            .window_identity()
+            .map_or(true, |owner| owner == *window)
+    });
+    if window_dirty && let Some(window) = window {
         let live = editor
             .window_variables_mut(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
         let mut mirror = scope.global_mirror.borrow_mut();
         merge_scope_map_into_editor(live, &scope.window, &mut mirror, ScopeKind::Window)?;
     }
-    if let Some(window) = editor.current_window() {
+    if let Some(window) = window {
         let window_version = editor
             .window_variables_version(window)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -26162,6 +26189,7 @@ pub(crate) fn sync_scope_into_editor(
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
             pull_scope_map_from_editor(live, &mut scope.window, &mut mirror, ScopeKind::Window)?;
+            scope.synced.set_window_identity(Some(window));
             scope.synced.set(ScopeKind::Window, window_version);
         }
         if window_dirty {
@@ -26170,14 +26198,20 @@ pub(crate) fn sync_scope_into_editor(
     }
 
     let tab_dirty = scope.synced.is_dirty(ScopeKind::Tab);
-    if tab_dirty && let Some(tab) = editor.current_tabpage() {
+    let tab = editor.current_tabpage().filter(|tab| {
+        scope
+            .synced
+            .tab_identity()
+            .map_or(true, |owner| owner == *tab)
+    });
+    if tab_dirty && let Some(tab) = tab {
         let live = editor
             .tabpage_variables_mut(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
         let mut mirror = scope.global_mirror.borrow_mut();
         merge_scope_map_into_editor(live, &scope.tab, &mut mirror, ScopeKind::Tab)?;
     }
-    if let Some(tab) = editor.current_tabpage() {
+    if let Some(tab) = tab {
         let tab_version = editor
             .tabpage_variables_version(tab)
             .map_err(|error| ExecError::Editor(error.to_string()))?;
@@ -26187,6 +26221,7 @@ pub(crate) fn sync_scope_into_editor(
                 .map_err(|error| ExecError::Editor(error.to_string()))?;
             let mut mirror = scope.global_mirror.borrow_mut();
             pull_scope_map_from_editor(live, &mut scope.tab, &mut mirror, ScopeKind::Tab)?;
+            scope.synced.set_tab_identity(Some(tab));
             scope.synced.set(ScopeKind::Tab, tab_version);
         }
         if tab_dirty {

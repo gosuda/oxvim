@@ -11,7 +11,10 @@
 
 use std::cell::{Cell, RefCell};
 
-use ox_types::{BufHandle, DictEntry, DictEntryFlags, DictRef, EntryValueLock, OxStr, Typval};
+use ox_types::{
+    BufHandle, DictEntry, DictEntryFlags, DictRef, EntryValueLock, OxStr, TabHandle, Typval,
+    WinHandle,
+};
 
 use crate::error::{EvalError, Result};
 
@@ -115,9 +118,13 @@ pub type ScopeMap = Vec<(OxStr, Typval)>;
 /// [`Scope::remove_pair`]). `Clone` starts empty so a snapshot gets
 /// its own identities instead of aliasing the original's live dicts, and
 /// `PartialEq` ignores the cache so map equality keeps its meaning.
+/// `Script` dicts use the script id (`sc_sid`); buffer/window/tab dicts
+/// key on their owning handle, so a retained `b:` keeps naming the buffer
+/// it was read from when the current buffer moves on. Non-owned kinds
+/// share owner `0`.
 #[derive(Default)]
 struct ScopeDictCache {
-    cached: RefCell<[Option<DictRef>; 8]>,
+    cached: RefCell<std::collections::HashMap<(usize, i64), DictRef>>,
 }
 
 impl std::fmt::Debug for ScopeDictCache {
@@ -259,12 +266,22 @@ pub struct SyncVersions {
     vim: Cell<u64>,
     // The option-store stamp the mirrored `&opt` tables were built from.
     options: Cell<u64>,
+    // The buffer/window identities the mirrored `&opt` local table was
+    // resolved against: `&l:` values follow the current window/buffer, so
+    // a context switch must rebuild the table even when the option-store
+    // stamp is unchanged (`nvim_set_current_win` does not bump it).
+    options_buffer: Cell<Option<BufHandle>>,
+    options_window: Cell<Option<WinHandle>>,
     // The register-store stamp the mirrored `@r` table was built from.
     registers: Cell<u64>,
     // Buffer identity + version tracking: a `current_buffer()` switch
-    // invalidates the cached `b:` map even when versions coincide.
+    // invalidates the cached `b:` map even when versions coincide. The
+    // window/tab handles play the same role for `w:`/`t:` — a current
+    // window/tabpage switch invalidates those maps too.
     buffer_handle: Cell<Option<BufHandle>>,
     buffer_version: Cell<u64>,
+    window_handle: Cell<Option<WinHandle>>,
+    tab_handle: Cell<Option<TabHandle>>,
     // Per-kind dirty flags: a scope-side write the editor has not received.
     dirty_global: Cell<bool>,
     dirty_buffer: Cell<bool>,
@@ -334,6 +351,19 @@ impl SyncVersions {
         self.options.set(version);
     }
 
+    /// The buffer/window context the mirrored `&opt` local table was
+    /// resolved against.
+    #[must_use]
+    pub fn options_context(&self) -> (Option<BufHandle>, Option<WinHandle>) {
+        (self.options_buffer.get(), self.options_window.get())
+    }
+
+    /// Record which buffer/window the `&opt` local table was resolved for.
+    pub fn set_options_context(&self, buffer: Option<BufHandle>, window: Option<WinHandle>) {
+        self.options_buffer.set(buffer);
+        self.options_window.set(window);
+    }
+
     /// The buffer whose variables the cached `b:` map mirrors, if any.
     #[must_use]
     pub fn buffer_identity(&self) -> Option<BufHandle> {
@@ -343,6 +373,28 @@ impl SyncVersions {
     /// Record which buffer the cached `b:` map mirrors.
     pub fn set_buffer_identity(&self, handle: Option<BufHandle>) {
         self.buffer_handle.set(handle);
+    }
+
+    /// The window whose variables the cached `w:` map mirrors, if any.
+    #[must_use]
+    pub fn window_identity(&self) -> Option<WinHandle> {
+        self.window_handle.get()
+    }
+
+    /// Record which window the cached `w:` map mirrors.
+    pub fn set_window_identity(&self, handle: Option<WinHandle>) {
+        self.window_handle.set(handle);
+    }
+
+    /// The tabpage whose variables the cached `t:` map mirrors, if any.
+    #[must_use]
+    pub fn tab_identity(&self) -> Option<TabHandle> {
+        self.tab_handle.get()
+    }
+
+    /// Record which tabpage the cached `t:` map mirrors.
+    pub fn set_tab_identity(&self, handle: Option<TabHandle>) {
+        self.tab_handle.set(handle);
     }
 
     /// The `BufferState::variables_version` the cached `b:` map mirrors.
@@ -516,16 +568,35 @@ impl Scope {
     /// through a live alias) keeps the previous contents instead of
     /// panicking — identity is what the read owes — and the next read
     /// retries the refresh.
+    /// The owner token identifying the live object this kind's map
+    /// mirrors: buffer/window/tab kinds key on their owning handle,
+    /// every other kind shares `0`. A namespace read after the owner
+    /// changed refreshes that owner's own dict — the dict handed out for
+    /// the previous owner keeps its contents, so `let saved = b:` before
+    /// a buffer switch still names the old buffer's variables.
+    fn owner_token(&self, kind: ScopeKind) -> i64 {
+        match kind {
+            ScopeKind::Buffer => self.synced.buffer_identity().map_or(-1, i64::from),
+            ScopeKind::Window => self.synced.window_identity().map_or(-1, i64::from),
+            ScopeKind::Tab => self.synced.tab_identity().map_or(-1, i64::from),
+            _ => 0,
+        }
+    }
+
     #[must_use]
     pub fn scope_dict(&self, kind: ScopeKind) -> Typval {
-        let cached = self.scope_dicts.cached.borrow()[kind.cache_index()].clone();
+        let key = (kind.cache_index(), self.owner_token(kind));
+        let cached = self.scope_dicts.cached.borrow().get(&key).cloned();
         let dict = match cached {
             Some(dict) => dict,
             None => {
                 let Typval::Dict(dict) = Typval::dict_with_entries(Vec::new()) else {
                     unreachable!("dict_with_entries always builds a Dict");
                 };
-                self.scope_dicts.cached.borrow_mut()[kind.cache_index()] = Some(dict.clone());
+                self.scope_dicts
+                    .cached
+                    .borrow_mut()
+                    .insert(key, dict.clone());
                 dict
             }
         };
@@ -554,7 +625,8 @@ impl Scope {
     /// borrow skips the mirror rather than panicking; the next read retries
     /// the refresh.
     fn mirror_cached_pair(&self, kind: ScopeKind, name: &[u8]) {
-        let Some(dict) = self.scope_dicts.cached.borrow()[kind.cache_index()].clone() else {
+        let key = (kind.cache_index(), self.owner_token(kind));
+        let Some(dict) = self.scope_dicts.cached.borrow().get(&key).cloned() else {
             return;
         };
         let stored = find_pair(self.map(kind), name)
@@ -1080,5 +1152,41 @@ mod scope_dict_identity_tests {
         assert_eq!(dict.borrow().get(b"gone"), None);
         let after = scope.scope_dict(ScopeKind::Global);
         assert!(std::rc::Rc::ptr_eq(&dict, &dict_ref(&after)));
+    }
+
+    #[test]
+    fn buffer_dict_stays_attached_to_its_owning_buffer() {
+        let mut scope = Scope::new();
+        let first_buf = BufHandle::try_from(1_i64).unwrap();
+        let second_buf = BufHandle::try_from(2_i64).unwrap();
+        scope.synced.set_buffer_identity(Some(first_buf));
+        scope
+            .set_scoped(ScopeKind::Buffer, b"label", 0, Typval::String(OxStr::from("first")))
+            .unwrap();
+        let saved = dict_ref(&scope.scope_dict(ScopeKind::Buffer));
+
+        // Buffer switch: the map is rebuilt for the new owner.
+        scope.buffer.clear();
+        scope.synced.set_buffer_identity(Some(second_buf));
+        scope
+            .set_scoped(ScopeKind::Buffer, b"label", 0, Typval::String(OxStr::from("second")))
+            .unwrap();
+        let current = dict_ref(&scope.scope_dict(ScopeKind::Buffer));
+
+        assert!(!std::rc::Rc::ptr_eq(&saved, &current));
+        assert_eq!(
+            saved.borrow().get(b"label"),
+            Some(&Typval::String(OxStr::from("first"))),
+            "the retained dict must keep the first buffer's variables"
+        );
+        assert_eq!(
+            current.borrow().get(b"label"),
+            Some(&Typval::String(OxStr::from("second")))
+        );
+
+        // Switching back returns the first buffer's dict identity.
+        scope.synced.set_buffer_identity(Some(first_buf));
+        let back = dict_ref(&scope.scope_dict(ScopeKind::Buffer));
+        assert!(std::rc::Rc::ptr_eq(&saved, &back));
     }
 }
