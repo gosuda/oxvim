@@ -1590,16 +1590,6 @@ fn call_screenpos(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typva
     let snap = vcol_to_byte(line, start_vcol, tabstop);
     let is_tab = line.get(snap) == Some(&b'\t');
     let cursor_vcol = if is_tab { end_last } else { start_vcol };
-    // `textpos2screenpos`: rows below the topline plus filler above the line
-    // (`win_get_fill`, `move.c:1174-1176`); lines above the topline are not
-    // on screen.
-    let filler = crate::diffmode::diff_filler_for(editor, window, lnum);
-    let row_in_window = lnum
-        .saturating_sub(i64::try_from(topline).unwrap_or(i64::MAX))
-        .saturating_add(filler);
-    if row_in_window < 0 {
-        return Ok(zeros());
-    }
     // Long-line wrapping (`move.c:1192-1197`): the character's own row and
     // column shift by whole window widths. There is no horizontal scroll in
     // this model, so `w_leftcol` is 0 and the check is the width alone.
@@ -1610,6 +1600,33 @@ fn call_screenpos(editor: &mut Editor, args: &[Typval]) -> ox_eval::Result<Typva
         .unwrap_or(true);
     let width = geometry.width;
     if width == 0 {
+        return Ok(zeros());
+    }
+    // `textpos2screenpos`: screen rows below the topline plus filler above
+    // the line (`win_get_fill`, `move.c:1174-1176`); lines above the
+    // topline are not on screen. With 'wrap' each line between them occupies
+    // `plines_win` rows (`plines.c:838`), not one, so count them.
+    let filler = crate::diffmode::diff_filler_for(editor, window, lnum);
+    let plain_rows = lnum.saturating_sub(i64::try_from(topline).unwrap_or(i64::MAX));
+    let mut row_in_window = plain_rows.saturating_add(filler);
+    if wrap && plain_rows > 0 {
+        let skip = usize::try_from(topline.saturating_sub(1)).unwrap_or(0);
+        let take = usize::try_from(plain_rows).unwrap_or(usize::MAX);
+        let extra: usize = lines
+            .iter()
+            .skip(skip)
+            .take(take)
+            .map(|line| {
+                let cells = crate::builtins::position::display_len(line, tabstop).max(1);
+                // `plines_win_nofold` with no number-column offsets:
+                // `ceil(cells / width)`, at least 1; the -1 keeps the base
+                // one-row-per-line accounting.
+                cells.div_ceil(width).saturating_sub(1)
+            })
+            .sum();
+        row_in_window = row_in_window.saturating_add(i64::try_from(extra).unwrap_or(i64::MAX));
+    }
+    if row_in_window < 0 {
         return Ok(zeros());
     }
     let (col_adjusted, row_extra) = if wrap && start_vcol >= width {
@@ -1705,6 +1722,50 @@ mod tests {
             .create_tabpage(buffer, crate::Geometry::new(0, 0, 80, 24).unwrap())
             .unwrap();
         editor
+    }
+
+    /// `screenpos()` counts the wrapped rows of lines between the topline
+    /// and the target (`textpos2screenpos` walks `plines_win`, not lnum
+    /// deltas, `move.c:1174-1197`): a 15-cell line in a 10-column window
+    /// pushes the next line down a row, and a column inside the wrap lands
+    /// on the second screen row of its own line.
+    #[test]
+    fn screenpos_counts_wrapped_rows() {
+        let mut editor = Editor::new();
+        let buffer = editor
+            .create_buffer_with(
+                Buffer::from_bytes(b"aaaaaaaaaaaaaaa\nb\n").unwrap(),
+                true,
+            )
+            .unwrap();
+        editor
+            .create_tabpage(buffer, crate::Geometry::new(0, 0, 10, 24).unwrap())
+            .unwrap();
+        let winid = i64::from(editor.current_window().unwrap());
+        let field = |tv: &Typval, key: &[u8]| match tv {
+            Typval::Dict(dict) => match dict.borrow().get(key) {
+                Some(Typval::Number(n)) => *n,
+                _ => panic!("missing numeric field"),
+            },
+            _ => panic!("expected dict"),
+        };
+        let mut at = |lnum, col| {
+            call_screenpos(
+                &mut editor,
+                &[
+                    Typval::Number(winid),
+                    Typval::Number(lnum),
+                    Typval::Number(col),
+                ],
+            )
+            .unwrap()
+        };
+        // Line 2 sits on row 3: line 1 occupies rows 1-2 wrapped.
+        assert_eq!(field(&at(2, 1), b"row"), 3);
+        // Column 11 of line 1 is on that line's second screen row, col 1.
+        let wide = at(1, 11);
+        assert_eq!(field(&wide, b"row"), 2);
+        assert_eq!(field(&wide, b"col"), 1);
     }
 
     /// `f_getwininfo` (`eval/window.c:431-464`): no argument covers every
