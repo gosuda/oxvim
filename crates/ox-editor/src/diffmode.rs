@@ -820,7 +820,10 @@ fn line_number(line: usize) -> i64 {
 /// Collects the hunks between `current` and `other` in ascending order.
 ///
 /// Blocks are computed per compared buffer against the tabpage's reference
-/// buffer, so only pairs touching it resolve; anything else is empty.
+/// buffer, so pairs touching it resolve from the stored list. Any other
+/// pair diffs its own lines directly: upstream records every buffer's
+/// coordinates in each block, so a `:diffget`/`:diffput` between two
+/// non-reference buffers transfers real hunks instead of nothing.
 fn hunks_between(
     editor: &Editor,
     tab: TabHandle,
@@ -849,6 +852,59 @@ fn hunks_between(
                 other: (line_number(from_start), line_number(from_count)),
             });
         }
+    }
+    if !hunks.is_empty() || current == reference || other == reference {
+        return hunks;
+    }
+    // Neither side is the reference: the reference-anchored block list
+    // says nothing about this pair, so compute it directly.
+    let opts = DiffOpts::read(editor);
+    let Ok(current_lines) = crate::excmd_exec::buffer_lines(editor, current) else {
+        return Vec::new();
+    };
+    let Ok(other_lines) = crate::excmd_exec::buffer_lines(editor, other) else {
+        return Vec::new();
+    };
+    let current_text = lines_to_text(
+        &current_lines
+            .iter()
+            .map(|line| compare_key(line, &opts))
+            .collect::<Vec<_>>(),
+    );
+    let other_text = lines_to_text(
+        &other_lines
+            .iter()
+            .map(|line| compare_key(line, &opts))
+            .collect::<Vec<_>>(),
+    );
+    let diff = TextDiff::configure()
+        .algorithm(Algorithm::Myers)
+        .diff_lines(&current_text, &other_text);
+    for operation in diff.ops() {
+        if operation.tag() == DiffTag::Equal {
+            continue;
+        }
+        let hunk = Hunk {
+            current: (
+                line_number(operation.old_range().start + 1),
+                line_number(operation.old_range().len()),
+            ),
+            other: (
+                line_number(operation.new_range().start + 1),
+                line_number(operation.new_range().len()),
+            ),
+        };
+        // Same merging rule `compute_blocks` applies: one block per
+        // contiguous change.
+        if let Some(last) = hunks.last_mut()
+            && last.current.0 + last.current.1 == hunk.current.0
+            && last.other.0 + last.other.1 == hunk.other.0
+        {
+            last.current.1 += hunk.current.1;
+            last.other.1 += hunk.other.1;
+            continue;
+        }
+        hunks.push(hunk);
     }
     hunks
 }
@@ -1638,6 +1694,44 @@ mod diffgetput_tests {
             .unwrap();
         let lines = buffer_strings(&access);
         assert_eq!(lines[20], "20");
+    }
+
+    // diff.c:3757-3795 — an explicit buffer argument selects a source even
+    // when neither endpoint is the reference buffer; the stored blocks are
+    // reference-anchored, so the pair's hunks are computed directly.
+    #[test]
+    fn diffget_transfers_between_two_non_reference_buffers() {
+        let access = editor();
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &access,
+            "diffmode.vim",
+            "call setline(1, ['a', 'b', 'c'])\n\
+             diffthis\n\
+             new\n\
+             call setline(1, ['a', 'B2', 'c'])\n\
+             diffthis\n\
+             new\n\
+             call setline(1, ['a', 'b', 'c'])\n\
+             diffthis",
+        )
+        .unwrap();
+        let source = {
+            let editor = access.editor();
+            let tab = editor.current_tabpage().unwrap();
+            let participants = diff_participants(&editor, tab);
+            assert_eq!(participants.len(), 3);
+            let current = editor.current_buffer().unwrap();
+            participants[1..]
+                .iter()
+                .map(|&(_, buffer)| buffer)
+                .find(|&buffer| buffer != current)
+                .unwrap()
+        };
+        let mut editor = access.editor_mut();
+        diffgetput(&mut editor, false, Some(source), 1, 3, 1).unwrap();
+        drop(editor);
+        assert_eq!(buffer_strings(&access), ["a", "B2", "c"]);
     }
 
     // Test_diffget_diffput_deleted_lines (`3,3diffget` gets nothing,
