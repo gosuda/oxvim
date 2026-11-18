@@ -6049,12 +6049,18 @@ fn msgpack_value_to_typval(value: rmpv::Value, types: &[ox_types::ListRef; 8]) -
             let mut regular = true;
             let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
             for (key, value) in pairs {
+                // Only a msgpack STR key can head a plain Dict: a BIN key
+                // that decodes to a String (no NUL inside) must keep its
+                // binary type, which only the special-map form survives —
+                // `vimfn.txt` requires it and `msgpackdump` re-emits BIN.
+                let is_str_key = matches!(key, rmpv::Value::String(_));
                 let key = msgpack_value_to_typval(key, types);
                 let value = msgpack_value_to_typval(value, types);
                 if regular {
                     match &key {
                         Typval::String(text)
-                            if !text.as_bytes().is_empty()
+                            if is_str_key
+                                && !text.as_bytes().is_empty()
                                 && seen.insert(text.as_bytes().to_vec()) => {}
                         _ => regular = false,
                     }
