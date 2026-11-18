@@ -1673,6 +1673,11 @@ struct VimTimer {
     /// timer visible to `timer_info` while its callback runs (`eval.c:5092`,
     /// `5074-5078`).
     in_flight: bool,
+    /// Set by `timer_stop`/`timer_stopall` — an explicit cancel, as opposed
+    /// to the automatic stop a timer's last firing performs for itself.
+    /// Delivery drops queued firings of a cancelled timer, while the final
+    /// firing of a finished timer still runs its callback.
+    cancelled: bool,
     /// The `self` dictionary cloned into every firing's [`JobEvent`]. One
     /// identity per timer, so [`JobManager::timer_id_for_event`] recognizes
     /// timer firings by `Rc::ptr_eq` instead of by argument shape — a job
@@ -1725,6 +1730,7 @@ impl JobManager {
                 emsg_count: 0,
                 stopped: false,
                 in_flight: false,
+                cancelled: false,
                 receiver,
             },
         );
@@ -1732,8 +1738,23 @@ impl JobManager {
     }
 
     /// Stop the timer, silently ignoring unknown ids (upstream `f_timer_stop`
-    /// returns without touching `rettv` when the id is unknown).
+    /// returns without touching `rettv` when the id is unknown). An explicit
+    /// stop also cancels firings already queued for delivery — upstream
+    /// frees the timer entry and its close callback drops the pending
+    /// event.
     pub fn timer_stop(&mut self, id: u64) {
+        self.stop_timer(id, true);
+    }
+
+    /// Stop the timer without cancelling queued firings: the automatic
+    /// close a timer's last repeat performs still owes its callback the
+    /// delivery that decremented the count (upstream `timer_due_cb` calls
+    /// `callback_call` after `timer->stopped = TRUE`).
+    fn timer_expire(&mut self, id: u64) {
+        self.stop_timer(id, false);
+    }
+
+    fn stop_timer(&mut self, id: u64, cancelled: bool) {
         let Some(timer) = self.timers.get_mut(&id) else {
             return;
         };
@@ -1741,6 +1762,7 @@ impl JobManager {
         let _ignored = ox_uv::Handle::close(&timer.handle, &mut self.loop_);
         timer.armed = false;
         timer.stopped = true;
+        timer.cancelled |= cancelled;
         // A timer stopped from inside its own callback stays listed until the
         // delivery finishes, then `timer_delivered` frees it — upstream's
         // async `timer_close_cb` (`eval.c:5165-5174`).
@@ -1759,6 +1781,13 @@ impl JobManager {
         if timer.stopped {
             self.timers.remove(&id);
         }
+    }
+
+    /// Whether the timer was explicitly cancelled (`timer_stop` /
+    /// `timer_stopall`), so queued firings must not invoke their callback.
+    #[must_use]
+    pub fn timer_is_cancelled(&self, id: u64) -> bool {
+        self.timers.get(&id).is_some_and(|timer| timer.cancelled)
     }
 
     /// Stop every timer (upstream `timer_stop_all`).
@@ -1885,7 +1914,7 @@ impl JobManager {
             stop = timer.emsg_count >= 3;
         }
         if stop {
-            self.timer_stop(id);
+            self.timer_expire(id);
         }
     }
 
@@ -1936,16 +1965,24 @@ impl JobManager {
             return Vec::new();
         }
         let mut events = Vec::with_capacity(fired.len());
+        let mut still_running = Vec::new();
         for id in fired {
-            // The firing is in flight before repeat bookkeeping runs: upstream
-            // raises `refcount` first, so the `timer_stop` a last repeat
-            // performs only marks the timer and the callback still sees it in
-            // `timer_info` (`eval.c:5092-5116`).
-            if let Some(timer) = self.timers.get_mut(&id) {
-                timer.in_flight = true;
+            // A firing of a timer whose callback is still running stays
+            // pending: a nested poll (`sleep 10m` inside the callback) must
+            // not reenter the same callback, so the firing is kept for the
+            // next drain. Other timers still fire.
+            if self.timers.get(&id).is_some_and(|timer| timer.in_flight) {
+                still_running.push(id);
+                continue;
             }
             let (callback, receiver) = match self.timers.get_mut(&id) {
                 Some(timer) if !timer.paused => {
+                    // The firing is in flight before repeat bookkeeping
+                    // runs: upstream raises `refcount` first, so the
+                    // `timer_stop` a last repeat performs only marks the
+                    // timer and the callback still sees it in `timer_info`
+                    // (`eval.c:5092-5116`).
+                    timer.in_flight = true;
                     if timer.repeat_remaining >= 0 {
                         timer.repeat_remaining -= 1;
                     }
@@ -1958,7 +1995,7 @@ impl JobManager {
                 .get(&id)
                 .is_some_and(|timer| timer.repeat_remaining == 0);
             if finished {
-                self.timer_stop(id);
+                self.timer_expire(id);
             } else if self
                 .timers
                 .get(&id)
@@ -1990,6 +2027,9 @@ impl JobManager {
                 receiver,
                 args: vec![Typval::Number(id.cast_signed())],
             });
+        }
+        if let Ok(mut queue) = self.timer_fired.lock() {
+            queue.extend(still_running);
         }
         events
     }

@@ -836,4 +836,142 @@ mod tests {
         };
         assert_eq!(items.borrow().items.len(), 1);
     }
+
+    /// A timer explicitly stopped from another callback does not invoke the
+    /// firing that was already queued behind it (upstream frees the timer
+    /// entry, so the queued event dies with it). The same applies to
+    /// `timer_stopall`: only the callback that ran counts.
+    #[test]
+    fn stopped_timer_queued_firing_does_not_invoke() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            r#"
+            let g:fired = []
+            function! Stopper(timer)
+                let g:fired += ['stopper']
+                call timer_stop(g:victim)
+            endfunction
+            function! Victim(timer)
+                let g:fired += ['victim']
+            endfunction
+            let g:victim = timer_start(0, 'Victim', {'repeat': -1})
+            let g:stopper = timer_start(0, 'Stopper', {'repeat': -1})
+            "#,
+        )
+        .unwrap();
+        // One poll queues both zero-timeout firings. Deliver the Stopper's
+        // event first regardless of queue order — the victim's queued
+        // firing must then be dropped, not invoked.
+        {
+            let (runtime, _) = exec.runtime_scope_mut();
+            let manager = runtime.jobs.as_mut().expect("timers installed a manager");
+            let events = manager.poll().expect("loop poll");
+            manager.defer_events(events);
+        }
+        let mut events = exec.take_deferred_job_events();
+        let callback_name = |event: &crate::JobEvent| match &event.callback {
+            Typval::String(name) => name.to_string_lossy().into_owned(),
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+                funcref.name.to_string_lossy().into_owned()
+            }
+            other => format!("{other:?}"),
+        };
+        let names: Vec<String> = events.iter().map(&callback_name).collect();
+        assert_eq!(names.len(), 2, "both zero-timeout timers fired: {names:?}");
+        let stopper = events
+            .iter()
+            .position(|event| callback_name(event) == "Stopper")
+            .unwrap_or_else(|| panic!("Stopper firing is queued, got {names:?}"));
+        let event = events.remove(stopper);
+        exec.invoke_vimscript_job_callback(&editor, event).unwrap();
+        for event in events {
+            exec.invoke_vimscript_job_callback(&editor, event).unwrap();
+        }
+        let Typval::List(fired) = global(exec.scope(), "fired").expect("g:fired exists") else {
+            panic!("g:fired must be a List");
+        };
+        let fired = fired.borrow();
+        assert_eq!(fired.items.len(), 1, "only the stopper ran: {:?}", fired.items);
+        exec.execute_script(&editor, "<test>", "call timer_stopall()")
+            .unwrap();
+    }
+
+    /// A timer's automatic stop on its last repeat is not a cancellation:
+    /// upstream sets `stopped` inside `timer_due_cb` and still calls the
+    /// final callback. The queued firing must invoke.
+    #[test]
+    fn expired_timer_final_firing_still_invokes() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            r#"
+            let g:count = 0
+            function! Once(timer)
+                let g:count += 1
+            endfunction
+            let g:tid = timer_start(0, 'Once', {'repeat': 1})
+            "#,
+        )
+        .unwrap();
+        {
+            let (runtime, _) = exec.runtime_scope_mut();
+            let manager = runtime.jobs.as_mut().expect("timers installed a manager");
+            let events = manager.poll().expect("loop poll");
+            manager.defer_events(events);
+        }
+        for event in exec.take_deferred_job_events() {
+            exec.invoke_vimscript_job_callback(&editor, event).unwrap();
+        }
+        assert_eq!(global_number(exec.scope(), "count"), Some(1));
+        match exec.evaluate_expression(&editor, "timer_info()").unwrap() {
+            Typval::List(items) => assert!(items.borrow().items.is_empty()),
+            other => panic!("timer_info must answer a List, got {other:?}"),
+        }
+    }
+
+    /// While a timer's callback is still running (`in_flight`), a repeat
+    /// firing collected by a nested poll stays queued instead of producing
+    /// a second event — the callback is never reentered recursively.
+    #[test]
+    fn repeat_firing_stays_pending_while_callback_runs() {
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let (runtime, scope) = exec.runtime_scope_mut();
+        let (mut direct, scope) = Direct::new(runtime, &editor, scope);
+        let id = u64::try_from(number(&direct.call(
+            scope,
+            "timer_start",
+            &[
+                Typval::Number(0),
+                Typval::String(OxStr::from("Cb")),
+                Typval::dict(vec![(OxStr::from("repeat"), Typval::Number(-1))]),
+            ],
+        )))
+        .expect("timer ids are positive");
+        {
+            let (runtime, _) = exec.runtime_scope_mut();
+            let manager = runtime.jobs.as_mut().expect("timer installed a manager");
+            // First poll emits the firing and marks it in flight; the
+            // zero-timeout repeater re-arms inside the same drain.
+            let first = manager.poll().expect("loop poll");
+            assert_eq!(first.len(), 1, "first poll yields one firing");
+            // A nested poll mid-delivery collects the re-armed firing but
+            // cannot turn it into another event while in flight.
+            let nested = manager.poll().expect("loop poll");
+            assert!(
+                nested.is_empty(),
+                "an in-flight timer's repeat stays pending"
+            );
+            // After delivery completes, the pending firing surfaces again.
+            manager.timer_delivered(id);
+            let next = manager.poll().expect("loop poll");
+            assert_eq!(next.len(), 1, "the pending repeat fires next round");
+            manager.timer_stop(id);
+        }
+    }
 }

@@ -1320,6 +1320,19 @@ pub(crate) fn invoke_job_events<F: FileIO, E: ExEditorAccess>(
             .jobs
             .as_ref()
             .and_then(|manager| manager.timer_id_for_event(&event));
+        // A timer explicitly stopped since its firing queued does not
+        // invoke: upstream frees the entry, and the event that was already
+        // queued for it is dropped with the close. Natural expiry (the
+        // last repeat's own stop) still delivers.
+        if let Some(id) = timer_id
+            && let Some(manager) = runtime.jobs.as_ref()
+            && manager.timer_is_cancelled(id)
+        {
+            if let Some(manager) = runtime.jobs.as_mut() {
+                manager.timer_delivered(id);
+            }
+            continue;
+        }
         if event_lua_reference(&event).is_some() {
             if lua.is_none() {
                 redefer_job_events(runtime, vec![event]);

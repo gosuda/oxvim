@@ -1464,6 +1464,19 @@ impl<F: FileIO> ExExecutor<F> {
             .jobs
             .as_ref()
             .and_then(|manager| manager.timer_id_for_event(&event));
+        // A timer explicitly stopped since its firing queued does not
+        // invoke: upstream frees the entry, and the queued event is dropped
+        // with the close. Natural expiry (the last repeat's own stop)
+        // still delivers.
+        if let Some(id) = timer_id
+            && let Some(manager) = self.runtime.jobs.as_ref()
+            && manager.timer_is_cancelled(id)
+        {
+            if let Some(manager) = self.runtime.jobs.as_mut() {
+                manager.timer_delivered(id);
+            }
+            return Ok(());
+        }
         // A stored Funcref must be invoked as a value: a lambda carries its
         // body in the closure registry, and redispatched by name it would hit
         // user-function lookup, which owns no `<lambda>N` entry. Only the
