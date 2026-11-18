@@ -606,6 +606,17 @@ impl Registers {
     /// register, or [`RegisterError::ProviderRequired`] for selection registers
     /// without a clipboard host.
     pub fn set(&mut self, name: char, content: RegisterContent) -> Result<(), RegisterError> {
+        let result = self.set_bank(name, content);
+        // Every successful mutation advances the stamp the evaluator's
+        // register mirror gates on; callers may add their own bumps for
+        // pointer updates, which costs only a skipped cache.
+        if result.is_ok() {
+            self.version = self.version.wrapping_add(1);
+        }
+        result
+    }
+
+    fn set_bank(&mut self, name: char, content: RegisterContent) -> Result<(), RegisterError> {
         match RegisterName::try_from(name)? {
             RegisterName::Named { index, append } => {
                 let Some(slot) = self.named.get_mut(index) else {
@@ -742,6 +753,7 @@ impl Registers {
         match RegisterName::try_from(name)? {
             RegisterName::Selection(selection) => {
                 clipboard.set(selection, &content)?;
+                self.version = self.version.wrapping_add(1);
                 self.unnamed_target = Some(UnnamedTarget::ProviderSnapshot {
                     name: match selection {
                         Selection::Primary => '*',
@@ -846,7 +858,6 @@ impl Registers {
     /// unchanged, like upstream's failed index lookup.
     pub fn set_unnamed_target(&mut self, name: char) {
         self.version = self.version.wrapping_add(1);
-        self.version = self.version.wrapping_add(1);
         if let Ok(parsed) = RegisterName::try_from(name)
             && let Some(target) = unnamed_pointer_name(parsed)
         {
@@ -878,6 +889,19 @@ impl Registers {
     /// Returns [`RegisterError::InvalidName`] if `name` is not a supported
     /// register.
     pub fn set_from_setreg(
+        &mut self,
+        name: char,
+        content: RegisterContent,
+        append: bool,
+    ) -> Result<(), RegisterError> {
+        let result = self.set_from_setreg_bank(name, content, append);
+        if result.is_ok() {
+            self.version = self.version.wrapping_add(1);
+        }
+        result
+    }
+
+    fn set_from_setreg_bank(
         &mut self,
         name: char,
         content: RegisterContent,

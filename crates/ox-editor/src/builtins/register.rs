@@ -527,18 +527,22 @@ fn sync_scope_register<F: FileIO, E: ExEditorAccess>(
     if stored_name.is_ascii_alphabetic()
         || matches!(stored_name, '0'..='9' | '"' | '-' | '/' | '*' | '+')
     {
-        if let Some(stored_bytes) = host.access.with_ex_editor(|editor| {
+        let stored_bytes = host.access.with_ex_editor(|editor| {
             editor
                 .registers()
                 .get(stored_name)
                 .map_err(|error| EvalError::new("E354", 0, error.to_string()))
                 .map(|content| content.map(RegisterContent::getreg_bytes))
-        })? {
-            let byte = u8::try_from(stored_name).map_err(|_| {
-                EvalError::new("E354", 0, format!("invalid register name {stored_name:?}"))
-            })?;
-            scope.set_register(&[byte], Typval::String(OxStr(stored_bytes)));
-        }
+        })?;
+        let byte = u8::try_from(stored_name).map_err(|_| {
+            EvalError::new("E354", 0, format!("invalid register name {stored_name:?}"))
+        })?;
+        // A cleared register reads as an empty string upstream; overwrite
+        // the mirror instead of leaving a stale cached value behind.
+        scope.set_register(
+            &[byte],
+            Typval::String(stored_bytes.map_or_else(|| OxStr::from(""), OxStr)),
+        );
     }
     Ok(())
 }
