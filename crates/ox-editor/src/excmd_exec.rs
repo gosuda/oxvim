@@ -5120,6 +5120,18 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
     fn closure_registry(&self) -> Option<ox_eval::eval::ClosureRegistry> {
         Some(self.runtime.closures.clone())
     }
+
+    fn current_script_id(&self) -> Option<u64> {
+        self.runtime.scripts.current_sid()
+    }
+
+    fn load_script_scope(&mut self, sid: u64, scope: &mut Scope) {
+        self.runtime.scripts.load_script_scope(sid, scope);
+    }
+
+    fn store_script_scope(&mut self, sid: u64, scope: &Scope) {
+        self.runtime.scripts.store_script_scope(sid, scope);
+    }
 }
 
 impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {

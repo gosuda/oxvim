@@ -120,6 +120,23 @@ pub trait BuiltinHost {
     fn closure_registry(&self) -> Option<ClosureRegistry> {
         None
     }
+
+    /// The script id whose `s:` map is currently visible (upstream
+    /// `sc_sid`), when the host keeps per-script variable namespaces.
+    /// `None` means the host has no script concept — a closure then keeps
+    /// its captured `s:` snapshot for the call.
+    fn current_script_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Load `sid`'s live `s:` map into `scope.script`, or an empty map
+    /// when the script holds none. Hosts without per-script namespaces
+    /// leave the scope untouched.
+    fn load_script_scope(&mut self, _sid: u64, _scope: &mut Scope) {}
+
+    /// Persist `scope.script` into `sid`'s `s:` registry — upstream's
+    /// `svars` write-back after a foreign-script call.
+    fn store_script_scope(&mut self, _sid: u64, _scope: &Scope) {}
 }
 
 /// A regex match range plus capture groups one through nine.
@@ -300,6 +317,10 @@ struct Closure {
     params: Vec<OxStr>,
     body: Expr,
     captured: Scope,
+    /// The script that defined the lambda (upstream `sc_sid` at
+    /// definition): `s:` inside the body resolves to that script's live
+    /// map, never to the caller's.
+    sid: Option<u64>,
 }
 
 /// A shared registry of lambda closures.
@@ -750,6 +771,7 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
                     params: params.clone(),
                     body: body.as_ref().clone(),
                     captured: scope.snapshot(),
+                    sid: self.host.current_script_id(),
                 });
                 let name = OxStr(format!("<lambda>{id}").into_bytes());
                 let identity = Some(registry_id.wrapping_mul(0x9e37_79b9).wrapping_add(id));
@@ -1271,7 +1293,25 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         std::mem::swap(&mut scope.window, &mut caller.window);
         std::mem::swap(&mut scope.tab, &mut caller.tab);
         std::mem::swap(&mut scope.vim, &mut caller.vim);
-        std::mem::swap(&mut scope.script, &mut caller.script);
+        // `s:` belongs to the defining script, not the invocation
+        // context (upstream resolves it through `sc_sid`'s `svars`,
+        // which the lambda records at definition). Called from that same
+        // script, the caller's live map is the lambda's own `s:` —
+        // borrow it so writes land directly; called from anywhere else,
+        // flush the caller's map first (so a registry copy is current),
+        // then load the defining script's live registry map. With no
+        // defining script the captured snapshot stays, whose `s:` reads
+        // fail E121 as upstream's empty `svars` do.
+        let shares_caller_script =
+            closure.sid.is_some() && self.host.current_script_id() == closure.sid;
+        if shares_caller_script {
+            std::mem::swap(&mut scope.script, &mut caller.script);
+        } else if let Some(sid) = closure.sid {
+            if let Some(current) = self.host.current_script_id() {
+                self.host.store_script_scope(current, caller);
+            }
+            self.host.load_script_scope(sid, &mut scope);
+        }
         for (param, value) in closure.params.iter().zip(args) {
             // Named parameters resolve both unqualified and as `a:name`.
             scope.local.retain(|(name, _)| name != param);
@@ -1305,7 +1345,14 @@ impl<'a, H: BuiltinHost, R: RegexEngine> Evaluator<'a, H, R> {
         std::mem::swap(&mut scope.window, &mut caller.window);
         std::mem::swap(&mut scope.tab, &mut caller.tab);
         std::mem::swap(&mut scope.vim, &mut caller.vim);
-        std::mem::swap(&mut scope.script, &mut caller.script);
+        if shares_caller_script {
+            std::mem::swap(&mut scope.script, &mut caller.script);
+        } else if let Some(sid) = closure.sid {
+            // Hand the borrowed `s:` map back to the defining script's
+            // registry so the body's `let s:` writes stay visible to the
+            // script and to later calls of this or sibling lambdas.
+            self.host.store_script_scope(sid, &scope);
+        }
         result
     }
 }
