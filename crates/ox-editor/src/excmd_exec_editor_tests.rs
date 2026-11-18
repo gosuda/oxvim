@@ -13422,6 +13422,31 @@ fn dictwatcher_tick_callback_split_fails_e565() {
         other => panic!("expected E565, got {other:?}"),
     }
 }
+/// `tv_dict_watcher_notify` runs inside `tv_dict_extend`/`tv_dict_rm` —
+/// before the builtin returns — so a later operand of the same expression
+/// observes the watcher's side effects. A statement-boundary drain would
+/// deliver the notification one round late.
+#[test]
+fn dictwatcher_fires_before_expression_continues() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_seq.vim",
+            "function! WatchSeqCb(d, k, c)\n  let g:seen = 1\nendfunction\nlet g:d = {}\nlet g:seen = 0\ncall dictwatcheradd(g:d, '*', 'WatchSeqCb')\n",
+        )
+        .unwrap();
+    executor
+        .execute_line(&editor, "let g:result = [extend(g:d, {'x': 1}), g:seen][1]")
+        .unwrap();
+    assert_eq!(global_number(&executor, "result"), 1);
+    executor.execute_line(&editor, "let g:seen = 0").unwrap();
+    executor
+        .execute_line(&editor, "let g:result = [remove(g:d, 'x'), g:seen][1]")
+        .unwrap();
+    assert_eq!(global_number(&executor, "result"), 1);
+}
+
 /// Watchers on `b:`/`w:`/`t:` pin the owning object, like upstream's
 /// `buf_T`-embedded `dict_T`: a `b:` watcher registered in one buffer must
 /// neither fire for another buffer's map nor be deleted from it.

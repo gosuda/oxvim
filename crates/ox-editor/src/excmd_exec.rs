@@ -5066,6 +5066,11 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 new,
             });
         }
+        // `tv_dict_watcher_notify` runs inside `tv_dict_extend`/`tv_dict_rm`
+        // before the builtin returns (eval/typval.c), so a later operand of
+        // the same expression observes the watcher's side effects — the
+        // statement-boundary drain alone would deliver them one round late.
+        drain_dict_watchers(self.runtime, self.access, scope, self.lua);
         result
     }
 
@@ -5093,6 +5098,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 .builtins
                 .call_with_identities(name, args, scope);
             Self::drain_builtins_watch_events(self);
+            drain_dict_watchers(self.runtime, self.access, scope, self.lua);
             return result;
         }
         if ox_eval::is_higher_order_builtin(&name_text) {
@@ -5124,6 +5130,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
                 .builtins
                 .call_with_identities(name, args, scope);
             Self::drain_builtins_watch_events(self);
+            drain_dict_watchers(self.runtime, self.access, scope, self.lua);
             return result;
         }
         if ox_eval::is_higher_order_builtin(&name_text) {
