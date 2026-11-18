@@ -52,7 +52,13 @@ impl CoreState {
     fn new() -> Self {
         Self {
             files: RefCell::new(HashMap::new()),
-            next_file: RefCell::new(3),
+            // The synthetic file descriptors share a Lua-facing number space
+            // with the pipe registry's raw OS descriptors (`fs_close`,
+            // `pipe:open`, `spawn` stdio all take plain numbers). A band far
+            // above any real descriptor keeps the two owners unambiguous
+            // forever — without it `fs_close` could retire an unrelated
+            // file whose number happened to equal a live pipe half.
+            next_file: RefCell::new(1 << 40),
         }
     }
 
