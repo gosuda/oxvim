@@ -19,6 +19,7 @@ use ox_eval::closure_index;
 use ox_eval::exists as exists_in_scope;
 use ox_excmd::{ResolveError, ResolvedCommand, resolve_command};
 use ox_types::{BufHandle, Funcref, Object, OxStr, Special, Typval};
+use std::cmp::Ordering;
 use std::rc::Rc;
 
 use super::input_string_arg;
@@ -94,14 +95,49 @@ fn call_uniq_builtin<F: FileIO, E: ExEditorAccess>(
             "Argument of uniq() must be a List",
         ));
     };
-    let comparator = match args.get(1) {
-        None | Some(Typval::Special(Special::Null)) => None,
-        Some(value) => Some(value.clone()),
+    // `parse_sort_uniq_args` (eval/typval.c:1482): the second argument is
+    // a comparison mode ("i"/"n"/"N"/"f"/"l", or `1` for ignore-case)
+    // before it is ever a function name; absent, `v:null` and `0`/`""`
+    // all mean the default item_compare encoding compare.
+    let mode = match args.get(1) {
+        None | Some(Typval::Special(Special::Null)) => ox_eval::SortMode::Default,
+        Some(value) => ox_eval::parse_sort_mode(Some(value))?,
     };
     let receiver = match args.get(2) {
         None | Some(Typval::Special(Special::Null)) => None,
         Some(value @ Typval::Dict(_)) => Some(value.clone()),
         Some(_) => return Err(EvalError::new("E731", 0, "Using a List as a Dict")),
+    };
+    // Resolve the callback once, upstream's one `item_compare` setup: a
+    // bare function name resolves through `resolve_function_reference`,
+    // and a {dict} receiver binds into the comparator's `self`.
+    let callable = match (&mode, &receiver) {
+        (ox_eval::SortMode::Callback(comparator), receiver) => {
+            match (receiver, comparator) {
+                (Some(receiver), Typval::String(_)) => {
+                    let function =
+                        resolve_function_reference(host.runtime, None, comparator)?;
+                    let function =
+                        bind_function_arguments(function, std::slice::from_ref(receiver))?;
+                    Some(Typval::Partial(function))
+                }
+                (None, Typval::String(_)) => Some(Typval::Funcref(
+                    resolve_function_reference(host.runtime, None, comparator)?,
+                )),
+                (Some(receiver), Typval::Funcref(funcref) | Typval::Partial(funcref)) => {
+                    let function = bind_function_arguments(
+                        funcref.clone(),
+                        std::slice::from_ref(receiver),
+                    )?;
+                    Some(Typval::Partial(function))
+                }
+                (Some(_), _) => {
+                    return Err(EvalError::new("E1085", 0, "not a callable value"))
+                }
+                (None, _) => Some(comparator.clone()),
+            }
+        }
+        _ => None,
     };
     let snapshot = reference
         .try_borrow()
@@ -114,32 +150,16 @@ fn call_uniq_builtin<F: FileIO, E: ExEditorAccess>(
     // item that the last kept item would have swallowed.
     let mut kept = 0_usize;
     for index in 1..snapshot.len() {
-        let duplicate = match &comparator {
-            None => snapshot[kept] == snapshot[index],
-            Some(comparator) => {
-                let callable = match (&receiver, comparator) {
-                    (Some(receiver), Typval::String(name)) => {
-                        let function = resolve_function_reference(
-                            host.runtime,
-                            None,
-                            &Typval::String(name.clone()),
-                        )?;
-                        let function =
-                            bind_function_arguments(function, std::slice::from_ref(receiver))?;
-                        Typval::Partial(function)
-                    }
-                    (Some(receiver), Typval::Funcref(funcref) | Typval::Partial(funcref)) => {
-                        let function = bind_function_arguments(
-                            funcref.clone(),
-                            std::slice::from_ref(receiver),
-                        )?;
-                        Typval::Partial(function)
-                    }
-                    (None, comparator) => comparator.clone(),
-                    (Some(_), _) => return Err(EvalError::new("E1085", 0, "not a callable value")),
-                };
+        let duplicate = match &callable {
+            // `do_uniq` removes the item when `item_compare` answers 0 —
+            // for the flag modes, an equal ordering under that mode.
+            None => {
+                ox_eval::sort_mode_ordering(&mode, &snapshot[kept], &snapshot[index])
+                    == Ordering::Equal
+            }
+            Some(callable) => {
                 let value = Evaluator::new(host, &VimRegex).invoke(
-                    callable,
+                    callable.clone(),
                     vec![snapshot[kept].clone(), snapshot[index].clone()],
                     scope,
                 )?;
