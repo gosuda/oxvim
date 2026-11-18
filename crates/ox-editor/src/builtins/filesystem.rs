@@ -3,19 +3,82 @@
 //! option its `recover_names` scan walks.
 
 use crate::excmd_exec::ExEditorAccess;
-use ox_types::Typval;
+use ox_eval::{Evaluator, Parser as ExprParser, Scope};
+use ox_types::{OxStr, Typval};
 
 use crate::options::OptionValue;
 use crate::script::FileIO;
 
-use crate::excmd_exec::EvalHost;
+use crate::excmd_exec::{EvalHost, VimRegex};
+
+/// `f_readdir`'s optional `{expr}` filter (`fs.c` `readdir_checkitem`
+/// 1182-1207): `v:val` and the callback's single argument both carry the
+/// entry name, a 0 result drops the entry, -1 ends the scan, and anything
+/// else keeps it. Strings evaluate as expressions; Funcrefs and Partials
+/// invoke with the name.
+fn readdir_filtered<F: FileIO, E: ExEditorAccess>(
+    host: &mut EvalHost<'_, F, E>,
+    args: &[Typval],
+    scope: &mut Scope,
+) -> ox_eval::Result<Typval> {
+    let list = crate::fs_builtins::call(host.runtime.scripts.io(), "readdir", &args[..1])?;
+    let Typval::List(reference) = &list else {
+        return Ok(list);
+    };
+    let entries = reference.borrow().items.clone();
+    let regex = VimRegex;
+    let mut kept = Vec::with_capacity(entries.len());
+    for item in entries {
+        let result = match &args[1] {
+            callable @ (Typval::Funcref(_) | Typval::Partial(_)) => {
+                Evaluator::new(host, &regex).invoke(callable.clone(), vec![item.clone()], scope)?
+            }
+            other => {
+                let source = super::input_string_arg(other)?;
+                let expression = ExprParser::new(source.as_bytes()).parse()?;
+                // `readdir_checkitem`: set_vim_var_string(VV_VAL) before
+                // eval, restore after — the save/restore is unconditional.
+                // The slot lives on the live scope's `v:` map: the editor's
+                // vvars only reach the scope through a versioned sync this
+                // expression never triggers.
+                let saved = scope
+                    .vim
+                    .iter()
+                    .position(|(key, _)| key.as_bytes() == b"val")
+                    .map(|at| (at, scope.vim[at].1.clone()));
+                match saved {
+                    Some((at, _)) => scope.vim[at].1 = item.clone(),
+                    None => scope.vim.push((OxStr::from("val"), item.clone())),
+                }
+                let outcome = Evaluator::new(host, &regex).eval(&expression, scope);
+                match saved {
+                    Some((at, value)) => scope.vim[at].1 = value,
+                    None => scope
+                        .vim
+                        .retain(|(key, _)| key.as_bytes() != b"val"),
+                }
+                outcome?
+            }
+        };
+        match ox_eval::builtins::number_arg(&result)? {
+            0 => continue,
+            -1 => break,
+            _ => kept.push(item),
+        }
+    }
+    Ok(Typval::list(kept))
+}
 
 /// Routes one filesystem builtin.
 pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
     name: &str,
     args: &[Typval],
+    scope: &mut Scope,
 ) -> ox_eval::Result<Typval> {
+    if name == "readdir" && args.len() >= 2 {
+        return readdir_filtered(host, args, scope);
+    }
     if name == "swapfilelist" {
         // f_swapfilelist iterates the 'directory' option (recover_names); the
         // option has no static default upstream (it is computed at startup),
@@ -153,5 +216,60 @@ fn collect_glob_matches<F: FileIO>(
         if let Typval::String(s) = item {
             all_matches.push(s.to_string_lossy().into_owned());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_eval::ScopeKind;
+    use ox_types::Typval;
+
+    use crate::excmd_exec::ExEditorAccess as _;
+    use crate::{Editor, ExExecutor, TestEditorAccess};
+
+    fn global_string(exec: &ExExecutor<crate::script::RealFileIO>, name: &str) -> Option<String> {
+        match exec
+            .scope()
+            .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
+            .ok()?
+        {
+            Typval::String(text) => Some(text.to_string_lossy().into_owned()),
+            Typval::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    }
+
+    /// `readdir({dir}, {expr})` binds `v:val` to each entry and keeps it
+    /// while the expression is non-zero (`readdir_checkitem`,
+    /// `fs.c:1182-1207`): 0 drops the entry and -1 also stops the scan.
+    #[test]
+    fn readdir_evaluates_filter_with_vval() {
+        let dir = std::env::temp_dir().join(format!("oxvim-readdir-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["alpha.txt", "beta.md", "gamma.txt"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let editor = TestEditorAccess::new(Editor::new());
+        let mut exec = ExExecutor::new();
+        let path = dir.display().to_string();
+        exec.execute_script(
+            &editor,
+            "<test>",
+            &format!("let g:kept = join(sort(readdir('{path}', 'v:val =~ \"txt$\"')), '|')"),
+        )
+        .unwrap();
+        assert_eq!(
+            global_string(&exec, "kept"),
+            Some("alpha.txt|gamma.txt".to_owned())
+        );
+        exec.execute_script(
+            &editor,
+            "<test>",
+            &format!("let g:stopped = len(readdir('{path}', '-1'))"),
+        )
+        .unwrap();
+        assert_eq!(global_string(&exec, "stopped"), Some("0".to_owned()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

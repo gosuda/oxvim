@@ -160,7 +160,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         Family::Buffer => buffer::call(host, name, args, scope),
         Family::Environment => environment::call(host, name, args),
         Family::Eval => eval::call(host, name, args, scope),
-        Family::FileSystem => filesystem::call(host, name, args),
+        Family::FileSystem => filesystem::call(host, name, args, scope),
         Family::Fold => fold::call(host, name, args),
         Family::Input => input::call(host, name, args),
         Family::Mapping => mapping::call(host, name, args, scope),
