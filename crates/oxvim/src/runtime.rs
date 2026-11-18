@@ -123,6 +123,7 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
         (cli.no_write && !cli.no_modifiable, "-m"),
         (cli.no_swap_file, "-n"),
         (cli.binary, "-b"),
+        (cli.diff_mode, "-d"),
     ] {
         if requested {
             arguments.push(flag.into());
@@ -418,8 +419,25 @@ pub fn open_startup_buffers(
             binary: cli.binary,
         },
     )?;
-    if cli.window_layout != WindowLayout::Single {
-        create_startup_windows(editor, cli, &buffers)?;
+    // `set_window_layout` (main.c:1651): `-d` without an explicit `-o`,
+    // `-O` or `-p` still opens one window per file — a vertical split,
+    // unless 'diffopt' asks for horizontal diffs.
+    let layout = if cli.diff_mode && cli.window_layout == WindowLayout::Single {
+        let horizontal = matches!(
+            editor.options().get_global("diffopt"),
+            Ok(OptionValue::String(value))
+                if value.split(',').any(|flag| flag.trim() == "horizontal")
+        );
+        if horizontal {
+            WindowLayout::Horizontal
+        } else {
+            WindowLayout::Vertical
+        }
+    } else {
+        cli.window_layout
+    };
+    if layout != WindowLayout::Single {
+        create_startup_windows(editor, cli, layout, &buffers)?;
     }
     if cli.diff_mode {
         // `-d` is `diff_mode` in `main.c`: every window that shows a startup
@@ -631,6 +649,7 @@ fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
 fn create_startup_windows(
     editor: &mut Editor,
     cli: &Cli,
+    layout: WindowLayout,
     buffers: &[BufHandle],
 ) -> Result<(), AppError> {
     let editor_error = |error: EditorError| AppError::Editor(error.to_string());
@@ -646,7 +665,7 @@ fn create_startup_windows(
             Some(buffer) => *buffer,
             None => editor.create_buffer(true).map_err(editor_error)?,
         };
-        if cli.window_layout == WindowLayout::Tabs {
+        if layout == WindowLayout::Tabs {
             let geometry =
                 Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?;
             editor
@@ -654,7 +673,7 @@ fn create_startup_windows(
                 .map_err(editor_error)?;
             continue;
         }
-        previous = if cli.window_layout == WindowLayout::Vertical {
+        previous = if layout == WindowLayout::Vertical {
             editor
                 .split_vertical(first_tab, previous, buffer, true)
                 .map_err(editor_error)?
@@ -1082,7 +1101,11 @@ impl Scheduler for ImmediateScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::split_commands;
+    use ox_editor::Editor;
+    use ox_editor::options::OptionValue;
+
+    use super::{interactive_child_arguments, open_startup_buffers, split_commands};
+    use crate::cli::Cli;
 
     #[test]
     fn splits_only_unquoted_unescaped_bars() {
@@ -1090,5 +1113,50 @@ mod tests {
             split_commands("echo 'a|b' | echo \"c|d\" | echo e\\|f"),
             ["echo 'a|b'", "echo \"c|d\"", "echo e\\|f"]
         );
+    }
+
+    /// `main.c` `command_line_scan` forwards every startup flag to the
+    /// `--embed` child: `-d` must survive so the child enters diff mode.
+    #[test]
+    fn interactive_child_arguments_forward_diff_mode() {
+        let cli = Cli::parse(["-d", "left", "right"].into_iter()).expect("parse -d");
+        let arguments = interactive_child_arguments(&cli);
+        assert!(arguments.iter().any(|arg| arg == "-d"));
+    }
+
+    /// `set_window_layout` (main.c:1651): `-d` alone opens one vertical
+    /// window per file and marks every shown startup window 'diff';
+    /// an explicit `-o` keeps its own layout.
+    #[test]
+    fn diff_mode_defaults_to_vertical_splits() {
+        let dir = std::env::temp_dir().join(format!("oxvim-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let left = dir.join("left");
+        let right = dir.join("right");
+        std::fs::write(&left, b"a\n").unwrap();
+        std::fs::write(&right, b"b\n").unwrap();
+        let cli = Cli::parse(
+            [
+                "-d".to_owned(),
+                left.display().to_string(),
+                right.display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("parse -d");
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, ox_editor::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        open_startup_buffers(&mut editor, &cli, None).unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let windows = editor.tabpage_windows(tab).unwrap();
+        assert_eq!(windows.len(), 2, "-d splits one window per file");
+        for window in windows {
+            let diff = editor.options().get_window(window, "diff").unwrap();
+            assert!(matches!(diff, OptionValue::Boolean(true)));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
