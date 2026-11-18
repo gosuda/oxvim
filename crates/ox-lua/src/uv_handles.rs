@@ -2116,12 +2116,9 @@ pub(crate) fn install(
             spawn_options.gid = options.get::<Option<u32>>("gid")?;
             let stdio = options.get::<Option<Table>>("stdio")?;
             let mut pipe_targets: [Option<LuaProcessPipe>; 3] = [None, None, None];
-            // Descriptors that came out of the registry and move into a child
-            // slot here; `None` leaves the slot's `StdioConfig` in charge.
+            // Descriptors duplicated out of the registry for child slots;
+            // `None` leaves the slot's `StdioConfig` in charge.
             let mut owned_slots: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
-            // Numbers to mark as spawned, applied only after the spawn starts
-            // so a rejected `stdio` table leaves no marker behind.
-            let mut owned_descriptors: Vec<i32> = Vec::new();
             if let Some(stdio) = stdio {
                 for (index, target) in pipe_targets.iter_mut().enumerate() {
                     match stdio.raw_get::<Value>(index + 1)? {
@@ -2138,20 +2135,23 @@ pub(crate) fn install(
                                 u8::try_from(fd).map_err(mlua::Error::external)?,
                             );
                         }
-                        // A number this host created is a real descriptor
-                        // slot: take it, and the spawn owns it from here.
+                        // A number this host created is inherited, not
+                        // consumed (`luvref.txt`): copy it for the slot, so
+                        // `{nil, p.write, p.write}` fills both and the
+                        // original stays in the parent's registry until
+                        // `fs_close`.
                         Value::Integer(fd) => {
                             let descriptor = i32::try_from(fd)
                                 .map_err(mlua::Error::external)?;
                             let owned = spawn_registry
-                                .borrow_mut()
-                                .take(descriptor);
+                                .borrow()
+                                .dup(descriptor)
+                                .map_err(mlua::Error::external)?;
                             let Some(owned) = owned else {
                                 return Err(mlua::Error::runtime(
                                     "stdio entries must be pipe handles, false, nil, or descriptors 0, 1, or 2",
                                 ));
                             };
-                            owned_descriptors.push(descriptor);
                             spawn_options.stdio[index] = StdioConfig::Ignore;
                             owned_slots[index] = Some(owned);
                         }
@@ -2188,11 +2188,6 @@ pub(crate) fn install(
                         mlua::Error::external(error)
                     }
                 })?;
-            // The spawn took the descriptors; record the numbers the Lua side
-            // still closes so `fs_close` answers once and then `EBADF`.
-            for descriptor in owned_descriptors {
-                spawn_registry.borrow_mut().mark_spawned(descriptor);
-            }
             let mut pipes = spawned.pipes;
             if let (Some(target), Some(pipe)) = (&pipe_targets[0], pipes.stdin.take()) { target.install_endpoint(pipe); }
             if let (Some(target), Some(pipe)) = (&pipe_targets[1], pipes.stdout.take()) { target.install_endpoint(pipe); }
