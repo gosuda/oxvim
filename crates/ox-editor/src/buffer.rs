@@ -403,6 +403,9 @@ pub struct BufferState {
     saved_changedtick: u64,
     /// Final-EOL state at the last save.
     saved_has_eol: bool,
+    /// File bytes as last read from or written to disk (`:checktime`
+    /// baseline; `None` when the buffer never synced with a file).
+    file_baseline: Option<Vec<u8>>,
     /// Undo-tree state corresponding to the last saved contents, as the
     /// header sequence and how many edits that header held. The edit count is
     /// part of it because a header keeps growing while its block is open, so
@@ -494,6 +497,7 @@ impl BufferState {
             saved_has_eol,
             saved_undo_state: (0, 0),
             forced_modified: false,
+            file_baseline: None,
             attachments: 0,
             did_filetype: false,
             file_path: None,
@@ -805,6 +809,24 @@ impl BufferState {
     pub fn mark_modified(&mut self) {
         self.forced_modified = true;
         self.flags.set(BufferFlags::MODIFIED, true);
+    }
+
+    /// Records the file's bytes as last synced with this buffer.
+    ///
+    /// `:checktime` compares disk contents against this baseline
+    /// (`buf_check_timestamp` content check): a timestamp-only touch keeps
+    /// identical bytes and stays silent, while a local edit leaves the
+    /// baseline untouched so it can still tell an external change apart.
+    /// `None` is upstream's `b_mtime == 0` — never read nor written — and
+    /// the timestamp check skips the buffer entirely.
+    pub fn note_file_sync(&mut self, bytes: Vec<u8>) {
+        self.file_baseline = Some(bytes);
+    }
+
+    /// Returns the file bytes recorded at the last read or write, if any.
+    #[must_use]
+    pub fn file_baseline(&self) -> Option<&[u8]> {
+        self.file_baseline.as_deref()
     }
 
     /// Records the current undo state as saved and clears `'modified'`.

@@ -9654,8 +9654,8 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     if !matches!(flow, Flow::Normal) {
         return flow;
     }
-    let text = match read_file_text(runtime, access, buffer, path) {
-        Ok(text) => text,
+    let (raw, text) = match read_file_text(runtime, access, buffer, path) {
+        Ok(read) => read,
         Err(error) => {
             return error_flow(
                 runtime,
@@ -9670,6 +9670,7 @@ fn edit_reload_current<F: FileIO, E: ExEditorAccess>(
     };
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
+            state.note_file_sync(raw);
             state.load(text);
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
             editor.do_autochdir();
@@ -11035,13 +11036,18 @@ fn load_swap_recovery<F: FileIO, E: ExEditorAccess>(
     let bytes = runtime.scripts.io().read_bytes(swap).map_err(|_| ())?;
     let snapshot = SwapFile::read(&bytes[..]).map_err(|_| ())?;
     let recovered = snapshot.buffer.to_bytes();
-    let differs = access.with_ex_editor(|editor| {
+    // 'modified' answers to the original file on disk, not the buffer the
+    // recovery replaces — same rule as `recover_from_swap_file`.
+    let original = access.with_ex_editor(|editor| {
         editor
             .buffer(buffer)
             .ok()
-            .and_then(|state| state.text().ok())
-            .is_none_or(|text| text.to_bytes() != recovered)
+            .map(|state| path_from_ox_str(state.name()))
     });
+    let differs = match original {
+        Some(path) => recovered_differs_from_file(runtime, access, &path, &recovered),
+        None => true,
+    };
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
             state.load(snapshot.buffer);
@@ -11683,13 +11689,16 @@ fn recover_from_swap_file<F: FileIO, E: ExEditorAccess>(
         );
     });
     let recovered = snapshot.buffer.to_bytes();
-    let differs = access.with_ex_editor(|editor| {
-        editor
-            .buffer(buffer)
-            .ok()
-            .and_then(|state| state.text().ok())
-            .is_none_or(|text| text.to_bytes() != recovered)
-    });
+    // `ml_recover` (memline.c:939-948): 'modified' and the post-recovery
+    // message both answer to the ORIGINAL FILE — comparing against the
+    // pre-recovery buffer would clear 'modified' on text that still has
+    // unsaved changes versus disk, and a `:q` would drop them silently.
+    let differs = recovered_differs_from_file(
+        runtime,
+        access,
+        Path::new(original),
+        &recovered,
+    );
     access.with_ex_editor(|editor| {
         if let Ok(state) = editor.buffer_mut(buffer) {
             state.load(snapshot.buffer);
@@ -13761,15 +13770,42 @@ pub fn detect_file_format(
 
 /// Loads `path` for `buffer` the way `readfile` does: run the 'fileformats'
 /// EOL detection, normalize line separators to `\n`, then record the result
-/// as the buffer-local 'fileformat' and 'endofline'.
+/// as the buffer-local 'fileformat' and 'endofline'. Answers the raw file
+/// bytes beside the normalized text: the raw half is the buffer's
+/// `:checktime` baseline — a timestamp-only touch compares byte-identical.
 fn read_file_text<F: FileIO, E: ExEditorAccess>(
     runtime: &ExRuntime<F>,
     access: &E,
     buffer: BufHandle,
     path: &Path,
-) -> std::io::Result<Vec<u8>> {
+) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let bytes = runtime.scripts.io().read_bytes(path)?;
-    Ok(access.with_ex_editor(|editor| detect_file_format(editor, Some(buffer), &bytes).text))
+    let text = access.with_ex_editor(|editor| detect_file_format(editor, Some(buffer), &bytes).text);
+    Ok((bytes, text))
+}
+
+/// Whether the recovered text differs from the original file on disk — the
+/// `ml_recover` baseline that decides `'modified'` and the post-recovery
+/// message. The file is read with its 'fileformats' normalization so the
+/// comparison runs in the same domain as swap-snapshot text. An unreadable
+/// original answers `true`: recovered text that cannot be checked stays
+/// conservatively modified rather than risking a silent `:q`.
+fn recovered_differs_from_file<F: FileIO, E: ExEditorAccess>(
+    runtime: &ExRuntime<F>,
+    access: &E,
+    path: &Path,
+    recovered: &[u8],
+) -> bool {
+    let bytes = match runtime.scripts.io().read_bytes(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return true,
+    };
+    access.with_ex_editor(|editor| {
+        let text = detect_file_format(editor, None, &bytes).text;
+        Buffer::from_bytes(&text)
+            .map(|file| file.to_bytes() != recovered)
+            .unwrap_or(true)
+    })
 }
 
 /// Splits read bytes into buffer lines. A trailing newline terminates the last
@@ -14113,6 +14149,7 @@ fn command_write<F: FileIO, E: ExEditorAccess>(
             #[cfg(not(unix))]
             let saved: OxStr = OxStr::from(path.to_string_lossy().as_ref());
             state.set_name(saved);
+            state.note_file_sync(bytes.clone());
             state.mark_saved();
             state.flags.set(crate::BufferFlags::NOTEDITED, false);
         }
@@ -17376,8 +17413,8 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
         return Ok(entered());
     }
 
-    let content = match read_file_text(runtime, access, buffer, &path) {
-        Ok(content) => content,
+    let (raw, content) = match read_file_text(runtime, access, buffer, &path) {
+        Ok(read) => read,
         Err(error) => {
             rollback_buffer_switch(access, buffer, &mut restore, true);
             return Err(LoadSwitchError::Read {
@@ -17395,6 +17432,7 @@ fn load_buffer_for_switch<F: FileIO, E: ExEditorAccess>(
     };
     if let Err(error) = access.with_ex_editor(|editor| -> Result<(), EditorError> {
         let state = editor.buffer_mut(buffer)?;
+        state.note_file_sync(raw);
         state.load(text);
         state.mark_saved();
         state.flags.set(crate::BufferFlags::NOTEDITED, false);
@@ -21129,17 +21167,21 @@ fn command_checktime<F: FileIO, E: ExEditorAccess>(
             // stays silent instead of guessing `E211`.
             Err(_) => continue,
         };
-        let current = access.with_ex_editor(|editor| {
+        // Change detection answers to the last-read/last-written baseline,
+        // not the live buffer: a local edit without an external change must
+        // not masquerade as W12 (`buf_check_timestamp` compares against the
+        // buffer's own file state). `None` is upstream's `b_mtime == 0` —
+        // the buffer never synced with a file, so the check stays silent.
+        let baseline = access.with_ex_editor(|editor| {
             editor
                 .buffer(buffer)
                 .ok()
-                .and_then(|state| state.text().ok())
-                .map(|text| buffer_file_bytes(editor, buffer, text))
+                .and_then(|state| state.file_baseline().map(|bytes| bytes.to_vec()))
         });
-        let Some(current) = current else {
+        let Some(baseline) = baseline else {
             continue;
         };
-        if disk == current {
+        if disk == baseline {
             continue;
         }
         let autoread = access.with_ex_editor(|editor| {
@@ -21149,7 +21191,13 @@ fn command_checktime<F: FileIO, E: ExEditorAccess>(
             )
         });
         if autoread && !modified {
-            let text = match Buffer::from_bytes(&disk) {
+            // The reload goes through the 'fileformats' detection path: raw
+            // CRLF bytes never reach buffer content, and 'fileformat' plus
+            // 'endofline' track the file's new shape.
+            let text = access.with_ex_editor(|editor| {
+                detect_file_format(editor, Some(buffer), &disk).text
+            });
+            let text = match Buffer::from_bytes(&text) {
                 Ok(text) => text,
                 Err(error) => return error_flow(runtime, "E474", error.to_string()),
             };
@@ -21157,6 +21205,7 @@ fn command_checktime<F: FileIO, E: ExEditorAccess>(
                 editor
                     .buffer_mut(buffer)
                     .map(|state| {
+                        state.note_file_sync(disk.clone());
                         state.load(text);
                         state.flags.set(crate::BufferFlags::NOTEDITED, false);
                     })

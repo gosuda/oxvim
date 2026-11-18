@@ -12124,6 +12124,61 @@ fn checktime_reloads_changed_buffer_under_autoread() {
     assert_eq!(buffer_text(&editor), vec!["changed"]);
 }
 
+/// `:checktime` stays silent when only the buffer was edited locally:
+/// change detection compares disk against the last-read baseline
+/// (`buf_check_timestamp`'s own file state), not the live text — an
+/// unsaved local edit without an external change is not a W12.
+#[test]
+fn checktime_quiet_when_only_the_buffer_was_edited() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("current.txt", "disk\n");
+    executor.execute_line(&editor, "edit current.txt").unwrap();
+    executor.execute_line(&editor, "set noautoread").unwrap();
+    executor
+        .execute_line(&editor, "call setline(1, 'local edit')")
+        .unwrap();
+    let seen = editor.editor().messages().len();
+    executor.execute_line(&editor, "checktime").unwrap();
+    let fresh: Vec<String> = editor.editor().messages()[seen..]
+        .iter()
+        .map(|message| match &message.content {
+            ox_types::Object::String(text) => text.to_string_lossy().into_owned(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert!(
+        !fresh.iter().any(|text| text.contains("W1")),
+        "a local edit alone must not warn, got: {fresh:?}",
+    );
+}
+
+/// `:checktime`'s autoread reload normalizes separators through the
+/// 'fileformats' path: a dos file's CRLF never becomes buffer content,
+/// 'fileformat' stays `dos`, and 'endofline' tracks the file.
+#[test]
+fn checktime_reload_normalizes_dos_separators() {
+    let (editor, mut executor) = setup();
+    executor.scripts().io().insert("dos.txt", "first\r\nsecond\r\n");
+    executor.execute_line(&editor, "edit dos.txt").unwrap();
+    executor.execute_line(&editor, "set autoread").unwrap();
+    executor.scripts().io().insert("dos.txt", "alpha\r\nbeta\r\n");
+    executor.execute_line(&editor, "checktime").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["alpha", "beta"]);
+    let fileformat = editor.editor().current_buffer().and_then(|buffer| {
+        editor
+            .editor()
+            .options()
+            .get_buffer(buffer, "fileformat")
+            .ok()
+            .cloned()
+            .and_then(|value| match value {
+                crate::OptionValue::String(text) => Some(text),
+                _ => None,
+            })
+    });
+    assert_eq!(fileformat.as_deref(), Some("dos"));
+}
+
 /// `:tabfirst` (and `:tabrewind`) enters the first tabpage.
 /// Upstream: `ex_tabnext` `CMD_tabfirst`/`CMD_tabrewind` → `goto_tabpage(1)`.
 #[test]
@@ -13530,6 +13585,49 @@ fn recover_restores_swapfile_content() {
     // No swapfile for an unnamed, unmodified buffer: `E305`.
     let (clean, mut clean_executor) = setup();
     assert_vim_error(clean_executor.execute_line(&clean, "recover"), "E305");
+}
+
+/// `:recover!` keeps `'modified'` when the swapfile text matches the
+/// current buffer but still differs from the original file (`ml_recover`'s
+/// baseline is the file on disk, not the pre-recovery buffer) — otherwise
+/// a plain `:q` would silently drop the recovered text.
+#[test]
+fn recover_keeps_modified_when_recovered_text_differs_from_file() {
+    let io = MemoryFileIO::new();
+    io.insert("orig.txt", "original\n");
+    let editor = TestEditorAccess::new(Editor::new());
+    let buffer = editor.editor_mut().create_buffer(true).unwrap();
+    editor
+        .editor_mut()
+        .create_tabpage(buffer, Geometry::new(0, 0, 80, 24).unwrap())
+        .unwrap();
+    let mut executor = ExExecutor::with_io(io.clone());
+    executor.execute_line(&editor, "edit orig.txt").unwrap();
+    executor.execute_line(&editor, "set directory=.").unwrap();
+    // The swapfile carries the same text the buffer was just edited into:
+    // preserving the old comparison (recovered vs current buffer) would
+    // clear 'modified' although the text was never written to disk.
+    executor
+        .execute_line(&editor, "call setline(1, 'edited')")
+        .unwrap();
+    let snapshot = Buffer::from_lines(&[b"edited".to_vec()], true).unwrap();
+    let mut swap = Vec::new();
+    ox_text::SwapFile::new("orig.txt", snapshot)
+        .write(&mut swap)
+        .unwrap();
+    io.insert_blob(".orig.txt.swp", swap);
+    executor.execute_line(&editor, "recover!").unwrap();
+    assert_eq!(buffer_text(&editor), vec!["edited"]);
+    assert!(
+        editor
+            .editor()
+            .current_buffer()
+            .is_some_and(|buffer| editor
+                .editor()
+                .buffer(buffer)
+                .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))),
+        "recovered text that differs from the file must stay modified",
+    );
 }
 
 /// `:edit` runs the `findswapname` swapfile check before reading: a
