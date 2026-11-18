@@ -152,16 +152,16 @@ fn cmdline_text<F: FileIO, E: ExEditorAccess>(host: &EvalHost<'_, F, E>) -> Stri
     })
 }
 
-/// 1-based character cursor for `getcmdpos()`; 0 when no command line is
-/// open. Deferred `setcmdpos()` positions are deliberately invisible here:
-/// upstream only applies `new_cmdpos` at the next `CTRL-R` paste.
+/// 1-based byte cursor for `getcmdpos()` (`ex_getln.c` `ccline.cmdpos + 1`);
+/// 0 when no command line is open. Deferred `setcmdpos()` positions are
+/// deliberately invisible here: upstream only applies `new_cmdpos` at the
+/// next `CTRL-R` paste.
 fn cmdline_cursor<F: FileIO, E: ExEditorAccess>(host: &EvalHost<'_, F, E>) -> i64 {
-    let (text, cursor_byte, active) = cmdline_snapshot(host);
+    let (_text, cursor_byte, active) = cmdline_snapshot(host);
     if !active {
         return 0;
     }
-    let end = floor_char_boundary(&text, cursor_byte);
-    i64::try_from(text[..end].chars().count() + 1).unwrap_or(i64::MAX)
+    i64::try_from(cursor_byte.saturating_add(1)).unwrap_or(i64::MAX)
 }
 
 /// `(line, cursor_byte, open)`: the raw snapshot behind [`cmdline_cursor`].
@@ -261,20 +261,21 @@ fn cmdline_prompt<F: FileIO, E: ExEditorAccess>(host: &EvalHost<'_, F, E>) -> St
 }
 
 /// `setcmdpos({pos})`: defers the cursor move into the session's `new_cmdpos`
-/// slot, consumed by the next `CTRL-R` paste — never applied eagerly, so
-/// `getcmdpos()` still reports the old position afterwards (`ex_getln.c`).
-/// Returns 1 on success, 0 when `{pos} < 1`.
+/// slot (a 0-based byte offset), consumed by the next `CTRL-R` paste —
+/// never applied eagerly, so `getcmdpos()` still reports the old position
+/// afterwards (`ex_getln.c`). Returns 0 on success, 1 when no command line
+/// is open, and 0 again for `{pos} < 1` (upstream's undefined-input quirk).
 fn call_setcmdpos<F: FileIO, E: ExEditorAccess>(
     host: &mut EvalHost<'_, F, E>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     let position = tv_get_number(&args[0])?;
+    // `f_setcmdpos` (ex_getln.c:4357): a position below 1 leaves the return
+    // value at its default 0 — an upstream quirk the doc calls undefined.
     if position < 1 {
         return Ok(Typval::Number(0));
     }
-    // Outside an open command line there is no session slot; upstream keeps a
-    // static one for the next command line, this port resets per session, so
-    // there is nowhere to store it — still a success either way.
+    let mut stored = false;
     if let Some(machine) = host
         .runtime
         .mode_machine
@@ -283,9 +284,14 @@ fn call_setcmdpos<F: FileIO, E: ExEditorAccess>(
         .as_deref_mut()
         && let Mode::Cmdline(state) = machine.mode_mut()
     {
-        state.new_cmdpos = Some(usize::try_from(position).unwrap_or(usize::MAX));
+        // The slot is upstream's 0-based byte `new_cmdpos`; overlong values
+        // clamp at the next `CTRL-R` paste, like `MIN(cmdlen, new_cmdpos)`.
+        state.new_cmdpos = Some(usize::try_from(position - 1).unwrap_or(usize::MAX));
+        stored = true;
     }
-    Ok(Typval::Number(1))
+    // 0 when the active command line took the position, 1 when not editing
+    // one (`setcmdpos()` contract, vimfn.txt:9548).
+    Ok(Typval::Number(i64::from(!stored)))
 }
 
 /// Whether the insert-completion popup is visible (`pum_visible()`). The

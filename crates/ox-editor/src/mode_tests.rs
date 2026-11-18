@@ -5054,11 +5054,14 @@ fn insert_del_deletes_forward() {
 #[test]
 fn cmdline_up_down_walk_matching_history() {
     let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
-    machine.set_cmdline_history(vec![
-        "e /tmp/alpha".to_owned(),
-        "e /tmp/beta".to_owned(),
-        "e /tmp/alt".to_owned(),
-    ]);
+    editor.history_mut().replace(
+        crate::history::HistoryKind::Cmd,
+        vec![
+            "e /tmp/alpha".to_owned(),
+            "e /tmp/beta".to_owned(),
+            "e /tmp/alt".to_owned(),
+        ],
+    );
     let mut eval = NullExprEval;
     machine
         .feed_keys(&mut editor, ":e /tmp/al", &mut eval)
@@ -5139,7 +5142,9 @@ fn ctrl_bslash_named_key_overwrites_in_replace() {
 #[test]
 fn cmdline_ctrl_bslash_named_key_inserts_literal_then_runs() {
     let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
-    machine.set_cmdline_history(vec!["edit file".to_owned()]);
+    editor
+        .history_mut()
+        .replace(crate::history::HistoryKind::Cmd, vec!["edit file".to_owned()]);
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, ":", &mut eval).unwrap();
     machine.feed_keys(&mut editor, "\u{1c}", &mut eval).unwrap();
@@ -5153,6 +5158,37 @@ fn cmdline_ctrl_bslash_named_key_inserts_literal_then_runs() {
     assert_eq!(text_of(&machine), "\u{1c}".to_owned());
     machine.feed_keys(&mut editor, "x", &mut eval).unwrap();
     assert_eq!(text_of(&machine), "\u{1c}x".to_owned());
+}
+
+/// A position deferred by `setcmdpos()` lands in `state.new_cmdpos` as a
+/// byte offset; the next `c_CTRL-R` paste clamps it into the new text and
+/// leaves the cursor there (`ex_getln.c:1080`), then clears it.
+#[test]
+fn cmdline_ctrl_r_paste_honors_deferred_cmdpos() {
+    let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
+    editor
+        .registers_mut()
+        .set(
+            'a',
+            crate::register::RegisterContent::characterwise(b"XY").unwrap(),
+        )
+        .unwrap();
+    let mut eval = NullExprEval;
+    machine.feed_keys(&mut editor, ":abcdef", &mut eval).unwrap();
+    if let Mode::Cmdline(state) = machine.mode_mut() {
+        state.new_cmdpos = Some(1);
+    }
+    machine.feed_keys(&mut editor, "\x12a", &mut eval).unwrap();
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode")
+    };
+    assert_eq!((state.text.as_str(), state.cursor_byte), ("abcdefXY", 1));
+    // The slot was consumed: a second paste keeps its own cursor position.
+    machine.feed_keys(&mut editor, "\x12a", &mut eval).unwrap();
+    let Mode::Cmdline(state) = machine.mode() else {
+        panic!("expected cmdline mode")
+    };
+    assert_eq!((state.text.as_str(), state.cursor_byte), ("aXYbcdefXY", 3));
 }
 
 /// `c_CTRL-\` + an ordinary character also takes the `vungetc` path:
@@ -5281,7 +5317,10 @@ fn visual_operand_abort_clears_count() {
 #[test]
 fn cmdline_up_matches_prefix_through_cursor_only() {
     let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
-    machine.set_cmdline_history(vec!["edit file".to_owned(), "edit target".to_owned()]);
+    editor.history_mut().replace(
+        crate::history::HistoryKind::Cmd,
+        vec!["edit file".to_owned(), "edit target".to_owned()],
+    );
     let mut eval = NullExprEval;
     machine
         .feed_keys(&mut editor, ":edit typo", &mut eval)
@@ -5305,7 +5344,10 @@ fn cmdline_up_matches_prefix_through_cursor_only() {
 #[test]
 fn cmdline_edit_after_recall_restarts_history_walk() {
     let (mut editor, _, mut machine) = named_editor("x", position(1, 0));
-    machine.set_cmdline_history(vec!["e one".to_owned(), "e two".to_owned()]);
+    editor.history_mut().replace(
+        crate::history::HistoryKind::Cmd,
+        vec!["e one".to_owned(), "e two".to_owned()],
+    );
     let mut eval = NullExprEval;
     machine.feed_keys(&mut editor, ":e ", &mut eval).unwrap();
     feed_special(&mut editor, &mut machine, b'k', b'u');

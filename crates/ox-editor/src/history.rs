@@ -200,6 +200,26 @@ impl History {
             .map(|position| self.tables[kind.index()].entries[position].text.as_str())
     }
 
+    /// Entries oldest-first. `cmdhist.c` keeps one `history[HIST_*]` bank,
+    /// so interactive recall, the `hist*()` builtins, and ShaDa all read
+    /// this same store.
+    #[must_use]
+    pub fn entries(&self, kind: HistoryKind) -> impl Iterator<Item = &str> {
+        self.tables[kind.index()]
+            .entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+    }
+
+    /// `rshada` rebuild (`shada.c` `copy_history_part`): clears the bank and
+    /// re-adds every item with fresh hisnums.
+    pub fn replace(&mut self, kind: HistoryKind, items: impl IntoIterator<Item = String>) {
+        self.clear(kind);
+        for item in items {
+            self.add(kind, &item, usize::MAX);
+        }
+    }
+
     /// `clr_history` (`cmdhist.c:408+`): empties the bank and resets its
     /// counter, so the next add restarts at hisnum 1.
     pub fn clear(&mut self, kind: HistoryKind) {

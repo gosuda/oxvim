@@ -152,8 +152,9 @@ pub struct CmdlineState {
     /// Insertion position: a UTF-8 boundary in `text`, including its end.
     pub cursor_byte: usize,
     /// Cursor column deferred by `setcmdpos()` (`ex_getln.c` `new_cmdpos`):
-    /// a 1-based character position consumed — and cleared — by the next
-    /// `CTRL-R` paste, never applied eagerly. `None` outside `setcmdpos`.
+    /// a 0-based byte offset into `text`, consumed — and cleared — by the
+    /// next `CTRL-R` paste (`ex_getln.c:1080`), never applied eagerly.
+    /// `None` outside `setcmdpos`.
     pub new_cmdpos: Option<usize>,
     /// Match occurrence requested before entering command-line mode.
     pub count: usize,
@@ -334,7 +335,6 @@ pub struct ModeMachine {
     last_find: Option<FindMotion>,
     last_visual: Option<VisualState>,
     completed_ex_command: Option<String>,
-    cmdline_history: Vec<String>,
     pending_mapping_action: Option<(MappingAction, MappingOptions)>,
     /// `mapdepth` (`getchar.c`): mapping expansions since the last key was
     /// consumed. `nmap ,x ,x` re-expands forever without it.
@@ -401,7 +401,6 @@ impl Default for ModeMachine {
             last_visual: None,
             completed_ex_command: None,
             block_insert: None,
-            cmdline_history: Vec::new(),
             pending_mapping_action: None,
             map_depth: 0,
             timestamp: 0,
@@ -559,34 +558,6 @@ impl ModeMachine {
             Mode::Cmdline(state) => &state.text,
             _ => "",
         }
-    }
-
-    /// Returns an entry from Ex command-line history using Vim's signed indexing.
-    #[must_use]
-    pub fn cmdline_history(&self, index: isize) -> Option<&str> {
-        let len = isize::try_from(self.cmdline_history.len()).ok()?;
-        let index = if index < 0 {
-            len.checked_add(index)?
-        } else {
-            index
-        };
-        usize::try_from(index)
-            .ok()
-            .and_then(|index| self.cmdline_history.get(index))
-            .map(String::as_str)
-    }
-
-    /// Returns the Ex command-line history, oldest first (`shada.c` dumps it
-    /// on `:wshada`).
-    #[must_use]
-    pub fn cmdline_history_entries(&self) -> &[String] {
-        &self.cmdline_history
-    }
-
-    /// Replaces the Ex command-line history (`shada.c` rebuilds it on
-    /// `:rshada`).
-    pub fn set_cmdline_history(&mut self, history: Vec<String>) {
-        self.cmdline_history = history;
     }
 
     /// Restores the last search pattern (`shada.c` `set_search_pattern`,
@@ -1308,7 +1279,7 @@ impl ModeMachine {
         }
         match key {
             NamedKey::Up | NamedKey::Down => {
-                self.cmdline_history_nav(state, key == NamedKey::Up);
+                self.cmdline_history_nav(editor, state, key == NamedKey::Up);
                 self.update_incsearch_preview(editor, state)?;
             }
             NamedKey::Home => state.cursor_byte = 0,
@@ -1379,7 +1350,7 @@ impl ModeMachine {
     /// for an entry whose beginning matches the current text. `<Down>`
     /// past the newest match returns to the text the user had typed
     /// (the scratch input saved on the first `<Up>`).
-    fn cmdline_history_nav(&mut self, state: &mut CmdlineState, up: bool) {
+    fn cmdline_history_nav(&mut self, editor: &Editor, state: &mut CmdlineState, up: bool) {
         if state.kind != CmdlineKind::Ex || (state.history_index.is_none() && !up) {
             return;
         }
@@ -1393,7 +1364,14 @@ impl ModeMachine {
             state.history_lookfor = state.text[..state.cursor_byte].to_string();
         }
         let lookfor = state.history_lookfor.clone();
-        let history = &self.cmdline_history;
+        // Upstream keeps one `history[HIST_CMD]` bank: `histadd()` writes
+        // and ShaDa rebuilds land in the same store this walk reads, so a
+        // builtin-added entry is recallable and a `histdel()` one is gone.
+        let history: Vec<String> = editor
+            .history()
+            .entries(crate::history::HistoryKind::Cmd)
+            .map(str::to_owned)
+            .collect();
         let start = state.history_index.unwrap_or(history.len());
         let found = if up {
             (0..start)
@@ -4046,21 +4024,19 @@ impl ModeMachine {
             .map(|line| String::from_utf8_lossy(line))
             .collect::<Vec<_>>()
             .join("\n");
-        let before = state.text[..state.cursor_byte].chars().count();
         state.text.insert_str(state.cursor_byte, &pasted);
         state.cursor_byte += pasted.len();
-        let end = before + pasted.chars().count();
-        let total = state.text.chars().count();
-        let target = state
+        // `ex_getln.c:1080`: `cmdpos = MIN(cmdlen, new_cmdpos)` — the slot
+        // is a byte offset, clamped to the new length; without a deferred
+        // position the cursor stays right after the pasted text.
+        let mut target = state
             .new_cmdpos
             .take()
-            .map(|position| position.clamp(1, total + 1))
-            .unwrap_or(end + 1);
-        state.cursor_byte = state
-            .text
-            .char_indices()
-            .nth(target.saturating_sub(1))
-            .map_or(state.text.len(), |(byte, _)| byte);
+            .map_or(state.cursor_byte, |position| position.min(state.text.len()));
+        while target > 0 && !state.text.is_char_boundary(target) {
+            target -= 1;
+        }
+        state.cursor_byte = target;
         Ok(())
     }
 
@@ -4379,7 +4355,15 @@ impl ModeMachine {
                     }
                     CmdlineKind::Ex => {
                         let command = std::mem::take(&mut state.text);
-                        self.cmdline_history.push(command.clone());
+                        // `add_to_history` (cmdhist.c:301): submit lands in
+                        // the shared bank the `hist*()` builtins and ShaDa
+                        // see, capped by 'history'.
+                        let capacity = history_capacity(editor);
+                        editor.history_mut().add(
+                            crate::history::HistoryKind::Cmd,
+                            &command,
+                            capacity,
+                        );
                         self.completed_ex_command = Some(command);
                     }
                 }
@@ -6658,6 +6642,16 @@ fn option_bool(editor: &Editor, name: &str, fallback: bool) -> bool {
     match editor.options().get_global(name) {
         Ok(OptionValue::Boolean(value)) => *value,
         _ => fallback,
+    }
+}
+
+/// Command-history table capacity from `'history'` (`p_hi`,
+/// `init_history`), upstream's 10000 default when unset or non-numeric —
+/// the same fallback `builtins::cmdline` and `shada.rs` use.
+fn history_capacity(editor: &Editor) -> usize {
+    match editor.options().get_global("history") {
+        Ok(OptionValue::Number(value)) => usize::try_from((*value).max(0)).unwrap_or(usize::MAX),
+        _ => 10_000,
     }
 }
 fn option_contains(editor: &Editor, name: &str, item: &str, fallback: bool) -> bool {

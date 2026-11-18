@@ -9,9 +9,9 @@
 //! entries (`shada.c:120, 3090-3093`), and `SERR`/`E886` for system errors
 //! (`shada.c:127`).
 //!
-//! What is persisted follows the port's state: the last search pattern and
-//! the Ex command-line history live on [`ModeMachine`]; registers, marks,
-//! jump list, buffer list, and `v:oldfiles` live on [`Editor`]. Global
+//! What is persisted follows the port's state: the last search pattern
+//! lives on [`ModeMachine`]; registers, marks, jump list, buffer list,
+//! `v:oldfiles`, and the Ex command-line history live on [`Editor`]. Global
 //! variables (`!` in `'shada'`) and the substitute replacement string are not
 //! persisted by this port. Timestamps do not exist on port state, so the
 //! upstream merge-by-timestamp comparisons degrade to presence checks: a
@@ -376,7 +376,7 @@ pub(crate) fn write_shada(
     }
     if params.history_count(':', history) > 0 {
         // shada.c:2658-2673
-        entries.extend(history_entries(machine, history, &params, timestamp));
+        entries.extend(history_entries(editor, history, &params, timestamp));
     }
     let fresh = Stream { entries };
     let merged = if nomerge {
@@ -897,19 +897,20 @@ fn create_missing_named_buffer(editor: &mut Editor, name: &[u8]) {
 }
 
 fn history_entries(
-    machine: Option<&ModeMachine>,
+    editor: &Editor,
     history: i64,
     params: &ShadaParams,
     timestamp: u64,
 ) -> Vec<StreamEntry> {
-    let Some(machine) = machine else {
-        return Vec::new();
-    };
     let cap = params.history_count(':', history);
     if cap <= 0 {
         return Vec::new();
     }
-    let items = machine.cmdline_history_entries();
+    let items: Vec<String> = editor
+        .history()
+        .entries(crate::history::HistoryKind::Cmd)
+        .map(str::to_owned)
+        .collect();
     let skip = items
         .len()
         .saturating_sub(usize::try_from(cap).unwrap_or(0));
@@ -1365,17 +1366,23 @@ impl ApplyState<'_, '_> {
         if cap <= 0 {
             return;
         }
-        let Some(machine) = self.machine.as_deref_mut() else {
-            return;
-        };
-        let mut merged = machine.cmdline_history_entries().to_vec();
+        // `copy_history_part` (shada.c:2368): merge onto the shared cmd
+        // bank — the same store interactive recall and `histadd()` use.
+        let mut merged: Vec<String> = self
+            .editor
+            .history()
+            .entries(crate::history::HistoryKind::Cmd)
+            .map(str::to_owned)
+            .collect();
         if !merged.iter().any(|existing| existing == &item) {
             merged.push(item);
         }
         let skip = merged
             .len()
             .saturating_sub(usize::try_from(cap).unwrap_or(0));
-        machine.set_cmdline_history(merged[skip..].to_vec());
+        self.editor
+            .history_mut()
+            .replace(crate::history::HistoryKind::Cmd, merged[skip..].iter().cloned());
     }
 
     fn apply_register(&mut self, position: u64, data: &Value) {
@@ -1704,9 +1711,10 @@ mod tests {
         machine
             .borrow_mut()
             .restore_search_pattern("needle".to_owned(), true);
-        machine
-            .borrow_mut()
-            .set_cmdline_history(vec!["echo one".to_owned(), "echo two".to_owned()]);
+        editor.history_mut().replace(
+            crate::history::HistoryKind::Cmd,
+            vec!["echo one".to_owned(), "echo two".to_owned()],
+        );
 
         let scratch = Scratch::new("roundtrip");
         write_shada(
@@ -1778,8 +1786,11 @@ mod tests {
             fresh_machine.borrow().search_state().last_direction(),
             Some(SearchDirection::Backward)
         );
-        assert_eq!(fresh_machine.borrow().cmdline_history(0), Some("echo one"));
-        assert_eq!(fresh_machine.borrow().cmdline_history(1), Some("echo two"));
+        let restored: Vec<&str> = fresh
+            .history()
+            .entries(crate::history::HistoryKind::Cmd)
+            .collect();
+        assert_eq!(restored, ["echo one", "echo two"]);
 
         // v:oldfiles gains the file names from local-mark entries
         // (shada.c:1159-1175): the named buffer, not the global-mark file.
