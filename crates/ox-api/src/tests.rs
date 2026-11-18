@@ -2549,6 +2549,116 @@ fn api_option_write_without_a_scope_reports_plain_set() {
     let _ = id;
 }
 
+/// A no-scope `nvim_set_option_value` is upstream's plain `set`, which
+/// commits the global value too — so `v:option_oldglobal` must be captured
+/// before the write, not read back after it (`option.c`:2127).
+#[test]
+fn option_oldglobal_reports_the_replaced_global_value() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[("command", Object::String(OxStr::from("echo fired")))]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let recorded = seen.clone();
+    let reenter: SessionReentry = Rc::new(move |session| {
+        let snapshot = session.with_editor(|editor| {
+            [
+                editor.vvars().get(&OxStr::from("option_oldglobal")).cloned(),
+                editor.vvars().get(&OxStr::from("option_oldlocal")).cloned(),
+            ]
+        });
+        recorded.borrow_mut().push(snapshot);
+        Ok(())
+    });
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: Some(reenter),
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("scrolloff"),
+        Object::Integer(9),
+        dict(&[]),
+    )
+    .unwrap();
+
+    let seen = seen.borrow();
+    assert_eq!(seen.len(), 1, "one dispatch");
+    assert_eq!(
+        seen[0][0],
+        Some(Object::Integer(0)),
+        "v:option_oldglobal is the global value the write replaced"
+    );
+    assert_eq!(
+        seen[0][1],
+        Some(Object::Integer(0)),
+        "v:option_oldlocal is the local value the write replaced"
+    );
+    let _ = id;
+}
+
+/// The published `v:option_type` is the single `OptionSet` recursion guard
+/// upstream has (`option.c`:2102) — and the one the Ex setter checks. An
+/// `nvim_set_option_value` from inside a `:set`-triggered handler must see
+/// the published guard and not re-dispatch.
+#[test]
+fn api_set_during_a_set_dispatch_does_not_refire_optionset() {
+    let (editor, _, _, _) = editor_with_lines(&["one"]);
+    let session = session_with(editor);
+    session.with_editor_mut(|editor| editor.set_v_vim_did_enter());
+    let id = crate::autocmd::nvim_create_autocmd(
+        &session,
+        Object::String(OxStr::from("OptionSet")),
+        dict(&[("command", Object::String(OxStr::from("echo fired")))]),
+    )
+    .unwrap();
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    crate::set_autocmd_executor(
+        &session,
+        Box::new(ActionRecorder {
+            actions: actions.clone(),
+            reenter: None,
+        }),
+        Box::new(ActionRecorder::default()),
+    );
+
+    // The in-flight Ex dispatch has the v:option_* vars published for its
+    // handlers; the API write inside one of them must observe that guard.
+    let saved = session.with_editor_mut(|editor| {
+        editor.publish_option_set(
+            ox_editor::OptionSetScope::Set,
+            &Object::Integer(0),
+            None,
+            None,
+            &Object::Integer(1),
+        )
+    });
+    crate::global::nvim_set_option_value(
+        &session,
+        OxStr::from("scrolloff"),
+        Object::Integer(9),
+        dict(&[]),
+    )
+    .unwrap();
+    assert!(
+        actions.borrow().is_empty(),
+        "no nested OptionSet dispatch"
+    );
+    session.with_editor_mut(|editor| editor.restore_option_set(saved));
+    let _ = id;
+}
+
 /// The deprecated `nvim_set_option` reaches the same `set_option_value` path
 /// upstream, so it publishes `OptionSet` too, with the global scope
 /// (`option.c:4373`).

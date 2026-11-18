@@ -285,14 +285,23 @@ pub(crate) fn fire_option_set(
             Some(Object::Integer(1))
         )
     });
-    let firing = session.with_state(|state| state.option_set_in_flight);
+    // The published `v:option_type` is the one recursion guard upstream has
+    // and the one the Ex setter checks (`fire_optionset_autocmd`): while a
+    // dispatch is in flight the variable is non-empty on both paths, so a
+    // handler that sets an option — through the API or through `:set` —
+    // cannot reenter the event.
+    let firing = session.with_editor(|editor| {
+        !matches!(
+            editor.vvars().get(&OxStr::from("option_type")),
+            Some(Object::String(value)) if value.as_bytes().is_empty()
+        )
+    });
     if !started || firing {
         return Ok(());
     }
     let saved = session.with_editor_mut(|editor| {
         editor.publish_option_set(scope, old, old_local, old_global, new)
     });
-    session.with_state_mut(|state| state.option_set_in_flight = true);
     let match_name = OxStr::from(name);
     let buffer = session.with_editor(|editor| editor.current_buffer());
     let plan = session.with_editor_mut(|editor| {
@@ -308,7 +317,6 @@ pub(crate) fn fire_option_set(
         )
     });
     let result = execute_firing_plan(session, plan);
-    session.with_state_mut(|state| state.option_set_in_flight = false);
     session.with_editor_mut(|editor| editor.restore_option_set(saved));
     result
 }

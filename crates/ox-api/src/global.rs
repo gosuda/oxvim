@@ -1477,6 +1477,17 @@ pub fn nvim_set_option_value(
         return Ok(structured_option_value(metadata, &value));
     }
     let assigned = structured_option_value(metadata, &value);
+    // A no-scope write is upstream's plain `set`: it commits the global
+    // value too, so the `v:option_oldglobal` baseline is read before the
+    // write — after `set_option_at` it would be the new value.
+    let previous_global = if metadata.scopes.contains(&OptionScope::Global) {
+        Some(structured_option_value(
+            metadata,
+            &current_option_value(session, name, OptionTarget::Global)?,
+        ))
+    } else {
+        None
+    };
     set_option_at(session, name, value.clone(), target)?;
     // `apply_optionset_autocmd_now` (option.c:2099) reports the flags the
     // *request* carried, not the value target: `opt_flags` starts at zero and
@@ -1497,14 +1508,7 @@ pub fn nvim_set_option_value(
         OptionSetScope::Set => {
             // A buffer-only option has no global value to read; upstream's
             // `oldval_g` is then the value the write replaced.
-            let global = if metadata.scopes.contains(&OptionScope::Global) {
-                structured_option_value(
-                    metadata,
-                    &current_option_value(session, name, OptionTarget::Global)?,
-                )
-            } else {
-                previous_object.clone()
-            };
+            let global = previous_global.unwrap_or_else(|| previous_object.clone());
             (Some(previous_object.clone()), Some(global))
         }
         OptionSetScope::Global => (None, Some(previous_object.clone())),
