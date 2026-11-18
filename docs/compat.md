@@ -13,7 +13,7 @@ Oxvim targets functional compatibility with Neovim 0.13.0-dev (API level 15): ru
 - `just replay`: replays recorded YAML MessagePack-RPC sessions against both binaries.
 - `just differential`: release-binary smoke and PTY checks (`cargo nextest run -p differential`).
 - `just functional`: upstream Busted functional suite against Oxvim via `NVIM_PRG`.
-- `just oldtest`: upstream legacy Vimscript suite against Oxvim via `NVIM_PRG`, run on a copy of the testdir with a sandboxed `HOME`.
+- `just oldtest`: upstream legacy Vimscript suite against Oxvim via `NVIM_PRG`. `tests/oldtest/run.sh` gives every file its own scratch copy of the testdir, its own `HOME`, XDG tree, and `TMPDIR`, and drives `runtest.vim` directly. The upstream Makefile path is not used because its `%.res` rule starts each test through `jobstart(..., {'term': v:true})` and reads the result back as terminal-buffer lines, which Oxvim does not paint yet.
 
 ## Current compatibility
 
@@ -55,11 +55,20 @@ Known divergences are recorded in `tests/differential/SKIPS.md` and admitted onl
 
 ## Known gaps
 
-- Terminal channels connect and route data, but parsing terminal VT escape sequences into buffer cells is not implemented.
+- Terminal channels connect and route data, but parsing terminal VT escape sequences into buffer cells is not implemented, so `:terminal` and the upstream Makefile's oldtest path produce no visible buffer text.
+- Five oldtest files still time out before running a test: `test_plugin_termdebug.vim`, `test_tabpage.vim`, `test_functions.vim`, `test_put.vim`, and `test_regexp_latin.vim`, which crashes instead.
 - Unsetting a local option value with `nil` is not yet supported in the editor options store.
 - Advanced `vim.uv` features (custom polling priorities, non-standard file descriptor redirection, and platform system metrics) return typed `Unsupported` errors.
 - Windows is untested; verification runs on Linux and POSIX-compliant systems.
 
 ## In-progress upstream suites
 
-`just functional` (Busted) and `just oldtest` (legacy Vimscript) run Neovim's own suites against the Oxvim binary through `NVIM_PRG`. Both are being enabled test by test.
+Measured on 2026-10-28 against the release binary at `c4520b0` plus the fixes in this tree:
+
+| Suite | Files | Pass | Fail | Skip | Error |
+|---|---|---|---|---|---|
+| `just functional` (Busted) | 484 | 1830 | 4076 | 58 | 1 |
+| `just oldtest` (legacy Vimscript) | 236 | - | 2365 of 3654 executed | 686 | 40 blocked, 5 timed out |
+
+Neither suite passes yet. `just apidiff`, `cargo build --workspace --release`, and
+`cargo nextest run --workspace` do pass, and the workspace suite covers 3646 tests.

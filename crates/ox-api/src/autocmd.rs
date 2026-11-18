@@ -258,6 +258,69 @@ pub(crate) fn fire_filetype(
     result
 }
 
+/// Plans and executes `Event::OptionSet` for one committed option change
+/// (`apply_optionset_autocmd_now`, option.c:2099-2134).
+///
+/// The option's full name is the match text. The six `v:option_*` values are
+/// published before the plan runs and put back afterwards, whatever the
+/// callbacks do, so a nested dispatch restores its own values on the way out
+/// and never leaks them into the outer dispatch.
+pub(crate) fn fire_option_set(
+    session: &ApiSession,
+    name: &str,
+    scope: ox_editor::OptionSetScope,
+    old: &Object,
+    old_local: Option<&Object>,
+    old_global: Option<&Object>,
+    new: &Object,
+) -> Result<(), ApiError> {
+    // Upstream skips the event while startup runs (`starting`,
+    // option.c:2147) and while a dispatch is already in flight
+    // (`*get_vim_var_str(VV_OPTION_TYPE) != NUL`, option.c:2102). Startup in
+    // this port has finished exactly when `v:vim_did_enter` is 1, which
+    // upstream sets at the same point it clears `starting`.
+    let started = session.with_editor(|editor| {
+        matches!(
+            editor.vvars().get(&OxStr::from("vim_did_enter")),
+            Some(Object::Integer(1))
+        )
+    });
+    // The published `v:option_type` is the one recursion guard upstream has
+    // and the one the Ex setter checks (`fire_optionset_autocmd`): while a
+    // dispatch is in flight the variable is non-empty on both paths, so a
+    // handler that sets an option — through the API or through `:set` —
+    // cannot reenter the event.
+    let firing = session.with_editor(|editor| {
+        !matches!(
+            editor.vvars().get(&OxStr::from("option_type")),
+            Some(Object::String(value)) if value.as_bytes().is_empty()
+        )
+    });
+    if !started || firing {
+        return Ok(());
+    }
+    let saved = session.with_editor_mut(|editor| {
+        editor.publish_option_set(scope, old, old_local, old_global, new)
+    });
+    let match_name = OxStr::from(name);
+    let buffer = session.with_editor(|editor| editor.current_buffer());
+    let plan = session.with_editor_mut(|editor| {
+        editor.autocmds_mut().plan(
+            Event::OptionSet,
+            AutocmdContext {
+                buffer,
+                file_name: None,
+                match_name: Some(match_name.as_bytes()),
+                nested: true,
+                data: None,
+            },
+        )
+    });
+    let result = execute_firing_plan(session, plan);
+    session.with_editor_mut(|editor| editor.restore_option_set(saved));
+    result
+}
+
 fn text(value: &OxStr, what: &str) -> Result<String, ApiError> {
     String::from_utf8(value.0.clone())
         .map_err(|_| ApiError::validation(format!("{what} must be valid UTF-8")))
@@ -525,7 +588,7 @@ fn autocmd_kind(opts: &Dict) -> Result<AutocmdKind, ApiError> {
     let callback = opts.get(&OxStr::from("callback"));
     match (command, callback) {
         (Some(Object::String(command)), None) => {
-            Ok(AutocmdKind::ExString(text(command, "command")?))
+            Ok(AutocmdKind::ExString { source: text(command, "command")?, script: None })
         }
         (None, Some(Object::LuaRef(callback))) => Ok(AutocmdKind::LuaCallback(
             u64::try_from(*callback).map_err(|_| ApiError::validation("Invalid 'callback'"))?,
@@ -826,7 +889,7 @@ fn autocmd_definition(item: &AutocmdDefinition) -> Dict {
     entries.push((
         OxStr::from("command"),
         match &item.kind {
-            AutocmdKind::ExString(command) => Object::String(OxStr::from(command.as_str())),
+            AutocmdKind::ExString { source: command, .. } => Object::String(OxStr::from(command.as_str())),
             AutocmdKind::VimscriptFunction(_) | AutocmdKind::LuaCallback(_) => {
                 Object::String(OxStr::from(""))
             }
@@ -845,7 +908,7 @@ fn autocmd_definition(item: &AutocmdDefinition) -> Dict {
                 Object::LuaRef(i32::try_from(*callback).unwrap_or(i32::MAX)),
             ));
         }
-        AutocmdKind::ExString(_) => {}
+        AutocmdKind::ExString { .. } => {}
     }
     entries.push((
         OxStr::from("pattern"),

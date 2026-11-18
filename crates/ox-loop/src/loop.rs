@@ -406,9 +406,7 @@ impl Loop {
     }
 
     fn fire_expired(&mut self, now: Instant) {
-        for mut timer in self.timers.expired(now) {
-            timer.fire();
-        }
+        self.timers.fire_expired(now);
     }
 }
 

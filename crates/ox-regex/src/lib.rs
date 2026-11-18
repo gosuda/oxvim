@@ -14,7 +14,7 @@ mod parser;
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 
-use parser::Parser;
+use parser::{Parsed, Parser};
 use thiserror::Error;
 
 const DEFAULT_STEP_LIMIT: usize = 1_000_000;
@@ -84,7 +84,9 @@ impl Prog {
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum CompileError {
     /// The grammar is malformed at the given byte offset.
-    #[error("regex syntax error at byte {offset}: {message}")]
+    ///
+    /// Upstream reports these failures with the generic `E54` code.
+    #[error("{message}")]
     Syntax {
         /// Pattern byte offset at which parsing failed.
         offset: usize,
@@ -102,6 +104,39 @@ pub enum CompileError {
     /// The `\%#=` engine prefix contains a value other than zero, one, or two.
     #[error("invalid engine selector; expected \\%#=0, \\%#=1, or \\%#=2")]
     InvalidEngine,
+    /// A character range runs backwards (`[z-a]`).
+    ///
+    /// Upstream reports the dedicated `E944` code for this failure instead of
+    /// the generic `E54`. See [`CompileError::code`].
+    #[error("Reverse range in character class")]
+    ReversedRange,
+    /// A `[` with no matching `]` while compiling strict patterns.
+    ///
+    /// Upstream only rejects this when `RE_STRICT` is in effect
+    /// (`vim.regex()`, spell files, `'indentexpr'`); everywhere else the
+    /// lone `[` is a literal character. See [`CompileError::code`].
+    ///
+    /// The `%s` in the message is literal upstream text (regexp.c passes a
+    /// non-string argument to the `%s` slot); it is preserved verbatim.
+    #[error("Missing ] after %s[")]
+    MissingBracket,
+}
+
+impl CompileError {
+    /// Vim error code upstream reports for this failure.
+    ///
+    /// Most compile failures surface as the generic `E54` pattern error;
+    /// reversed ranges and strict missing brackets carry the dedicated
+    /// `E944` and `E769` codes. Callers that render the error with its
+    /// upstream code should use this instead of hard-coding `E54`.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::ReversedRange => "E944",
+            Self::MissingBracket => "E769",
+            Self::Syntax { .. } | Self::InvalidEscape { .. } | Self::InvalidEngine => "E54",
+        }
+    }
 }
 
 /// Bounded matcher failure.
@@ -288,11 +323,35 @@ impl From<&str> for Text {
 ///
 /// Returns [`CompileError::InvalidEngine`] for a malformed `\%#=` engine
 /// selector and the parser's [`CompileError`] (invalid escape, unterminated
-/// group or collection, backref before a closed group, …) for a
-/// syntactically invalid pattern.
+/// group, backref before a closed group, …) for a syntactically invalid
+/// pattern. An unclosed `[` collection is a literal `[`, matching Vim's
+/// non-strict compilation.
 pub fn compile(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
     let (selection, body) = parse_engine_selector(pattern)?;
     let parsed = Parser::new(body, magic).parse()?;
+    Ok(finish(selection, parsed))
+}
+
+/// Parses a Vim pattern like [`compile`], but rejects a `[` collection with
+/// no matching `]`.
+///
+/// Upstream compiles with `RE_STRICT` for `vim.regex()`, spell files, and
+/// `'indentexpr'`; everything else (search, `:substitute`, `=~`) compiles
+/// non-strict and treats an unclosed `[` as a literal bracket. This entry
+/// point mirrors the strict mode so strict consumers can keep upstream's
+/// `E769` diagnostic instead of silently accepting the pattern.
+///
+/// # Errors
+///
+/// Returns the same errors as [`compile`], plus
+/// [`CompileError::MissingBracket`] for an unclosed `[` collection.
+pub fn compile_strict(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
+    let (selection, body) = parse_engine_selector(pattern)?;
+    let parsed = Parser::new_strict(body, magic).parse()?;
+    Ok(finish(selection, parsed))
+}
+
+fn finish(selection: Option<Engine>, parsed: Parsed) -> Prog {
     let complex =
         parsed.features.backref || parsed.features.lookbehind || parsed.features.complex_repeat;
     let engine = match selection {
@@ -300,7 +359,7 @@ pub fn compile(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
         None if complex => Engine::Backtracking,
         None => Engine::Nfa,
     };
-    Ok(Prog {
+    Prog {
         expr: parsed.expr,
         capture_count: parsed.captures,
         ignore_case: parsed.ignore_case,
@@ -308,7 +367,7 @@ pub fn compile(pattern: &str, magic: Magic) -> Result<Prog, CompileError> {
         has_backref: parsed.features.backref,
         step_limit: DEFAULT_STEP_LIMIT,
         depth_limit: DEFAULT_DEPTH_LIMIT,
-    })
+    }
 }
 
 /// Searches the complete input, suppressing a bounded-execution error as no match.

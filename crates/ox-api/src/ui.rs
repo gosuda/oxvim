@@ -322,9 +322,7 @@ fn ui_extra_mut<R>(
     operation: impl FnOnce(&mut UiExtra) -> R,
 ) -> Result<R, ApiError> {
     require_ui(session, channel)?;
-    Ok(session.with_state_mut(|state| {
-        operation(state.ui_extra.entry(channel).or_default())
-    }))
+    Ok(session.with_state_mut(|state| operation(state.ui_extra.entry(channel).or_default())))
 }
 
 /// `api_err_exp` shape (`api/private/validate.c:41-58`): a name without a
@@ -3572,14 +3570,8 @@ mod tests {
                     .map(|extra| (extra.pum_nlines, extra.pum_bounds))
             })
         };
-        assert_eq!(
-            popup_state(&first),
-            Some((5, Some((10.0, 4.0, 1.0, 2.0))))
-        );
-        assert_eq!(
-            popup_state(&second),
-            Some((9, Some((20.0, 8.0, 3.0, 4.0))))
-        );
+        assert_eq!(popup_state(&first), Some((5, Some((10.0, 4.0, 1.0, 2.0)))));
+        assert_eq!(popup_state(&second), Some((9, Some((20.0, 8.0, 3.0, 4.0)))));
     }
 
     #[expect(

@@ -16,13 +16,15 @@ const FIRST_GLOBAL_MARK: char = 'A';
 const LAST_GLOBAL_MARK: char = 'Z';
 const FIRST_NUMBERED_MARK: char = '0';
 const LAST_NUMBERED_MARK: char = '9';
-const SPECIAL_LOCAL_MARKS: [char; 8] = ['\'', '`', '.', '^', ':', '[', ']', '"'];
+const SPECIAL_LOCAL_MARKS: [char; 10] = [
+    '\'', '`', '.', '^', ':', '[', ']', '"', '<', '>',
+];
 
 /// An invalid named-mark operation.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum MarkError {
     /// The name is not one of `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`,
-    /// or `"`.
+    /// `"`, `<`, or `>`.
     #[error("invalid local mark name '{0}'")]
     InvalidLocal(char),
     /// The name is not in `A-Z` or `0-9`.
@@ -110,7 +112,7 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn set(&mut self, name: char, position: Position) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.set(id, position))
@@ -121,7 +123,7 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn get(&self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.get(id))
@@ -132,13 +134,13 @@ impl LocalMarks {
     /// # Errors
     ///
     /// Returns [`MarkError::InvalidLocal`] if `name` is not one of `a-z`,
-    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, or `"`.
+    /// `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"`, `<`, or `>`.
     pub fn remove(&mut self, name: char) -> Result<Option<Position>, MarkError> {
         let id = local_mark_id(name)?;
         Ok(self.marks.remove(id))
     }
 
-    /// Iterates over set marks in `a-z`, `'`, `` ` ``, `.`, `^`, `:`, `[`, `]`, `"` order.
+    /// Iterates over set marks in `a-z`, specials, `<`, `>` order.
     pub fn iter(&self) -> impl Iterator<Item = (char, Position)> + '_ {
         self.marks
             .iter()
@@ -148,6 +150,18 @@ impl LocalMarks {
     /// Adjusts all local marks for a logical-line splice.
     pub fn splice(&mut self, start: usize, old_count: usize, new_count: usize) {
         self.marks.splice(start, old_count, new_count);
+    }
+
+    /// Runs every mark's line number through `adjust` (columns preserved),
+    /// for line permutations a range splice cannot express, like `:move`.
+    pub fn adjust_lines(&mut self, adjust: impl Fn(usize) -> usize) {
+        let entries: Vec<(char, Position)> = self.iter().collect();
+        for (name, position) in entries {
+            let lnum = adjust(position.lnum);
+            if lnum != position.lnum {
+                let _ = self.set(name, Position { lnum, ..position });
+            }
+        }
     }
 }
 
@@ -230,6 +244,17 @@ impl GlobalMarks {
                 (positions.get(id as u64), self.marks.get_mut(&name))
             {
                 location.position = position;
+            }
+        }
+    }
+
+    /// Runs the line number of every mark pointing at `buffer` through
+    /// `adjust` (columns preserved), for permutations a range splice
+    /// cannot express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        for location in self.marks.values_mut() {
+            if location.buffer() == Some(buffer) {
+                location.position.lnum = adjust(location.position.lnum);
             }
         }
     }
@@ -320,6 +345,17 @@ impl Jumplist {
         new_count: usize,
     ) {
         splice_locations(&mut self.entries, buffer, start, old_count, new_count);
+    }
+
+    /// Runs the line number of every jump into `buffer` through `adjust`
+    /// (columns preserved), for permutations a range splice cannot
+    /// express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        for entry in &mut self.entries {
+            if entry.buffer() == Some(buffer) {
+                entry.position.lnum = adjust(entry.position.lnum);
+            }
+        }
     }
 }
 
@@ -421,6 +457,18 @@ impl Changelists {
             return;
         };
         splice_positions(&mut history.entries, start, old_count, new_count);
+    }
+
+    /// Runs the line number of every retained change in `buffer` through
+    /// `adjust` (columns preserved), for permutations a range splice
+    /// cannot express.
+    pub fn adjust_buffer_lines(&mut self, buffer: BufHandle, adjust: impl Fn(usize) -> usize) {
+        let Some(history) = self.buffers.get_mut(&buffer) else {
+            return;
+        };
+        for position in &mut history.entries {
+            position.lnum = adjust(position.lnum);
+        }
     }
 
     /// Removes all history and navigation state for `buffer`.

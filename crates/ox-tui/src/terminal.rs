@@ -1708,7 +1708,9 @@ mod tests {
         };
         session.restore()?;
         let bytes = String::from_utf8(session.writer.clone())?;
-        let leave = bytes.find("\x1b[?1049l").ok_or("missing alt-screen leave")?;
+        let leave = bytes
+            .find("\x1b[?1049l")
+            .ok_or("missing alt-screen leave")?;
         let cursor = bytes.find("\x1b[0 q").ok_or("missing cursor reset")?;
         // The alt screen is left after every other screen-state restore so the
         // primary screen shows none of the teardown writes.

@@ -18,16 +18,28 @@ use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 
 pub mod perf;
-pub const ORACLE: &str = ".references/neovim/build/bin/nvim";
+/// Default subject: the release binary beside the workspace root's `target`.
 pub const OXVIM: &str = "target/release/oxvim";
+/// Oracle override; the checkout's built reference tree is the default.
+pub const ORACLE: &str = ".references/neovim/build/bin/nvim";
 
 #[must_use]
 pub fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// Resolves a harness path against the workspace root.
+///
+/// `OXVIM_BIN` overrides the subject so a build that used `CARGO_TARGET_DIR`
+/// is tested as built, instead of silently exercising whichever binary happens
+/// to sit at `target/release/oxvim`.
 #[must_use]
 pub fn binary(relative: &str) -> PathBuf {
+    if relative == OXVIM {
+        if let Some(subject) = std::env::var_os("OXVIM_BIN") {
+            return PathBuf::from(subject);
+        }
+    }
     root().join(relative)
 }
 

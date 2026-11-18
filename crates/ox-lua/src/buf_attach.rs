@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, HashSet};
 use mlua::{Lua, Value, Variadic};
 use ox_api::{ApiSession, DispatchFn};
 use ox_editor::{
-    buffer::{BufferSubscriptionRelease, BufferUpdateKind},
     BufferAttachSubscription, BufferBytesEvent, BufferState,
+    buffer::{BufferSubscriptionRelease, BufferUpdateKind},
 };
 use ox_rpc::Message;
 use ox_types::{BufHandle, Object, OxStr};
@@ -241,9 +241,7 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
                     };
                     if matches!(&delivery.event.update, BufferUpdateKind::Reload) {
                         if subscription.channel_id != 0 {
-                            delivery
-                                .reload_channels
-                                .push((id, subscription.channel_id));
+                            delivery.reload_channels.push((id, subscription.channel_id));
                         } else if let Some(callback) =
                             callback_ref(state, id, &reload_key, &utf_sizes_key)
                         {
@@ -257,13 +255,8 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
                         delivery.rpc_channels.push((id, subscription.channel_id));
                         continue;
                     }
-                    if matches!(
-                        &delivery.event.update,
-                        BufferUpdateKind::Changedtick
-                    ) {
-                        if let Some(callback) =
-                            callback_ref(state, id, &tick_key, &utf_sizes_key)
-                        {
+                    if matches!(&delivery.event.update, BufferUpdateKind::Changedtick) {
+                        if let Some(callback) = callback_ref(state, id, &tick_key, &utf_sizes_key) {
                             delivery.tick_refs.push(callback);
                         }
                         continue;
@@ -271,14 +264,10 @@ fn collect_pending(session: &ApiSession) -> PendingBatch {
                     if !matches!(&delivery.event.update, BufferUpdateKind::Mutation { .. }) {
                         continue;
                     }
-                    if let Some(callback) =
-                        callback_ref(state, id, &line_key, &utf_sizes_key)
-                    {
+                    if let Some(callback) = callback_ref(state, id, &line_key, &utf_sizes_key) {
                         delivery.line_refs.push(callback);
                     }
-                    if let Some(callback) =
-                        callback_ref(state, id, &bytes_key, &utf_sizes_key)
-                    {
+                    if let Some(callback) = callback_ref(state, id, &bytes_key, &utf_sizes_key) {
                         delivery.byte_refs.push(callback);
                     }
                 }
@@ -392,7 +381,10 @@ fn lines_args(
         new_lines.len(),
         "buffer line",
     )?));
-    args.push(Value::Integer(api_integer(*old_byte_size, "deleted byte size")?));
+    args.push(Value::Integer(api_integer(
+        *old_byte_size,
+        "deleted byte size",
+    )?));
     if utf_sizes {
         args.push(Value::Integer(api_integer(
             *deleted_codepoints,
@@ -485,8 +477,7 @@ fn line_data(lines: &[Vec<u8>]) -> Object {
 fn rpc_message(buffer: BufHandle, event: &BufferBytesEvent) -> Result<Message, String> {
     let buffer = Object::Integer(i64::from(buffer));
     let changedtick = Object::Integer(
-        i64::try_from(event.tick)
-            .map_err(|_| "buffer changedtick is out of range".to_owned())?,
+        i64::try_from(event.tick).map_err(|_| "buffer changedtick is out of range".to_owned())?,
     );
     match &event.update {
         BufferUpdateKind::Mutation {
@@ -499,11 +490,7 @@ fn rpc_message(buffer: BufHandle, event: &BufferBytesEvent) -> Result<Message, S
                 buffer,
                 changedtick,
                 Object::Integer(api_integer(event.start_row, "buffer line")?),
-                Object::Integer(api_sum(
-                    event.start_row,
-                    *old_line_count,
-                    "buffer line",
-                )?),
+                Object::Integer(api_sum(event.start_row, *old_line_count, "buffer line")?),
                 line_data(new_lines),
                 Object::Boolean(false),
             ],
@@ -775,9 +762,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                         let still_attached = session.with_editor(|editor| {
                             editor
                                 .buffer(pending.buffer)
-                                .is_ok_and(|state| {
-                                    state.subscriptions().contains_key(&callback.id)
-                                })
+                                .is_ok_and(|state| state.subscriptions().contains_key(&callback.id))
                         });
                         if !still_attached {
                             detached.insert(callback.id);
@@ -814,11 +799,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                         detached.insert(callback.id);
                         continue;
                     }
-                    let args = match changedtick_args(
-                        lua,
-                        pending.buffer,
-                        &event_delivery.event,
-                    ) {
+                    let args = match changedtick_args(lua, pending.buffer, &event_delivery.event) {
                         Ok(args) => args,
                         Err(error) => {
                             first_error.get_or_insert(error);
@@ -857,9 +838,11 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                             let Some(release) = release else {
                                 continue;
                             };
-                            if let Err(error) =
-                                invoke_detach_callbacks(lua, &context, std::slice::from_ref(&release))
-                            {
+                            if let Err(error) = invoke_detach_callbacks(
+                                lua,
+                                &context,
+                                std::slice::from_ref(&release),
+                            ) {
                                 first_error.get_or_insert(error);
                             }
                             if let Err(error) =
@@ -873,11 +856,9 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
                                 continue;
                             }
                             let still_attached = session.with_editor(|editor| {
-                                editor
-                                    .buffer(pending.buffer)
-                                    .is_ok_and(|state| {
-                                        state.subscriptions().contains_key(&callback.id)
-                                    })
+                                editor.buffer(pending.buffer).is_ok_and(|state| {
+                                    state.subscriptions().contains_key(&callback.id)
+                                })
                             });
                             if !still_attached {
                                 detached.insert(callback.id);
@@ -905,9 +886,7 @@ pub fn drain_buffer_callbacks(lua: &Lua, session: &ApiSession) -> Result<(), Str
 
                 if !failed_channels.is_empty() {
                     let mut event = event_delivery.event;
-                    event
-                        .subscribers
-                        .retain(|id| failed_channels.contains(id));
+                    event.subscribers.retain(|id| failed_channels.contains(id));
                     if !event.subscribers.is_empty() {
                         retries.entry(pending.buffer).or_default().push(event);
                     }
@@ -936,9 +915,9 @@ mod tests {
     use std::rc::Rc;
 
     use mlua::Table;
-    use ox_api::{register_channel, set_channel_sink, ChannelInfo, ChannelSink};
-    use ox_rpc::{ChannelId, IncrementalDecoder};
+    use ox_api::{ChannelInfo, ChannelSink, register_channel, set_channel_sink};
     use ox_editor::{BufferAttachSubscription, Editor, Geometry};
+    use ox_rpc::{ChannelId, IncrementalDecoder};
     use ox_types::Dict;
 
     use super::*;
@@ -950,12 +929,7 @@ mod tests {
         };
         let next: i32 = refs.raw_get("__next").unwrap();
         (1..next)
-            .filter(|reference| {
-                !matches!(
-                    refs.raw_get::<Value>(*reference).unwrap(),
-                    Value::Nil
-                )
-            })
+            .filter(|reference| !matches!(refs.raw_get::<Value>(*reference).unwrap(), Value::Nil))
             .count()
     }
     fn setup_with_callback<F>(lua: &Lua, callback: F) -> (Editor, BufHandle, i32)
@@ -989,12 +963,18 @@ mod tests {
             options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(reference))]),
         });
         state
-            .replace_lines(1, 1, &[b"first".to_vec(), b"second".to_vec()], cursor, cursor, 0)
+            .replace_lines(
+                1,
+                1,
+                &[b"first".to_vec(), b"second".to_vec()],
+                cursor,
+                cursor,
+                0,
+            )
             .unwrap();
 
         (editor, buffer, reference)
     }
-
 
     fn callback_args(args: &Variadic<Value>) -> Vec<String> {
         args.iter()
@@ -1012,8 +992,7 @@ mod tests {
         if lua.app_data_ref::<ApiDispatchContext>().is_some() {
             return drain_buffer_callbacks(lua, session);
         }
-        let context_session =
-            Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
+        let context_session = Rc::new(ApiSession::new(Rc::new(RefCell::new(Editor::new()))));
         lua.set_app_data(ApiDispatchContext::new(context_session));
         drain_buffer_callbacks(lua, session)
     }
@@ -1303,13 +1282,11 @@ mod tests {
             .create_function(make_callback(Rc::clone(&calls_b)))
             .unwrap();
 
-        let Object::LuaRef(ref_a) =
-            lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
+        let Object::LuaRef(ref_a) = lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
         else {
             unreachable!()
         };
-        let Object::LuaRef(ref_b) =
-            lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
+        let Object::LuaRef(ref_b) = lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
         else {
             unreachable!()
         };
@@ -1379,8 +1356,7 @@ mod tests {
             .create_function(make_callback(Rc::clone(&calls_a)))
             .unwrap();
 
-        let Object::LuaRef(ref_a) =
-            lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
+        let Object::LuaRef(ref_a) = lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
         else {
             unreachable!()
         };
@@ -1402,21 +1378,13 @@ mod tests {
 
         // Queue the first edit before the second listener attaches.
         state
-            .replace_lines(
-                1,
-                1,
-                &[b"before".to_vec(), b"".to_vec()],
-                cursor,
-                cursor,
-                0,
-            )
+            .replace_lines(1, 1, &[b"before".to_vec(), b"".to_vec()], cursor, cursor, 0)
             .unwrap();
 
         let callback_b = lua
             .create_function(make_callback(Rc::clone(&calls_b)))
             .unwrap();
-        let Object::LuaRef(ref_b) =
-            lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
+        let Object::LuaRef(ref_b) = lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
         else {
             unreachable!()
         };
@@ -1532,7 +1500,9 @@ mod tests {
         let session = ApiSession::new(Rc::new(RefCell::new(editor)));
 
         for _ in 0..8 {
-            let callback = lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+            let callback = lua
+                .create_function(|_, _args: Variadic<Value>| Ok(Value::Nil))
+                .unwrap();
             let Object::LuaRef(reference) =
                 lua_to_object_ref(&lua, &Value::Function(callback)).unwrap()
             else {
@@ -1545,10 +1515,7 @@ mod tests {
                     .attach_lua(BufferAttachSubscription {
                         channel_id: 0,
                         send_buffer: false,
-                        options: Dict(vec![(
-                            OxStr::from("on_bytes"),
-                            Object::LuaRef(reference),
-                        )]),
+                        options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(reference))]),
                     });
                 editor
                     .buffer_mut(buffer)
@@ -1569,7 +1536,9 @@ mod tests {
             .unwrap();
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
-        let callback = lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
+        let callback = lua
+            .create_function(|_, _args: Variadic<Value>| Ok(Value::Nil))
+            .unwrap();
         let Object::LuaRef(reference) =
             lua_to_object_ref(&lua, &Value::Function(callback)).unwrap()
         else {
@@ -1583,10 +1552,7 @@ mod tests {
                 .attach_lua(BufferAttachSubscription {
                     channel_id: 0,
                     send_buffer: false,
-                    options: Dict(vec![(
-                        OxStr::from("on_bytes"),
-                        Object::LuaRef(reference),
-                    )]),
+                    options: Dict(vec![(OxStr::from("on_bytes"), Object::LuaRef(reference))]),
                 });
             editor.unload_buffer(buffer).unwrap();
         });
@@ -1605,17 +1571,17 @@ mod tests {
             .unwrap();
         let mut editor = Editor::new();
         let buffer = editor.create_buffer(true).unwrap();
-        let callback_a =
-            lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
-        let callback_b =
-            lua.create_function(|_, _args: Variadic<Value>| Ok(Value::Nil)).unwrap();
-        let Object::LuaRef(ref_a) =
-            lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
+        let callback_a = lua
+            .create_function(|_, _args: Variadic<Value>| Ok(Value::Nil))
+            .unwrap();
+        let callback_b = lua
+            .create_function(|_, _args: Variadic<Value>| Ok(Value::Nil))
+            .unwrap();
+        let Object::LuaRef(ref_a) = lua_to_object_ref(&lua, &Value::Function(callback_a)).unwrap()
         else {
             unreachable!()
         };
-        let Object::LuaRef(ref_b) =
-            lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
+        let Object::LuaRef(ref_b) = lua_to_object_ref(&lua, &Value::Function(callback_b)).unwrap()
         else {
             unreachable!()
         };
@@ -1795,17 +1761,14 @@ mod tests {
         );
 
         session.with_editor_mut(|editor| {
-            editor
-                .buffer_mut(buffer)
-                .unwrap()
-                .insert_subscription(
-                    7,
-                    BufferAttachSubscription {
-                        channel_id: 7,
-                        send_buffer: true,
-                        options: Dict(Vec::new()),
-                    },
-                );
+            editor.buffer_mut(buffer).unwrap().insert_subscription(
+                7,
+                BufferAttachSubscription {
+                    channel_id: 7,
+                    send_buffer: true,
+                    options: Dict(Vec::new()),
+                },
+            );
         });
         drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 1);
@@ -1830,17 +1793,14 @@ mod tests {
         assert_eq!(params[5], Object::Boolean(false));
 
         session.with_editor_mut(|editor| {
-            editor
-                .buffer_mut(buffer)
-                .unwrap()
-                .insert_subscription(
-                    8,
-                    BufferAttachSubscription {
-                        channel_id: 8,
-                        send_buffer: false,
-                        options: Dict(Vec::new()),
-                    },
-                );
+            editor.buffer_mut(buffer).unwrap().insert_subscription(
+                8,
+                BufferAttachSubscription {
+                    channel_id: 8,
+                    send_buffer: false,
+                    options: Dict(Vec::new()),
+                },
+            );
         });
         drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 2);
@@ -1857,14 +1817,7 @@ mod tests {
         session.with_editor_mut(|editor| {
             let state = editor.buffer_mut(buffer).unwrap();
             state
-                .replace_lines(
-                    1,
-                    1,
-                    &[b"next".to_vec()],
-                    cursor,
-                    cursor,
-                    0,
-                )
+                .replace_lines(1, 1, &[b"next".to_vec()], cursor, cursor, 0)
                 .unwrap();
         });
         drain_test_callbacks(&Lua::new(), &session).unwrap();
@@ -1907,17 +1860,14 @@ mod tests {
         );
 
         session.with_editor_mut(|editor| {
-            editor
-                .buffer_mut(buffer)
-                .unwrap()
-                .insert_subscription(
-                    17,
-                    BufferAttachSubscription {
-                        channel_id: 17,
-                        send_buffer: false,
-                        options: Dict(Vec::new()),
-                    },
-                );
+            editor.buffer_mut(buffer).unwrap().insert_subscription(
+                17,
+                BufferAttachSubscription {
+                    channel_id: 17,
+                    send_buffer: false,
+                    options: Dict(Vec::new()),
+                },
+            );
         });
         drain_test_callbacks(&Lua::new(), &session).unwrap();
         assert_eq!(writes.borrow().len(), 1);

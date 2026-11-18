@@ -15,8 +15,8 @@ pub use command::{
 pub use expand::{CmdlineContext, CmdlineSpecial, ExpansionPart, expand_with, scan_expansions};
 pub use parser::{
     Address, AddressBase, CommandModifier, ErrorCode, ExCommand, ModifierKind, ParseError, Parser,
-    PreviewMagic, PreviewPattern, Range, RangeKind, RangeSeparator, effective_addr_type,
-    effective_flags, parse_modifiers, parse_preview_pattern,
+    PreviewMagic, PreviewPattern, Range, RangeKind, RangeSeparator, VimgrepArgs, effective_addr_type,
+    effective_flags, parse_modifiers, parse_preview_pattern, split_vimgrep_args,
 };
 
 impl ExCommand {

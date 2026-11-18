@@ -27,6 +27,14 @@ pub fn hrtime() -> u64 {
     u64::try_from(elapsed).unwrap_or(u64::MAX)
 }
 
+/// Returns the number of parallel threads the runtime reports, as
+/// `uv.available_parallelism()` does.
+pub fn available_parallelism() -> u64 {
+    std::thread::available_parallelism()
+        .map(|n| u64::try_from(n.get()).unwrap_or(u64::MAX))
+        .unwrap_or(1)
+}
+
 /// Returns Unix seconds and microseconds within the current second.
 ///
 /// # Errors
@@ -91,6 +99,22 @@ pub fn os_tmpdir() -> PathBuf {
 #[must_use]
 pub fn getpid() -> u32 {
     std::process::id()
+}
+
+/// Returns the current process user ID.
+///
+/// See `luvref.txt`, `uv.getuid()` (lines 4208-4215).
+#[must_use]
+pub fn getuid() -> u32 {
+    #[cfg(unix)]
+    {
+        rustix::process::getuid().as_raw()
+    }
+
+    #[cfg(not(unix))]
+    {
+        0
+    }
 }
 
 /// Returns the current working directory.

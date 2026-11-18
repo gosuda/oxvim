@@ -55,6 +55,9 @@ jobs:
       - run: rustup toolchain install 1.98.0 --profile minimal
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo test --locked -p ox-tui -p ox-sys --lib
+      - name: Check the whole workspace for the host MSVC target
+        run: cargo check --locked --workspace --all-targets
+      - run: cargo test --locked -p ox-editor --test platform_startup
       - run: rustup target add i686-pc-windows-msvc
       - name: Preserve libuv uname behavior under WOW64
         run: cargo test --locked -p ox-sys --lib --target i686-pc-windows-msvc

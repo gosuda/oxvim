@@ -250,7 +250,6 @@ fn ext_payload_uint(payload: &[u8]) -> Option<i64> {
 #[error("could not encode msgpack: {0}")]
 pub struct EncodeError(#[from] rmpv::encode::Error);
 
-
 /// Encode a single [`Object`] into `out` as its msgpack byte representation.
 ///
 /// # Errors
@@ -387,9 +386,7 @@ impl IncrementalDecoder {
             match rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_MESSAGE_DEPTH) {
                 Ok(value) => {
                     let Ok(bytes_used) = usize::try_from(cursor.position()) else {
-                        error = Some(DecodeError::Malformed(
-                            "cursor position overflow".into(),
-                        ));
+                        error = Some(DecodeError::Malformed("cursor position overflow".into()));
                         break;
                     };
                     // Validate message shape before consuming the frame.
@@ -477,7 +474,6 @@ mod tests {
         encode(&mut out, obj).unwrap();
         out
     }
-
 
     #[test]
     fn object_round_trip_all_kinds() {
@@ -688,7 +684,10 @@ mod tests {
             method: OxStr::from("fresh"),
             params: vec![],
         };
-        assert_eq!(dec.feed(&fresh.encode_bytes().unwrap()).unwrap(), vec![fresh]);
+        assert_eq!(
+            dec.feed(&fresh.encode_bytes().unwrap()).unwrap(),
+            vec![fresh]
+        );
 
         // Same contract for an oversized tail: under a small staging limit an
         // incomplete tail larger than the limit still reports the earlier

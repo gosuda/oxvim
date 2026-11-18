@@ -1031,7 +1031,9 @@ fn mod_mask(byte: u8) -> Option<u8> {
 
 /// Byte length of the first UTF-8 scalar (`utfc_ptr2len`); 1 on invalid UTF-8.
 fn utf_len(bytes: &[u8]) -> usize {
-    let Some(&first) = bytes.first() else { return 0 };
+    let Some(&first) = bytes.first() else {
+        return 0;
+    };
     let len = if first < 0x80 {
         1
     } else if first < 0xe0 {
@@ -1077,17 +1079,10 @@ fn vim_str2nr(text: &[u8]) -> Option<(u32, usize)> {
     }
     // The number ends at the first non-digit; strict mode rejects a trailing
     // identifier character (`char-66x` is E474).
-    if digits
-        .get(digit_len)
-        .is_some_and(|byte| is_ident(*byte))
-    {
+    if digits.get(digit_len).is_some_and(|byte| is_ident(*byte)) {
         return None;
     }
-    let value = u32::from_str_radix(
-        std::str::from_utf8(&digits[..digit_len]).ok()?,
-        radix,
-    )
-    .ok()?;
+    let value = u32::from_str_radix(std::str::from_utf8(&digits[..digit_len]).ok()?, radix).ok()?;
     let signed = if negative {
         value.wrapping_neg()
     } else {
@@ -1121,7 +1116,10 @@ fn handle_x_keys(second: u8, third: u8) -> DecodedKey {
 fn named_key_code(name: &[u8], next: u8) -> Option<DecodedKey> {
     const EXTRA: u8 = 0xfd;
     if name.len() >= 3 && name[0] == b't' && name[1] == b'_' {
-        return Some(DecodedKey::Special(name[2], name.get(3).copied().unwrap_or(next)));
+        return Some(DecodedKey::Special(
+            name[2],
+            name.get(3).copied().unwrap_or(next),
+        ));
     }
     let lower: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
     if let [b'f', rest @ ..] = lower.as_slice()
@@ -1342,8 +1340,7 @@ fn find_special_key(tail: &[u8], offset: usize) -> Result<Option<(Vec<u8>, usize
         && after[5].is_ascii_digit()
     {
         // `<Char-123>`, `<Char-033>`, `<Char-0x33>` (`keycodes.c:544-552`).
-        vim_str2nr(&after[5..])
-            .map(|(value, _)| DecodedKey::Char(value))
+        vim_str2nr(&after[5..]).map(|(value, _)| DecodedKey::Char(value))
     } else {
         let single = if modifiers != 0 {
             if after == b"\\\"" {

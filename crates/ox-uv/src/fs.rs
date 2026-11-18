@@ -29,9 +29,13 @@ pub struct FsError {
 impl FsError {
     fn from_io(error: &io::Error) -> Self {
         let raw_os_error = error.raw_os_error();
+        let name = errno_name(raw_os_error, error.kind());
+        let message = uv_strerror(name)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
         Self {
-            name: errno_name(raw_os_error, error.kind()),
-            message: error.to_string(),
+            name,
+            message,
             raw_os_error,
         }
     }
@@ -2157,4 +2161,68 @@ fn errno_name(raw: Option<i32>, kind: io::ErrorKind) -> &'static str {
         io::ErrorKind::Unsupported => "ENOSYS",
         _ => "EIO",
     }
+}
+
+/// Returns the libuv-standard error message for a given errno name, if known.
+pub fn uv_strerror(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "E2BIG" => "argument list too long",
+        "EACCES" => "permission denied",
+        "EADDRINUSE" => "address already in use",
+        "EADDRNOTAVAIL" => "address not available",
+        "EAFNOSUPPORT" => "address family not supported",
+        "EAGAIN" => "resource temporarily unavailable",
+        "EBADF" => "bad file descriptor",
+        "EBUSY" => "resource busy or locked",
+        "ECANCELED" => "operation canceled",
+        "ECHARSET" => "invalid Unicode character",
+        "ECONNABORTED" => "software caused connection abort",
+        "ECONNREFUSED" => "connection refused",
+        "ECONNRESET" => "connection reset by peer",
+        "EDESTADDRREQ" => "destination address required",
+        "EEXIST" => "file already exists",
+        "EFAULT" => "bad address in system call argument",
+        "EFBIG" => "file too large",
+        "EHOSTUNREACH" => "host is unreachable",
+        "EINTR" => "interrupted system call",
+        "EINVAL" => "invalid argument",
+        "EIO" => "i/o error",
+        "EISCONN" => "socket is already connected",
+        "EISDIR" => "illegal operation on a directory",
+        "ELOOP" => "too many symbolic links encountered",
+        "EMFILE" => "too many open files",
+        "EMSGSIZE" => "message too long",
+        "ENAMETOOLONG" => "name too long",
+        "ENETDOWN" => "network is down",
+        "ENETUNREACH" => "network is unreachable",
+        "ENFILE" => "file table overflow",
+        "ENOBUFS" => "no buffer space available",
+        "ENODEV" => "no such device",
+        "ENOENT" => "no such file or directory",
+        "ENOMEM" => "not enough memory",
+        "ENONET" => "machine is not on the network",
+        "ENOPROTOOPT" => "protocol not available",
+        "ENOSPC" => "no space left on device",
+        "ENOSYS" => "function not implemented",
+        "ENOTCONN" => "socket is not connected",
+        "ENOTDIR" => "not a directory",
+        "ENOTEMPTY" => "directory not empty",
+        "ENOTSOCK" => "socket operation on non-socket",
+        "ENOTSUP" => "operation not supported on socket",
+        "EOVERFLOW" => "value too large for defined data type",
+        "EPERM" => "operation not permitted",
+        "EPIPE" => "broken pipe",
+        "EPROTO" => "protocol error",
+        "EPROTONOSUPPORT" => "protocol not supported",
+        "EPROTOTYPE" => "protocol wrong type for socket",
+        "ERANGE" => "result too large",
+        "EROFS" => "read-only file system",
+        "ESHUTDOWN" => "cannot send after transport endpoint shutdown",
+        "ESPIPE" => "invalid seek",
+        "ESRCH" => "no such process",
+        "ETIMEDOUT" => "connection timed out",
+        "ETXTBSY" => "text file is busy",
+        "EXDEV" => "cross-device link not permitted",
+        _ => return None,
+    })
 }

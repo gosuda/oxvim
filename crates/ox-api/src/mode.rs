@@ -83,13 +83,24 @@ pub fn current_cmdline_text(session: &ApiSession) -> Result<String, ApiError> {
 ///
 /// Returns an error when the host mode machine is unavailable or busy.
 pub fn command_history(session: &ApiSession, index: isize) -> Result<Option<String>, ApiError> {
-    let machine = session
-        .with_state(|state| state.mode_machine.clone())
-        .ok_or_else(|| ApiError::exception("input mode state is not installed"))?;
-    let machine = machine
-        .try_borrow()
-        .map_err(|_| ApiError::exception("input mode state is busy"))?;
-    Ok(machine.cmdline_history(index).map(str::to_owned))
+    // The single `history[HIST_CMD]` bank on Editor is the store
+    // interactive recall, histadd/histdel and ShaDa all share.
+    Ok(session.with_editor(|editor| {
+        let entries: Vec<String> = editor
+            .history()
+            .entries(ox_editor::history::HistoryKind::Cmd)
+            .map(str::to_owned)
+            .collect();
+        let len = isize::try_from(entries.len()).ok()?;
+        let index = if index < 0 {
+            len.checked_add(index)?
+        } else {
+            index
+        };
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| entries.get(index).cloned())
+    }))
 }
 
 /// Returns the register currently recording a macro.

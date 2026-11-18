@@ -668,6 +668,8 @@ impl UvLoop {
 
 impl Drop for UvLoop {
     fn drop(&mut self) {
+        // Closing rejects new posts and drops queued completions, including
+        // ones that captured a clone of this loop's completion queue.
         self.completions.close();
     }
 }

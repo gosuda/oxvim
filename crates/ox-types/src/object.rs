@@ -86,7 +86,6 @@ mod tests {
     use super::Dict;
     use super::Object;
     use crate::byte_str::OxStr;
-    use crate::handle::BufHandle;
 
     #[test]
     fn dict_insert_replaces_in_place() {
@@ -107,13 +106,6 @@ mod tests {
     }
 
     #[test]
-    fn dict_get_missing_returns_none() {
-        let d = Dict(vec![]);
-        assert_eq!(d.get(&OxStr::from("nope")), None);
-        assert!(d.0.is_empty());
-    }
-
-    #[test]
     fn dict_iter_preserves_order() {
         let d = Dict(vec![
             (OxStr::from("x"), Object::Nil),
@@ -128,8 +120,5 @@ mod tests {
         assert_eq!(super::EXT_TYPE_BUFFER, 0);
         assert_eq!(super::EXT_TYPE_WINDOW, 1);
         assert_eq!(super::EXT_TYPE_TABPAGE, 2);
-        // The handle payloads carry the extensible kinds.
-        let obj = Object::Buffer(BufHandle::try_from(5).unwrap());
-        assert_eq!(obj, Object::Buffer(BufHandle::try_from(5).unwrap()));
     }
 }

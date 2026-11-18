@@ -59,6 +59,28 @@ pub fn seed_argv(editor: &mut Editor) {
         .insert(OxStr::from("argv"), Object::Array(argv));
 }
 
+/// Seeds `v:argf` (`vvars.txt`): the positional file arguments given at
+/// startup, as absolute paths, without option arguments and without the
+/// `:args` list that later commands can change.
+pub fn seed_argf(editor: &mut Editor, files: &[String]) {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let args = files
+        .iter()
+        .map(|file| {
+            let path = std::path::Path::new(file);
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            Object::String(OxStr::from(absolute.to_string_lossy().as_bytes()))
+        })
+        .collect::<Vec<_>>();
+    editor
+        .vvars_mut()
+        .insert(OxStr::from("argf"), Object::Array(args));
+}
+
 /// Rebuilds the parsed command line for the embedded child process.
 ///
 /// The child is the editor, so every option the scanner parsed has its
@@ -101,6 +123,7 @@ fn interactive_child_arguments(cli: &Cli) -> Vec<String> {
         (cli.no_write && !cli.no_modifiable, "-m"),
         (cli.no_swap_file, "-n"),
         (cli.binary, "-b"),
+        (cli.diff_mode, "-d"),
     ] {
         if requested {
             arguments.push(flag.into());
@@ -396,8 +419,39 @@ pub fn open_startup_buffers(
             binary: cli.binary,
         },
     )?;
-    if cli.window_layout != WindowLayout::Single {
-        create_startup_windows(editor, cli, &buffers)?;
+    // `set_window_layout` (main.c:1651): `-d` without an explicit `-o`,
+    // `-O` or `-p` still opens one window per file — a vertical split,
+    // unless 'diffopt' asks for horizontal diffs.
+    let layout = if cli.diff_mode && cli.window_layout == WindowLayout::Single {
+        let horizontal = matches!(
+            editor.options().get_global("diffopt"),
+            Ok(OptionValue::String(value))
+                if value.split(',').any(|flag| flag.trim() == "horizontal")
+        );
+        if horizontal {
+            WindowLayout::Horizontal
+        } else {
+            WindowLayout::Vertical
+        }
+    } else {
+        cli.window_layout
+    };
+    if layout != WindowLayout::Single {
+        create_startup_windows(editor, cli, layout, &buffers)?;
+    }
+    if cli.diff_mode {
+        // `-d` is `diff_mode` in `main.c`: every window that shows a startup
+        // file starts with `'diff'` set, which is what the difftool plugin
+        // checks before opening itself (`plugin/difftool.lua` `start_diff`).
+        let windows = editor
+            .current_tabpage()
+            .and_then(|tab| editor.tabpage_windows(tab).ok())
+            .unwrap_or_default();
+        for window in windows {
+            let _ = editor
+                .options_mut()
+                .set_window(window, "diff", OptionValue::Boolean(true));
+        }
     }
     Ok(())
 }
@@ -469,6 +523,30 @@ fn open_startup_files(
     });
     let mut handles = Vec::with_capacity(files.len());
     for (index, file) in files.iter().enumerate() {
+        // A directory argument shows its listing, not an `E484`. Startup
+        // reuses the `:edit <dir>` view so `-d dir1 dir2` can reach VimEnter
+        // with both directories loaded.
+        if std::path::Path::new(file).is_dir() {
+            let buffer = if index == 0 && first_into_current {
+                editor
+                    .current_buffer()
+                    .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?
+            } else {
+                editor
+                    .create_buffer_with(Buffer::from_bytes(b"").map_err(|error| {
+                        AppError::Editor(error.to_string())
+                    })?, true)
+                    .map_err(|error| AppError::Editor(error.to_string()))?
+            };
+            ox_editor::excmd_exec::load_directory_view(
+                editor,
+                buffer,
+                std::path::Path::new(file),
+            )
+            .map_err(|error| AppError::Editor(error.to_string()))?;
+            handles.push(buffer);
+            continue;
+        }
         let bytes = read_startup_file(file)?;
         // `file_readonly` (fileio.c:462): a file with no write permission
         // bit loads 'readonly'; a file that does not exist yet stays
@@ -487,9 +565,10 @@ fn open_startup_files(
                 .current_buffer()
                 .ok_or_else(|| AppError::Editor("no current buffer at startup".into()))?;
             if flags.binary {
-                let _ = editor
-                    .options_mut()
-                    .set_buffer(current, "binary", OptionValue::Boolean(true));
+                let _ =
+                    editor
+                        .options_mut()
+                        .set_buffer(current, "binary", OptionValue::Boolean(true));
             }
             let read = startup_file_read(editor, Some(current), &bytes);
             let text = startup_file_buffer(&read)?;
@@ -521,9 +600,10 @@ fn open_startup_files(
             "fileformat",
             OptionValue::String(read.fileformat.to_owned()),
         );
-        let _ = editor
-            .options_mut()
-            .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
+        let _ =
+            editor
+                .options_mut()
+                .set_buffer(handle, "endofline", OptionValue::Boolean(read.eol));
         if let Ok(state) = editor.buffer_mut(handle) {
             state.set_name(OxStr::from(file.as_str()));
             state.mark_saved();
@@ -569,6 +649,7 @@ fn open_stdin_buffer(editor: &mut Editor) -> Result<(), AppError> {
 fn create_startup_windows(
     editor: &mut Editor,
     cli: &Cli,
+    layout: WindowLayout,
     buffers: &[BufHandle],
 ) -> Result<(), AppError> {
     let editor_error = |error: EditorError| AppError::Editor(error.to_string());
@@ -584,7 +665,7 @@ fn create_startup_windows(
             Some(buffer) => *buffer,
             None => editor.create_buffer(true).map_err(editor_error)?,
         };
-        if cli.window_layout == WindowLayout::Tabs {
+        if layout == WindowLayout::Tabs {
             let geometry =
                 Geometry::new(0, 0, 80, 24).map_err(|error| AppError::Editor(error.to_string()))?;
             editor
@@ -592,7 +673,7 @@ fn create_startup_windows(
                 .map_err(editor_error)?;
             continue;
         }
-        previous = if cli.window_layout == WindowLayout::Vertical {
+        previous = if layout == WindowLayout::Vertical {
             editor
                 .split_vertical(first_tab, previous, buffer, true)
                 .map_err(editor_error)?
@@ -699,6 +780,8 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             })?;
         } else {
             session.with_editor_mut(|editor| {
+                // `v:argf` is fixed at startup, before any `:args` change.
+                seed_argf(editor, &cli.files);
                 open_startup_buffers(editor, cli, cli.stdin_file.then_some(input.as_str()))
             })?;
         }
@@ -707,6 +790,17 @@ pub fn run_batch(cli: &Cli, timer: &mut StartupTimer) -> Result<i64, AppError> {
             exit_code = code;
             break 'startup;
         }
+        // Startup is over: `v:vim_did_enter` turns 1 and `VimEnter` applies
+        // before the Ex loop reads standard input (main.c:620). Batch mode
+        // never fired either, so every `-S`/`-c` script after startup saw 0.
+        session.with_editor_mut(ox_editor::Editor::set_v_vim_did_enter);
+        let plan = session.with_editor_mut(|editor| {
+            editor
+                .autocmds_mut()
+                .plan(ox_editor::Event::VimEnter, ox_editor::AutocmdContext::default())
+        });
+        ox_api::execute_firing_plan(&session, plan)
+            .map_err(|error| AppError::Api(error.to_string()))?;
         // The Ex-commands read sits at the end of startup (main.c:670-685)
         // and only when stdin is not a tty (main.c:674-676: "nvim -es +cmd"
         // in a tty executes and exits, it doesn't wait for input).
@@ -872,11 +966,11 @@ pub fn run_lua(script: &LuaScript, clean: bool) -> Result<(), AppError> {
     crate::server::seed_executor_from(&mut nested, &primary, &channel_ids);
     let host = LuaHost::new(
         RuntimeRoot::new(runtime_root().unwrap_or_default()),
-        Rc::new(crate::server::EditorBuiltins {
-            session: session.clone(),
-            ex: Rc::new(RefCell::new(primary)),
-            nested_ex: Rc::new(RefCell::new(nested)),
-        }),
+        Rc::new(crate::server::EditorBuiltins::new(
+            session.clone(),
+            Rc::new(RefCell::new(primary)),
+            Rc::new(RefCell::new(nested)),
+        )),
         Rc::new(ImmediateScheduler),
     )
     .map_err(|error| AppError::Lua(error.to_string()))?;
@@ -1007,7 +1101,11 @@ impl Scheduler for ImmediateScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::split_commands;
+    use ox_editor::Editor;
+    use ox_editor::options::OptionValue;
+
+    use super::{interactive_child_arguments, open_startup_buffers, split_commands};
+    use crate::cli::Cli;
 
     #[test]
     fn splits_only_unquoted_unescaped_bars() {
@@ -1015,5 +1113,50 @@ mod tests {
             split_commands("echo 'a|b' | echo \"c|d\" | echo e\\|f"),
             ["echo 'a|b'", "echo \"c|d\"", "echo e\\|f"]
         );
+    }
+
+    /// `main.c` `command_line_scan` forwards every startup flag to the
+    /// `--embed` child: `-d` must survive so the child enters diff mode.
+    #[test]
+    fn interactive_child_arguments_forward_diff_mode() {
+        let cli = Cli::parse(["-d", "left", "right"].into_iter()).expect("parse -d");
+        let arguments = interactive_child_arguments(&cli);
+        assert!(arguments.iter().any(|arg| arg == "-d"));
+    }
+
+    /// `set_window_layout` (main.c:1651): `-d` alone opens one vertical
+    /// window per file and marks every shown startup window 'diff';
+    /// an explicit `-o` keeps its own layout.
+    #[test]
+    fn diff_mode_defaults_to_vertical_splits() {
+        let dir = std::env::temp_dir().join(format!("oxvim-diff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let left = dir.join("left");
+        let right = dir.join("right");
+        std::fs::write(&left, b"a\n").unwrap();
+        std::fs::write(&right, b"b\n").unwrap();
+        let cli = Cli::parse(
+            [
+                "-d".to_owned(),
+                left.display().to_string(),
+                right.display().to_string(),
+            ]
+            .into_iter(),
+        )
+        .expect("parse -d");
+        let mut editor = Editor::new();
+        let buffer = editor.create_buffer(true).unwrap();
+        editor
+            .create_tabpage(buffer, ox_editor::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        open_startup_buffers(&mut editor, &cli, None).unwrap();
+        let tab = editor.current_tabpage().unwrap();
+        let windows = editor.tabpage_windows(tab).unwrap();
+        assert_eq!(windows.len(), 2, "-d splits one window per file");
+        for window in windows {
+            let diff = editor.options().get_window(window, "diff").unwrap();
+            assert!(matches!(diff, OptionValue::Boolean(true)));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

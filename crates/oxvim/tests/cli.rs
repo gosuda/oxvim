@@ -972,7 +972,6 @@ fn upstream_no_op_flags_are_accepted() {
 #[test]
 fn flags_without_their_subsystem_are_rejected_by_name() {
     for (arguments, requirement) in [
-        (vec!["-d"], "a diff engine"),
         (
             vec!["-A"],
             "the 'arabic' option side effects and keymap files",

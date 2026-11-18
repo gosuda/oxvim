@@ -39,7 +39,8 @@ pub trait LoopPoster: Clone + Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`PostError`] if the owning loop is no longer accepting
-    /// completions or if waking the loop fails.
+    /// completions, in which case the completion is dropped without running,
+    /// or if waking the loop fails.
     fn post(&self, completion: LoopCompletion) -> Result<(), PostError>;
 }
 
@@ -184,16 +185,11 @@ impl Pool {
         let finish_for_job = finish.clone();
         let job = Box::new(move || {
             let result = catch_unwind(AssertUnwindSafe(work)).map_err(|_| PoolError::WorkPanicked);
-            let finish_in_callback = finish_for_job.clone();
-            if poster
-                .post(Box::new(move |uv_loop| {
-                    let _guard = RequestGuard(finish_in_callback);
-                    complete(uv_loop, result);
-                }))
-                .is_err()
-            {
-                finish_for_job.end();
-            }
+            let guard = RequestGuard(finish_for_job);
+            let _ = poster.post(Box::new(move |uv_loop| {
+                let _guard = guard;
+                complete(uv_loop, result);
+            }));
         });
         let sender = self.inner.sender.lock().map_err(|_| {
             finish.end();
@@ -247,8 +243,23 @@ impl UvLoopPoster {
         self.inner.outstanding.load(Ordering::Acquire) != 0
     }
 
+    /// Closes ingress and drops completions this loop will never dispatch.
+    ///
+    /// Pooled completions capture a clone of this queue until they run, so
+    /// leaving them queued after the owning loop is gone would make the queue
+    /// keep itself reachable. The accepting flag flips and the drain both
+    /// happen under the pending lock, so a concurrent [`LoopPoster::post`]
+    /// either enqueues before the drain or is rejected afterwards; it can never
+    /// leave an entry behind.
     pub(crate) fn close(&self) {
+        let mut pending = match self.inner.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         self.inner.accepting.store(false, Ordering::Release);
+        let drained = std::mem::take(&mut *pending);
+        drop(pending);
+        drop(drained);
     }
 }
 
@@ -277,15 +288,20 @@ impl LoopPoster for UvLoopPoster {
     }
 
     fn post(&self, completion: LoopCompletion) -> Result<(), PostError> {
+        let mut pending = self.inner.pending.lock().map_err(|_| PostError)?;
         if !self.inner.accepting.load(Ordering::Acquire) {
+            drop(pending);
             return Err(PostError);
         }
-        self.inner
-            .pending
-            .lock()
-            .map_err(|_| PostError)?
-            .push_back(completion);
-        self.inner.waker.wake().map_err(|_| PostError)
+        pending.push_back(completion);
+        if self.inner.waker.wake().is_err() {
+            let rejected = pending.pop_back();
+            drop(pending);
+            drop(rejected);
+            return Err(PostError);
+        }
+        drop(pending);
+        Ok(())
     }
 }
 

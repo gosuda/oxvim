@@ -53,12 +53,17 @@ fn edits_quits_and_restores_terminal_palette() {
         }
     });
     let mut output = Vec::new();
+    let mut parser = vt100::Parser::new(24, 80, 0);
     let mut writer = pair.master.take_writer().expect("take PTY writer");
-    wait_for(&receiver, &mut output, "terminal setup", |bytes| {
-        contains(bytes, b"\x1b[?25l")
-    });
+    wait_for(
+        &mut parser,
+        &receiver,
+        &mut output,
+        "terminal setup",
+        |screen| screen.hide_cursor(),
+    );
 
-    drive_edit_overlay_session(&receiver, &mut output, &mut writer);
+    drive_edit_overlay_session(&receiver, &mut parser, &mut output, &mut writer);
 
     writer.write_all(b":q!\r").expect("send forced quit");
     writer.flush().expect("flush forced quit");
@@ -94,43 +99,47 @@ fn edits_quits_and_restores_terminal_palette() {
 
 fn drive_edit_overlay_session(
     receiver: &mpsc::Receiver<Vec<u8>>,
+    parser: &mut vt100::Parser,
     output: &mut Vec<u8>,
     writer: &mut impl Write,
 ) {
-    let text_offset = printable_text(output).len();
     writer
         .write_all(b"iHello\x1b")
         .expect("send insert sequence");
     writer.flush().expect("flush insert sequence");
-    wait_for(receiver, output, "inserted grid content", |bytes| {
-        printable_text(bytes)
-            .get(text_offset..)
-            .is_some_and(|text| contains(text, b"Hello"))
-    });
+    wait_for(
+        parser,
+        receiver,
+        output,
+        "inserted grid content",
+        |screen| screen.contents().contains("Hello"),
+    );
 
-    let cmdline_offset = printable_text(output).len();
     writer
         .write_all(b":edit x")
         .expect("type command-line overlay");
     writer.flush().expect("flush command-line overlay");
-    wait_for(receiver, output, "rendered :edit x overlay", |bytes| {
-        printable_text(bytes)
-            .get(cmdline_offset..)
-            .is_some_and(|text| contains(text, b"editx"))
-    });
+    wait_for(
+        parser,
+        receiver,
+        output,
+        "rendered :edit x overlay",
+        |screen| screen.contents().contains(":edit x"),
+    );
 
-    let nested_offset = printable_text(output).len();
     writer
         .write_all(b"\x12=1+1")
         .expect("type nested expression command line");
     writer
         .flush()
         .expect("flush nested expression command line");
-    wait_for(receiver, output, "rendered Ctrl-R = level", |bytes| {
-        printable_text(bytes)
-            .get(nested_offset..)
-            .is_some_and(|text| contains(text, b"1+1"))
-    });
+    wait_for(
+        parser,
+        receiver,
+        output,
+        "rendered Ctrl-R = level",
+        |screen| screen.contents().contains("1+1"),
+    );
 
     writer
         .write_all(b"\x1b")
@@ -277,91 +286,33 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Feeds the PTY stream into a terminal model and waits for a screen predicate.
+///
+/// Asserting on the parsed screen keeps the check independent of how the
+/// client encodes a frame: a cell that was repainted is not the same thing as
+/// a byte sequence, and a delta that skips blank cells carries no spaces for
+/// the text to contain.
 fn wait_for(
+    parser: &mut vt100::Parser,
     receiver: &mpsc::Receiver<Vec<u8>>,
     output: &mut Vec<u8>,
     description: &str,
-    ready: impl Fn(&[u8]) -> bool,
+    ready: impl Fn(&vt100::Screen) -> bool,
 ) {
     let deadline = Instant::now() + TIMEOUT;
     loop {
-        if ready(output) {
+        if ready(parser.screen()) {
             return;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "timed out waiting for {description}; output: {}",
-            String::from_utf8_lossy(output)
+            "timed out waiting for {description}; screen:\n{}",
+            parser.screen().contents()
         );
         if let Ok(bytes) = receiver.recv_timeout(remaining.min(Duration::from_millis(50))) {
+            parser.process(&bytes);
             output.extend(bytes);
         }
     }
-}
-
-fn printable_text(bytes: &[u8]) -> Vec<u8> {
-    #[derive(Clone, Copy)]
-    enum State {
-        Ground,
-        Escape,
-        Csi,
-        Osc,
-        OscEscape,
-        Dcs,
-        DcsEscape,
-    }
-    let mut state = State::Ground;
-    let mut text = Vec::new();
-    for &byte in bytes {
-        state = match state {
-            State::Ground if byte == 0x1b => State::Escape,
-            State::Ground => {
-                if byte >= b' ' || matches!(byte, b'\n' | b'\r' | b'\t') {
-                    text.push(byte);
-                }
-                State::Ground
-            }
-            State::Escape => match byte {
-                b'[' => State::Csi,
-                b']' => State::Osc,
-                b'P' => State::Dcs,
-                _ => State::Ground,
-            },
-            State::Csi => {
-                if (0x40..=0x7e).contains(&byte) {
-                    State::Ground
-                } else {
-                    State::Csi
-                }
-            }
-            State::Osc => match byte {
-                0x07 => State::Ground,
-                0x1b => State::OscEscape,
-                _ => State::Osc,
-            },
-            State::OscEscape => {
-                if byte == b'\\' {
-                    State::Ground
-                } else {
-                    State::Osc
-                }
-            }
-            State::Dcs => {
-                if byte == 0x1b {
-                    State::DcsEscape
-                } else {
-                    State::Dcs
-                }
-            }
-            State::DcsEscape => {
-                if byte == b'\\' {
-                    State::Ground
-                } else {
-                    State::Dcs
-                }
-            }
-        };
-    }
-    text
 }

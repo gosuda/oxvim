@@ -116,23 +116,29 @@ impl ShaDa {
     /// length that exceeds the remaining bytes or address space, and
     /// [`ShaDaError::Decode`] for a malformed `MessagePack` payload.
     pub fn read(mut reader: impl Read, max_kbyte: usize) -> Result<Self, ShaDaError> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        let mut cursor = Cursor::new(bytes.as_slice());
         let mut entries = Vec::new();
-        while usize::try_from(cursor.position()).map_err(|_| ShaDaError::Length)? < bytes.len() {
-            let type_id = read_uint(&mut cursor)?;
-            let timestamp = read_uint(&mut cursor)?;
-            let length =
-                usize::try_from(read_uint(&mut cursor)?).map_err(|_| ShaDaError::Length)?;
-            let start = usize::try_from(cursor.position()).map_err(|_| ShaDaError::Length)?;
-            let end = start.checked_add(length).ok_or(ShaDaError::Length)?;
-            let payload = bytes.get(start..end).ok_or(ShaDaError::Length)?;
-            cursor.set_position(u64::try_from(end).map_err(|_| ShaDaError::Length)?);
+        while let Some(type_id) = read_uint(&mut reader, true)? {
+            let timestamp = read_uint(&mut reader, false)?.ok_or(ShaDaError::Length)?;
+            let length_u64 = read_uint(&mut reader, false)?.ok_or(ShaDaError::Length)?;
+            let max_length = u64::try_from(isize::MAX).map_err(|_| ShaDaError::Length)?;
+            if length_u64 > max_length {
+                return Err(ShaDaError::Length);
+            }
+            let length = usize::try_from(length_u64).map_err(|_| ShaDaError::Length)?;
             if max_kbyte != 0 && length > max_kbyte.saturating_mul(1024) {
+                skip_bytes(&mut reader, length)?;
                 continue;
             }
-            let mut payload_cursor = Cursor::new(payload);
+
+            let mut payload = Vec::with_capacity(length);
+            reader
+                .by_ref()
+                .take(length_u64)
+                .read_to_end(&mut payload)?;
+            if payload.len() != length {
+                return Err(ShaDaError::Length);
+            }
+            let mut payload_cursor = Cursor::new(payload.as_slice());
             let data = rmpv::decode::read_value(&mut payload_cursor)
                 .map_err(|error| ShaDaError::Decode(error.to_string()))?;
             entries.push(Entry {
@@ -246,16 +252,117 @@ fn map_value<'a>(value: &'a Value, key: &[u8]) -> Option<&'a Value> {
         matches.then_some(value)
     })
 }
+fn read_uint(
+    reader: &mut impl Read,
+    allow_eof: bool,
+) -> Result<Option<u64>, ShaDaError> {
+    let mut prefix = [0; 1];
+    if reader.read(&mut prefix)? == 0 {
+        return if allow_eof {
+            Ok(None)
+        } else {
+            Err(ShaDaError::Length)
+        };
+    }
+    let width = match prefix[0] {
+        0x00..=0x7f => return Ok(Some(u64::from(prefix[0]))),
+        0xcc => 1,
+        0xcd => 2,
+        0xce => 4,
+        0xcf => 8,
+        _ => return Err(ShaDaError::Prefix),
+    };
+    let mut bytes = [0; 8];
+    reader
+        .read_exact(&mut bytes[8 - width..])
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => ShaDaError::Length,
+            _ => ShaDaError::Io(error),
+        })?;
+    Ok(Some(u64::from_be_bytes(bytes)))
+}
 
-fn read_uint(cursor: &mut Cursor<&[u8]>) -> Result<u64, ShaDaError> {
-    rmpv::decode::read_value(cursor)
-        .map_err(|error| ShaDaError::Decode(error.to_string()))?
-        .as_u64()
-        .ok_or(ShaDaError::Prefix)
+fn skip_bytes(reader: &mut impl Read, mut remaining: usize) -> Result<(), ShaDaError> {
+    let mut buffer = [0; 8192];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len());
+        let read = reader.read(&mut buffer[..chunk])?;
+        if read == 0 {
+            return Err(ShaDaError::Length);
+        }
+        remaining -= read;
+    }
+    Ok(())
 }
 
 fn write_uint(writer: &mut impl Write, value: u64) -> Result<(), ShaDaError> {
     rmpv::encode::write_value(writer, &Value::from(value))
         .map_err(|error| ShaDaError::Decode(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Read};
+
+    use super::*;
+
+    struct CountingReader {
+        inner: Cursor<Vec<u8>>,
+        largest_request: usize,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.largest_request = self.largest_request.max(buffer.len());
+            self.inner.read(buffer)
+        }
+    }
+
+    #[test]
+    fn read_skips_oversized_payload_without_buffering_the_file() {
+        let stream = ShaDa {
+            entries: vec![
+                Entry::new(
+                    EntryType::SubString,
+                    1,
+                    Value::Binary(vec![b'x'; 128 * 1024]),
+                ),
+                Entry::new(EntryType::Header, 2, Value::Map(vec![])),
+            ],
+        };
+        let mut bytes = Vec::new();
+        stream.write(&mut bytes, 0).expect("test stream must encode");
+        let expected = stream.entries[1].clone();
+        let mut reader = CountingReader {
+            inner: Cursor::new(bytes),
+            largest_request: 0,
+        };
+
+        let decoded = ShaDa::read(&mut reader, 1).expect("stream must decode");
+
+        assert_eq!(decoded.entries, vec![expected]);
+        assert!(reader.largest_request <= 8192);
+    }
+
+    #[test]
+    fn write_then_read_round_trips_entries() {
+        let stream = ShaDa {
+            entries: vec![
+                Entry::new(EntryType::Header, 1, Value::Map(vec![])),
+                Entry::new(
+                    EntryType::SubString,
+                    2,
+                    Value::Array(vec![Value::Binary(b"replacement".to_vec())]),
+                ),
+            ],
+        };
+        let mut bytes = Vec::new();
+        stream.write(&mut bytes, 0).expect("test stream must encode");
+
+        assert_eq!(
+            ShaDa::read(Cursor::new(bytes), 0).expect("stream must decode"),
+            stream
+        );
+    }
 }

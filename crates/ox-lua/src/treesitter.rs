@@ -1269,16 +1269,15 @@ fn collect_query_cursor(
 /// default treesitter priority is 100 (`runtime/lua/vim/hl.lua`
 /// `priorities.treesitter`).
 ///
-/// Standard predicates (`#eq?`, `#not-eq?`, `#any-eq?`, `#match?`,
-/// `#not-match?`, `#any-of?`, `#not-any-of?`) are already evaluated by the
-/// tree-sitter engine itself inside `QueryCursor::captures`/`::matches`
+/// Built-in ancestor and parent predicates (`#has-ancestor?`,
+/// `#not-has-ancestor?`, `#has-parent?`, `#not-has-parent?`, runtime
+/// `query.lua:579-612`) are evaluated directly against the node tree before
+/// extmark emission. Standard predicates (`#eq?`, `#not-eq?`, `#any-eq?`,
+/// `#match?`, `#not-match?`, `#any-of?`, `#not-any-of?`) are already evaluated
+/// by the tree-sitter engine itself inside `QueryCursor::captures`/`::matches`
 /// (`tree-sitter` 0.26.12 `binding_rust/lib.rs:3416-3467`,
 /// `satisfies_text_predicates`), the same mechanism [`collect_query_cursor`]
-/// already relies on, so no predicate re-evaluation happens here. Custom
-/// Lua-registered predicates (`vim.treesitter.query.add_predicate`, e.g.
-/// `#has-ancestor?`) are a Lua-only concept upstream and are out of scope:
-/// their `general_predicates` entries are not consulted, so a pattern that
-/// depends on one highlights unconditionally rather than being filtered.
+/// already relies on.
 fn emit_highlight_extmarks(
     lua: &Lua,
     node: &NodeHandle,
@@ -1294,6 +1293,14 @@ fn emit_highlight_extmarks(
     let mut cursor = QueryCursor::new();
     let mut iterator = cursor.captures(&query.query, resolved, node.tree.0.source.as_ref());
     while let Some((matched, capture_index)) = iterator.next() {
+        if let Some(pattern_predicates) = query.predicates.get(matched.pattern_index) {
+            if !pattern_predicates
+                .iter()
+                .all(|pred| match_emit_predicate(&matched, pred))
+            {
+                continue;
+            }
+        }
         let capture = matched.captures[*capture_index];
         let capture_slot = usize::try_from(capture.index)
             .map_err(|_| runtime_error("capture index out of bounds"))?;
@@ -1329,6 +1336,69 @@ fn emit_highlight_extmarks(
         set_extmark.call::<i64>((bufnr, ns, start_row, start_col, opts))?;
     }
     Ok(())
+}
+
+/// Evaluates ancestor/parent predicates matching upstream Neovim
+/// `runtime/lua/vim/treesitter/query.lua:587-614`.
+fn match_emit_predicate(
+    matched: &tree_sitter::QueryMatch<'_, '_>,
+    predicate: &InspectPredicate,
+) -> bool {
+    let raw_op = predicate
+        .operator
+        .strip_prefix('#')
+        .unwrap_or(&predicate.operator);
+    let (is_ancestor, should_match) = match raw_op {
+        "has-ancestor?" => (true, true),
+        "not-has-ancestor?" => (true, false),
+        "has-parent?" => (false, true),
+        "not-has-parent?" => (false, false),
+        _ => return true,
+    };
+
+    let Some(InspectArg::Capture(target_capture)) = predicate.args.first() else {
+        return true;
+    };
+
+    let target_types: Vec<&str> = predicate.args[1..]
+        .iter()
+        .filter_map(|arg| match arg {
+            InspectArg::String(s) => Some(s.trim_matches('"')),
+            _ => None,
+        })
+        .collect();
+
+    let matching_nodes: Vec<_> = matched
+        .captures
+        .iter()
+        .filter(|c| c.index == *target_capture)
+        .map(|c| c.node)
+        .collect();
+
+    if matching_nodes.is_empty() {
+        let does_match = true;
+        return does_match == should_match;
+    }
+
+    let does_match = if is_ancestor {
+        matching_nodes.iter().any(|node| {
+            let mut curr = *node;
+            while let Some(parent) = curr.parent() {
+                if target_types.contains(&parent.kind()) {
+                    return true;
+                }
+                curr = parent;
+            }
+            false
+        })
+    } else {
+        matching_nodes.iter().any(|node| {
+            node.parent()
+                .is_some_and(|parent| target_types.contains(&parent.kind()))
+        })
+    };
+
+    does_match == should_match
 }
 
 /// Install Neovim's tree-sitter C-facing fields on the existing `vim` table.

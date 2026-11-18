@@ -963,8 +963,9 @@ fn extmark_splice_is_total_for_unbounded_positions() {
 
 /// Creates an editor with a single window showing `lines`, with the window
 /// cursor at `cursor` and topline at `topline`. The `height` parameter is the
-/// desired text-row height; the geometry is sized `height + 1` to account for
-/// the command-line row that `tiled_window_text_height` subtracts.
+/// desired text-row height; the geometry is sized `height + 2` to account for
+/// the message and statusline rows that `tiled_window_text_height` subtracts
+/// at the default `'laststatus'=2`.
 fn editor_with_scrolled_window(
     lines: &[&[u8]],
     cursor: Position,
@@ -980,7 +981,7 @@ fn editor_with_scrolled_window(
         )
         .unwrap();
     let tab = editor
-        .create_tabpage(buffer, Geometry::new(0, 0, 20, height + 1).unwrap())
+        .create_tabpage(buffer, Geometry::new(0, 0, 20, height + 2).unwrap())
         .unwrap();
     let window = editor.tabpage(tab).unwrap().current_window();
     editor.set_window_cursor(window, cursor).unwrap();

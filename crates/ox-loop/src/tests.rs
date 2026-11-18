@@ -191,6 +191,45 @@ fn fast_work_runs_before_deferred_safe_point() {
     assert_eq!(*order.lock().unwrap(), vec!["fast", "deferred"]);
 }
 
+#[test]
+fn transfer_requeues_deferred_tail_after_unknown_owner() {
+    let reactor = Reactor::new().unwrap();
+    let queues = crate::WorkQueues::new(reactor.waker());
+    let owner = {
+        let mut owners = MultiQueue::new();
+        let root = owners.root();
+        owners.child(root).unwrap()
+    };
+    let scheduler = queues.scheduler();
+    scheduler
+        .schedule_deferred(owner, Event::Signal(1))
+        .unwrap();
+    scheduler
+        .schedule_deferred(owner, Event::Signal(2))
+        .unwrap();
+
+    let mut events = MultiQueue::new();
+    assert!(matches!(
+        queues.transfer(&mut events),
+        Err(crate::Error::UnknownOwner(found)) if found == owner
+    ));
+
+    let root = events.root();
+    assert_eq!(events.child(root).unwrap(), owner);
+    queues.transfer(&mut events).unwrap();
+
+    let signals: Vec<_> = events
+        .process_events(owner)
+        .unwrap()
+        .into_iter()
+        .map(|event| match event {
+            Event::Signal(signal) => signal,
+            Event::Callback(_) => unreachable!(),
+        })
+        .collect();
+    assert_eq!(signals, vec![1, 2]);
+}
+
 #[cfg(unix)]
 #[test]
 fn signal_is_delivered_as_loop_event() {
@@ -476,5 +515,67 @@ fn stop_before_run_makes_run_return_immediately() {
     assert!(
         started.elapsed() < Duration::from_millis(100),
         "run should return immediately when stopped before entry"
+    );
+}
+
+#[test]
+fn timer_panic_preserves_sibling_one_shot_timers() {
+    let mut timers = TimerHeap::new();
+    let now = Instant::now();
+    let sibling_fired = Arc::new(AtomicBool::new(false));
+    let sibling_flag = Arc::clone(&sibling_fired);
+
+    timers.insert(
+        now,
+        TimerEntry::once(|| {
+            panic!("first timer panics");
+        }),
+    );
+    timers.insert(
+        now,
+        TimerEntry::once(move || {
+            sibling_flag.store(true, Ordering::SeqCst);
+        }),
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        timers.fire_expired(now);
+    }));
+
+    assert!(result.is_err(), "expected first timer panic to propagate");
+    assert!(
+        sibling_fired.load(Ordering::SeqCst),
+        "sibling one-shot timer must fire even if earlier timer panics"
+    );
+}
+
+#[test]
+fn loop_timer_panic_preserves_sibling_timers() {
+    let mut event_loop = Loop::new().unwrap();
+    let now = Instant::now();
+    let sibling_fired = Arc::new(AtomicBool::new(false));
+    let sibling_flag = Arc::clone(&sibling_fired);
+
+    event_loop.timers().insert(
+        now,
+        TimerEntry::once(|| {
+            panic!("loop timer panics");
+        }),
+    );
+    event_loop.timers().insert(
+        now,
+        TimerEntry::once(move || {
+            sibling_flag.store(true, Ordering::SeqCst);
+        }),
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = event_loop.run_once(Some(Duration::ZERO));
+    }));
+
+    assert!(result.is_err(), "expected timer panic to propagate");
+    assert!(
+        sibling_fired.load(Ordering::SeqCst),
+        "sibling timer must fire and not be dropped"
     );
 }

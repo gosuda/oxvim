@@ -753,7 +753,11 @@ fn mutate_indent(
                 .iter()
                 .take_while(|byte| byte.is_ascii_whitespace())
                 .count();
-            let bytes = indent_bytes(target, opts.tabstop, opts.flags.contains(indent::IndentFlags::EXPANDTAB));
+            let bytes = indent_bytes(
+                target,
+                opts.tabstop,
+                opts.flags.contains(indent::IndentFlags::EXPANDTAB),
+            );
             line.splice(0..run, bytes.iter().copied());
             requests.push(BufferTextEditRequest {
                 start: ExtmarkPosition::new(range.start.lnum - 1 + row_offset, 0),

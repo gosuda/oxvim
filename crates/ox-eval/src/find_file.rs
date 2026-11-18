@@ -15,7 +15,7 @@
 use std::fs;
 use std::path::Path;
 
-use ox_types::OxStr;
+use ox_types::{OxStr, path_with_url};
 
 use crate::error::{EvalError, Result};
 use crate::eval::RegexEngine;
@@ -1037,16 +1037,6 @@ fn path_tail_index(path: &str) -> usize {
         .map_or(0, |offset| offset + 1)
 }
 
-/// `path_with_url`: a scheme followed by `://`.
-fn path_with_url(path: &str) -> bool {
-    let scheme = path.split("://").next().unwrap_or(path);
-    scheme.len() < path.len()
-        && !scheme.is_empty()
-        && scheme.starts_with(|character: char| character.is_ascii_alphabetic())
-        && scheme.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
-        })
-}
 
 /// `path_equal(a, b, kPathCmpLiteral)`: byte equality after trimming a
 /// trailing separator, which is how upstream avoids re-pushing a directory
