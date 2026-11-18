@@ -2486,7 +2486,12 @@ pub fn pipe_pair(
     // sees end-of-file, so `vim.system({'cat'}, { stdin = ... })` hangs. The
     // descriptor handed to the child is `dup2`-ed onto the standard slot, which
     // clears the flag for that copy only.
-    let (reader, writer) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    // `pipe_with(PipeFlags::CLOEXEC)` is `#[cfg(not(apple))]` in rustix;
+    // plain `pipe` plus `fcntl(F_SETFD)` carries the same flag on every
+    // unix target.
+    let (reader, writer) = rustix::pipe::pipe()?;
+    rustix::io::fcntl_setfd(&reader, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::fcntl_setfd(&writer, rustix::io::FdFlags::CLOEXEC)?;
     // `luvref.txt:2148-2165` sets `nonblock` per endpoint: `vim.system`
     // asks for a nonblocking parent reader but a blocking child writer, so
     // a child that fills the pipe blocks instead of failing on `EAGAIN`.
