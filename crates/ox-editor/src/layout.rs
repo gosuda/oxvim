@@ -548,26 +548,23 @@ impl Layout {
                 children: 2,
             });
         }
-        let old_root = std::mem::replace(
-            &mut self.root,
-            Frame::Leaf(LeafFrame {
-                window,
-                state,
-                geometry,
-            }),
-        );
-        let new_leaf = std::mem::replace(
-            &mut self.root,
-            Frame::Column {
-                geometry,
-                children: Vec::new(),
-            },
-        );
-        self.root = Frame::Column {
+        // Stage the new root off-tree: `equalize_frame` can still refuse the
+        // split when the existing windows do not fit the upper half, and a
+        // refusal must leave the live layout untouched (`win_split_ins`
+        // abandons the split before re-framing).
+        let mut staged = Frame::Column {
             geometry,
-            children: vec![old_root, new_leaf],
+            children: vec![
+                self.root.clone(),
+                Frame::Leaf(LeafFrame {
+                    window,
+                    state,
+                    geometry,
+                }),
+            ],
         };
-        equalize_frame(&mut self.root, geometry)?;
+        equalize_frame(&mut staged, geometry)?;
+        self.root = staged;
         if enter {
             self.current = window;
         }
