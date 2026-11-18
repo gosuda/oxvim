@@ -67,6 +67,21 @@ pub fn normalize_and_escape(path: &str) -> String {
     escape_fname(&sname.replace('\\', "/"))
 }
 
+/// A Lua long-bracket string literal for `value`. The `=` count is chosen
+/// so the closing bracket cannot appear in the payload — a file or
+/// directory name holding `]==]` must not close the literal early and run
+/// the rest of its text as Lua while a session is sourced.
+fn lua_long_bracket(value: &str) -> String {
+    let mut level = 2usize;
+    loop {
+        let close = format!("]{}]", "=".repeat(level));
+        if !value.contains(&close) {
+            return format!("[{}[{value}]{}]", "=".repeat(level), "=".repeat(level));
+        }
+        level += 1;
+    }
+}
+
 fn normalize_term_name(name: &str) -> String {
     if let Some(rest) = name.strip_prefix("term://///") {
         format!("term:///.//{rest}")
@@ -392,7 +407,27 @@ impl<'a> SessionWriter<'a> {
             let escaped = normalize_and_escape(&name);
             self.output.push_str(&format!("badd +0 {escaped}\n"));
         }
+        // `ses_arglist` (ex_session.c:218): the global argument list is
+        // rebuilt after `%argdel`, one `$argadd` per entry, and the current
+        // index lands on a `{idx}argu` like `put_view` writes it. Entries
+        // are full-named unless 'curdir' is on, matching upstream's
+        // `fullname` argument.
         self.output.push_str("argglobal\n%argdel\n");
+        let arglist = self.editor.arglist();
+        for name in arglist.names() {
+            let raw = String::from_utf8_lossy(&name.0).into_owned();
+            let entry = if self.options.curdir || Path::new(&raw).is_absolute() {
+                raw
+            } else {
+                Path::new(self.cwd).join(&raw).to_string_lossy().into_owned()
+            };
+            let escaped = normalize_and_escape(&entry);
+            self.output.push_str(&format!("$argadd {escaped}\n"));
+        }
+        let index = arglist.index();
+        if index < arglist.len() {
+            self.output.push_str(&format!("{}argu\n", index + 1));
+        }
 
         if self.options.curdir {
             self.write_buffer_local_dirs();
@@ -417,8 +452,13 @@ impl<'a> SessionWriter<'a> {
                 Path::new(self.cwd).join(local_dir)
             };
             let abs_local_dir_str = abs_local_dir.to_string_lossy().replace('\\', "/");
+            // The names embed in Lua string literals, so the bracket level
+            // must be absent from both values — a fixed `]==]` is one path
+            // component away from breaking out and running Lua.
             self.output.push_str(&format!(
-                "lua vim.api.nvim_create_autocmd('BufEnter', {{ once = true, buffer = vim.fn.bufadd([==[{name}]==]), callback = function() vim.cmd.bcd({{ [==[{abs_local_dir_str}]==], magic = {{ file = false, bar = false }} }}) end }})\n"
+                "lua vim.api.nvim_create_autocmd('BufEnter', {{ once = true, buffer = vim.fn.bufadd({}), callback = function() vim.cmd.bcd({{ {}, magic = {{ file = false, bar = false }} }}) end }})\n",
+                lua_long_bracket(&name),
+                lua_long_bracket(&abs_local_dir_str),
             ));
             self.did_lcd = true;
         }
@@ -571,8 +611,23 @@ impl<'a> SessionWriter<'a> {
         };
         let line = win_state.cursor.lnum.max(1);
         self.output.push_str(&format!(
-            "let s:l = {line}\nif s:l < 1 | let s:l = 1 | endif\nkeepjumps exe s:l\nnormal! zt\nkeepjumps {line}\nnormal! 0\n"
+            "let s:l = {line}\nif s:l < 1 | let s:l = 1 | endif\nkeepjumps exe s:l\nnormal! zt\nkeepjumps {line}\n"
         ));
+        // `put_view_curpos` (ex_session.c:63): column zero is `normal! 0`;
+        // a MAXCOL `curswant` is `normal! $`. Otherwise upstream writes the
+        // screen-cell `normal! 0{vcol}|` — `call cursor()` is the
+        // byte-accurate form here since `cursor.col` counts bytes, not
+        // display cells.
+        if win_state.cursor.col == 0 {
+            self.output.push_str("normal! 0\n");
+        } else if win_state.curswant == i64::MAX {
+            self.output.push_str("normal! $\n");
+        } else {
+            self.output.push_str(&format!(
+                "call cursor(s:l, {})\n",
+                win_state.cursor.col + 1
+            ));
+        }
     }
 
     fn write_tabpage(&mut self, tabpage: &TabpageState, tab_index: usize) {
@@ -1169,5 +1224,82 @@ mod tests {
         assert!(session.contains(
             "lua vim.api.nvim_create_autocmd('BufEnter', { once = true, buffer = vim.fn.bufadd([==[test'file.txt]==]), callback = function() vim.cmd.bcd({ [==[/home/user/b'uf d]==], magic = { file = false, bar = false } }) end })\n"
         ));
+    }
+
+    #[test]
+    fn session_restores_the_cursor_column() {
+        let mut editor = Editor::new();
+        let b = editor.create_buffer(true).unwrap();
+        editor
+            .buffer_mut(b)
+            .unwrap()
+            .set_name(ox_types::OxStr::from("doc.txt"));
+        let tab = editor
+            .create_tabpage(b, crate::layout::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        let window = editor.tabpage(tab).unwrap().current_window();
+        editor.window_mut(window).unwrap().cursor = ox_text::Position { lnum: 10, col: 24 };
+
+        let ssop = SessionOptions::default();
+        let session = generate_session(&editor, &ssop, "curdir,buffers", "/test/dir");
+
+        assert!(session.contains("call cursor(s:l, 25)\n"));
+        assert!(!session.contains("normal! 0\nnormal! $\n"));
+    }
+
+    #[test]
+    fn session_rebuilds_the_argument_list_and_index() {
+        let mut editor = Editor::new();
+        let b = editor.create_buffer(true).unwrap();
+        editor
+            .buffer_mut(b)
+            .unwrap()
+            .set_name(ox_types::OxStr::from("doc.txt"));
+        editor
+            .create_tabpage(b, crate::layout::Geometry::new(0, 0, 80, 24).unwrap())
+            .unwrap();
+        editor.arglist_mut().set(vec![
+            ox_types::OxStr::from("a.txt"),
+            ox_types::OxStr::from("b.txt"),
+        ]);
+        editor.arglist_mut().set_index(1);
+
+        let ssop = SessionOptions::default();
+        let session = generate_session(&editor, &ssop, "curdir,buffers", "/test/dir");
+
+        assert!(session.contains("$argadd a.txt\n"));
+        assert!(session.contains("$argadd b.txt\n"));
+        assert!(session.contains("2argu\n"));
+    }
+
+    #[test]
+    fn session_lua_literals_choose_a_bracket_level_absent_from_the_name() {
+        assert_eq!(lua_long_bracket("plain"), "[==[plain]==]");
+        assert_eq!(lua_long_bracket("has ]==] inside"), "[===[has ]==] inside]===]");
+    }
+
+    #[test]
+    fn session_buffer_local_dir_name_cannot_close_the_lua_literal() {
+        let mut editor = Editor::new();
+        let b = editor.create_buffer(true).unwrap();
+        let hostile = "dir]==]), callback = function() end }); io.open('PWNED','w'):close(); --";
+        editor
+            .buffer_mut(b)
+            .unwrap()
+            .set_name(ox_types::OxStr::from("file.txt"));
+        editor
+            .buffer_mut(b)
+            .unwrap()
+            .local_directory = Some(PathBuf::from(hostile));
+
+        let ssop = SessionOptions::default();
+        let session = generate_session(&editor, &ssop, "curdir,buffers", "/home/user");
+
+        let joined = format!("/home/user/{hostile}");
+        assert!(session.contains(&format!(
+            "bcd({{ {}",
+            lua_long_bracket(&joined)
+        )));
+        assert!(session.contains("]===]"));
     }
 }
