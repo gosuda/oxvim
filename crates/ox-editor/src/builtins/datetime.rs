@@ -247,6 +247,42 @@ fn parse_posix_tz(tz: &str, timestamp: i64) -> Option<TimeZoneInfo> {
         std_offset + 3600
     };
 
+    // Explicit `,start[/time],end[/time]` rules use the parsed offsets —
+    // not whatever zone `/usr/share/zoneinfo/posixrules` happens to name —
+    // (POSIX.1 `tzset`; glibc only falls back to that file when the rules
+    // are absent).
+    if bytes.get(cursor) == Some(&b',') {
+        cursor += 1;
+        if let Some((start_rule, start_secs)) = parse_posix_rule(bytes, &mut cursor)
+            && bytes.get(cursor) == Some(&b',')
+        {
+            cursor += 1;
+            if let Some((end_rule, end_secs)) = parse_posix_rule(bytes, &mut cursor) {
+                let year = civil_from_days(timestamp.div_euclid(86_400)).0;
+                let start_epoch =
+                    posix_rule_epoch(&start_rule, start_secs, year, std_offset);
+                let end_epoch = posix_rule_epoch(&end_rule, end_secs, year, dst_offset);
+                let in_dst = if start_epoch < end_epoch {
+                    timestamp >= start_epoch && timestamp < end_epoch
+                } else {
+                    // Southern-hemisphere order: DST wraps the year end.
+                    timestamp >= start_epoch || timestamp < end_epoch
+                };
+                return Some(if in_dst {
+                    TimeZoneInfo {
+                        offset: dst_offset,
+                        name: dst_name.to_string(),
+                    }
+                } else {
+                    TimeZoneInfo {
+                        offset: std_offset,
+                        name: std_name.to_string(),
+                    }
+                });
+            }
+        }
+    }
+
     if let Ok(data) = std::fs::read("/usr/share/zoneinfo/posixrules") {
         if let Some(info) = parse_tzif(&data, timestamp) {
             let name = if info.offset == dst_offset {
@@ -265,6 +301,111 @@ fn parse_posix_tz(tz: &str, timestamp: i64) -> Option<TimeZoneInfo> {
         offset: std_offset,
         name: std_name.to_string(),
     })
+}
+
+/// One POSIX `,start`/`end` transition rule: `Jn` (Julian day 1-365, leap
+/// day uncounted), `n` (0-based Julian day), or `Mm.w.d` (the `w`-th
+/// weekday `d` of month `m`, `w` 5 meaning the last one).
+enum PosixRule {
+    Julian(i64),
+    ZeroJulian(i64),
+    MonthWeekDay(u8, u8, u8),
+}
+
+fn parse_posix_rule(bytes: &[u8], cursor: &mut usize) -> Option<(PosixRule, i64)> {
+    let rule = match bytes.get(*cursor)? {
+        b'J' => {
+            *cursor += 1;
+            let day = parse_digits(bytes, cursor);
+            (1..=365).contains(&day).then_some(PosixRule::Julian(day))?
+        }
+        b'M' => {
+            *cursor += 1;
+            let month = parse_digits(bytes, cursor);
+            if bytes.get(*cursor) != Some(&b'.') {
+                return None;
+            }
+            *cursor += 1;
+            let week = parse_digits(bytes, cursor);
+            if bytes.get(*cursor) != Some(&b'.') {
+                return None;
+            }
+            *cursor += 1;
+            let weekday = parse_digits(bytes, cursor);
+            let (Ok(month), Ok(week), Ok(weekday)) = (
+                u8::try_from(month),
+                u8::try_from(week),
+                u8::try_from(weekday),
+            ) else {
+                return None;
+            };
+            if !(1..=12).contains(&month) || !(1..=5).contains(&week) || weekday > 6 {
+                return None;
+            }
+            PosixRule::MonthWeekDay(month, week, weekday)
+        }
+        _ => PosixRule::ZeroJulian(parse_digits(bytes, cursor)),
+    };
+    // `[hh[:mm[:ss]]]` past `/`, default 2:00:00 — a plain local time, so
+    // the sign reads the POSIX way (`+` positive) unlike zone offsets.
+    let secs = if bytes.get(*cursor) == Some(&b'/') {
+        *cursor += 1;
+        let negative = bytes.get(*cursor) == Some(&b'-');
+        if negative {
+            *cursor += 1;
+        } else if bytes.get(*cursor) == Some(&b'+') {
+            *cursor += 1;
+        }
+        let value = parse_digits(bytes, cursor) * 3600
+            + parse_colon_digits(bytes, cursor) * 60
+            + parse_colon_digits(bytes, cursor);
+        if negative { -value } else { value }
+    } else {
+        2 * 3600
+    };
+    Some((rule, secs))
+}
+
+/// The rule's 0-based day-of-year for `year`.
+fn posix_rule_yday(rule: &PosixRule, year: i64) -> i64 {
+    let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+    match rule {
+        // `Jn`: February 29 exists but is never counted — days 60+ land one
+        // civil day later in leap years.
+        PosixRule::Julian(day) => {
+            if leap && *day >= 60 {
+                *day
+            } else {
+                *day - 1
+            }
+        }
+        PosixRule::ZeroJulian(day) => *day,
+        PosixRule::MonthWeekDay(month, week, weekday) => {
+            const DAYS_IN_MONTH: [i64; 12] =
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+            let first = days_from_civil(year, u32::from(*month), 1);
+            // 1970-01-01 was a Thursday (weekday 4).
+            let first_dow = (first + 4).rem_euclid(7);
+            let first_occurrence = (i64::from(*weekday) - first_dow).rem_euclid(7) + 1;
+            let days_in_month =
+                DAYS_IN_MONTH[usize::from(*month - 1)] + i64::from(leap && *month == 2);
+            let mut day = first_occurrence + 7 * (i64::from(*week) - 1);
+            if day > days_in_month {
+                day -= 7;
+            }
+            days_from_civil(year, u32::from(*month), u32::try_from(day).unwrap_or(1))
+                - days_from_civil(year, 1, 1)
+        }
+    }
+}
+
+/// UTC epoch of a transition: rule times are local in the type in effect
+/// just before the change (`in_effect_offset` is the POSIX-signed offset —
+/// positive east — already negated into seconds-west semantics used here
+/// as `local - offset = utc`).
+fn posix_rule_epoch(rule: &PosixRule, secs: i64, year: i64, in_effect_offset: i64) -> i64 {
+    let local = (days_from_civil(year, 1, 1) + posix_rule_yday(rule, year)) * 86_400 + secs;
+    local - in_effect_offset
 }
 
 fn parse_tz_name<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a str> {
@@ -848,6 +989,45 @@ mod tests {
         assert_eq!(strftime_utc("%c", 0), "Thu 01 Jan 1970 12:00:00 AM UTC");
         assert_eq!(strftime_utc("%x", 0), "01/01/1970");
         assert_eq!(strftime_utc("%X", 0), "12:00:00 AM");
+    }
+
+    /// Explicit `,start,end` rules must drive the DST switch with the
+    /// parsed offsets — not the host's `posixrules` zone, which on this
+    /// box is America's data and would stamp `EST5EDT` with the wrong
+    /// boundary dates (POSIX.1 `tzset`).
+    #[test]
+    fn posix_tz_transition_rules() {
+        // US 2024: DST starts Sun Mar 10 2:00 local (07:00 UTC), ends
+        // Sun Nov 3 2:00 local (06:00 UTC).
+        let tz = "EST5EDT,M3.2.0/02,M11.1.0/02";
+        let jan = parse_posix_tz(tz, 1_704_067_200).unwrap(); // 2024-01-01T00Z
+        assert_eq!((jan.offset, jan.name.as_str()), (-18_000, "EST"));
+        let jun = parse_posix_tz(tz, 1_717_200_000).unwrap(); // 2024-06-01T00Z
+        assert_eq!((jun.offset, jun.name.as_str()), (-14_400, "EDT"));
+        // Boundaries: 06:59 UTC Mar 10 is still standard, 07:00 is DST;
+        // 05:59 UTC Nov 3 is still DST, 06:00 is standard.
+        let before_start = parse_posix_tz(tz, 1_710_053_999).unwrap();
+        assert_eq!(before_start.name, "EST");
+        let at_start = parse_posix_tz(tz, 1_710_054_000).unwrap();
+        assert_eq!(at_start.name, "EDT");
+        let before_end = parse_posix_tz(tz, 1_730_613_599).unwrap();
+        assert_eq!(before_end.name, "EDT");
+        let at_end = parse_posix_tz(tz, 1_730_613_600).unwrap();
+        assert_eq!(at_end.name, "EST");
+        // Southern hemisphere wraps the year: DST covers Dec–Feb.
+        let au = parse_posix_tz("AU-10AUD-11,M10.1.0/02,M4.1.0/03", 1_703_500_000).unwrap();
+        assert_eq!(au.name, "AUD");
+        let au_winter = parse_posix_tz("AU-10AUD-11,M10.1.0/02,M4.1.0/03", 1_720_000_000).unwrap();
+        assert_eq!(au_winter.name, "AU");
+        // `n` counts every day: index 59 is Feb 29 only in a leap year.
+        let leap = parse_posix_tz("X0Y,0,59", 951_825_600).unwrap(); // 2000-02-29T12Z
+        assert_eq!(leap.name, "X");
+        let before_leap_end = parse_posix_tz("X0Y,0,59", 951_739_200).unwrap(); // 2000-02-28T12Z
+        assert_eq!(before_leap_end.name, "Y");
+        let nonleap = parse_posix_tz("X0Y,0,59", 983_361_600).unwrap(); // 2001-02-28T12Z
+        assert_eq!(nonleap.name, "Y");
+        let nonleap_end = parse_posix_tz("X0Y,0,59", 983_448_000).unwrap(); // 2001-03-01T12Z
+        assert_eq!(nonleap_end.name, "X");
     }
 
     #[test]
