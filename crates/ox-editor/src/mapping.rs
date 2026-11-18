@@ -290,20 +290,19 @@ impl MappingAction {
         }
         Ok(Self::Keys(Keys::parse_notation(rhs, leader, local_leader)))
     }
+    /// ASCII delimiters compared against checked UTF-8 slices: a right-hand
+    /// side like `日本語` has no boundary at the `<Cmd>` width, so plain
+    /// indexing would panic instead of answering "no".
     fn strip_case_prefix<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-        if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            Some(&s[prefix.len()..])
-        } else {
-            None
-        }
+        let head = s.get(..prefix.len())?;
+        head.eq_ignore_ascii_case(prefix)
+            .then(|| &s[prefix.len()..])
     }
 
     fn strip_case_suffix<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
-        if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
-            Some(&s[..s.len() - suffix.len()])
-        } else {
-            None
-        }
+        let start = s.len().checked_sub(suffix.len())?;
+        let tail = s.get(start..)?;
+        tail.eq_ignore_ascii_case(suffix).then(|| &s[..start])
     }
 
     /// The right-hand side after `replace_termcodes`, upstream's

@@ -126,8 +126,11 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
     })?;
     let borrowed = dict.borrow();
     let lhs = dict_string(&borrowed, "lhs").ok_or_else(mapset_entries_error)?;
-    let lhsraw = dict_string(&borrowed, "lhsraw").ok_or_else(mapset_entries_error)?;
-    let lhsrawalt = dict_string(&borrowed, "lhsrawalt");
+    // `lhsraw`/`lhsrawalt` are decoded `m_keys` byte strings — `0x80`
+    // (`K_SPECIAL`) leads `<F2>` and friends — so they must stay bytes; a
+    // lossy `String` would replace the byte with U+FFFD and corrupt the key.
+    let lhsraw = dict_bytes(&borrowed, "lhsraw").ok_or_else(mapset_entries_error)?;
+    let lhsrawalt = dict_bytes(&borrowed, "lhsrawalt");
     let leader = map_leader(scope, "mapleader");
     let local_leader = map_leader(scope, "maplocalleader");
     let callback_ref = borrowed.get(b"callback").and_then(|cb| match cb {
@@ -176,6 +179,10 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
     );
     let remap =
         borrowed.get(b"noremap").and_then(typval_number).unwrap_or(0) == 0 && !flags.contains(MapFlags::SCRIPT);
+    // The saved `noremap` governs abbreviations too — without this the
+    // `AbbrevOptions` below still carries the initial REMAP flag
+    // (`mapset` restoring `inoreabbrev` drops its `noremap` bit).
+    flags.set(MapFlags::REMAP, remap);
     let description = dict_string(&borrowed, "desc");
     let mut script_context = host.runtime.scripts.current_context();
     if let Some(sid) = borrowed.get(b"sid").and_then(typval_number)
@@ -201,7 +208,9 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
         // abbreviation table (`mapping.c:2404`).
         host.access
             .with_ex_editor(|editor| {
-                editor.mappings_mut().abbreviate_full(&lhsraw, action, options)
+                editor
+                    .mappings_mut()
+                    .abbreviate_full(&lhsraw.to_string_lossy(), action, options)
             })
             .map_err(|error| EvalError::new("E474", 0, error.to_string()))?;
         return Ok(Typval::Number(0));
@@ -225,7 +234,7 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
             editor
                 .mappings_mut()
                 .unmap(&human, modes, scope_value);
-            let lhs = decode_mapset_lhs(&lhsraw);
+            let lhs = decode_mapset_lhs(lhsraw.as_bytes());
             let stored = if remap {
                 editor
                     .mappings_mut()
@@ -241,7 +250,7 @@ fn mapset<F: FileIO, E: ExEditorAccess>(
             // The alternate left-hand side answers the same lookups through
             // a second entry; upstream links the pair as `m_alt` instead.
             if let Some(alt) = lhsrawalt {
-                let lhs = decode_mapset_lhs(&alt);
+                let lhs = decode_mapset_lhs(alt.as_bytes());
                 if remap {
                     editor.mappings_mut().map(lhs, action, options)
                 } else {
@@ -329,9 +338,17 @@ fn parse_mapset_mode(mode_string: &str, abbr: bool) -> Option<MapModes> {
 /// The raw left-hand side as stored encoded bytes (`m_keys`). A value that
 /// fails validation cannot come from `maparg()`; it is kept literally rather
 /// than rejected.
-fn decode_mapset_lhs(lhsraw: &str) -> Keys {
-    Keys::from_encoded(lhsraw.as_bytes().to_vec())
-        .unwrap_or_else(|_| Keys::encode(lhsraw.as_bytes()))
+fn decode_mapset_lhs(lhsraw: &[u8]) -> Keys {
+    Keys::from_encoded(lhsraw.to_vec()).unwrap_or_else(|_| Keys::encode(lhsraw))
+}
+
+/// Same lookup as [`dict_string`] but keeping the raw `OxStr` bytes — for
+/// entries that carry decoded key strings rather than display text.
+fn dict_bytes(dict: &ox_types::DictData, key: &str) -> Option<OxStr> {
+    match dict.get(key.as_bytes()) {
+        Some(Typval::String(value)) => Some(value.clone()),
+        _ => None,
+    }
 }
 
 /// Strict `tv_dict_get_string`: only a String value counts, mirroring the
