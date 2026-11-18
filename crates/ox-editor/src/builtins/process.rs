@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use ox_eval::{EvalError, Scope};
-use ox_types::{OxStr, Special, Typval};
+use ox_rpc::Message;
+use ox_types::{ApiError, Object, OxStr, Special, Typval};
 use ox_uv::process::PtySize;
 
 use crate::excmd_exec::{
@@ -148,7 +149,7 @@ pub(crate) fn call<F: FileIO, E: ExEditorAccess>(
         // every part — there is no stdin default.
         "jobclose" | "chanclose" => call_chan_close(runtime, args, ChannelPart::All),
         "rpcnotify" => call_rpc_notify(runtime, args),
-        "rpcrequest" => call_rpc_request(runtime, args),
+        "rpcrequest" => call_rpc_request(runtime, access, scope, lua, args),
         "sockconnect" => call_sock_connect(runtime, args),
         "timer_info" | "timer_pause" | "timer_start" | "timer_stop" | "timer_stopall" => {
             crate::timers::call(host, name, args, scope)
@@ -940,8 +941,11 @@ fn call_rpc_notify<F: FileIO>(
 /// `f_rpcrequest`): encode a `[0, msgid, method, args]` request and block for
 /// the `[1, msgid, error, result]` reply. A remote error raises the peer's
 /// message; anything that is not an open RPC channel is `E475`.
-fn call_rpc_request<F: FileIO>(
+fn call_rpc_request<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     args: &[Typval],
 ) -> ox_eval::Result<Typval> {
     let channel = match args.first().and_then(value_number) {
@@ -982,7 +986,44 @@ fn call_rpc_request<F: FileIO>(
     // milliseconds and the loop still pumps the reactor every millisecond, so
     // callbacks for other jobs keep their FIFO delivery through the deferred
     // queue instead of stalling behind the wait.
-    let reply = manager.rpc_call(id, &method, params, std::time::Duration::from_secs(30));
+    //
+    // While the wait runs, inbound requests and notifications dispatch
+    // through the editor the way upstream's main loop dispatches them: a
+    // peer that calls back in before answering gets a reply on the wire
+    // instead of deadlocking the channel.
+    let mut dispatch = |manager: &mut JobManager, id: u64, message: Message| -> Result<(), String> {
+        let Message::Request {
+            msgid,
+            method,
+            params,
+        } = message
+        else {
+            // Notifications dispatch fire-and-forget; there is no response
+            // frame to write back.
+            if let Message::Notification { method, params } = message {
+                let _ignored =
+                    dispatch_channel_request(runtime, access, scope, lua, &method, params);
+            }
+            return Ok(());
+        };
+        let result = dispatch_channel_request(runtime, access, scope, lua, &method, params);
+        let frame = Message::Response { msgid, result }
+            .encode_bytes()
+            .map_err(|error| error.to_string())?;
+        if manager.is_socket_channel(id) {
+            manager.socket_send(id, &frame)?;
+        } else {
+            manager.send(id, frame)?;
+        }
+        Ok(())
+    };
+    let reply = manager.rpc_call(
+        id,
+        &method,
+        params,
+        std::time::Duration::from_secs(30),
+        &mut dispatch,
+    );
     runtime.jobs = Some(manager);
     match reply {
         Ok(object) => Ok(object_to_typval(&object)),
@@ -1020,10 +1061,57 @@ fn call_rpc_request<F: FileIO>(
     }
 }
 
+/// Answer an inbound RPC method a channel peer called into the editor
+/// while an `rpcrequest` waits — the same synchronous reentry upstream's
+/// main loop performs during `rpc_send_call`. The Vimscript-facing
+/// methods (`nvim_eval`, `nvim_call_function` and their `vim_` aliases)
+/// are served through the live evaluator; anything else answers a proper
+/// error reply so the peer unblocks instead of hanging on the wire.
+fn dispatch_channel_request<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    method: &OxStr,
+    params: Vec<Object>,
+) -> Result<Object, ApiError> {
+    let exception = |message: String| ApiError::exception(message);
+    match method.as_bytes() {
+        b"nvim_eval" | b"vim_eval" => {
+            let Some(Object::String(expr)) = params.first() else {
+                return Err(exception("Invalid method arguments".to_owned()));
+            };
+            let expr = expr.to_string_lossy().into_owned();
+            crate::excmd_exec::eval_text(runtime, access, scope, lua, &expr)
+                .map(|value| ox_rpc::typval_to_object(&value))
+                .map_err(|flow| exception(flow_to_eval_error(flow, &expr).to_string()))
+        }
+        b"nvim_call_function" | b"vim_call_function" => {
+            let (Some(Object::String(name)), Some(args)) =
+                (params.first(), params.get(1))
+            else {
+                return Err(exception("Invalid method arguments".to_owned()));
+            };
+            let name = name.to_string_lossy().into_owned();
+            let args = match args {
+                Object::Array(items) => items.iter().map(object_to_typval).collect(),
+                _ => return Err(exception("Invalid method arguments".to_owned())),
+            };
+            call_user_function_with_self(runtime, access, scope, lua, &name, args, 1, 1, None)
+                .map(|value| ox_rpc::typval_to_object(&value))
+                .map_err(|flow| exception(flow_to_eval_error(flow, &name).to_string()))
+        }
+        _ => Err(exception(format!(
+            "unknown method: {}",
+            method.to_string_lossy()
+        ))),
+    }
+}
+
 /// `sockconnect({mode}, {address}[, {opts}])` (upstream `eval/funcs.c`
 /// `f_sockconnect`): connect a channel to a Unix socket (`'pipe'`) or TCP
-/// address (`'tcp'`, `host:port`). `{opts}` honours `rpc`. Answers the channel
-/// id, or 0 when the peer refuses the connection.
+/// address (`'tcp'`, `host:port`). `{opts}` honours `rpc` and `on_data`.
+/// Answers the channel id, or 0 when the peer refuses the connection.
 fn call_sock_connect<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     args: &[Typval],
@@ -1032,12 +1120,19 @@ fn call_sock_connect<F: FileIO>(
         (Some(Typval::String(mode)), Some(Typval::String(address))) => (mode.clone(), address.clone()),
         _ => return Err(EvalError::new("E475", 0, "Invalid argument")),
     };
-    let rpc = match args.get(2) {
-        None => false,
-        Some(Typval::Dict(options)) => options
-            .borrow()
-            .get(b"rpc")
-            .is_some_and(|value| value_number(value).is_some_and(|value| value != 0)),
+    let (rpc, on_data) = match args.get(2) {
+        None => (false, None),
+        Some(Typval::Dict(options)) => {
+            let options = options.borrow();
+            let rpc = options
+                .get(b"rpc")
+                .is_some_and(|value| value_number(value).is_some_and(|value| value != 0));
+            let on_data = options
+                .get(b"on_data")
+                .filter(|value| !matches!(value, Typval::Special(Special::Null)))
+                .cloned();
+            (rpc, on_data)
+        }
         Some(_) => {
             return Err(EvalError::new(
                 "E475",
@@ -1073,14 +1168,15 @@ fn call_sock_connect<F: FileIO>(
         runtime.jobs = Some(manager);
         return Ok(Typval::Number(-1));
     };
-    manager.add_socket(id, stream, rpc);
+    manager.add_socket_with(id, stream, rpc, on_data);
     runtime.jobs = Some(manager);
     Ok(Typval::Number(result))
 }
 
-/// Connect a Unix-domain socket: every read carries a short timeout so the
-/// `rpcrequest` pump stays bounded by its own deadline instead of one slow
-/// peer. A refused path is `Ok(None)` — the documented 0 return.
+/// Connect a Unix-domain socket: reads run nonblocking so the job
+/// manager's poll can service the channel without stalling, while writes
+/// keep a bounded blocking timeout (the write path re-blocks for its
+/// duration). A refused path is `Ok(None)` — the documented 0 return.
 #[cfg(unix)]
 fn sock_connect_pipe(
     address: &OxStr,
@@ -1090,7 +1186,7 @@ fn sock_connect_pipe(
     match StdUnixStream::connect(&path) {
         Ok(stream) => {
             stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                .set_nonblocking(true)
                 .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
             // A peer that stops reading must not wedge `rpcrequest` past its
             // deadline inside a blocking write.
@@ -1132,7 +1228,7 @@ fn sock_connect_tcp(address: &OxStr) -> ox_eval::Result<Option<SocketStream>> {
     match TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(10)) {
         Ok(stream) => {
             stream
-                .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                .set_nonblocking(true)
                 .map_err(|error| EvalError::new("E475", 0, error.to_string()))?;
             stream
                 .set_write_timeout(Some(std::time::Duration::from_secs(5)))

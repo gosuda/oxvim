@@ -338,6 +338,12 @@ struct SocketChannel {
     msgid: MsgidCounter,
     /// Replies that arrived while waiting for a different `msgid`.
     stash: VecDeque<(u32, Result<Object, ApiError>)>,
+    /// `sockconnect`'s `on_data` callback, invoked with the raw bytes as
+    /// they arrive — and once with an empty chunk at EOF (upstream's
+    /// `on_data` channel option).
+    on_data: Option<Typval>,
+    /// The `self` dictionary carried into every `on_data` event.
+    receiver: DictRef,
 }
 
 /// A connected socket transport behind [`SocketChannel`].
@@ -349,14 +355,33 @@ pub enum SocketStream {
     Tcp(TcpStream),
 }
 
+impl SocketStream {
+    /// Flip the descriptor's nonblocking flag; a failed flag flip leaves
+    /// the prior mode in place.
+    fn set_nonblocking(&mut self, nonblocking: bool) {
+        let _ignored = match self {
+            #[cfg(unix)]
+            SocketStream::Pipe(stream) => stream.set_nonblocking(nonblocking),
+            SocketStream::Tcp(stream) => stream.set_nonblocking(nonblocking),
+        };
+    }
+}
+
 impl SocketChannel {
-    /// Write the whole frame or report the transport error.
+    /// Write the whole frame or report the transport error. Reads run
+    /// nonblocking so [`JobManager::poll`] can service the channel; the
+    /// write flips back to the configured timeout-bounded blocking mode
+    /// for its duration, so a stalled peer still errors instead of
+    /// wedging the caller.
     fn write_all(&mut self, data: &[u8]) -> Result<(), String> {
-        match &mut self.stream {
+        self.stream.set_nonblocking(false);
+        let result = match &mut self.stream {
             #[cfg(unix)]
             SocketStream::Pipe(stream) => stream.write_all(data).map_err(|error| error.to_string()),
             SocketStream::Tcp(stream) => stream.write_all(data).map_err(|error| error.to_string()),
-        }
+        };
+        self.stream.set_nonblocking(true);
+        result
     }
 
     /// One bounded read; an empty read or any error but a timeout ends the
@@ -784,6 +809,7 @@ impl JobManager {
         let mut events = std::mem::take(&mut self.deferred);
         events.extend(self.drain_raw());
         events.extend(self.drain_timers());
+        events.extend(self.drain_sockets());
         Ok(events)
     }
 
@@ -1157,6 +1183,22 @@ impl JobManager {
 
     /// Register a connected socket channel under the already-allocated id.
     pub fn add_socket(&mut self, id: u64, stream: SocketStream, rpc: bool) {
+        self.add_socket_with(id, stream, rpc, None);
+    }
+
+    /// Register a connected socket channel carrying a `sockconnect`
+    /// `on_data` callback.
+    pub fn add_socket_with(
+        &mut self,
+        id: u64,
+        stream: SocketStream,
+        rpc: bool,
+        on_data: Option<Typval>,
+    ) {
+        let receiver = match Typval::dict(Vec::new()) {
+            Typval::Dict(reference) => reference,
+            _ => unreachable!("Typval::dict builds a Dict"),
+        };
         self.sockets.insert(
             id,
             SocketChannel {
@@ -1167,6 +1209,8 @@ impl JobManager {
                 read_buf: Vec::new(),
                 msgid: MsgidCounter::new(),
                 stash: VecDeque::new(),
+                on_data,
+                receiver,
             },
         );
     }
@@ -1237,6 +1281,13 @@ impl JobManager {
     /// `msgid`s are stashed for the next call. Callback events that surface
     /// while waiting are re-deferred, never delivered on this stack.
     ///
+    /// Incoming requests and notifications decoded while waiting go
+    /// through `dispatch` on the borrow-free boundary the caller owns
+    /// (upstream dispatches them on the main loop during the same wait,
+    /// which is what AGENTS.md's synchronous-reentry requirement asks
+    /// for): a peer that calls back into the editor before answering is
+    /// served instead of deadlocking both sides.
+    ///
     /// # Errors
     ///
     /// Returns the encode, transport, decode, or timeout error, or the
@@ -1247,6 +1298,7 @@ impl JobManager {
         method: &OxStr,
         params: Vec<Object>,
         timeout: Duration,
+        dispatch: &mut dyn FnMut(&mut Self, u64, Message) -> Result<(), String>,
     ) -> Result<Object, RpcCallError> {
         let Some(msgid) = self.rpc_next_msgid(id) else {
             return Err(RpcCallError::NotRpc);
@@ -1272,8 +1324,15 @@ impl JobManager {
             return Err(RpcCallError::PeerGone);
         }
         let deadline = Instant::now() + timeout;
+        let mut inbound = Vec::new();
         loop {
-            if let Some(reply) = self.take_rpc_reply(id, msgid) {
+            let reply = self.take_rpc_reply(id, msgid, &mut inbound);
+            // Frames decoded ahead of the reply dispatch first, in wire
+            // order, before the reply completes the wait.
+            for message in inbound.drain(..) {
+                dispatch(self, id, message).map_err(RpcCallError::Transport)?;
+            }
+            if let Some(reply) = reply {
                 return reply;
             }
             if self.rpc_peer_gone(id) {
@@ -1288,11 +1347,14 @@ impl JobManager {
     }
 
     /// Pop the reply for `msgid` off the channel, decoding newly arrived bytes
-    /// first. Non-matching responses are stashed in wire order.
+    /// first. Non-matching responses are stashed in wire order; requests and
+    /// notifications addressed at the editor are collected into `inbound`
+    /// for the caller to dispatch rather than discarded.
     fn take_rpc_reply(
         &mut self,
         id: u64,
         msgid: u32,
+        inbound: &mut Vec<Message>,
     ) -> Option<Result<Object, RpcCallError>> {
         let (stashed, decoder, buffered) = if let Some(job) = self.jobs.get_mut(&id) {
             (
@@ -1315,25 +1377,29 @@ impl JobManager {
             Err(error) => (error.messages, Some(error.error.to_string())),
         };
         for message in messages {
-            if let Message::Response {
-                msgid: got,
-                result,
-            } = message
-            {
-                            if got == msgid {
-                return Some(result.map_err(|error| RpcCallError::Remote(error.to_string())));
+            match message {
+                Message::Response {
+                    msgid: got,
+                    result,
+                } => {
+                    if got == msgid {
+                        return Some(
+                            result.map_err(|error| RpcCallError::Remote(error.to_string())),
+                        );
+                    }
+                    if stashed.len() >= MAX_RPC_STASH {
+                        stashed.clear();
+                        return Some(Err(RpcCallError::Transport(
+                            "too many pending rpc responses".to_owned(),
+                        )));
+                    }
+                    stashed.push_back((got, result));
+                }
+                // Requests and notifications addressed at the editor go to
+                // the caller's dispatch hook — upstream dispatches them on
+                // the main loop rather than dropping them.
+                other => inbound.push(other),
             }
-            if stashed.len() >= MAX_RPC_STASH {
-                stashed.clear();
-                return Some(Err(RpcCallError::Transport(
-                    "too many pending rpc responses".to_owned(),
-                )));
-            }
-            stashed.push_back((got, result));
-            }
-            // Requests and notifications addressed at us have no host on
-            // this stack; upstream dispatches them on the main loop, so
-            // they are dropped here rather than answered wrongly.
         }
         if let Some(error) = decode_error {
             return Some(Err(RpcCallError::Transport(error)));
@@ -1344,6 +1410,68 @@ impl JobManager {
             });
         }
         None
+    }
+
+    /// Service every open socket channel: drain whatever the nonblocking
+    /// transport holds, feed RPC reply buffers (so responses are not only
+    /// decoded while an `rpcrequest` waits), emit `on_data` events for raw
+    /// channels, and close on EOF or a transport error.
+    fn drain_sockets(&mut self) -> Vec<JobEvent> {
+        let mut events = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        for (id, socket) in &mut self.sockets {
+            if socket.closed {
+                continue;
+            }
+            loop {
+                let mut eof = false;
+                match socket.read_chunk(&mut chunk) {
+                    Ok(0) => {
+                        socket.shutdown();
+                        eof = true;
+                    }
+                    Ok(read) => {
+                        if socket.rpc {
+                            if socket.read_buf.len() + read > MAX_RPC_BUFFER {
+                                socket.read_buf.clear();
+                                socket.shutdown();
+                            } else {
+                                socket.read_buf.extend_from_slice(&chunk[..read]);
+                            }
+                        }
+                        if let Some(callback) = socket.on_data.clone() {
+                            events.push(data_event(
+                                *id,
+                                callback,
+                                &socket.receiver,
+                                "data",
+                                &chunk[..read],
+                            ));
+                        }
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            || error.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // The transport is drained for this turn.
+                        break;
+                    }
+                    Err(_) => {
+                        socket.shutdown();
+                        eof = true;
+                    }
+                }
+                if eof || socket.closed {
+                    if let Some(callback) = socket.on_data.clone() {
+                        // Upstream delivers a terminal `['']` chunk at EOF
+                        // (channel.c `on_channel_data` with the closing frame).
+                        events.push(data_event(*id, callback, &socket.receiver, "data", &[]));
+                    }
+                    break;
+                }
+            }
+        }
+        events
     }
 
     /// Whether the RPC peer is gone: the job exited and its output drained,
@@ -2557,5 +2685,112 @@ mod tests {
             "the uninvoked tail must survive the failure"
         );
         assert_eq!(event_name(&requeued[0]), "exit");
+    }
+
+    /// An inbound request decoded while `rpc_call` waits goes through the
+    /// caller's dispatch hook before the reply completes the wait —
+    /// upstream's main-loop dispatch during `rpc_send_call`, which keeps a
+    /// peer that calls back into the editor from deadlocking the channel.
+    #[test]
+    #[cfg(unix)]
+    fn rpc_call_dispatches_inbound_request_before_reply() {
+        use std::io::Write as _;
+
+        let mut jobs = JobManager::new().unwrap();
+        let (mut peer, editor) = UnixStream::pair().unwrap();
+        editor.set_nonblocking(true).unwrap();
+        jobs.add_socket(9, SocketStream::Pipe(editor), true);
+
+        // The peer calls back into the editor first, then answers.
+        let callback = Message::Request {
+            msgid: 77,
+            method: OxStr::from("nvim_eval"),
+            params: vec![Object::String(OxStr::from("1 + 1"))],
+        };
+        peer.write_all(&callback.encode_bytes().unwrap()).unwrap();
+        let answer = Message::Response {
+            msgid: 1,
+            result: Ok(Object::Nil),
+        };
+        peer.write_all(&answer.encode_bytes().unwrap()).unwrap();
+
+        let mut dispatched = Vec::new();
+        let reply = jobs
+            .rpc_call(
+                9,
+                &OxStr::from("ping"),
+                Vec::new(),
+                Duration::from_secs(5),
+                &mut |manager, id, message| {
+                    match &message {
+                        Message::Request { msgid, .. } => dispatched.push(*msgid),
+                        _ => {}
+                    }
+                    // The dispatch owes the peer its own reply on the wire.
+                    if let Message::Request { msgid, .. } = message {
+                        let frame = Message::Response {
+                            msgid,
+                            result: Ok(Object::Integer(2)),
+                        }
+                        .encode_bytes()
+                        .unwrap();
+                        manager.socket_send(id, &frame).unwrap();
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(reply, Object::Nil);
+        assert_eq!(dispatched, vec![77]);
+    }
+
+    /// A raw socket channel's `on_data` callback fires through the poll
+    /// pipeline: each read becomes a `data` event, and EOF delivers the
+    /// terminal empty chunk (upstream `on_channel_data`).
+    #[test]
+    #[cfg(unix)]
+    fn socket_on_data_receives_bytes_and_eof() {
+        use std::io::Write as _;
+
+        let mut jobs = JobManager::new().unwrap();
+        let (mut peer, editor) = UnixStream::pair().unwrap();
+        editor.set_nonblocking(true).unwrap();
+        jobs.add_socket_with(
+            9,
+            SocketStream::Pipe(editor),
+            false,
+            Some(Typval::String(OxStr::from("Receive"))),
+        );
+
+        peer.write_all(b"hi").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while events.is_empty() {
+            assert!(Instant::now() < deadline, "on_data never delivered");
+            events.extend(jobs.poll().unwrap());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.args[2], Typval::String(OxStr::from("data")));
+        let Typval::List(lines) = &event.args[1] else {
+            panic!("on_data args carry a line list");
+        };
+        assert_eq!(lines.borrow().items[0], Typval::String(OxStr::from("hi")));
+
+        drop(peer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut eof = Vec::new();
+        while eof.is_empty() {
+            assert!(Instant::now() < deadline, "EOF on_data never delivered");
+            eof.extend(jobs.poll().unwrap());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(eof.len(), 1);
+        assert_eq!(eof[0].args[2], Typval::String(OxStr::from("data")));
+        let Typval::List(lines) = &eof[0].args[1] else {
+            panic!("on_data args carry a line list");
+        };
+        assert_eq!(lines.borrow().items[0], Typval::String(OxStr::from("")));
     }
 }
