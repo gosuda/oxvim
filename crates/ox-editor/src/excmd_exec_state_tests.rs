@@ -2621,6 +2621,111 @@ fn tabdo_runs_nested_command_in_each_tabpage() {
     assert_eq!(seen, vec![1, 2, 3]);
 }
 
+/// A `TabLeave`/`TabEnter` handler that fails aborts `:tabdo` outright —
+/// the nested command must not run in the tab the failed switch never left
+/// (`ex_listdo`, ex_cmds2.c:585).
+#[test]
+fn tabdo_aborts_when_the_leave_handler_fails() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "autocmd TabLeave * call NoSuchFunction()")
+        .unwrap();
+
+    let error = exec
+        .execute_line(
+            &editor,
+            "tabdo let g:seen = get(g:, 'seen', []) + [tabpagenr()]",
+        )
+        .unwrap_err();
+    match error {
+        ExecError::Vim(exception) => {
+            assert_eq!(exception.kind, VimExceptionKind::Error("E117".to_owned()));
+        }
+        other => panic!("expected Vim E117, got {other:?}"),
+    }
+    assert_eq!(global_scope(&exec, b"seen"), None);
+}
+
+/// `WinClosed` fires just before the window is removed (autocmd.txt:1499):
+/// a handler asking about the closing window sees its buffer, not an
+/// invalid handle.
+#[test]
+fn winclosed_fires_while_the_window_is_still_valid() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(
+        &editor,
+        "autocmd WinClosed * let g:buf = winbufnr(str2nr(expand('<amatch>')))",
+    )
+    .unwrap();
+    exec.execute_line(&editor, "split").unwrap();
+    exec.execute_line(&editor, "close").unwrap();
+
+    match global_scope(&exec, b"buf") {
+        Some(Typval::Number(number)) if number > 0 => {}
+        other => panic!("expected the closing window's buffer number, got {other:?}"),
+    }
+}
+
+/// `:helpclose` reaches `win_close` upstream, so it dispatches `WinClosed`
+/// too — with the window still valid while the handler runs.
+#[test]
+fn helpclose_fires_winclosed_while_the_window_is_valid() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    let help = editor
+        .editor_mut()
+        .create_buffer(true)
+        .expect("help buffer");
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(help, "buftype", OptionValue::String("help".to_owned()))
+        .unwrap();
+    exec.execute_line(&editor, "split").unwrap();
+    exec.execute_line(&editor, &format!("buffer {}", i64::from(help)))
+        .unwrap();
+    exec.execute_line(
+        &editor,
+        "autocmd WinClosed * let g:buf = winbufnr(str2nr(expand('<amatch>')))",
+    )
+    .unwrap();
+    exec.execute_line(&editor, "helpclose").unwrap();
+
+    match global_scope(&exec, b"buf") {
+        Some(Typval::Number(number)) if number > 0 => {}
+        other => panic!("expected the closing window's buffer number, got {other:?}"),
+    }
+    assert_eq!(editor.editor().windows().len(), 1);
+}
+
+/// A tabpage close frees every window it holds through `win_close`
+/// (`tabpage_close_other`, ex_docmd.c:5328): each one fires `WinClosed`.
+#[test]
+fn tabclose_fires_winclosed_for_every_window_of_the_tabpage() {
+    let (editor, _, _) = editor_with_window();
+    let editor = TestEditorAccess::new(editor);
+    let mut exec = ExExecutor::new();
+    exec.execute_line(&editor, "tabnew").unwrap();
+    exec.execute_line(&editor, "split").unwrap();
+    exec.execute_line(
+        &editor,
+        "autocmd WinClosed * let g:closed = get(g:, 'closed', 0) + 1",
+    )
+    .unwrap();
+    exec.execute_line(&editor, "tabclose").unwrap();
+
+    match global_scope(&exec, b"closed") {
+        Some(Typval::Number(2)) => {}
+        other => panic!("expected WinClosed for both tabpage windows, got {other:?}"),
+    }
+}
+
 /// `:vimgrep` collects one entry per matching line and jumps to the first
 /// match; without `!` a 'winfixbuf' window refuses with E1513.
 #[test]

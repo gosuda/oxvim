@@ -4543,10 +4543,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "tabprevious" | "tabprev" | "tabp" | "tabNext" => {
             command_tabprevious(runtime, access, scope, lua, command)
         }
-        "tabonly" => access.with_ex_editor(|editor| command_tabonly(runtime, editor, command)),
-        "tabclose" | "tabc" => {
-            access.with_ex_editor(|editor| command_tabclose(runtime, editor, command))
-        }
+        "tabonly" => command_tabonly(runtime, access, scope, lua, command),
+        "tabclose" | "tabc" => command_tabclose(runtime, access, scope, lua, command),
         // `:tabs` (`ex_tabs`, `ex_docmd.c:5812-5870`): one `Tab page N`
         // header per tabpage plus one row per window, the active one
         // marked `>`. The spec carries no `EX_BANG`, so `:tabs!` is `E477`
@@ -4580,8 +4578,8 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
         "echohl" => access.with_ex_editor(|editor| command_echohl(runtime, editor, command)),
         "redraw" | "redrawstatus" | "redrawtabline" => command_redraw(runtime, access, scope, lua),
         "close" => command_close(runtime, access, scope, lua, command, false),
-        "pclose" => access.with_ex_editor(|editor| command_pclose(runtime, editor)),
-        "only" => access.with_ex_editor(|editor| command_only(runtime, editor)),
+        "pclose" => command_pclose(runtime, access, scope, lua),
+        "only" => command_only(runtime, access, scope, lua),
         "quit" => command_close(runtime, access, scope, lua, command, true),
         "qall" | "quitall" => {
             access.with_ex_editor(|editor| command_qall(runtime, editor, command))
@@ -4681,7 +4679,7 @@ fn dispatch<F: FileIO, E: ExEditorAccess>(
             command_tabfirst(runtime, access, scope, lua, command)
         }
         "tablast" => command_tablast(runtime, access, scope, lua, command),
-        "helpclose" => access.with_ex_editor(|editor| command_helpclose(runtime, editor, command)),
+        "helpclose" => command_helpclose(runtime, access, scope, lua, command),
         "helptags" => command_helptags(runtime, access, command),
         "mark" | "k" => access.with_ex_editor(|editor| command_mark(runtime, editor, command)),
         "marks" => access.with_ex_editor(|editor| command_marks(runtime, editor)),
@@ -15140,31 +15138,63 @@ fn switch_current_tabpage<F: FileIO, E: ExEditorAccess>(
     }
     fire_buffer_lifecycle(runtime, access, scope, lua, &transition.enters, buffer)
 }
-fn command_tabclose<F: FileIO>(
+fn command_tabclose<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    let tabs = editor.tabpages();
-    if tabs.len() <= 1 {
+    if access.with_ex_editor(|editor| editor.tabpages().len() <= 1) {
         return error_flow(runtime, "E784", "Cannot close last tab page");
     }
     let argument = command.args.trim();
-    let Ok(target) = tabpage_arg(editor, command) else {
-        return error_flow(runtime, "E475", format!("Invalid argument: {argument}"));
+    let prepared = access.with_ex_editor(|editor| {
+        let Ok(target) = tabpage_arg(editor, command) else {
+            return Err(error_flow(runtime, "E475", format!("Invalid argument: {argument}")));
+        };
+        let windows = editor
+            .tabpage_windows(target)
+            .map(|windows| {
+                windows
+                    .into_iter()
+                    .filter_map(|window| {
+                        editor.window(window).ok().map(|state| (state.buffer, window))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok::<_, Flow>((target, windows))
+    });
+    let Ok((target, windows)) = prepared else {
+        return prepared.err().unwrap();
     };
-    let alternate = alt_tabpage(&tabs, target);
-    let was_current = editor.current_tabpage() == Some(target);
-    if editor.close_tabpage(target).is_err() {
-        return error_flow(runtime, "E784", "Cannot close last tab page");
+    // `tabpage_close` (`ex_docmd.c`:5297) walks the tabpage's windows through
+    // `ex_win_close`, so each fires `WinClosed` while it is still valid.
+    for (buffer, window) in windows {
+        let flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
     }
-    if was_current
-        && let Some(alternate) = alternate
-        && let Err(error) = editor.set_current_tabpage(alternate)
-    {
-        return error_flow(runtime, "E475", error.to_string());
-    }
-    Flow::Normal
+    access.with_ex_editor(|editor| {
+        let tabs = editor.tabpages();
+        if !tabs.contains(&target) {
+            return Flow::Normal;
+        }
+        let alternate = alt_tabpage(&tabs, target);
+        let was_current = editor.current_tabpage() == Some(target);
+        if editor.close_tabpage(target).is_err() {
+            return error_flow(runtime, "E784", "Cannot close last tab page");
+        }
+        if was_current
+            && let Some(alternate) = alternate
+            && let Err(error) = editor.set_current_tabpage(alternate)
+        {
+            return error_flow(runtime, "E475", error.to_string());
+        }
+        Flow::Normal
+    })
 }
 
 /// `:tabonly` (`ex_docmd.c` `ex_tabonly`:5238): make one tabpage current and
@@ -15178,24 +15208,64 @@ fn command_tabclose<F: FileIO>(
 /// leaves its buffers loaded and hidden here, as it does upstream under
 /// Neovim's default `'hidden'`, so both forms close the same tabpages. That
 /// was checked against the oracle rather than assumed.
-fn command_tabonly<F: FileIO>(
+fn command_tabonly<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
-    if editor.tabpages().len() <= 1 {
-        push_text_message(editor, "Already only one tab page".to_owned(), false, false);
+    if access.with_ex_editor(|editor| editor.tabpages().len() <= 1) {
+        access.with_ex_editor(|editor| {
+            push_text_message(editor, "Already only one tab page".to_owned(), false, false)
+        });
         return Flow::Normal;
     }
     let argument = command.args.trim();
-    let Ok(keep) = tabpage_arg(editor, command) else {
-        return error_flow(runtime, "E475", format!("Invalid argument: {argument}"));
+    let prepared = access.with_ex_editor(|editor| {
+        let Ok(keep) = tabpage_arg(editor, command) else {
+            return Err(error_flow(runtime, "E475", format!("Invalid argument: {argument}")));
+        };
+        if let Err(error) = editor.set_current_tabpage(keep) {
+            return Err(error_flow(runtime, "E475", error.to_string()));
+        }
+        Ok::<_, Flow>(keep)
+    });
+    let Ok(keep) = prepared else {
+        return prepared.err().unwrap();
     };
-    if let Err(error) = editor.set_current_tabpage(keep) {
-        return error_flow(runtime, "E475", error.to_string());
-    }
-    for tab in editor.tabpages() {
-        if tab != keep && editor.close_tabpage(tab).is_err() {
+    // `ex_tabonly` removes the other tabpages through `win_close`, so every
+    // window they hold fires `WinClosed` while it is still valid.
+    for tab in access.with_ex_editor(|editor| editor.tabpages()) {
+        if tab == keep {
+            continue;
+        }
+        let windows = access.with_ex_editor(|editor| {
+            editor
+                .tabpage_windows(tab)
+                .map(|windows| {
+                    windows
+                        .into_iter()
+                        .filter_map(|window| {
+                            editor.window(window).ok().map(|state| (state.buffer, window))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        });
+        for (buffer, window) in windows {
+            let flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
+            if !matches!(flow, Flow::Normal) {
+                return flow;
+            }
+        }
+        let applied = access.with_ex_editor(|editor| {
+            if !editor.tabpages().contains(&tab) {
+                return Ok(());
+            }
+            editor.close_tabpage(tab)
+        });
+        if applied.is_err() {
             return error_flow(runtime, "E444", "Cannot close last window");
         }
     }
@@ -15268,16 +15338,64 @@ fn preview_window(editor: &Editor) -> Option<WinHandle> {
     })
 }
 
-fn command_pclose<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    let Some(window) = preview_window(editor) else {
+fn command_pclose<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+) -> Flow {
+    let target = access.with_ex_editor(|editor| {
+        let window = preview_window(editor)?;
+        let tab = editor.current_tabpage()?;
+        let buffer = editor.window(window).ok()?.buffer;
+        Some((tab, window, buffer))
+    });
+    let Some((tab, window, buffer)) = target else {
         return Flow::Normal;
     };
-    let Some(tab) = editor.current_tabpage() else {
-        return Flow::Normal;
-    };
-    match editor.close_window(tab, window, true) {
-        Ok(_) => Flow::Normal,
-        Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
+    // `ex_pclose` closes through `win_close`, so `WinClosed` fires while the
+    // preview window is still valid.
+    let flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
+    }
+    access.with_ex_editor(|editor| {
+        if !editor.windows().contains(&window) {
+            return Flow::Normal;
+        }
+        match editor.close_window(tab, window, true) {
+            Ok(_) => Flow::Normal,
+            Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
+        }
+    })
+}
+
+/// What `:close`/`:quit` settles on once every guard passes. `prepare`
+/// collects the windows `WinClosed` must fire for so the event runs while
+/// they are still live, before [`command_close_apply`] removes them.
+enum CloseTarget {
+    Window {
+        tab: TabHandle,
+        window: WinHandle,
+        buffer: BufHandle,
+    },
+    /// Closing the tabpage's last window takes the tabpage with it; upstream
+    /// fires `WinClosed` for every window that goes away with it
+    /// (`win_close_othertab`, window.c:3207).
+    Tabpage {
+        tab: TabHandle,
+        windows: Vec<(BufHandle, WinHandle)>,
+    },
+}
+
+impl CloseTarget {
+    /// Windows whose `WinClosed` handlers run before the removal, each with
+    /// the buffer they were displaying.
+    fn windows(&self) -> Vec<(BufHandle, WinHandle)> {
+        match self {
+            CloseTarget::Window { buffer, window, .. } => vec![(*buffer, *window)],
+            CloseTarget::Tabpage { windows, .. } => windows.clone(),
+        }
     }
 }
 
@@ -15289,51 +15407,102 @@ fn command_close<F: FileIO, E: ExEditorAccess>(
     command: &ExCommand,
     quit: bool,
 ) -> Flow {
-    // `WinClosed` fires after the window is gone, with the closed window's id
-    // as the pattern and its buffer as `<abuf>` (`win_close`, window.c:2847;
-    // autocmd.c `apply_autocmds` for `EVENT_WINCLOSED`). Record what closed so
-    // the event carries the right match.
-    let mut closed: Option<(BufHandle, WinHandle)> = None;
-    let flow = access.with_ex_editor(|editor| {
-        command_close_inner(runtime, editor, command, quit, &mut closed)
-    });
-    if let Some((buffer, window)) = closed
-        && matches!(flow, Flow::Normal)
-    {
-        let id = i64::from(window).to_string();
-        let plan = access.with_ex_editor(|editor| {
-            editor.autocmds_mut().plan(
-                Event::WinClosed,
-                AutocmdContext {
-                    buffer: Some(buffer),
-                    file_name: None,
-                    match_name: Some(id.as_bytes()),
-                    nested: true,
-                    data: None,
-                },
-            )
-        });
-        let plan_flow = run_autocmd_plan(runtime, access, scope, lua, plan);
+    let target = match access.with_ex_editor(|editor| {
+        command_close_prepare(runtime, editor, command, quit)
+    }) {
+        Ok(target) => target,
+        Err(flow) => return flow,
+    };
+    // `WinClosed` fires just before the window's resources are freed, while
+    // the closing window still resolves (`win_close`, window.c:2911;
+    // autocmd.txt:1499), so a handler inspecting it sees the buffer it is
+    // losing rather than an invalid handle. It must therefore run before
+    // the structural removal, with the closing window's id as the match
+    // pattern and its buffer as `<abuf>`; a handler that throws aborts the
+    // close (`aborting()`).
+    for (buffer, window) in target.windows() {
+        let plan_flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
         if !matches!(plan_flow, Flow::Normal) {
             return plan_flow;
         }
     }
-    flow
+    access.with_ex_editor(|editor| command_close_apply(runtime, editor, &target))
 }
 
-fn command_close_inner<F: FileIO>(
+/// `do_autocmd_winclosed` (`window.c`:3112): `WinClosed` for one window,
+/// match pattern the window's id, `<abuf>` the buffer it was showing.
+/// Upstream nests it inside `win_close`, so handlers run `nested`.
+fn run_winclosed_plan<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+    buffer: BufHandle,
+    window: WinHandle,
+) -> Flow {
+    let id = i64::from(window).to_string();
+    let plan = access.with_ex_editor(|editor| {
+        editor.autocmds_mut().plan(
+            Event::WinClosed,
+            AutocmdContext {
+                buffer: Some(buffer),
+                file_name: None,
+                match_name: Some(id.as_bytes()),
+                nested: true,
+                data: None,
+            },
+        )
+    });
+    run_autocmd_plan(runtime, access, scope, lua, plan)
+}
+
+/// The structural half of `:close`/`:quit`, run after `WinClosed`. The
+/// handler was allowed to close the window or tabpage itself, so the
+/// removal re-validates its target (`window.c`:2912-2942).
+fn command_close_apply<F: FileIO>(
+    runtime: &mut ExRuntime<F>,
+    editor: &mut Editor,
+    target: &CloseTarget,
+) -> Flow {
+    match target {
+        CloseTarget::Window { tab, window, .. } => {
+            if !editor.windows().contains(window) {
+                return Flow::Normal;
+            }
+            match editor.close_window(*tab, *window, true) {
+                Ok(_) => Flow::Normal,
+                Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
+            }
+        }
+        CloseTarget::Tabpage { tab, .. } => {
+            let tabs = editor.tabpages();
+            if !tabs.contains(tab) {
+                return Flow::Normal;
+            }
+            let alternate = alt_tabpage(&tabs, *tab);
+            if editor.close_tabpage(*tab).is_err() {
+                return error_flow(runtime, "E444", "Cannot close last window");
+            }
+            if let Some(alternate) = alternate {
+                let _ = editor.set_current_tabpage(alternate);
+            }
+            Flow::Normal
+        }
+    }
+}
+
+fn command_close_prepare<F: FileIO>(
     runtime: &mut ExRuntime<F>,
     editor: &mut Editor,
     command: &ExCommand,
     quit: bool,
-    closed: &mut Option<(BufHandle, WinHandle)>,
-) -> Flow {
+) -> Result<CloseTarget, Flow> {
     let Some(buffer) = editor.current_buffer() else {
-        return if quit {
+        return Err(if quit {
             Flow::Quit(0)
         } else {
             error_flow(runtime, "E444", "Cannot close last window")
-        };
+        });
     };
     // `ex_quit` (`ex_docmd.c:4813-4818`): exiting via the last window runs
     // `check_changed_any` — any modified buffer blocks `:q` without `!`,
@@ -15349,11 +15518,11 @@ fn command_close_inner<F: FileIO>(
                 .is_ok_and(|state| state.flags.contains(crate::BufferFlags::MODIFIED))
         })
     {
-        return error_flow(
+        return Err(error_flow(
             runtime,
             "E37",
             "No write since last change (add ! to override)",
-        );
+        ));
     }
     // `ex_win_close` (`ex_docmd.c:5204-5217`): `need_hide` is a changed
     // buffer shown in at most one window; it refuses with E37 only when the
@@ -15387,18 +15556,18 @@ fn command_close_inner<F: FileIO>(
                 Ok(OptionValue::String(value)) if value == "hide"
             );
         if !hideable {
-            return error_flow(
+            return Err(error_flow(
                 runtime,
                 "E37",
                 "No write since last change (add ! to override)",
-            );
+            ));
         }
     }
     let Some(tab) = editor.current_tabpage() else {
-        return Flow::Quit(0);
+        return Err(Flow::Quit(0));
     };
     let Some(window) = editor.current_window() else {
-        return Flow::Quit(0);
+        return Err(Flow::Quit(0));
     };
     // `win_close` (`window.c`:2791-2847). Upstream's `last_window` is one
     // window in the *current tabpage* and one tabpage in the editor, and only
@@ -15408,30 +15577,34 @@ fn command_close_inner<F: FileIO>(
     // refusing. `editor.windows()` is the whole editor, so testing it here
     // made every one-window tabpage look like the last window in the editor.
     if current_tabpage_window_count(editor) <= 1 {
-        let tabs = editor.tabpages();
-        if tabs.len() <= 1 {
-            return if quit {
+        if editor.tabpages().len() <= 1 {
+            return Err(if quit {
                 Flow::Quit(0)
             } else {
                 error_flow(runtime, "E444", "Cannot close last window")
-            };
+            });
         }
-        let alternate = alt_tabpage(&tabs, tab);
-        if editor.close_tabpage(tab).is_err() {
-            return error_flow(runtime, "E444", "Cannot close last window");
-        }
-        if let Some(alternate) = alternate {
-            let _ = editor.set_current_tabpage(alternate);
-        }
-        return Flow::Normal;
+        let windows = editor
+            .tabpage_windows(tab)
+            .map(|windows| {
+                windows
+                    .into_iter()
+                    .map(|window| {
+                        (
+                            editor.window(window).map(|state| state.buffer).unwrap_or(buffer),
+                            window,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|_| vec![(buffer, window)]);
+        return Ok(CloseTarget::Tabpage { tab, windows });
     }
-    match editor.close_window(tab, window, true) {
-        Ok(_) => {
-            *closed = Some((buffer, window));
-            Flow::Normal
-        }
-        Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
-    }
+    Ok(CloseTarget::Window {
+        tab,
+        window,
+        buffer,
+    })
 }
 
 /// `alt_tabpage` (`window.c`:3719-3740): the tabpage entered when the current
@@ -16860,18 +17033,45 @@ fn screen_number_option(editor: &Editor, name: &str) -> usize {
     }
 }
 
-fn command_only<F: FileIO>(runtime: &mut ExRuntime<F>, editor: &mut Editor) -> Flow {
-    let Some(tab) = editor.current_tabpage() else {
-        return error_flow(runtime, "E749", "No current tabpage");
+fn command_only<F: FileIO, E: ExEditorAccess>(
+    runtime: &mut ExRuntime<F>,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
+) -> Flow {
+    let prepared = access.with_ex_editor(|editor| {
+        let Some(tab) = editor.current_tabpage() else {
+            return Err(error_flow(runtime, "E749", "No current tabpage"));
+        };
+        let Some(current) = editor.current_window() else {
+            return Err(error_flow(runtime, "E749", "No current window"));
+        };
+        let closing: Vec<(BufHandle, WinHandle)> = editor
+            .tabpage_windows(tab)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|window| *window != current)
+            .filter_map(|window| editor.window(window).ok().map(|state| (state.buffer, window)))
+            .collect();
+        Ok::<_, Flow>((tab, closing))
+    });
+    let Ok((tab, closing)) = prepared else {
+        return prepared.err().unwrap();
     };
-    let Some(current) = editor.current_window() else {
-        return error_flow(runtime, "E749", "No current window");
-    };
-    let windows = editor.tabpage_windows(tab).unwrap_or_default();
-    for window in windows {
-        if window != current
-            && let Err(error) = editor.close_window(tab, window, true)
-        {
+    // `ex_only` removes the other windows through `win_close`, so each one
+    // fires `WinClosed` while it is still valid.
+    for (buffer, window) in closing {
+        let flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
+        if !matches!(flow, Flow::Normal) {
+            return flow;
+        }
+        let applied = access.with_ex_editor(|editor| {
+            if !editor.windows().contains(&window) {
+                return Ok(());
+            }
+            editor.close_window(tab, window, true).map(|_| ())
+        });
+        if let Err(error) = applied {
             return error_flow(runtime, "E445", error.to_string());
         }
     }
@@ -18842,7 +19042,13 @@ fn command_tabdo<F: FileIO, E: ExEditorAccess>(
         if access.with_ex_editor(|editor| editor.tabpage(tab).is_err()) {
             break;
         }
-        switch_current_tabpage(runtime, access, scope, lua, tab);
+        // A throwing `TabLeave`/`TabEnter` handler aborts the whole
+        // `:tabdo` (`ex_listdo`, ex_cmds2.c:585): the body must not run in
+        // the tab the failed switch never left.
+        let switch = switch_current_tabpage(runtime, access, scope, lua, tab);
+        if !matches!(switch, Flow::Normal) {
+            return switch;
+        }
         let flow = run_program(runtime, access, scope, lua, &program, 0, program.len());
         if !matches!(flow, Flow::Normal) {
             return flow;
@@ -21306,37 +21512,48 @@ fn command_tablast<F: FileIO, E: ExEditorAccess>(
 }
 
 /// `:helpclose` (`help.c` `ex_helpclose`): close one help window in the
-/// current tabpage. With no help window open this is a silent no-op.
-fn command_helpclose<F: FileIO>(
+/// current tabpage. With no help window open this is a silent no-op. The
+/// close is upstream's `win_close`, so `WinClosed` fires before the window
+/// goes — same ordering as `:close`.
+fn command_helpclose<F: FileIO, E: ExEditorAccess>(
     runtime: &mut ExRuntime<F>,
-    editor: &mut Editor,
+    access: &E,
+    scope: &mut Scope,
+    lua: Option<&Rc<dyn LuaExec>>,
     command: &ExCommand,
 ) -> Flow {
     let _ = command;
-    let Some(tab) = editor.current_tabpage() else {
+    let target = access.with_ex_editor(|editor| {
+        let tab = editor.current_tabpage()?;
+        for window in editor.tabpage_windows(tab).ok()? {
+            let buffer = editor.window(window).ok()?.buffer;
+            let is_help = matches!(
+                editor.options().get_buffer(buffer, "buftype"),
+                Ok(OptionValue::String(value)) if value == "help"
+            );
+            if is_help {
+                return Some((tab, window, buffer));
+            }
+        }
+        None
+    });
+    let Some((tab, window, buffer)) = target else {
         return Flow::Normal;
     };
-    let Ok(windows) = editor.tabpage_windows(tab) else {
-        return Flow::Normal;
-    };
-    for window in windows {
-        let buffer = match editor.window(window) {
-            Ok(state) => state.buffer,
-            Err(_) => continue,
-        };
-        let is_help = matches!(
-            editor.options().get_buffer(buffer, "buftype"),
-            Ok(OptionValue::String(value)) if value == "help"
-        );
-        if !is_help {
-            continue;
-        }
-        if editor.close_window(tab, window, true).is_err() {
-            return error_flow(runtime, "E444", "Cannot close last window");
-        }
-        return Flow::Normal;
+    let flow = run_winclosed_plan(runtime, access, scope, lua, buffer, window);
+    if !matches!(flow, Flow::Normal) {
+        return flow;
     }
-    Flow::Normal
+    access.with_ex_editor(|editor| {
+        // The `WinClosed` handler may have closed the window itself.
+        if !editor.windows().contains(&window) {
+            return Flow::Normal;
+        }
+        match editor.close_window(tab, window, true) {
+            Ok(_) => Flow::Normal,
+            Err(_) => error_flow(runtime, "E444", "Cannot close last window"),
+        }
+    })
 }
 
 /// `:print` / `:p` — `ex_docmd.c` `ex_print`: every addressed line goes to
