@@ -622,7 +622,7 @@ impl<'a> Builtins<'a> {
             "utf16idx" => utf16idx(&args),
             "charidx" => charidx(&args),
             "type" => Ok(Typval::Number(type_constant(&args[0]))),
-            "uniq" => uniq(args),
+            "uniq" => uniq(self, &RegexRef(self.regex), args, scope),
             "values" => dict_projection(&args[0], &Projection::Values),
             // Release nvim's body is inert outside `-DUNIT_TESTING` builds
             // (testing.c); this port has no cycle collector to force, so the
@@ -666,7 +666,16 @@ impl<'a> Builtins<'a> {
                 return match name {
                     "remove" => remove_from_scope(self, scope, kind, &values),
                     "extend" => extend_scope(self, scope, kind, values, true),
-                    _ => extend_scope(self, scope, kind, values, false),
+                    // `extendnew` never mutates the scope: merge into a
+                    // copy of the scope dictionary through the generic
+                    // path, matching `f_extendnew`'s copied left.
+                    _ => {
+                        let copy = shallow_copy(&scope.scope_dict(kind))?;
+                        let mut copy_args = Vec::with_capacity(values.len());
+                        copy_args.push(copy);
+                        copy_args.extend(values.into_iter().skip(1));
+                        extend_common(self, copy_args, false)
+                    }
                 };
             }
             return self.dispatch(name, values, scope);
@@ -1390,25 +1399,7 @@ impl<'a> Builtins<'a> {
         let Some(Typval::List(reference)) = args.first() else {
             return Err(EvalError::new("E714", 0, "List required"));
         };
-        let mode = match args.get(1) {
-            None => SortMode::Default,
-            Some(Typval::Number(number)) => match *number {
-                0 => SortMode::Default,
-                1 => SortMode::IgnoreCase,
-                _ => return Err(EvalError::new("E474", 0, "Invalid argument")),
-            },
-            Some(Typval::String(text)) => match text.as_bytes() {
-                b"" => SortMode::Default,
-                b"i" => SortMode::IgnoreCase,
-                b"n" => SortMode::Numeric,
-                b"N" => SortMode::Integer,
-                b"f" => SortMode::Float,
-                b"l" => SortMode::Locale,
-                _ => SortMode::Callback(args[1].clone()),
-            },
-            Some(Typval::Funcref(_) | Typval::Partial(_)) => SortMode::Callback(args[1].clone()),
-            _ => return Err(EvalError::new("E921", 0, "Invalid callback argument")),
-        };
+        let mode = parse_sort_mode(args.get(1))?;
         let (mut values, previous_lock) = {
             let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
             if data.lock.locked {
@@ -1425,15 +1416,11 @@ impl<'a> Builtins<'a> {
                 return Ordering::Equal;
             }
             let result = match &mode {
-                SortMode::Default | SortMode::Locale => Ok(sort_string_pair(left, right, false)),
-                SortMode::IgnoreCase => Ok(sort_string_pair(left, right, true)),
-                SortMode::Numeric => Ok(sort_numeric(left).total_cmp(&sort_numeric(right))),
-                SortMode::Integer => Ok(sort_integer(left).cmp(&sort_integer(right))),
-                SortMode::Float => Ok(sort_float(left).total_cmp(&sort_float(right))),
                 SortMode::Callback(callback) => self
                     .eval_callback(callback, left.clone(), right.clone(), scope)
                     .and_then(|value| number_arg(&value))
                     .map(|value| value.cmp(&0)),
+                _ => Ok(sort_mode_ordering(&mode, left, right)),
             };
             match result {
                 Ok(ordering) => ordering,
@@ -1644,14 +1631,71 @@ enum CollectionOp {
 }
 
 /// How the builtin `sort()`/`uniq()` comparison behaves (`parse_sort_uniq_args`).
-enum SortMode {
+#[derive(Clone, Debug)]
+pub enum SortMode {
+    /// `item_compare`'s flag-less string-encoding compare.
     Default,
+    /// `"i"` or `1`: case-insensitive string compare.
     IgnoreCase,
+    /// `"l"`: locale collation (`strcoll`), same order as `Default` here.
     Locale,
+    /// `"n"`: leading-number string compare (`strtod` on the encoding).
     Numeric,
+    /// `"N"`: integer compare (`tv_get_number`).
     Integer,
+    /// `"f"`: float compare (`tv_get_float`).
     Float,
+    /// Any other `{func}` value: a comparator to invoke.
     Callback(Typval),
+}
+
+/// Parse `sort()`/`uniq()`'s optional `{func}` argument the way upstream
+/// `parse_sort_uniq_args` (eval/typval.c:1482-1549) does: the number `1`
+/// (or a string leading with it) picks case-insensitive comparison,
+/// `0`/empty the default, the strings "n"/"N"/"f"/"i"/"l" the numbered
+/// modes, and any other value the name of a callback — a Funcref or
+/// Partial stays a callback directly. A non-zero, non-`1` Number is E474.
+pub fn parse_sort_mode(arg: Option<&Typval>) -> Result<SortMode> {
+    let Some(value) = arg else {
+        return Ok(SortMode::Default);
+    };
+    if let Typval::Funcref(_) | Typval::Partial(_) = value {
+        return Ok(SortMode::Callback(value.clone()));
+    }
+    let number = number_arg(value)?;
+    if number == 1 {
+        return Ok(SortMode::IgnoreCase);
+    }
+    if !matches!(value, Typval::Number(_)) {
+        let text = string_arg(value)?;
+        return Ok(match text.as_bytes() {
+            b"" => SortMode::Default,
+            b"n" => SortMode::Numeric,
+            b"N" => SortMode::Integer,
+            b"f" => SortMode::Float,
+            b"i" => SortMode::IgnoreCase,
+            b"l" => SortMode::Locale,
+            _ => SortMode::Callback(value.clone()),
+        });
+    }
+    if number != 0 {
+        return Err(EvalError::new("E474", 0, "Invalid argument"));
+    }
+    Ok(SortMode::Default)
+}
+
+/// Compare two values in one of `sort()`/`uniq()`'s non-callback modes
+/// (`item_compare` for the flag-driven orderings). Callback modes have no
+/// answer here — the caller runs the comparator.
+pub fn sort_mode_ordering(mode: &SortMode, left: &Typval, right: &Typval) -> Ordering {
+    match mode {
+        SortMode::Default | SortMode::Locale => sort_string_pair(left, right, false),
+        SortMode::IgnoreCase => sort_string_pair(left, right, true),
+        SortMode::Numeric => sort_numeric(left).total_cmp(&sort_numeric(right)),
+        SortMode::Integer => sort_integer(left).cmp(&sort_integer(right)),
+        SortMode::Float => sort_float(left).total_cmp(&sort_float(right)),
+        SortMode::Callback(_) => Ordering::Equal,
+    }
 }
 
 /// Encode a value for string comparison, following upstream `item_compare`
@@ -4360,6 +4404,15 @@ fn extend_common<H: BuiltinHost>(
         .first()
         .cloned()
         .ok_or_else(|| EvalError::new("E119", 0, "not enough arguments"))?;
+    // `f_extendnew` (eval/typval.c:736-743): copy the first argument and
+    // merge into the copy — the source (possibly a locked or shared
+    // value, or a live scope dictionary) is never mutated, and the copy
+    // does not carry the source's lock check.
+    let left = if notify {
+        left
+    } else {
+        shallow_copy(&left)?
+    };
     match (&left, right) {
         (Typval::List(left_ref), Typval::List(right_ref)) => {
             let right = list_items(&right_ref)?;
@@ -4367,7 +4420,11 @@ fn extend_common<H: BuiltinHost>(
             ensure_unlocked(left.lock)?;
             left.items.extend(right);
             drop(left);
-            Ok(args.remove(0))
+            if notify {
+                Ok(args.remove(0))
+            } else {
+                Ok(Typval::List(left_ref.clone()))
+            }
         }
         (Typval::Dict(left_ref), Typval::Dict(right_ref)) => {
             let right = cloned_entries(&right_ref)?;
@@ -4411,7 +4468,11 @@ fn extend_common<H: BuiltinHost>(
                 }
             }
             drop(left);
-            Ok(args.remove(0))
+            if notify {
+                Ok(args.remove(0))
+            } else {
+                Ok(Typval::Dict(left_ref.clone()))
+            }
         }
         _ => Err(EvalError::new(
             "E712",
@@ -4835,22 +4896,91 @@ fn remove<H: BuiltinHost>(host: &mut H, args: &[Typval]) -> Result<Typval> {
     }
 }
 
-fn uniq(mut args: Vec<Typval>) -> Result<Typval> {
-    let Some(container @ Typval::List(_)) = args.get_mut(0).cloned() else {
+/// `uniq({list} [, {func} [, {dict}]])` for the eval-only host — the
+/// same `do_uniq` contract the editor's `call_uniq_builtin` implements:
+/// flag modes compare through [`sort_mode_ordering`], and a callback
+/// mode invokes the comparator once per adjacent pair, dropping the
+/// item whenever the answer is `0`.
+fn uniq(
+    host: &mut impl BuiltinHost,
+    regex: &RegexRef<'_>,
+    args: Vec<Typval>,
+    scope: &mut Scope,
+) -> Result<Typval> {
+    let Some(container @ Typval::List(_)) = args.first().cloned() else {
         return Err(EvalError::new("E714", 0, "List required"));
     };
     let Typval::List(reference) = &container else {
         return Err(EvalError::new("E714", 0, "List required"));
     };
+    let mode = parse_sort_mode(args.get(1))?;
+    let receiver = match args.get(2) {
+        None | Some(Typval::Special(Special::Null)) => None,
+        Some(Typval::Dict(reference)) => Some(reference.clone()),
+        Some(_) => {
+            return Err(EvalError::new("E731", 0, "Using a List as a Dict"));
+        }
+    };
+    // One comparator setup, like upstream's single `item_compare`
+    // resolution: a string names a function, and the optional {dict}
+    // binds `self` on the invoked callable.
+    let callable = match &mode {
+        SortMode::Callback(comparator) => match comparator {
+            Typval::String(name) => Typval::Funcref(Funcref {
+                name: name.clone(),
+                args: Vec::new(),
+                dict: receiver.clone(),
+                registry: None,
+            }),
+            Typval::Funcref(funcref) | Typval::Partial(funcref) => {
+                let mut funcref = funcref.clone();
+                if receiver.is_some() {
+                    funcref.dict = receiver.clone();
+                }
+                Typval::Partial(funcref)
+            }
+            _ => return Err(EvalError::new("E1085", 0, "not a callable value")),
+        },
+        _ => Typval::Special(Special::Null),
+    };
+    let snapshot = reference
+        .try_borrow()
+        .map_err(|_| borrow_error())?
+        .items
+        .clone();
+    let mut removals = Vec::new();
+    // `do_uniq` compares each item against the last one it kept.
+    let mut kept = 0_usize;
+    for index in 1..snapshot.len() {
+        let duplicate = match &mode {
+            SortMode::Callback(_) => {
+                let value = Evaluator::new(&mut *host, regex).invoke(
+                    callable.clone(),
+                    vec![snapshot[kept].clone(), snapshot[index].clone()],
+                    scope,
+                )?;
+                match value {
+                    Typval::Number(number) => number == 0,
+                    Typval::Float(number) => number == 0.0,
+                    Typval::Bool(flag) => !flag,
+                    _ => return Err(EvalError::new("E474", 0, "Invalid argument")),
+                }
+            }
+            _ => sort_mode_ordering(&mode, &snapshot[kept], &snapshot[index]) == Ordering::Equal,
+        };
+        if duplicate {
+            removals.push(index);
+        } else {
+            kept = index;
+        }
+    }
     let mut data = reference.try_borrow_mut().map_err(|_| borrow_error())?;
     ensure_unlocked(data.lock)?;
-    let mut index = 1;
-    while index < data.items.len() {
-        if values_equal(&data.items[index - 1], &data.items[index], false, 0)? {
-            data.items.remove(index);
-        } else {
-            index += 1;
-        }
+    if data.items.len() != snapshot.len() {
+        return Err(EvalError::new("E741", 0, "Cannot change list"));
+    }
+    for index in removals.into_iter().rev() {
+        data.items.remove(index);
     }
     drop(data);
     Ok(container)
