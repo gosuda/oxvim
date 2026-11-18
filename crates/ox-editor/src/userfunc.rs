@@ -85,8 +85,12 @@ pub enum WatchCallback {
     Name(OxStr),
     /// A `Funcref` value, cloned at registration with its bound arguments.
     Funcref(Funcref),
-    /// A `Partial` value, cloned at registration.
-    Partial(Funcref),
+    /// A `Partial` value, cloned at registration with the identity the
+    /// argument expression carried. `tv_callback_equal` compares partial
+    /// pointers (`eval/typval.c`), so two partials that merely spell the
+    /// same function and bindings must not match: the identity stands in
+    /// for the `partial_T` address.
+    Partial(Funcref, Option<usize>),
     /// A null callback (`v:null` on the add path): registers like any other
     /// watcher but never fires, matching upstream's no-op `callback_call`.
     None,
@@ -95,8 +99,11 @@ pub enum WatchCallback {
 impl WatchCallback {
     /// Whether two callbacks identify the same watcher
     /// (`tv_callback_equal` in `eval/typval.c`): names compare by spelling,
-    /// funcrefs by name, partials by name and binding shape (upstream
-    /// compares partial identity, unobservable across calls here).
+    /// funcrefs by name, partials by identity — upstream compares the
+    /// `partial_T*` itself, so `dictwatcherdel` only removes a partial
+    /// watcher for the same partial value, never for another partial with
+    /// equal bindings. A caller without provenance (the values-only path)
+    /// falls back to name and binding shape.
     #[must_use]
     pub fn matches(&self, other: &Self) -> bool {
         match (self, other) {
@@ -104,11 +111,17 @@ impl WatchCallback {
             (Self::Name(name), Self::Funcref(function))
             | (Self::Funcref(function), Self::Name(name)) => &function.name == name,
             (Self::Funcref(left), Self::Funcref(right)) => left.name == right.name,
-            (Self::Partial(left), Self::Partial(right)) => {
-                left.name == right.name
-                    && left.args.len() == right.args.len()
-                    && left.dict.is_some() == right.dict.is_some()
-                    && left.registry == right.registry
+            (Self::Partial(left, left_id), Self::Partial(right, right_id)) => {
+                match (left_id, right_id) {
+                    (Some(left_id), Some(right_id)) => left_id == right_id,
+                    _ => {
+                        left.name == right.name
+                            && left.args.len() == right.args.len()
+                            && left.args == right.args
+                            && left.dict.is_some() == right.dict.is_some()
+                            && left.registry == right.registry
+                    }
+                }
             }
             (Self::None, Self::None) => true,
             _ => false,
@@ -123,11 +136,15 @@ impl WatchCallback {
 /// `b:` / `w:` / `t:` argument therefore needs its scope recorded at the
 /// builtin call site (the evaluator knows it; a bare `Typval` does not), so
 /// both spellings exist: plain-dict variables key by live `Dict` identity,
-/// scope namespaces key by kind.
+/// scope namespaces key by kind plus owner — upstream pins the live
+/// `buf_T`/`win_T`/`tabpage_T` pointer, so a `b:` watcher registered in one
+/// buffer neither fires for nor deletes another buffer's registration.
+/// Kinds without an owning object share owner `0`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum WatchTarget {
-    /// A scope namespace, resolved by the dictionary builtins.
-    Scope(ScopeKind),
+    /// A scope namespace, resolved by the dictionary builtins: the scope
+    /// kind and the owning handle (buffer/window/tabpage, `0` otherwise).
+    Scope(ScopeKind, i64),
     /// One live `Dict` identity (`Rc::as_ptr` of its `DictRef`).
     Dict(usize),
 }
@@ -1037,7 +1054,7 @@ mod g_scope_tests {
             if functions.dictwatcher_is_live(&target, *id) {
                 let name = match callback {
                     WatchCallback::Name(name) => name.to_string_lossy().into_owned(),
-                    WatchCallback::Funcref(function) | WatchCallback::Partial(function) => {
+                    WatchCallback::Funcref(function) | WatchCallback::Partial(function, _) => {
                         function.name.to_string_lossy().into_owned()
                     }
                     WatchCallback::None => "<none>".to_owned(),
@@ -1083,7 +1100,7 @@ mod shared_watcher_registry_tests {
         let mut primary = UserFunctions::new();
         let mut nested = UserFunctions::new();
         nested.share_watchers_from(&primary);
-        let target = WatchTarget::Scope(ScopeKind::Global);
+        let target = WatchTarget::Scope(ScopeKind::Global, 0);
         primary.dictwatcher_add(
             target,
             OxStr::from("watched"),

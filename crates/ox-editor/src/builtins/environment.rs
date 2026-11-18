@@ -993,7 +993,7 @@ fn dictwatcher_name_rejected(name: &OxStr) -> bool {
 fn dictwatcher_add_callback(argument: &Typval) -> ox_eval::Result<WatchCallback> {
     match argument {
         Typval::Funcref(function) => Ok(WatchCallback::Funcref(function.clone())),
-        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone())),
+        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone(), None)),
         Typval::String(name) if !dictwatcher_name_rejected(name) => {
             Ok(WatchCallback::Name(name.clone()))
         }
@@ -1008,7 +1008,7 @@ fn dictwatcher_add_callback(argument: &Typval) -> ox_eval::Result<WatchCallback>
 fn dictwatcher_del_callback(argument: &Typval) -> ox_eval::Result<WatchCallback> {
     match argument {
         Typval::Funcref(function) => Ok(WatchCallback::Funcref(function.clone())),
-        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone())),
+        Typval::Partial(function) => Ok(WatchCallback::Partial(function.clone(), None)),
         Typval::String(name) if dictwatcher_name_rejected(name) => Err(EvalError::new(
             "E921",
             0,
@@ -1052,17 +1052,21 @@ fn dictwatcher_add_target(argument: &Typval) -> ox_eval::Result<WatchTarget> {
 /// its variable slot's instead. Anything else is not a scope namespace.
 fn scope_target(identity: Option<usize>, scope: &Scope) -> Option<WatchTarget> {
     let identity = identity?;
-    if identity == std::ptr::from_ref(&scope.global) as usize {
-        Some(WatchTarget::Scope(ScopeKind::Global))
+    let kind = if identity == std::ptr::from_ref(&scope.global) as usize {
+        ScopeKind::Global
     } else if identity == std::ptr::from_ref(&scope.buffer) as usize {
-        Some(WatchTarget::Scope(ScopeKind::Buffer))
+        ScopeKind::Buffer
     } else if identity == std::ptr::from_ref(&scope.window) as usize {
-        Some(WatchTarget::Scope(ScopeKind::Window))
+        ScopeKind::Window
     } else if identity == std::ptr::from_ref(&scope.tab) as usize {
-        Some(WatchTarget::Scope(ScopeKind::Tab))
+        ScopeKind::Tab
     } else {
-        None
-    }
+        return None;
+    };
+    // The owner pins which buffer/window/tabpage this `b:`/`w:`/`t:` dict
+    // lives on (`dict_T` inside `buf_T` upstream): a watcher registered
+    // while another buffer was current must not fire for this one's map.
+    Some(WatchTarget::Scope(kind, scope.owner_token(kind)))
 }
 
 /// The scoped `dictwatcheradd()`/`dictwatcherdel()` target: a bare scope
@@ -1087,6 +1091,21 @@ fn dictwatcher_add_target_scoped(
     dictwatcher_add_target(&argument.value)
 }
 
+/// The identity-tagged callback for the scoped add/del paths: a `Partial`
+/// keeps the identity its argument expression carried, so `del` matches
+/// only the same partial value (`tv_callback_equal` compares `partial_T*`).
+fn dictwatcher_callback_identity(
+    argument: &CallArg,
+    parse: fn(&Typval) -> ox_eval::Result<WatchCallback>,
+) -> ox_eval::Result<WatchCallback> {
+    match parse(&argument.value)? {
+        WatchCallback::Partial(function, _) => {
+            Ok(WatchCallback::Partial(function, argument.identity))
+        }
+        callback => Ok(callback),
+    }
+}
+
 /// Validates scoped `dictwatcheradd()` arguments: same pattern/callback
 /// checks as [`dictwatcher_add_args`], with the target resolved against the
 /// live `scope` maps.
@@ -1097,7 +1116,7 @@ fn dictwatcher_add_args_scoped(
     check_arity("dictwatcheradd", args.len())?;
     let target = dictwatcher_add_target_scoped(&args[0], scope)?;
     let pattern = dictwatcher_pattern(&args[1].value)?;
-    let callback = dictwatcher_add_callback(&args[2].value)?;
+    let callback = dictwatcher_callback_identity(&args[2], dictwatcher_add_callback)?;
     Ok((target, pattern, callback))
 }
 
@@ -1111,7 +1130,7 @@ fn dictwatcher_del_args_scoped(
     check_arity("dictwatcherdel", args.len())?;
     let target = dictwatcher_target_scoped(&args[0], scope)?;
     let pattern = dictwatcher_pattern(&args[1].value)?;
-    let callback = dictwatcher_del_callback(&args[2].value)?;
+    let callback = dictwatcher_callback_identity(&args[2], dictwatcher_del_callback)?;
     Ok((target, pattern, callback))
 }
 

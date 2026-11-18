@@ -1972,6 +1972,7 @@ impl<F: FileIO> ExExecutor<F> {
             .map_err(ExecError::Eval)?;
         push_scope_watch_event(
             &mut self.runtime,
+            0,
             ScopeKind::Global,
             name.as_bytes(),
             old,
@@ -2014,6 +2015,7 @@ impl<F: FileIO> ExExecutor<F> {
         }
         push_scope_watch_event(
             &mut self.runtime,
+            0,
             ScopeKind::Global,
             name.as_bytes(),
             old,
@@ -2073,6 +2075,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(buffer),
             ScopeKind::Buffer,
             name.as_bytes(),
             old,
@@ -2132,6 +2135,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(buffer),
             ScopeKind::Buffer,
             name.as_bytes(),
             Some(old),
@@ -2178,6 +2182,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(window),
             ScopeKind::Window,
             name.as_bytes(),
             old,
@@ -2223,6 +2228,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(window),
             ScopeKind::Window,
             name.as_bytes(),
             Some(old),
@@ -2269,6 +2275,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(tabpage),
             ScopeKind::Tab,
             name.as_bytes(),
             old,
@@ -2314,6 +2321,7 @@ impl<F: FileIO> ExExecutor<F> {
         })?;
         push_scope_watch_event(
             &mut self.runtime,
+            i64::from(tabpage),
             ScopeKind::Tab,
             name.as_bytes(),
             Some(old),
@@ -4941,7 +4949,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
         new: Option<Typval>,
     ) {
         self.runtime.dict_watch_events.push(DictWatchEvent {
-            target: WatchTarget::Scope(kind),
+            target: WatchTarget::Scope(kind, watch_scope_owner(self.access, kind)),
             dict: None,
             key: key.to_vec(),
             old,
@@ -5051,7 +5059,7 @@ impl<F: FileIO, E: ExEditorAccess> BuiltinHost for EvalHost<'_, F, E> {
         }
         for (kind, key, old, new) in self.builtins.take_scope_watch_events() {
             self.runtime.dict_watch_events.push(DictWatchEvent {
-                target: WatchTarget::Scope(kind),
+                target: WatchTarget::Scope(kind, watch_scope_owner(self.access, kind)),
                 dict: None,
                 key,
                 old,
@@ -5187,7 +5195,7 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
         }
         for (kind, key, old, new) in host.builtins.take_scope_watch_events() {
             host.runtime.dict_watch_events.push(DictWatchEvent {
-                target: WatchTarget::Scope(kind),
+                target: WatchTarget::Scope(kind, watch_scope_owner(host.access, kind)),
                 dict: None,
                 key,
                 old,
@@ -5251,6 +5259,7 @@ impl<F: FileIO, E: ExEditorAccess> EvalHost<'_, F, E> {
             )?;
             push_scope_watch_event(
                 self.runtime,
+                0,
                 ScopeKind::Global,
                 var_name.as_bytes(),
                 old,
@@ -6526,7 +6535,7 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
         // A scope namespace has no live `Dict` identity to pass along, so its
         // callback argument is the same snapshot a bare `g:` read gets.
         let dict = match event.target {
-            WatchTarget::Scope(kind) => scope.scope_dict(kind),
+            WatchTarget::Scope(kind, _) => scope.scope_dict(kind),
             WatchTarget::Dict(_) => match event.dict {
                 Some(dict) => dict,
                 None => continue,
@@ -6568,7 +6577,7 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
                     Typval::Funcref(function.clone()),
                     args,
                 ),
-                WatchCallback::Partial(function) => invoke_callable_value(
+                WatchCallback::Partial(function, _) => invoke_callable_value(
                     runtime,
                     access,
                     scope,
@@ -6597,6 +6606,20 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
     None
 }
 
+/// Owning handle of a `b:`/`w:`/`t:` watch target or event: upstream pins
+/// the live `buf_T`/`win_T`/`tabpage_T` for the watcher, so one owner's
+/// watcher neither fires for another's dict nor deletes its registration.
+/// Scope kinds without an owning object share owner `0`; a missing owner
+/// reports `-1` like [`Scope::scope_dict`]'s cache key.
+pub(crate) fn watch_scope_owner<E: ExEditorAccess>(access: &E, kind: ScopeKind) -> i64 {
+    access.with_ex_editor(|editor| match kind {
+        ScopeKind::Buffer => editor.current_buffer().map_or(-1, i64::from),
+        ScopeKind::Window => editor.current_window().map_or(-1, i64::from),
+        ScopeKind::Tab => editor.current_tabpage().map_or(-1, i64::from),
+        _ => 0,
+    })
+}
+
 /// Queues one scope-namespace mutation for watcher notification.
 ///
 /// Callers read the previous value before the write and pass it as `old`
@@ -6605,13 +6628,14 @@ fn drain_dict_watchers_inner<F: FileIO, E: ExEditorAccess>(
 /// changed nothing, so it notifies nothing.
 pub(crate) fn push_scope_watch_event<F: FileIO>(
     runtime: &mut ExRuntime<F>,
+    owner: i64,
     kind: ScopeKind,
     key: &[u8],
     old: Option<Typval>,
     new: Option<Typval>,
 ) {
     runtime.dict_watch_events.push(DictWatchEvent {
-        target: WatchTarget::Scope(kind),
+        target: WatchTarget::Scope(kind, owner),
         dict: None,
         key: key.to_vec(),
         old,
@@ -6663,6 +6687,7 @@ fn record_changedtick_movement<F: FileIO, E: ExEditorAccess>(
     }
     push_scope_watch_event(
         runtime,
+        i64::from(buffer_after),
         ScopeKind::Buffer,
         b"changedtick",
         Some(Typval::Number(tick_before)),
@@ -13089,6 +13114,7 @@ fn command_buffer_remove<F: FileIO, E: ExEditorAccess>(
             runtime.textlock += 1;
             push_scope_watch_event(
                 runtime,
+                i64::from(target),
                 ScopeKind::Buffer,
                 b"changedtick",
                 Some(Typval::Number(before)),
@@ -26629,7 +26655,14 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
         scope
             .set_scoped(kind, name.as_bytes(), 0, value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
-        push_scope_watch_event(runtime, kind, name.as_bytes(), old, Some(value));
+        push_scope_watch_event(
+            runtime,
+            scope.owner_token(kind),
+            kind,
+            name.as_bytes(),
+            old,
+            Some(value),
+        );
     } else if runtime.functions.call_stack().len() > runtime.source_bar {
         // `get_var_ht_dict` (eval/vars.c:2505-2512): inside a function a
         // bare name is function-local; outside one it is global. A file the
@@ -26642,7 +26675,7 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
         scope
             .set(name.as_bytes(), value.clone())
             .map_err(|error| eval_error_flow(runtime, error))?;
-        push_scope_watch_event(runtime, ScopeKind::Local, name.as_bytes(), old, Some(value));
+        push_scope_watch_event(runtime, 0, ScopeKind::Local, name.as_bytes(), old, Some(value));
     } else {
         let old = scope
             .get_scoped(ScopeKind::Global, name.as_bytes(), 0)
@@ -26653,6 +26686,7 @@ fn assign_target<F: FileIO, E: ExEditorAccess>(
             .map_err(|error| eval_error_flow(runtime, error))?;
         push_scope_watch_event(
             runtime,
+            0,
             ScopeKind::Global,
             name.as_bytes(),
             old,
@@ -26786,7 +26820,7 @@ fn remove_target<F: FileIO>(runtime: &mut ExRuntime<F>, scope: &mut Scope, targe
         let old = previous(scope, kind, name.as_bytes());
         let removed = scope.remove_pair(kind, name.as_bytes());
         if removed {
-            push_scope_watch_event(runtime, kind, name.as_bytes(), old, None);
+            push_scope_watch_event(runtime, scope.owner_token(kind), kind, name.as_bytes(), old, None);
         }
         removed
     };
@@ -29894,7 +29928,7 @@ mod shared_watcher_pair_tests {
         let mut primary = ExExecutor::new();
         let mut nested = ExExecutor::new();
         nested.share_user_functions_from(&primary);
-        let target = WatchTarget::Scope(ScopeKind::Global);
+        let target = WatchTarget::Scope(ScopeKind::Global, 0);
         primary.runtime.functions.dictwatcher_add(
             target,
             OxStr::from("watched"),

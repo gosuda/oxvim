@@ -13422,6 +13422,67 @@ fn dictwatcher_tick_callback_split_fails_e565() {
         other => panic!("expected E565, got {other:?}"),
     }
 }
+/// Watchers on `b:`/`w:`/`t:` pin the owning object, like upstream's
+/// `buf_T`-embedded `dict_T`: a `b:` watcher registered in one buffer must
+/// neither fire for another buffer's map nor be deleted from it.
+#[test]
+fn dictwatcher_scope_target_pins_owning_buffer() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_owner.vim",
+            "function! WatchBOwner(d, k, c)\n  call add(g:b_fires, a:k)\nendfunction\nlet g:b_fires = []\ncall dictwatcheradd(b:, '*', 'WatchBOwner')\n",
+        )
+        .unwrap();
+    executor.execute_line(&editor, "enew").unwrap();
+    executor.execute_line(&editor, "let b:label = 'other'").unwrap();
+    assert!(recorded_strings(&executor, "b_fires").is_empty());
+    let error = executor
+        .execute_line(&editor, "call dictwatcherdel(b:, '*', 'WatchBOwner')")
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Couldn't find a watcher"),
+        "deleting another buffer's watcher must miss, got {error:?}"
+    );
+    executor.execute_line(&editor, "bprevious").unwrap();
+    executor.execute_line(&editor, "let b:label = 'home'").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "b_fires"),
+        vec!["label".to_owned()]
+    );
+}
+
+/// `tv_callback_equal` compares partial pointers: a `dictwatcherdel` that
+/// spells a different partial — even one binding equal arguments to the
+/// same function — must not remove the registered watcher.
+#[test]
+fn dictwatcherdel_requires_the_same_partial() {
+    let (editor, mut executor) = setup();
+    executor
+        .execute_script(
+            &editor,
+            "watch_partial.vim",
+            "function! WatchPartialCb(bound, d, k, c)\n  call add(g:p_fires, a:k)\nendfunction\nlet g:p_fires = []\nlet g:d = {}\nlet g:P1 = function('WatchPartialCb', [1])\ncall dictwatcheradd(g:d, 'k', g:P1)\nlet g:P2 = function('WatchPartialCb', [2])\n",
+        )
+        .unwrap();
+    // Deleting by a different partial on the same function misses, and the
+    // registered watcher still fires.
+    let error = executor
+        .execute_line(&editor, "call dictwatcherdel(g:d, 'k', g:P2)")
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("Couldn't find a watcher"),
+        "deleting by a different partial must miss, got {error:?}"
+    );
+    executor.execute_line(&editor, "let g:d.k = 1").unwrap();
+    assert_eq!(
+        recorded_strings(&executor, "p_fires"),
+        vec!["k".to_owned()]
+    );
+    executor.execute_line(&editor, "call dictwatcherdel(g:d, 'k', g:P1)").unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // :pwd / :list / :number / :uptime / :tabs
 // ---------------------------------------------------------------------------

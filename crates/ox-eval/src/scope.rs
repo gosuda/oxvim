@@ -568,13 +568,18 @@ impl Scope {
     /// through a live alias) keeps the previous contents instead of
     /// panicking — identity is what the read owes — and the next read
     /// retries the refresh.
+    ///
+    /// Buffer/window/tab kinds are keyed by their owning handle: a
+    /// namespace read after the owner changed refreshes that owner's own
+    /// dict — the dict handed out for the previous owner keeps its
+    /// contents, so `let saved = b:` before a buffer switch still names
+    /// the old buffer's variables.
     /// The owner token identifying the live object this kind's map
-    /// mirrors: buffer/window/tab kinds key on their owning handle,
-    /// every other kind shares `0`. A namespace read after the owner
-    /// changed refreshes that owner's own dict — the dict handed out for
-    /// the previous owner keeps its contents, so `let saved = b:` before
-    /// a buffer switch still names the old buffer's variables.
-    fn owner_token(&self, kind: ScopeKind) -> i64 {
+    /// mirrors: buffer/window/tab kinds key on their owning handle, every
+    /// other kind shares `0`. Watch targets and watch events use the same
+    /// token so a `b:` watcher registered for one buffer cannot match
+    /// another buffer's dict.
+    pub fn owner_token(&self, kind: ScopeKind) -> i64 {
         match kind {
             ScopeKind::Buffer => self.synced.buffer_identity().map_or(-1, i64::from),
             ScopeKind::Window => self.synced.window_identity().map_or(-1, i64::from),
@@ -583,6 +588,29 @@ impl Scope {
         }
     }
 
+    /// Return the stable namespace dictionary for a bare scope expression.
+    ///
+    /// Entries owned by a scope (upstream embeds them in `buf_T` and friends)
+    /// materialize with their mutability metadata attached, so a dict like
+    /// `let d = b:` still refuses to mutate `d.changedtick`.
+    ///
+    /// The same [`DictRef`] is handed out on every read of one kind, so
+    /// `a:dict isnot g:` inside a `g:` watcher callback is false. The map
+    /// stays authoritative: the cached dict's entries are rebuilt from it on
+    /// each read, and every in-`Scope` map write mirrors into it. The dict
+    /// shares every container value with the map, so a bare `g:` read hands
+    /// out aliases just like [`Scope::get_scoped`] and marks the map dirty.
+    ///
+    /// A read that finds the dict already mutably borrowed (a reentrant read
+    /// through a live alias) keeps the previous contents instead of
+    /// panicking — identity is what the read owes — and the next read
+    /// retries the refresh.
+    ///
+    /// Buffer/window/tab kinds are keyed by their owning handle: a
+    /// namespace read after the owner changed refreshes that owner's own
+    /// dict — the dict handed out for the previous owner keeps its
+    /// contents, so `let saved = b:` before a buffer switch still names
+    /// the old buffer's variables.
     #[must_use]
     pub fn scope_dict(&self, kind: ScopeKind) -> Typval {
         let key = (kind.cache_index(), self.owner_token(kind));

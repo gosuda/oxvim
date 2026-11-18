@@ -260,7 +260,7 @@ pub(crate) fn assign_lvalue<F: FileIO, E: ExEditorAccess>(
             scope
                 .set_scoped(kind, key.as_bytes(), 0, value.clone())
                 .map_err(|error| eval_error(runtime, error))?;
-            push_scope_watch_event(runtime, kind, key.as_bytes(), old, Some(value));
+            push_scope_watch_event(runtime, scope.owner_token(kind), kind, key.as_bytes(), old, Some(value));
             Ok(())
         }
         Lvalue::Variable {
@@ -345,7 +345,7 @@ pub(crate) fn remove_lvalue<F: FileIO, E: ExEditorAccess>(
             }
             let removed = scope.remove_pair(kind, key.as_bytes());
             if removed {
-                push_scope_watch_event(runtime, kind, key.as_bytes(), old, None);
+                push_scope_watch_event(runtime, scope.owner_token(kind), kind, key.as_bytes(), old, None);
                 return Ok(true);
             }
             if bang {
@@ -1345,14 +1345,14 @@ fn assign_root_variable<F: FileIO>(
         scope
             .set_scoped(kind, name, 0, value.clone())
             .map_err(|error| eval_error(runtime, error))?;
-        push_scope_watch_event(runtime, kind, name, old, Some(value));
+        push_scope_watch_event(runtime, scope.owner_token(kind), kind, name, old, Some(value));
         Ok(())
     } else {
         let old = scope.get_scoped(ScopeKind::Local, name, 0).ok().cloned();
         scope
             .set(name, value.clone())
             .map_err(|error| eval_error(runtime, error))?;
-        push_scope_watch_event(runtime, ScopeKind::Local, name, old, Some(value));
+        push_scope_watch_event(runtime, 0, ScopeKind::Local, name, old, Some(value));
         Ok(())
     }
 }
@@ -1432,7 +1432,7 @@ fn remove_root_variable<F: FileIO>(
         let old = previous(scope, kind);
         let removed = scope.remove_pair(kind, name);
         if removed {
-            push_scope_watch_event(runtime, kind, name, old, None);
+            push_scope_watch_event(runtime, scope.owner_token(kind), kind, name, old, None);
         }
         removed
     };
