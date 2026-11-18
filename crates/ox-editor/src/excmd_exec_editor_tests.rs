@@ -10841,6 +10841,26 @@ fn sort_unique_dedupes_full_lines() {
     assert_eq!(sort_lines(&editor), ["apple", "banana", "cherry"]);
 }
 
+/// `ex_uniq`'s `u_save` fails E21 on a 'nomodifiable' buffer before any
+/// line is deleted — the same gate `:sort` passes through.
+#[test]
+fn uniq_rejects_nomodifiable_buffer() {
+    let (editor, mut executor) =
+        setup_with_content(&[b"apple".to_vec(), b"apple".to_vec()]);
+    let buffer = editor.editor().current_buffer().unwrap();
+    editor
+        .editor_mut()
+        .options_mut()
+        .set_buffer(
+            buffer,
+            "modifiable",
+            crate::options::OptionValue::Boolean(false),
+        )
+        .unwrap();
+    assert_vim_error(executor.execute_line(&editor, "uniq"), "E21");
+    assert_eq!(sort_lines(&editor), ["apple", "apple"]);
+}
+
 /// `/pat/` sorts on the text after the match; with `r` it sorts on the
 /// matched text itself.
 #[test]

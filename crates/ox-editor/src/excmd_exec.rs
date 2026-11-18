@@ -20513,6 +20513,12 @@ fn command_uniq<F: FileIO, E: ExEditorAccess>(
         // `ex_uniq` returns before parsing arguments for a single line.
         return Flow::Normal;
     }
+    // `ex_uniq` calls `u_save` before the dedup loop (`ex_cmds.c:711`), and
+    // `u_save` fails E21 on a 'nomodifiable' buffer — the check lands
+    // before any line is deleted, like upstream.
+    if access.with_ex_editor(|editor| !editor.is_modifiable(buffer)) {
+        return error_flow(runtime, "E21", "Cannot make changes, 'modifiable' is off");
+    }
     // Argument scan (`ex_uniq`, `ex_cmds.c:697-765`).
     let mut ignore_case = false;
     let mut match_portion = false;
